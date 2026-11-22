@@ -1331,7 +1331,9 @@ fn read_single_target(
             "# READ `{label}` [minified/long-line file: {}B across {total_lines} lines | {format_tag}]\n{body}\n\n[ap read minified pager: pass `--query <regex> --pretty` or `--offset 1800 --chars 2400 --pretty` to slice without context overflow]",
             converted.len()
         )
-    } else if converted.len() > cli.max_chars {
+    } else if converted.len() > cli.max_chars
+        && !(format_tag == "binary" && (cli.query.is_some() || cli.xref) && converted.len() <= 24000)
+    {
         let is_ast_code = ap_splice::ast::language_for_ext(&ext).is_some();
         let outline = if is_ast_code {
             let syms = ap_splice::ast::scan_symbols(&converted, &ext);

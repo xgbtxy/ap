@@ -1172,26 +1172,41 @@ pub fn inspect_binary_with_xref_md(
     if include_xref {
         if let Some(ref pe) = pe_ctx {
             let xrefs = scan_pe64_xrefs(bytes, pe, &matched_str_rvas, q_re.as_ref(), 60);
-            out.push(format!(
+            let mut xref_block = vec![format!(
                 "### PE64 RIP-Relative Code XREFs ({} found)",
                 xrefs.len()
-            ));
+            )];
             if xrefs.is_empty() {
-                out.push("*(no matching x64 RIP-relative LEA/CALL XREFs found in executable sections)*".to_string());
+                xref_block.push("*(no matching x64 RIP-relative LEA/CALL XREFs found in executable sections)*".to_string());
             } else {
-                out.extend(xrefs);
+                xref_block.extend(xrefs);
             }
+            // Place XREFs right after PE Sections/RPC/Exports (before bulky full import dump) so hunters see code targets immediately!
+            let insert_at = out
+                .iter()
+                .position(|l| l.starts_with("### PE Imports"))
+                .unwrap_or(out.len());
+            out.splice(insert_at..insert_at, xref_block);
         }
     }
 
-    out.push(format!(
+    let mut str_block = vec![format!(
         "### Extracted Strings ({} shown; scans ASCII + Windows UTF-16LE — narrow with `--query <regex>` or add `--xref`)",
         hits.len()
-    ));
+    )];
     if hits.is_empty() {
-        out.push("*(no matching printable ASCII/UTF-16LE strings)*".to_string());
+        str_block.push("*(no matching printable ASCII/UTF-16LE strings)*".to_string());
     } else {
-        out.extend(hits);
+        str_block.extend(hits);
+    }
+    if query.is_some() || include_xref {
+        let insert_at = out
+            .iter()
+            .position(|l| l.starts_with("### PE Imports"))
+            .unwrap_or(out.len());
+        out.splice(insert_at..insert_at, str_block);
+    } else {
+        out.extend(str_block);
     }
     out.join("\n")
 }
