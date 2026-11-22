@@ -145,14 +145,23 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "http_keepalive_and_transient_retry",
-        summary: "Add resilient HTTP keepAlive/connect timeouts and transient TLS/socket/gateway retry with jittered backoff",
+        summary: "Add resilient HTTP keepAlive (15s/28s/10s), 250ms Happy-Eyeballs connect failover & transient TLS/socket/gateway retry with jittered backoff",
         hunks: &[
             PatchHunk {
                 id: "bundle_http_keepalive",
                 rel_hint: None,
                 old: r#",bodyTimeout:normalizedTimeoutMs,connect:{autoSelectFamilyAttemptTimeout:DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS},headersTimeout:normalizedTimeoutMs,cli"#,
+                alt_olds: &[
+                    r#",bodyTimeout:normalizedTimeoutMs,connectTimeout:20000,keepAliveTimeout:25000,keepAliveMaxTimeout:55000,connect:{autoSelectFamilyAttemptTimeout:DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,timeout:20000,keepAlive:!0,keepAliveInitialDelay:15000},headersTimeout:normalizedTimeoutMs,cli"#,
+                ],
+                new: r#",bodyTimeout:normalizedTimeoutMs,connectTimeout:35000,keepAliveTimeout:15000,keepAliveMaxTimeout:28000,connect:{autoSelectFamilyAttemptTimeout:DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,timeout:35000,keepAlive:!0,keepAliveInitialDelay:10000},headersTimeout:normalizedTimeoutMs,cli"#,
+            },
+            PatchHunk {
+                id: "bundle_happy_eyeballs_250ms",
+                rel_hint: None,
+                old: r#"DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS=2e3"#,
                 alt_olds: &[],
-                new: r#",bodyTimeout:normalizedTimeoutMs,connectTimeout:20000,keepAliveTimeout:25000,keepAliveMaxTimeout:55000,connect:{autoSelectFamilyAttemptTimeout:DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,timeout:20000,keepAlive:!0,keepAliveInitialDelay:15000},headersTimeout:normalizedTimeoutMs,cli"#,
+                new: r#"DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS=250"#,
             },
             PatchHunk {
                 id: "bundle_transient_retry_jitter",
@@ -274,6 +283,26 @@ const PATCH_SPECS: &[PatchSpec] = &[
             alt_olds: &[],
             new: r#"function getCurrentTools(messages){let tools=new Map;for(let message of messages)if(isSystemMessage(message)){for(let tool of message.toolsRemoved??[])tools.delete(tool.name);for(let tool of message.toolsAdded??[])tools.set(tool.name,tool)}return[...tools.values()].sort((a,b)=>a.name<b.name?-1:a.name>b.name?1:0)}"#,
         }],
+    },
+    PatchSpec {
+        id: "codemode_text_returns_rendered",
+        summary: "Return rendered string from QuickJS codemode text(value) helper to prevent TypeError on text(x).slice()/trim()",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_codemode_text_return",
+                rel_hint: None,
+                old: "\t\toutput(\"text\", rendered);\n\t}\n\n\tfunction imageUrl(value) {",
+                alt_olds: &[],
+                new: "\t\toutput(\"text\", rendered);\n\t\treturn rendered;\n\t}\n\n\tfunction imageUrl(value) {",
+            },
+            PatchHunk {
+                id: "prelude_codemode_text_return",
+                rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
+                old: "\t\toutput(\"text\", rendered);\n\t}\n\n\tfunction imageUrl(value) {",
+                alt_olds: &[],
+                new: "\t\toutput(\"text\", rendered);\n\t\treturn rendered;\n\t}\n\n\tfunction imageUrl(value) {",
+            },
+        ],
     },
 ];
 
@@ -791,14 +820,22 @@ mod tests {
         )
         .unwrap();
 
-        // Populate minimal mock bundle + unbundled core files matching all 10 patch specs
+        // Populate minimal mock bundle + unbundled core files matching all 11 patch specs
+        let prelude_dir = pi_dir
+            .join("node_modules")
+            .join("@earendil-works")
+            .join("pi-codemode")
+            .join("dist")
+            .join("runtime");
+        fs::create_dir_all(&prelude_dir).unwrap();
         fs::write(
             chunks.join("chunk-main.js"),
             format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 PATCH_SPECS[0].hunks[0].old,
                 PATCH_SPECS[0].hunks[1].old,
                 PATCH_SPECS[3].hunks[0].old,
+                PATCH_SPECS[3].hunks[1].old,
                 PATCH_SPECS[4].hunks[0].old,
                 PATCH_SPECS[6].hunks[0].old,
                 PATCH_SPECS[6].hunks[1].old,
@@ -821,7 +858,7 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::write(chunks.join("chunk-retry.js"), PATCH_SPECS[3].hunks[1].old).unwrap();
+        fs::write(chunks.join("chunk-retry.js"), PATCH_SPECS[3].hunks[2].old).unwrap();
         fs::write(chunks.join("chunk-tools.js"), PATCH_SPECS[9].hunks[0].old).unwrap();
         fs::write(
             chunks.join("chunk-tools-dup.js"),
@@ -830,7 +867,15 @@ mod tests {
         .unwrap();
         fs::write(
             chunks.join("codemode-worker.js"),
-            format!("{}\n{}\n", CODEMODE_BUILTINS_OLD, CODEMODE_WRAPPER_OLD),
+            format!(
+                "{}\n{}\n{}\n",
+                CODEMODE_BUILTINS_OLD, CODEMODE_WRAPPER_OLD, PATCH_SPECS[10].hunks[0].old
+            ),
+        )
+        .unwrap();
+        fs::write(
+            prelude_dir.join("prelude-source.js"),
+            PATCH_SPECS[10].hunks[1].old,
         )
         .unwrap();
         fs::write(core_ext.join("runner.js"), PATCH_SPECS[0].hunks[2].old).unwrap();
@@ -850,7 +895,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 10);
+        assert_eq!(applied["report"]["applied_count"], 11);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));

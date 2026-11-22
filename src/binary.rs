@@ -467,15 +467,30 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
                 )
                 .map(shannon_entropy)
                 .unwrap_or(0.0);
+            let rwx_flag = if (s.chars & 0xE000_0000) == 0xE000_0000 {
+                " [RWX!]"
+            } else {
+                ""
+            };
             sec_rows.push(format!(
-                "`{}` (rva=0x{:x} raw={}B {} ent={:.2})",
-                s.name, s.vaddr, s.raw_size, perm, s_ent
+                "`{}` (rva=0x{:x} raw={}B {}{} ent={:.2})",
+                s.name, s.vaddr, s.raw_size, perm, rwx_flag, s_ent
             ));
         }
         out.push(format!(
             "### PE Sections ({}): {}",
             secs.len(),
             sec_rows.join(" · ")
+        ));
+    }
+
+    // Embedded RPC server interface scanner (NDR20 / NDR64 TransferSyntax GUIDs in .rdata/.data)
+    let rpc_ifaces = scan_pe_rpc_interfaces(bytes, is_pe64);
+    if !rpc_ifaces.is_empty() {
+        out.push(format!(
+            "### Embedded RPC Interfaces ({}): {}",
+            rpc_ifaces.len(),
+            rpc_ifaces.join(" · ")
         ));
     }
 
@@ -584,9 +599,74 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
     }
 }
 
+fn format_guid_le(b: &[u8]) -> Option<String> {
+    if b.len() < 16 {
+        return None;
+    }
+    let d1 = read_u32_le(b, 0)?;
+    let d2 = read_u16_le(b, 4)?;
+    let d3 = read_u16_le(b, 6)?;
+    Some(format!(
+        "{d1:08x}-{d2:04x}-{d3:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    ))
+}
+
+/// Pure-Rust scanner for embedded Windows MS-RPC `RPC_SERVER_INTERFACE` descriptors (NDR20 & NDR64).
+fn scan_pe_rpc_interfaces(bytes: &[u8], is_pe64: bool) -> Vec<String> {
+    // NDR20 TransferSyntax UUID: 8a885d04-1ceb-11c9-9fe8-08002b104860
+    const NDR20: [u8; 16] = [
+        0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48,
+        0x60,
+    ];
+    // NDR64 TransferSyntax UUID: 71710533-beba-4937-8319-b5dbef9ccc36
+    const NDR64: [u8; 16] = [
+        0x33, 0x05, 0x71, 0x71, 0xba, 0xbe, 0x37, 0x49, 0x83, 0x19, 0xb5, 0xdb, 0xef, 0x9c, 0xcc,
+        0x36,
+    ];
+    let expected_len: u32 = if is_pe64 { 0x60 } else { 0x44 };
+    let scan_lim = bytes.len().min(16 * 1024 * 1024);
+    let data = &bytes[..scan_lim];
+    let mut found: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (tag, needle) in [("NDR20", &NDR20), ("NDR64", &NDR64)] {
+        let mut pos = 24usize;
+        while pos + 16 <= data.len() && found.len() < 16 {
+            if let Some(rel) = data[pos..].windows(16).position(|w| w == needle) {
+                let hit = pos + rel;
+                // RPC_SERVER_INTERFACE layout:
+                // +0x00 Length (u32 == 0x60 on x64 / 0x44 on x86)
+                // +0x04 InterfaceId.SyntaxGUID (16B) + Major/Minor (u16/u16)
+                // +0x18 TransferSyntax.SyntaxGUID (16B == NDR20/NDR64)
+                if hit >= 24 {
+                    let base = hit - 24;
+                    let len_field = read_u32_le(data, base).unwrap_or(0);
+                    if len_field == expected_len || len_field == 0x60 || len_field == 0x44 {
+                        if let Some(uuid) = format_guid_le(&data[base + 4..base + 20]) {
+                            let maj = read_u16_le(data, base + 20).unwrap_or(0);
+                            let min = read_u16_le(data, base + 22).unwrap_or(0);
+                            if uuid != "00000000-0000-0000-0000-000000000000"
+                                && seen.insert(uuid.clone())
+                            {
+                                found.push(format!("`{uuid}` v{maj}.{min} ({tag} @0x{base:x})"));
+                            }
+                        }
+                    }
+                }
+                pos = hit + 16;
+            } else {
+                break;
+            }
+        }
+    }
+    found
+}
+
 fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
     let is_64 = bytes[4] == 2;
     let bits = if is_64 { "64-bit" } else { "32-bit" };
+    let e_type = read_u16_le(bytes, 16).unwrap_or(0);
     let mach = read_u16_le(bytes, 18).unwrap_or(0);
     let arch = match mach {
         0x3E => "x86_64",
@@ -601,11 +681,61 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
         bytes.len()
     ));
     let ent = shannon_entropy(&bytes[..bytes.len().min(4 * 1024 * 1024)]);
-    out.push(format!(
-        "- SHA-256: `{}` | Entropy: `{ent:.2}`",
-        sha256_hex(bytes)
-    ));
+
+    // Parse ELF64 Program Headers for NX / RELRO / PIE hardening summary
+    let mut elf_mit: Vec<&'static str> = Vec::new();
+    let mut has_relro = false;
+    let mut has_bind_now = false;
+    let mut has_nx = false;
+    let mut has_exec_stack = false;
+    if is_64 && bytes.len() >= 64 {
+        if e_type == 3 {
+            elf_mit.push("PIE");
+        } else if e_type == 2 {
+            elf_mit.push("NO-PIE!");
+        }
+        let phoff = read_u64_le(bytes, 32).unwrap_or(0) as usize;
+        let phentsize = read_u16_le(bytes, 54).unwrap_or(0) as usize;
+        let phnum = read_u16_le(bytes, 56).unwrap_or(0) as usize;
+        if phoff > 0 && phentsize >= 56 && phnum > 0 {
+            for i in 0..phnum.min(64) {
+                let p = phoff.saturating_add(i.saturating_mul(phentsize));
+                if p + 56 > bytes.len() {
+                    break;
+                }
+                let p_type = read_u32_le(bytes, p).unwrap_or(0);
+                let p_flags = read_u32_le(bytes, p + 4).unwrap_or(0);
+                if p_type == 0x6474_e551 {
+                    // PT_GNU_STACK
+                    if (p_flags & 1) != 0 {
+                        has_exec_stack = true;
+                    } else {
+                        has_nx = true;
+                    }
+                } else if p_type == 0x6474_e552 {
+                    // PT_GNU_RELRO
+                    has_relro = true;
+                }
+            }
+        }
+    }
+    if has_exec_stack {
+        elf_mit.push("EXEC-STACK!");
+    } else if has_nx {
+        elf_mit.push("NX");
+    }
+    let has_canary = bytes
+        .windows(b"__stack_chk_fail".len())
+        .any(|w| w == b"__stack_chk_fail");
+    if has_canary {
+        elf_mit.push("Canary");
+    }
+
     if !is_64 || bytes.len() < 64 {
+        out.push(format!(
+            "- SHA-256: `{}` | Entropy: `{ent:.2}`",
+            sha256_hex(bytes)
+        ));
         return;
     }
     let shoff = read_u64_le(bytes, 40).unwrap_or(0) as usize;
@@ -613,6 +743,18 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
     let shnum = read_u16_le(bytes, 60).unwrap_or(0) as usize;
     let shstrndx = read_u16_le(bytes, 62).unwrap_or(0) as usize;
     if shoff == 0 || shentsize < 64 || shnum == 0 {
+        if has_relro {
+            elf_mit.push("RELRO");
+        }
+        out.push(format!(
+            "- SHA-256: `{}` | Entropy: `{ent:.2}` | Mitigations: `[{}]`",
+            sha256_hex(bytes),
+            if elf_mit.is_empty() {
+                "none".to_string()
+            } else {
+                elf_mit.join(", ")
+            }
+        ));
         return;
     }
     let strtab_hdr = shoff.saturating_add(shstrndx.saturating_mul(shentsize));
@@ -644,6 +786,35 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
             dynamic_slice = Some((s_off, s_sz));
         }
     }
+    if let Some((dyn_off, dyn_sz)) = dynamic_slice {
+        let count = (dyn_sz / 16).min(128);
+        for k in 0..count {
+            let p = dyn_off + k * 16;
+            let tag = read_u64_le(bytes, p).unwrap_or(0);
+            let val = read_u64_le(bytes, p + 8).unwrap_or(0);
+            if tag == 0 {
+                break;
+            }
+            // DT_BIND_NOW (24) or DT_FLAGS(30) DF_BIND_NOW(0x8) or DT_FLAGS_1(0x6ffffffb) DF_1_NOW(0x1)
+            if tag == 24 || (tag == 30 && (val & 0x8) != 0) || (tag == 0x6fff_fffb && (val & 0x1) != 0) {
+                has_bind_now = true;
+            }
+        }
+    }
+    if has_relro {
+        elf_mit.push(if has_bind_now { "Full-RELRO" } else { "Partial-RELRO" });
+    } else {
+        elf_mit.push("NO-RELRO");
+    }
+    out.push(format!(
+        "- SHA-256: `{}` | Entropy: `{ent:.2}` | Mitigations: `[{}]`",
+        sha256_hex(bytes),
+        if elf_mit.is_empty() {
+            "none".to_string()
+        } else {
+            elf_mit.join(", ")
+        }
+    ));
     if !sec_names.is_empty() {
         out.push(format!("### ELF Sections: `[{}]`", sec_names.join(", ")));
     }
@@ -800,4 +971,58 @@ pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) 
         out.extend(hits);
     }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_embedded_pe_rpc_interface_uuid_ndr20() {
+        // Construct a synthetic 0x80-byte buffer containing an x64 RPC_SERVER_INTERFACE (Length=0x60)
+        // InterfaceId: 12345678-1234-5678-9abc-def012345678 v1.2 + NDR20 TransferSyntax
+        let mut buf = vec![0u8; 0x80];
+        let base = 0x10usize;
+        buf[base..base + 4].copy_from_slice(&0x60u32.to_le_bytes());
+        buf[base + 4..base + 20].copy_from_slice(&[
+            0x78, 0x56, 0x34, 0x12, 0x34, 0x12, 0x78, 0x56, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34,
+            0x56, 0x78,
+        ]);
+        buf[base + 20..base + 22].copy_from_slice(&1u16.to_le_bytes());
+        buf[base + 22..base + 24].copy_from_slice(&2u16.to_le_bytes());
+        buf[base + 24..base + 40].copy_from_slice(&[
+            0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10,
+            0x48, 0x60,
+        ]);
+        let res = scan_pe_rpc_interfaces(&buf, true);
+        assert_eq!(res.len(), 1);
+        assert!(res[0].contains("12345678-1234-5678-9abc-def012345678"));
+        assert!(res[0].contains("v1.2"));
+        assert!(res[0].contains("NDR20"));
+    }
+
+    #[test]
+    fn reports_elf64_security_mitigations_pie_nx_relro_canary() {
+        // Minimal synthetic ELF64 header (e_type=ET_DYN=3, x86_64) + 2 program headers (PT_GNU_STACK NX, PT_GNU_RELRO)
+        let mut elf = vec![0u8; 256];
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2; // 64-bit
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN -> PIE
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // x86_64
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
+        // PHDR 0: PT_GNU_STACK (RW only -> NX)
+        elf[64..68].copy_from_slice(&0x6474_e551u32.to_le_bytes());
+        elf[68..72].copy_from_slice(&6u32.to_le_bytes());
+        // PHDR 1: PT_GNU_RELRO
+        elf[120..124].copy_from_slice(&0x6474_e552u32.to_le_bytes());
+        // Embed __stack_chk_fail marker
+        elf[200..216].copy_from_slice(b"__stack_chk_fail");
+        let md = inspect_binary_md(&elf, None, 10);
+        assert!(md.contains("PIE"), "Expected PIE in {md}");
+        assert!(md.contains("NX"), "Expected NX in {md}");
+        assert!(md.contains("RELRO"), "Expected RELRO in {md}");
+        assert!(md.contains("Canary"), "Expected Canary in {md}");
+    }
 }
