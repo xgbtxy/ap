@@ -409,7 +409,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         let is_bin_ext = matches!(
             ext.as_str(),
-            "exe" | "dll" | "so" | "dylib" | "node" | "wasm" | "bin"
+            "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node" | "wasm" | "bin"
         );
         if is_bin_ext && !explicit_file && ext_allow.is_empty() {
             return local_matches;
@@ -417,8 +417,15 @@ pub fn run_cli(args: &[String]) -> i32 {
         let Ok(meta) = p.metadata() else {
             return local_matches;
         };
+        let is_archive_ext = matches!(ext.as_str(), "asar" | "zip" | "vsix" | "jar" | "whl");
         let size_cap = if explicit_file {
-            64 * 1024 * 1024
+            if is_archive_ext {
+                256 * 1024 * 1024
+            } else if is_bin_ext {
+                128 * 1024 * 1024
+            } else {
+                64 * 1024 * 1024
+            }
         } else {
             16 * 1024 * 1024
         };
@@ -491,7 +498,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         if ext == "asar" {
             if let Ok((base, entries)) = crate::binary::parse_asar_index(&bytes) {
                 for ent in entries {
-                    if ent.unpacked || ent.size == 0 || ent.size > 12 * 1024 * 1024 {
+                    if ent.unpacked || ent.size == 0 || ent.size > 32 * 1024 * 1024 {
                         continue;
                     }
                     let eext = Path::new(&ent.path)

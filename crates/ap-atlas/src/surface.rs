@@ -126,7 +126,7 @@ fn classify_guard_proximity(text: &str, byte_start: usize, byte_end: usize) -> (
 }
 
 fn is_native_binary_ext(ext: &str) -> bool {
-    matches!(ext, "exe" | "dll" | "so" | "dylib" | "node")
+    matches!(ext, "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node")
 }
 
 fn extract_binary_strings(raw: &[u8]) -> String {

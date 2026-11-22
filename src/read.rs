@@ -62,6 +62,9 @@ struct ReadCli {
     /// Canonical hex + ASCII dump (`xxd`/`hexdump -C`) with SHA-256 & entropy (supports decimal or `0x` `--offset`)
     #[arg(long)]
     hex: bool,
+    /// Resolve PE64 x64 RIP-relative string & IAT import cross-references with enclosing function RVAs
+    #[arg(long)]
+    xref: bool,
     /// Maximum characters before smart outline + pagination kicks in
     #[arg(long, default_value_t = 8000)]
     max_chars: usize,
@@ -1019,11 +1022,16 @@ fn read_single_target(
                 img_meta
             } else if matches!(
                 ext.as_str(),
-                "exe" | "dll" | "so" | "dylib" | "node" | "wasm" | "bin"
+                "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node" | "wasm" | "bin"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
                 format_tag = "binary";
-                crate::binary::inspect_binary_md(&raw_bytes, cli.query.as_deref(), 80)
+                crate::binary::inspect_binary_with_xref_md(
+                    &raw_bytes,
+                    cli.query.as_deref(),
+                    80,
+                    cli.xref,
+                )
             } else {
                 let (decoded, enc_name, healed) = decode_any_bytes(&raw_bytes);
                 win_heals += healed;

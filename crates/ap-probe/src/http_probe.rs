@@ -201,6 +201,7 @@ pub fn run_http_cli(
     insecure: bool,
     follow: bool,
     batch_stdin: bool,
+    audit_headers: bool,
     as_json: bool,
 ) -> i32 {
     let mut jobs: Vec<(String, String, Vec<String>, Option<String>)> = Vec::new();
@@ -278,15 +279,42 @@ pub fn run_http_cli(
     }
 
     let any_err = results.iter().any(|r| !r.error.is_empty() || r.status == 0);
+    let header_audits: Vec<Vec<String>> = if audit_headers {
+        results
+            .iter()
+            .map(|r| audit_response_headers(&r.url, r.status, &r.content_type, &r.headers))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let out_val = if audit_headers {
+            let enriched: Vec<Value> = results
+                .iter()
+                .zip(header_audits.iter())
+                .map(|(r, findings)| {
+                    let mut v = serde_json::to_value(r).unwrap_or_else(|_| json!({}));
+                    if let Some(m) = v.as_object_mut() {
+                        m.insert("header_findings".to_string(), json!(findings));
+                    }
+                    v
+                })
+                .collect();
+            json!({
+                "ok": !any_err,
+                "count": results.len(),
+                "results": enriched,
+            })
+        } else {
+            json!({
                 "ok": !any_err,
                 "count": results.len(),
                 "results": results,
-            }))
-            .unwrap_or_default()
+            })
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out_val).unwrap_or_default()
         );
     } else if results.len() == 1 {
         let r = &results[0];
@@ -299,6 +327,14 @@ pub fn run_http_cli(
             );
             for h in r.headers.iter().take(10) {
                 println!("  {h}");
+            }
+            if audit_headers {
+                let gaps = header_audits.first().cloned().unwrap_or_default();
+                if gaps.is_empty() {
+                    println!("  [header-audit] PASS (0 security/two-phase gaps)");
+                } else {
+                    println!("  [header-audit] {} gap(s): {}", gaps.len(), gaps.join(" | "));
+                }
             }
             if !r.body_preview.is_empty() {
                 println!("\n{}", r.body_preview);
@@ -316,13 +352,20 @@ pub fn run_http_cli(
                     .chars()
                     .take(120)
                     .collect();
+                let gap_tag = if audit_headers {
+                    let g = header_audits.get(i).map(|v| v.len()).unwrap_or(0);
+                    format!(" [gaps={g}]")
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {}. {} {} -> HTTP {} ({}ms) — `{}`",
+                    "  {}. {} {} -> HTTP {} ({}ms){} — `{}`",
                     i + 1,
                     r.method,
                     r.url,
                     r.status,
                     r.elapsed_ms,
+                    gap_tag,
                     snip
                 );
             }
@@ -776,4 +819,392 @@ pub fn run_http_vary(
         }
     }
     0
+}
+
+/// Inspect HTTP response headers for generic web & two-phase download/storage security defense gaps.
+pub fn audit_response_headers(
+    url: &str,
+    status: u16,
+    content_type: &str,
+    headers: &[String],
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    if status == 0 {
+        return findings;
+    }
+    let mut hdr_map: Vec<(String, String)> = Vec::new();
+    for h in headers {
+        if let Some((k, v)) = h.split_once(':') {
+            hdr_map.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    let get_hdr = |name: &str| -> Option<&str> {
+        hdr_map
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let ct_low = content_type.to_ascii_lowercase();
+    let url_low = url.to_ascii_lowercase();
+
+    let has_nosniff = get_hdr("x-content-type-options")
+        .map(|v| v.to_ascii_lowercase().contains("nosniff"))
+        .unwrap_or(false);
+    if (200..300).contains(&status) && !has_nosniff {
+        findings.push("missing X-Content-Type-Options: nosniff".to_string());
+    }
+    if let Some(cd) = get_hdr("content-disposition") {
+        if cd.to_ascii_lowercase().contains("inline") {
+            findings.push(format!("Content-Disposition inline ({cd})"));
+        }
+    } else if (200..300).contains(&status)
+        && (url_low.contains("download")
+            || url_low.contains("upload")
+            || url_low.contains("preview")
+            || url_low.contains("getobject")
+            || url_low.contains("file"))
+    {
+        findings.push("download/storage endpoint missing Content-Disposition: attachment".to_string());
+    }
+    if (200..300).contains(&status)
+        && (ct_low.contains("text/html") || ct_low.contains("image/svg+xml"))
+        && get_hdr("content-security-policy").is_none()
+    {
+        findings.push(format!("active content ({content_type}) missing Content-Security-Policy"));
+    }
+    if (200..300).contains(&status) && url_low.contains("response-content-type=") {
+        findings.push(format!(
+            "2xx response accepted response-content-type override (served as `{content_type}`)"
+        ));
+    }
+    if let Some(acao) = get_hdr("access-control-allow-origin") {
+        let acac = get_hdr("access-control-allow-credentials")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if acac && (acao.trim() == "*" || acao.trim().eq_ignore_ascii_case("null")) {
+            findings.push(format!(
+                "permissive CORS Access-Control-Allow-Origin: {acao} with Allow-Credentials: true"
+            ));
+        }
+    }
+    for (k, v) in &hdr_map {
+        if k == "set-cookie" {
+            let vl = v.to_ascii_lowercase();
+            let mut miss = Vec::new();
+            if !vl.contains("httponly") {
+                miss.push("HttpOnly");
+            }
+            if url_low.starts_with("https://") && !vl.contains("secure") {
+                miss.push("Secure");
+            }
+            if !miss.is_empty() {
+                let cname = v.split('=').next().unwrap_or("cookie").trim();
+                findings.push(format!("Set-Cookie `{cname}` missing {}", miss.join("/")));
+            }
+        }
+    }
+    findings
+}
+
+fn json_top_keys(body: &str) -> Vec<String> {
+    if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(body.trim()) {
+        let mut keys: Vec<String> = m.keys().cloned().collect();
+        keys.sort();
+        keys
+    } else {
+        Vec::new()
+    }
+}
+
+/// Compare an unprivileged/cross-tenant candidate HTTP response against a privileged owner baseline.
+/// Returns `(possible_bypass, reason)`.
+pub fn classify_auth_matrix_diff(base: &HttpProbeResult, cand: &HttpProbeResult) -> (bool, String) {
+    if cand.status == 0 || !cand.error.is_empty() {
+        return (false, format!("transport error: {}", cand.error));
+    }
+    if !(200..300).contains(&cand.status) {
+        return (false, format!("rejected with HTTP {}", cand.status));
+    }
+    let low_body = cand.body_preview.to_ascii_lowercase();
+    for deny_kw in [
+        "unauthorized",
+        "forbidden",
+        "access denied",
+        "permission denied",
+        "not allowed",
+        "invalid token",
+        "login required",
+        "\"code\":401",
+        "\"code\":403",
+        "\"status\":403",
+    ] {
+        if low_body.contains(deny_kw) {
+            return (
+                false,
+                format!("HTTP {} but body contains auth denial marker `{deny_kw}`", cand.status),
+            );
+        }
+    }
+    let base_keys = json_top_keys(&base.body_preview);
+    let cand_keys = json_top_keys(&cand.body_preview);
+    if !base_keys.is_empty() && !cand_keys.is_empty() {
+        let shared = cand_keys.iter().filter(|k| base_keys.contains(k)).count();
+        let denom = base_keys.len().max(1);
+        let overlap = (shared * 100) / denom;
+        if overlap >= 50 && cand.body_preview.len() >= 16 {
+            return (
+                true,
+                format!(
+                    "HTTP {} with {overlap}% JSON key overlap ({shared}/{denom}) and {}B body (baseline {}B)",
+                    cand.status,
+                    cand.body_preview.len(),
+                    base.body_preview.len()
+                ),
+            );
+        }
+    }
+    let base_len = base.body_preview.len();
+    let cand_len = cand.body_preview.len();
+    if (200..300).contains(&base.status) && base_len >= 16 && cand_len * 100 >= base_len * 40 {
+        return (
+            true,
+            format!(
+                "HTTP {} with non-denied {}B payload ({}% of baseline {}B)",
+                cand.status,
+                cand_len,
+                (cand_len * 100) / base_len.max(1),
+                base_len
+            ),
+        );
+    }
+    (
+        false,
+        format!("HTTP {} with divergent/minimal payload ({cand_len}B vs baseline {base_len}B)", cand.status),
+    )
+}
+
+fn parse_principal_spec(raw: &str) -> (String, Vec<String>) {
+    let (name, rest) = match raw.split_once('=') {
+        Some((n, r)) => (n.trim().to_string(), r.trim()),
+        None => (raw.trim().to_string(), ""),
+    };
+    let label = if name.is_empty() {
+        "principal".to_string()
+    } else {
+        name
+    };
+    let hdrs: Vec<String> = rest
+        .split(";;")
+        .map(str::trim)
+        .filter(|s| s.contains(':'))
+        .map(str::to_string)
+        .collect();
+    (label, hdrs)
+}
+
+fn merge_principal_headers(base_headers: &[String], principal_headers: &[String], strip_auth: bool) -> Vec<String> {
+    let override_keys: Vec<String> = principal_headers
+        .iter()
+        .filter_map(|h| h.split_once(':').map(|(k, _)| k.trim().to_ascii_lowercase()))
+        .collect();
+    let mut merged: Vec<String> = base_headers
+        .iter()
+        .filter(|h| {
+            let k = h
+                .split_once(':')
+                .map(|(k, _)| k.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if override_keys.contains(&k) {
+                return false;
+            }
+            if strip_auth && matches!(k.as_str(), "authorization" | "cookie" | "x-auth-token" | "x-api-key") {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    merged.extend(principal_headers.iter().cloned());
+    merged
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_http_auth_matrix(
+    req_file: Option<&std::path::Path>,
+    url_opt: Option<&str>,
+    method: &str,
+    headers: &[String],
+    body: Option<&str>,
+    principals: &[String],
+    audit_headers: bool,
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+    as_json: bool,
+) -> i32 {
+    let (m, u, mut base_hdrs, b) = if let Some(rf) = req_file {
+        match load_saved_request(rf) {
+            Ok(spec) => spec,
+            Err(e) => {
+                eprintln!("[probe http auth-matrix] {e}");
+                return 2;
+            }
+        }
+    } else if let Some(url) = url_opt.filter(|s| !s.trim().is_empty()) {
+        (
+            method.to_ascii_uppercase(),
+            url.to_string(),
+            Vec::new(),
+            body.map(str::to_string),
+        )
+    } else {
+        eprintln!("[probe http auth-matrix] Provide a URL or `--vary-request <file>`.");
+        return 2;
+    };
+    base_hdrs.extend(headers.iter().cloned());
+
+    let parsed: Vec<(String, Vec<String>)> = principals.iter().map(|p| parse_principal_spec(p)).collect();
+    let mut rows: Vec<(String, HttpProbeResult, Vec<String>)> = Vec::new();
+    for (label, phdrs) in &parsed {
+        let strip_auth = phdrs.is_empty();
+        let req_hdrs = merge_principal_headers(&base_hdrs, phdrs, strip_auth);
+        let res = execute_http_probe(&m, &u, &req_hdrs, b.as_deref(), timeout_sec, insecure, follow);
+        let gaps = if audit_headers {
+            audit_response_headers(&res.url, res.status, &res.content_type, &res.headers)
+        } else {
+            Vec::new()
+        };
+        rows.push((label.clone(), res, gaps));
+    }
+
+    let baseline = rows.first().map(|(_, r, _)| r.clone());
+    let mut bypasses = Vec::new();
+    let mut json_rows = Vec::new();
+    for (idx, (label, r, gaps)) in rows.iter().enumerate() {
+        let (possible_bypass, reason) = if idx == 0 {
+            (false, "baseline principal".to_string())
+        } else if let Some(ref base) = baseline {
+            classify_auth_matrix_diff(base, r)
+        } else {
+            (false, "no baseline".to_string())
+        };
+        if possible_bypass {
+            bypasses.push(json!({
+                "principal": label,
+                "status": r.status,
+                "reason": reason,
+                "body_preview": r.body_preview.chars().take(240).collect::<String>(),
+            }));
+        }
+        json_rows.push(json!({
+            "principal": label,
+            "status": r.status,
+            "elapsed_ms": r.elapsed_ms,
+            "content_type": r.content_type,
+            "body_len": r.body_preview.len(),
+            "possible_bypass": possible_bypass,
+            "diff_reason": reason,
+            "header_findings": gaps,
+            "error": r.error,
+            "body_preview": r.body_preview.chars().take(360).collect::<String>(),
+        }));
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "method": m,
+                "url": u,
+                "principal_count": rows.len(),
+                "possible_bypass_count": bypasses.len(),
+                "possible_bypasses": bypasses,
+                "results": json_rows,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "[probe http auth-matrix] {} {} — {} principal(s), {} possible bypass(es):",
+            m,
+            u,
+            rows.len(),
+            bypasses.len()
+        );
+        for item in &json_rows {
+            let flag = if item["possible_bypass"].as_bool().unwrap_or(false) {
+                "[POSSIBLE-AUTHZ-BYPASS]"
+            } else {
+                "[ok]"
+            };
+            println!(
+                "  - {:<14} HTTP {} ({}B) {} — {}",
+                item["principal"].as_str().unwrap_or("?"),
+                item["status"].as_u64().unwrap_or(0),
+                item["body_len"].as_u64().unwrap_or(0),
+                flag,
+                item["diff_reason"].as_str().unwrap_or("")
+            );
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audits_two_phase_and_cors_security_headers() {
+        let gaps = audit_response_headers(
+            "https://storage.example/download/doc?response-content-type=text/html",
+            200,
+            "text/html; charset=utf-8",
+            &[
+                "Content-Disposition: inline; filename=evil.html".to_string(),
+                "Access-Control-Allow-Origin: *".to_string(),
+                "Access-Control-Allow-Credentials: true".to_string(),
+                "Set-Cookie: sid=abc123; Path=/".to_string(),
+            ],
+        );
+        let joined = gaps.join(" | ");
+        assert!(joined.contains("nosniff"), "missing nosniff: {joined}");
+        assert!(joined.contains("inline"), "missing inline: {joined}");
+        assert!(joined.contains("Content-Security-Policy"), "missing CSP: {joined}");
+        assert!(joined.contains("response-content-type"), "missing override: {joined}");
+        assert!(joined.contains("Allow-Credentials"), "missing CORS: {joined}");
+        assert!(joined.contains("HttpOnly/Secure"), "missing cookie flags: {joined}");
+    }
+
+    #[test]
+    fn classifies_idor_auth_matrix_bypass_vs_denial() {
+        let base = HttpProbeResult {
+            method: "GET".to_string(),
+            url: "https://api.example/v1/items/42".to_string(),
+            status: 200,
+            elapsed_ms: 12.0,
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body_preview: r#"{"id":42,"owner":"alice","secret":"val"}"#.to_string(),
+            error: String::new(),
+        };
+        let leaked = HttpProbeResult {
+            body_preview: r#"{"id":42,"owner":"alice","secret":"val"}"#.to_string(),
+            ..base.clone()
+        };
+        let denied_403 = HttpProbeResult {
+            status: 403,
+            body_preview: r#"{"error":"forbidden"}"#.to_string(),
+            ..base.clone()
+        };
+        let soft_denied_200 = HttpProbeResult {
+            status: 200,
+            body_preview: r#"{"code":403,"msg":"permission denied"}"#.to_string(),
+            ..base.clone()
+        };
+        assert!(classify_auth_matrix_diff(&base, &leaked).0);
+        assert!(!classify_auth_matrix_diff(&base, &denied_403).0);
+        assert!(!classify_auth_matrix_diff(&base, &soft_denied_200).0);
+    }
 }

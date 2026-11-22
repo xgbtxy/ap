@@ -336,8 +336,27 @@ fn rva_to_file_offset(rva: u32, secs: &[PeSection]) -> Option<usize> {
     None
 }
 
+fn file_offset_to_rva<'a>(off: usize, secs: &'a [PeSection]) -> Option<(u32, &'a str)> {
+    for s in secs {
+        let start = s.raw_ptr as usize;
+        let end = start.saturating_add(s.raw_size as usize);
+        if off >= start && off < end {
+            let delta = (off - start) as u32;
+            return Some((s.vaddr.saturating_add(delta), s.name.as_str()));
+        }
+    }
+    None
+}
+
+struct PeContext {
+    is_pe64: bool,
+    image_base: u64,
+    secs: Vec<PeSection>,
+    iat_map: Vec<(u32, String)>,
+}
+
 fn is_notable_import(fn_name: &str) -> bool {
-    const NOTABLE: [&str; 22] = [
+    const NOTABLE: [&str; 36] = [
         "CreateProcess",
         "ShellExecute",
         "WinExec",
@@ -350,6 +369,18 @@ fn is_notable_import(fn_name: &str) -> bool {
         "CryptUnprotectData",
         "CreateNamedPipe",
         "ConnectNamedPipe",
+        "ImpersonateNamedPipeClient",
+        "DeviceIoControl",
+        "IoCreateDevice",
+        "IoCreateSymbolicLink",
+        "MmMapIoSpace",
+        "ZwOpenSection",
+        "RpcServerRegisterIf",
+        "RpcServerUseProtseq",
+        "SetNamedSecurityInfo",
+        "CoCreateInstance",
+        "MoveFileEx",
+        "CreateSymbolicLink",
         "WSAConnect",
         "InternetOpen",
         "WinHttpOpen",
@@ -359,12 +390,14 @@ fn is_notable_import(fn_name: &str) -> bool {
         "SetWindowsHook",
         "CreateService",
         "OpenProcess",
+        "memcpy_s",
+        "strcpy",
         "system",
     ];
     NOTABLE.iter().any(|k| fn_name.contains(k))
 }
 
-fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
+fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeContext {
     let machine = read_u16_le(bytes, pe_off + 4).unwrap_or(0);
     let n_sec = read_u16_le(bytes, pe_off + 6).unwrap_or(0) as usize;
     let opt_sz = read_u16_le(bytes, pe_off + 20).unwrap_or(0) as usize;
@@ -382,6 +415,13 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
         0
     };
     let is_pe64 = opt_magic == 0x020B;
+    let image_base = if is_pe64 && opt_sz >= 32 {
+        read_u64_le(bytes, opt_off + 24).unwrap_or(0x14000_0000)
+    } else if !is_pe64 && opt_sz >= 32 {
+        read_u32_le(bytes, opt_off + 28).unwrap_or(0x0040_0000) as u64
+    } else {
+        0
+    };
     let entry_rva = if opt_sz >= 20 {
         read_u32_le(bytes, opt_off + 16).unwrap_or(0)
     } else {
@@ -525,12 +565,13 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
     }
 
     // 2. Import Directory (index 1)
+    let mut iat_map: Vec<(u32, String)> = Vec::new();
     if opt_sz >= if is_pe64 { 128 } else { 112 } {
         let imp_rva = read_u32_le(bytes, dd_off + 8).unwrap_or(0);
         if let Some(imp_off) = rva_to_file_offset(imp_rva, &secs) {
             let mut dll_lines = Vec::new();
             let mut notable = Vec::new();
-            for d_idx in 0..40usize {
+            for d_idx in 0..64usize {
                 let desc = imp_off + d_idx * 20;
                 if desc + 20 > bytes.len() {
                     break;
@@ -548,7 +589,7 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
                 let mut funcs = Vec::new();
                 if let Some(mut t_off) = rva_to_file_offset(thunk_rva, &secs) {
                     let step = if is_pe64 { 8 } else { 4 };
-                    for _ in 0..40 {
+                    for slot_idx in 0..256u32 {
                         let val: u64 = if is_pe64 {
                             read_u64_le(bytes, t_off).unwrap_or(0)
                         } else {
@@ -564,12 +605,18 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
                             (val & (1u64 << 31)) != 0
                         };
                         if is_ord {
-                            funcs.push(format!("#{}", val & 0xFFFF));
+                            if funcs.len() < 16 {
+                                funcs.push(format!("#{}", val & 0xFFFF));
+                            }
                         } else if let Some(hn_off) =
                             rva_to_file_offset((val & 0x7FFF_FFFF) as u32, &secs)
                         {
                             if let Some(fn_name) = read_cstr(bytes, hn_off + 2, 128) {
-                                if is_notable_import(&fn_name) && notable.len() < 24 {
+                                if ft != 0 && iat_map.len() < 4096 {
+                                    let slot_rva = ft.saturating_add(slot_idx.saturating_mul(step as u32));
+                                    iat_map.push((slot_rva, format!("{dll_name}!{fn_name}")));
+                                }
+                                if is_notable_import(&fn_name) && notable.len() < 32 {
                                     notable.push(format!("{dll_name}!{fn_name}"));
                                 }
                                 if funcs.len() < 16 {
@@ -597,6 +644,140 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) {
             }
         }
     }
+    PeContext {
+        is_pe64,
+        image_base,
+        secs,
+        iat_map,
+    }
+}
+
+fn find_enclosing_x64_func_rva(sec_bytes: &[u8], sec_vaddr: u32, insn_rel: usize) -> u32 {
+    let min_back = insn_rel.saturating_sub(4096);
+    let mut cur = insn_rel;
+    while cur > min_back {
+        cur -= 1;
+        let b = sec_bytes[cur];
+        // Padding byte (INT3 0xCC or NOP 0x90) immediately preceding function prologue
+        if (b == 0xCC || b == 0x90) && cur + 1 < insn_rel {
+            let nxt = sec_bytes[cur + 1];
+            if nxt != 0xCC && nxt != 0x90 {
+                return sec_vaddr.saturating_add((cur + 1) as u32);
+            }
+        }
+        // Standard MSVC/Clang x64 prologues at 16-byte aligned boundary
+        if cur % 16 == 0 && cur + 3 < sec_bytes.len() {
+            let b0 = sec_bytes[cur];
+            let b1 = sec_bytes[cur + 1];
+            let b2 = sec_bytes[cur + 2];
+            if (b0 == 0x48 && b1 == 0x89 && b2 == 0x5C)
+                || (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC)
+                || (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC)
+                || (b0 == 0x40 && (b1 == 0x53 || b1 == 0x55 || b1 == 0x56 || b1 == 0x57))
+                || (b0 == 0x55 && b1 == 0x48)
+                || (b0 == 0x4C && b1 == 0x8B && b2 == 0xDC)
+            {
+                return sec_vaddr.saturating_add(cur as u32);
+            }
+        }
+    }
+    sec_vaddr.saturating_add(min_back as u32)
+}
+
+/// Pure-Rust `<20ms` x64 PE RIP-relative String (`LEA`) & IAT Import (`CALL`/`JMP`) cross-reference scanner.
+fn scan_pe64_xrefs(
+    bytes: &[u8],
+    pe: &PeContext,
+    str_rvas: &[(u32, String)],
+    q_re: Option<&Regex>,
+    max_xrefs: usize,
+) -> Vec<String> {
+    if !pe.is_pe64 {
+        return Vec::new();
+    }
+    let mut str_lookup = std::collections::HashMap::<u32, &str>::new();
+    for (rva, s) in str_rvas {
+        str_lookup.insert(*rva, s.as_str());
+    }
+    let mut iat_lookup = std::collections::HashMap::<u32, &str>::new();
+    for (rva, sym) in &pe.iat_map {
+        let keep = match q_re {
+            Some(re) => re.is_match(sym),
+            None => is_notable_import(sym),
+        };
+        if keep {
+            iat_lookup.insert(*rva, sym.as_str());
+        }
+    }
+    if str_lookup.is_empty() && iat_lookup.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::<(u32, u32)>::new();
+    for s in &pe.secs {
+        // IMAGE_SCN_MEM_EXECUTE (0x20000000)
+        if (s.chars & 0x2000_0000) == 0 || s.raw_size < 7 {
+            continue;
+        }
+        let start = s.raw_ptr as usize;
+        let len = (s.raw_size as usize).min(16 * 1024 * 1024);
+        let Some(code) = bytes.get(start..start.saturating_add(len).min(bytes.len())) else {
+            continue;
+        };
+        let mut i = 0usize;
+        while i + 7 <= code.len() && out.len() < max_xrefs {
+            let b0 = code[i];
+            let b1 = code[i + 1];
+            // 1. x64 RIP-relative `LEA reg, [RIP + disp32]` -> 48/4C 8D (mod=00, rm=101) disp32
+            if !str_lookup.is_empty() && (b0 == 0x48 || b0 == 0x4C) && b1 == 0x8D {
+                let modrm = code[i + 2];
+                if (modrm & 0xC7) == 0x05 {
+                    let disp = i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
+                    let insn_rva = s.vaddr.saturating_add(i as u32);
+                    let target = (insn_rva as i64) + 7 + (disp as i64);
+                    if target > 0 && target <= u32::MAX as i64 {
+                        let trva = target as u32;
+                        if let Some(sv) = str_lookup.get(&trva) {
+                            if seen.insert((insn_rva, trva)) {
+                                let func_rva = find_enclosing_x64_func_rva(code, s.vaddr, i);
+                                let func_va = pe.image_base.saturating_add(func_rva as u64);
+                                let preview: String = sv.chars().take(72).collect();
+                                out.push(format!(
+                                    "- [str-xref] insn=0x{insn_rva:x} in func_rva=0x{func_rva:x} (va=0x{func_va:x}) -> rva=0x{trva:x} `{preview}`"
+                                ));
+                                i += 7;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // 2. x64 RIP-relative `CALL/JMP [RIP + disp32]` -> FF 15/25 disp32
+            if !iat_lookup.is_empty() && b0 == 0xFF && (b1 == 0x15 || b1 == 0x25) && i + 6 <= code.len() {
+                let disp = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
+                let insn_rva = s.vaddr.saturating_add(i as u32);
+                let target = (insn_rva as i64) + 6 + (disp as i64);
+                if target > 0 && target <= u32::MAX as i64 {
+                    let trva = target as u32;
+                    if let Some(sym) = iat_lookup.get(&trva) {
+                        if seen.insert((insn_rva, trva)) {
+                            let func_rva = find_enclosing_x64_func_rva(code, s.vaddr, i);
+                            let func_va = pe.image_base.saturating_add(func_rva as u64);
+                            let op = if b1 == 0x15 { "call" } else { "jmp" };
+                            out.push(format!(
+                                "- [iat-xref] {op} insn=0x{insn_rva:x} in func_rva=0x{func_rva:x} (va=0x{func_va:x}) -> `{sym}` (iat=0x{trva:x})"
+                            ));
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 fn format_guid_le(b: &[u8]) -> Option<String> {
@@ -874,11 +1055,22 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
 
 /// Inspect PE / ELF / Mach-O / WASM headers, imports/exports, SHA-256, entropy + ASCII & Windows UTF-16LE wide strings.
 pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) -> String {
+    inspect_binary_with_xref_md(bytes, query, max_strings, false)
+}
+
+/// Inspect native binaries with optional pure-Rust PE64 x64 RIP-relative string & IAT import XREF resolution.
+pub fn inspect_binary_with_xref_md(
+    bytes: &[u8],
+    query: Option<&str>,
+    max_strings: usize,
+    include_xref: bool,
+) -> String {
     let mut out = Vec::new();
+    let mut pe_ctx: Option<PeContext> = None;
     if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
         let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
         if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
-            parse_pe_details(bytes, pe_off, &mut out);
+            pe_ctx = Some(parse_pe_details(bytes, pe_off, &mut out));
         } else {
             out.push(format!(
                 "## Binary Header: DOS/MZ ({} B) | SHA-256: `{}`",
@@ -917,7 +1109,13 @@ pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) 
             .ok()
     });
     let mut hits: Vec<String> = Vec::new();
-    let scan_lim = bytes.len().min(8 * 1024 * 1024);
+    let mut matched_str_rvas: Vec<(u32, String)> = Vec::new();
+    let scan_cap = if query.is_some() || include_xref {
+        24 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    let scan_lim = bytes.len().min(scan_cap);
     let data = &bytes[..scan_lim];
 
     // 1. ASCII printable strings (len >= 6)
@@ -931,7 +1129,12 @@ pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) 
             if i - st >= 6 {
                 let s = String::from_utf8_lossy(&data[st..i]);
                 if q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
-                    hits.push(format!("[ascii @0x{st:x}] {s}"));
+                    if let Some((rva, sec)) = pe_ctx.as_ref().and_then(|p| file_offset_to_rva(st, &p.secs)) {
+                        hits.push(format!("[ascii @0x{st:x} rva=0x{rva:x} ({sec})] {s}"));
+                        matched_str_rvas.push((rva, s.into_owned()));
+                    } else {
+                        hits.push(format!("[ascii @0x{st:x}] {s}"));
+                    }
                 }
             }
         } else {
@@ -954,15 +1157,35 @@ pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) 
                 j += 2;
             }
             if s.len() >= 5 && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
-                hits.push(format!("[utf16le @0x{st:x}] {s}"));
+                if let Some((rva, sec)) = pe_ctx.as_ref().and_then(|p| file_offset_to_rva(st, &p.secs)) {
+                    hits.push(format!("[utf16le @0x{st:x} rva=0x{rva:x} ({sec})] {s}"));
+                    matched_str_rvas.push((rva, s));
+                } else {
+                    hits.push(format!("[utf16le @0x{st:x}] {s}"));
+                }
             }
         } else {
             j += 1;
         }
     }
 
+    if include_xref {
+        if let Some(ref pe) = pe_ctx {
+            let xrefs = scan_pe64_xrefs(bytes, pe, &matched_str_rvas, q_re.as_ref(), 60);
+            out.push(format!(
+                "### PE64 RIP-Relative Code XREFs ({} found)",
+                xrefs.len()
+            ));
+            if xrefs.is_empty() {
+                out.push("*(no matching x64 RIP-relative LEA/CALL XREFs found in executable sections)*".to_string());
+            } else {
+                out.extend(xrefs);
+            }
+        }
+    }
+
     out.push(format!(
-        "### Extracted Strings ({} shown; scans ASCII + Windows UTF-16LE — narrow with `--query <regex>`)",
+        "### Extracted Strings ({} shown; scans ASCII + Windows UTF-16LE — narrow with `--query <regex>` or add `--xref`)",
         hits.len()
     ));
     if hits.is_empty() {
@@ -1024,5 +1247,79 @@ mod tests {
         assert!(md.contains("NX"), "Expected NX in {md}");
         assert!(md.contains("RELRO"), "Expected RELRO in {md}");
         assert!(md.contains("Canary"), "Expected Canary in {md}");
+    }
+
+    #[test]
+    fn scans_pe64_rip_relative_string_and_iat_xrefs() {
+        // Minimal synthetic PE64 with .text (RVA 0x1000, raw 0x200) + .rdata (RVA 0x2000, raw 0x400)
+        // Contains Import Directory pointing to KERNEL32.dll!CreateProcessW at IAT RVA 0x2040
+        // and wide string "\\\\.\\pipe\\DemoSvc" at RVA 0x2080, referenced by LEA + CALL in .text.
+        let mut pe = vec![0u8; 0x600];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes()); // x86_64
+        pe[0x86..0x88].copy_from_slice(&2u16.to_le_bytes()); // 2 sections
+        pe[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
+        let opt = 0x98usize;
+        pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+        pe[opt + 24..opt + 32].copy_from_slice(&0x14000_0000u64.to_le_bytes());
+        // Import Directory DataDirectory[1] at opt + 112 + 8 = opt + 120 -> RVA 0x2000
+        pe[opt + 120..opt + 124].copy_from_slice(&0x2000u32.to_le_bytes());
+        pe[opt + 124..opt + 128].copy_from_slice(&0x28u32.to_le_bytes());
+
+        let sh = opt + 0xF0; // 0x188
+        // Section 0: .text (vaddr 0x1000, raw 0x200, size 0x200, RX)
+        pe[sh..sh + 5].copy_from_slice(b".text");
+        pe[sh + 8..sh + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[sh + 16..sh + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        // Section 1: .rdata (vaddr 0x2000, raw 0x400, size 0x200, R)
+        let sh1 = sh + 40;
+        pe[sh1..sh1 + 6].copy_from_slice(b".rdata");
+        pe[sh1 + 8..sh1 + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sh1 + 12..sh1 + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        pe[sh1 + 16..sh1 + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sh1 + 20..sh1 + 24].copy_from_slice(&0x400u32.to_le_bytes());
+        pe[sh1 + 36..sh1 + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+
+        // .rdata @ 0x400 (RVA 0x2000): Import Descriptor
+        // OFT=0x2040, Name=0x2050 ("KERNEL32.dll"), FirstThunk=0x2040
+        pe[0x400..0x404].copy_from_slice(&0x2040u32.to_le_bytes());
+        pe[0x40C..0x410].copy_from_slice(&0x2050u32.to_le_bytes());
+        pe[0x410..0x414].copy_from_slice(&0x2040u32.to_le_bytes());
+        // Thunk @ 0x440 (RVA 0x2040) -> Hint/Name @ RVA 0x2060
+        pe[0x440..0x448].copy_from_slice(&0x2060u64.to_le_bytes());
+        pe[0x450..0x45D].copy_from_slice(b"KERNEL32.dll\0");
+        pe[0x462..0x471].copy_from_slice(b"CreateProcessW\0");
+        // UTF-16LE string @ 0x480 (RVA 0x2080): "\\.\pipe\DemoSvc"
+        let wide_str = r"\\.\pipe\DemoSvc";
+        for (idx, ch) in wide_str.bytes().enumerate() {
+            pe[0x480 + idx * 2] = ch;
+            pe[0x480 + idx * 2 + 1] = 0;
+        }
+
+        // .text @ 0x200 (RVA 0x1000): INT3 pad -> func @ 0x1010 (sub rsp, 0x28)
+        for b in &mut pe[0x200..0x210] {
+            *b = 0xCC;
+        }
+        // func @ 0x210 (RVA 0x1010): 48 83 EC 28
+        pe[0x210..0x214].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        // @ 0x214 (RVA 0x1014): LEA RCX, [RIP + disp32] -> target RVA 0x2080
+        // disp32 = 0x2080 - (0x1014 + 7) = 0x1065
+        pe[0x214..0x217].copy_from_slice(&[0x48, 0x8D, 0x0D]);
+        pe[0x217..0x21B].copy_from_slice(&(0x1065i32).to_le_bytes());
+        // @ 0x21B (RVA 0x101B): CALL [RIP + disp32] -> target IAT RVA 0x2040
+        // disp32 = 0x2040 - (0x101B + 6) = 0x101F
+        pe[0x21B..0x21D].copy_from_slice(&[0xFF, 0x15]);
+        pe[0x21D..0x221].copy_from_slice(&(0x101Fi32).to_le_bytes());
+
+        let md = inspect_binary_with_xref_md(&pe, Some("DemoSvc|CreateProcess"), 40, true);
+        assert!(md.contains("rva=0x2080 (.rdata)"), "Expected RVA on string in:\n{md}");
+        assert!(md.contains("[str-xref] insn=0x1014 in func_rva=0x1010"), "Expected str-xref in:\n{md}");
+        assert!(md.contains("[iat-xref] call insn=0x101b in func_rva=0x1010"), "Expected iat-xref in:\n{md}");
+        assert!(md.contains("KERNEL32.dll!CreateProcessW"), "Expected IAT symbol in:\n{md}");
     }
 }

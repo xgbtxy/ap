@@ -236,6 +236,12 @@ enum SubCmd {
         /// Generate `--vary-field` variants without sending any network request
         #[arg(long)]
         dry_run: bool,
+        /// Multi-principal AuthZ/IDOR matrix (`--principal "owner=Authorization: Bearer A" --principal "anon="`)
+        #[arg(long = "principal")]
+        principals: Vec<String>,
+        /// Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps
+        #[arg(long)]
+        audit_headers: bool,
         #[arg(long)]
         json: bool,
     },
@@ -580,8 +586,25 @@ pub fn run_cli(args: &[String]) -> i32 {
             rate_ms,
             max_variants,
             dry_run,
+            principals,
+            audit_headers,
             json,
         } => {
+            if !principals.is_empty() {
+                return http_probe::run_http_auth_matrix(
+                    vary_request.as_deref(),
+                    url.as_deref(),
+                    &method,
+                    &headers,
+                    body.as_deref(),
+                    &principals,
+                    audit_headers,
+                    timeout,
+                    insecure,
+                    follow,
+                    json,
+                );
+            }
             if let Some(vf) = vary_field.as_deref().filter(|s| !s.trim().is_empty()) {
                 return http_probe::run_http_vary(
                     vary_request.as_deref(),
@@ -609,6 +632,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 insecure,
                 follow,
                 batch_stdin,
+                audit_headers,
                 json,
             )
         }
