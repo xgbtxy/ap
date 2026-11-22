@@ -27,6 +27,9 @@ struct SecPatterns {
     ssrf_taint: Regex,
     two_phase_header: Regex,
     unsafe_deser: Regex,
+    xxe_parser: Regex,
+    proto_pollution: Regex,
+    weak_jwt_tls: Regex,
 }
 
 fn sec_re() -> &'static SecPatterns {
@@ -78,6 +81,18 @@ fn sec_re() -> &'static SecPatterns {
             r"\b(?:pickle\.loads?|marshal\.loads?)\s*\(|\byaml\.load\s*\([^)]*\)|\beval\s*\([^)]*(?:req\.|request\.|searchParams)",
         )
         .unwrap(),
+        xxe_parser: Regex::new(
+            r"\b(?:DocumentBuilderFactory\.newInstance|XMLInputFactory\.newInstance|SAXParserFactory\.newInstance|lxml\.etree\.XMLParser)\s*\(",
+        )
+        .unwrap(),
+        proto_pollution: Regex::new(
+            r"\bObject\.assign\s*\([^,]+,\s*(?:req\.body|req\.query|JSON\.parse\s*\()|\[\s*['\x22]__proto__['\x22]\s*\]",
+        )
+        .unwrap(),
+        weak_jwt_tls: Regex::new(
+            r#"(?i)(?:algorithms\s*:\s*\[\s*['"]none['"]\s*\]|requests\.(?:get|post|put|delete|request)\s*\([^)]*\bverify\s*=\s*False)"#,
+        )
+        .unwrap(),
     })
 }
 
@@ -120,7 +135,7 @@ fn walk_code_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if matches!(
                 ext,
-                "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "py" | "go" | "rs" | "c" | "cc" | "cpp" | "h" | "hpp"
+                "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "py" | "go" | "rs" | "java" | "c" | "cc" | "cpp" | "h" | "hpp"
             ) {
                 out.push(p);
             }
@@ -310,6 +325,41 @@ pub fn scan_security_issues(root: &Path) -> Vec<SecFinding> {
                     fix: "Replace `pickle`/`marshal`/`yaml.load`/`eval` on untrusted data with JSON or `yaml.safe_load` / `SafeLoader`.".to_string(),
                 });
             }
+            if re.xxe_parser.is_match(ln)
+                && !txt_low.contains("disallow-doctype-decl")
+                && !txt_low.contains("resolve_entities=false")
+                && !txt_low.contains("is_supporting_external_entities")
+            {
+                findings.push(SecFinding {
+                    cwe: "CWE-611 XML External Entity (XXE)".to_string(),
+                    file: rel.clone(),
+                    line: lineno,
+                    snippet: trim.chars().take(120).collect(),
+                    fix: "Disable DOCTYPE and external entities (`disallow-doctype-decl=true` or `resolve_entities=False`).".to_string(),
+                });
+            }
+            if re.proto_pollution.is_match(ln)
+                && !txt_low.contains("hasown")
+                && !txt.contains("!== '__proto__'")
+                && !txt.contains("!== \"__proto__\"")
+            {
+                findings.push(SecFinding {
+                    cwe: "CWE-1321 Prototype Pollution".to_string(),
+                    file: rel.clone(),
+                    line: lineno,
+                    snippet: trim.chars().take(120).collect(),
+                    fix: "Pick explicit allowlisted keys or reject `__proto__`/`constructor`/`prototype` before merging untrusted objects.".to_string(),
+                });
+            }
+            if re.weak_jwt_tls.is_match(ln) {
+                findings.push(SecFinding {
+                    cwe: "CWE-295/347 Weak JWT/TLS Verification".to_string(),
+                    file: rel.clone(),
+                    line: lineno,
+                    snippet: trim.chars().take(120).collect(),
+                    fix: "Enforce strong JWT algorithms (never `none`) and keep TLS certificate verification enabled (`verify=True`).".to_string(),
+                });
+            }
         }
     }
     findings
@@ -365,6 +415,22 @@ def route(request):
         assert!(cwes.iter().any(|c| c.contains("CWE-918")), "missing CWE-918: {cwes:?}");
         assert!(cwes.iter().any(|c| c.contains("CWE-434")), "missing CWE-434: {cwes:?}");
         assert!(cwes.iter().any(|c| c.contains("CWE-94/502")), "missing CWE-94/502: {cwes:?}");
+
+        fs::write(
+            dir.join("XmlCtrl.java"),
+            "class XmlCtrl { void f() { DocumentBuilderFactory.newInstance(); } }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("merge.js"),
+            "function m(dst, req) { Object.assign(dst, req.body); jwt.verify(t, k, { algorithms: ['none'] }); }\n",
+        )
+        .unwrap();
+        let findings2 = scan_security_issues(&dir);
+        let cwes2: Vec<&str> = findings2.iter().map(|f| f.cwe.as_str()).collect();
+        assert!(cwes2.iter().any(|c| c.contains("CWE-611")), "missing CWE-611: {cwes2:?}");
+        assert!(cwes2.iter().any(|c| c.contains("CWE-1321")), "missing CWE-1321: {cwes2:?}");
+        assert!(cwes2.iter().any(|c| c.contains("CWE-295/347")), "missing CWE-295/347: {cwes2:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

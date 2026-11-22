@@ -302,10 +302,462 @@ pub fn read_zip_member(bytes: &[u8], entry_path: &str) -> Result<Vec<u8>, String
     Ok(buf)
 }
 
+fn read_u16_be(b: &[u8], off: usize) -> Option<u16> {
+    let s = b.get(off..off + 2)?;
+    Some(u16::from_be_bytes([s[0], s[1]]))
+}
+
+pub fn is_java_class_magic(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[0..4] != b"\xCA\xFE\xBA\xBE" {
+        return false;
+    }
+    // Distinguish Java .class (major >= 45) from macOS Mach-O universal fat binary (nfat_arch is small, typically 1..16)
+    let major = read_u16_be(bytes, 6).unwrap_or(0);
+    major >= 45 && major <= 100
+}
+
+/// Pure-Rust JVM `.class` Constant Pool, Methods & Dangerous Sink Analyzer (zero `javap`/JDK required).
+pub fn parse_java_class_md(bytes: &[u8], query: Option<&str>) -> String {
+    if !is_java_class_magic(bytes) {
+        return "*(not a valid Java .class file)*".to_string();
+    }
+    let minor = read_u16_be(bytes, 4).unwrap_or(0);
+    let major = read_u16_be(bytes, 6).unwrap_or(0);
+    let cp_count = read_u16_be(bytes, 8).unwrap_or(0) as usize;
+    let mut pos = 10usize;
+    let mut utf8s: Vec<Option<String>> = vec![None; cp_count];
+    let mut classes: Vec<Option<u16>> = vec![None; cp_count];
+    let mut strings: Vec<u16> = Vec::new();
+    let mut member_refs: Vec<(u16, u16)> = Vec::new();
+    let mut name_and_types: Vec<Option<(u16, u16)>> = vec![None; cp_count];
+
+    let mut idx = 1usize;
+    while idx < cp_count && pos < bytes.len() {
+        let tag = bytes[pos];
+        pos += 1;
+        match tag {
+            1 => {
+                // CONSTANT_Utf8
+                let Some(len) = read_u16_be(bytes, pos).map(|v| v as usize) else {
+                    break;
+                };
+                pos += 2;
+                if pos + len > bytes.len() {
+                    break;
+                }
+                utf8s[idx] = Some(String::from_utf8_lossy(&bytes[pos..pos + len]).to_string());
+                pos += len;
+            }
+            3 | 4 => pos += 4, // Integer / Float
+            5 | 6 => {
+                // Long / Double occupy 2 CP slots
+                pos += 8;
+                idx += 1;
+            }
+            7 => {
+                // Class
+                classes[idx] = read_u16_be(bytes, pos);
+                pos += 2;
+            }
+            8 => {
+                // String
+                if let Some(si) = read_u16_be(bytes, pos) {
+                    strings.push(si);
+                }
+                pos += 2;
+            }
+            9 | 10 | 11 => {
+                // Fieldref / Methodref / InterfaceMethodref
+                if let (Some(ci), Some(nti)) = (read_u16_be(bytes, pos), read_u16_be(bytes, pos + 2)) {
+                    member_refs.push((ci, nti));
+                }
+                pos += 4;
+            }
+            12 => {
+                // NameAndType
+                if let (Some(ni), Some(di)) = (read_u16_be(bytes, pos), read_u16_be(bytes, pos + 2)) {
+                    name_and_types[idx] = Some((ni, di));
+                }
+                pos += 4;
+            }
+            15 => pos += 3, // MethodHandle
+            16 | 19 | 20 => pos += 2, // MethodType / Module / Package
+            17 | 18 => pos += 4, // Dynamic / InvokeDynamic
+            _ => break,
+        }
+        idx += 1;
+    }
+
+    let resolve_utf8 = |i: u16| -> String {
+        utf8s
+            .get(i as usize)
+            .and_then(|o| o.as_deref())
+            .unwrap_or("")
+            .to_string()
+    };
+    let resolve_class = |i: u16| -> String {
+        classes
+            .get(i as usize)
+            .and_then(|o| *o)
+            .map(resolve_utf8)
+            .unwrap_or_default()
+    };
+
+    let this_cls = read_u16_be(bytes, pos + 2).map(resolve_class).unwrap_or_default();
+    let super_cls = read_u16_be(bytes, pos + 4).map(resolve_class).unwrap_or_default();
+
+    let mut calls = Vec::new();
+    let mut notable = Vec::new();
+    const DANGER_JVM: [&str; 18] = [
+        "Runtime.exec",
+        "ProcessBuilder",
+        "ObjectInputStream",
+        "readObject",
+        "XMLDecoder",
+        "InitialContext",
+        "lookup",
+        "Class.forName",
+        "ScriptEngine",
+        "Method.invoke",
+        "DriverManager",
+        "URLClassLoader",
+        "DocumentBuilderFactory",
+        "XStream",
+        "Files.write",
+        "FileOutputStream",
+        "ZipInputStream",
+        "defineClass",
+    ];
+    for (ci, nti) in member_refs {
+        let cname = resolve_class(ci);
+        let (mname, mdesc) = name_and_types
+            .get(nti as usize)
+            .and_then(|o| *o)
+            .map(|(n, d)| (resolve_utf8(n), resolve_utf8(d)))
+            .unwrap_or_default();
+        if !cname.is_empty() && !mname.is_empty() {
+            let full = format!("{cname}.{mname}");
+            if DANGER_JVM.iter().any(|k| full.contains(k)) && !notable.contains(&full) && notable.len() < 24 {
+                notable.push(full.clone());
+            }
+            if calls.len() < 50 && !calls.contains(&full) {
+                calls.push(format!("{full}{mdesc}"));
+            }
+        }
+    }
+
+    let q_re = query.and_then(|q| {
+        Regex::new(&format!("(?i){q}"))
+            .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
+            .ok()
+    });
+    let mut str_hits = Vec::new();
+    for si in strings {
+        let s = resolve_utf8(si);
+        if s.len() >= 3 && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) && !str_hits.contains(&s) {
+            str_hits.push(s);
+            if str_hits.len() >= 60 {
+                break;
+            }
+        }
+    }
+
+    let mut out = vec![
+        format!(
+            "## Binary Header: Java Bytecode `.class` (major={major}.{minor}, {} B) | `{this_cls}` extends `{super_cls}`",
+            bytes.len()
+        ),
+        format!("- SHA-256: `{}` | Constant Pool entries: {}", sha256_hex(bytes), cp_count),
+    ];
+    if !notable.is_empty() {
+        out.push(format!("- **Notable JVM Sinks**: `{}`", notable.join("`, `")));
+    }
+    if !calls.is_empty() {
+        out.push(format!("### JVM Referenced Methods/Fields ({} shown)", calls.len()));
+        for c in calls.iter().take(35) {
+            out.push(format!("- `{c}`"));
+        }
+    }
+    if !str_hits.is_empty() {
+        out.push(format!("### JVM String Constants ({} shown)", str_hits.len()));
+        for s in str_hits {
+            out.push(format!("- {s}"));
+        }
+    }
+    out.join("\n")
+}
+
+/// Extract searchable text from a Java `.class` Constant Pool for zero-extraction `.jar`/`.war` search.
+pub fn extract_java_class_searchable_text(bytes: &[u8]) -> String {
+    if !is_java_class_magic(bytes) {
+        return String::new();
+    }
+    let cp_count = read_u16_be(bytes, 8).unwrap_or(0) as usize;
+    let mut pos = 10usize;
+    let mut out = String::new();
+    let mut idx = 1usize;
+    while idx < cp_count && pos < bytes.len() && out.len() < 128 * 1024 {
+        let tag = bytes[pos];
+        pos += 1;
+        match tag {
+            1 => {
+                let Some(len) = read_u16_be(bytes, pos).map(|v| v as usize) else {
+                    break;
+                };
+                pos += 2;
+                if pos + len > bytes.len() {
+                    break;
+                }
+                if len >= 3 {
+                    out.push_str(&String::from_utf8_lossy(&bytes[pos..pos + len]));
+                    out.push('\n');
+                }
+                pos += len;
+            }
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => pos += 4,
+            5 | 6 => {
+                pos += 8;
+                idx += 1;
+            }
+            7 | 8 | 16 | 19 | 20 => pos += 2,
+            15 => pos += 3,
+            _ => break,
+        }
+        idx += 1;
+    }
+    out
+}
+
+/// Pure-Rust `.NET` CLR `BSJB` metadata inspector: extracts runtime version & notable managed APIs.
+fn scan_dotnet_clr_meta(bytes: &[u8]) -> Option<(String, Vec<String>)> {
+    // Locate BSJB metadata signature (0x424A5342)
+    let scan_lim = bytes.len().min(16 * 1024 * 1024);
+    let bsjb = bytes[..scan_lim].windows(4).position(|w| w == b"BSJB")?;
+    if bsjb + 20 > bytes.len() {
+        return None;
+    }
+    let ver_len = read_u32_le(bytes, bsjb + 12).unwrap_or(0) as usize;
+    if ver_len == 0 || ver_len > 128 || bsjb + 16 + ver_len + 4 > bytes.len() {
+        return None;
+    }
+    let ver = String::from_utf8_lossy(&bytes[bsjb + 16..bsjb + 16 + ver_len])
+        .trim_end_matches('\0')
+        .to_string();
+    let mut cur = bsjb + 16 + ver_len;
+    // Align to 4-byte boundary if needed (ver_len in CLR is padded to 4 bytes)
+    if cur % 4 != 0 {
+        cur += 4 - (cur % 4);
+    }
+    if cur + 4 > bytes.len() {
+        return Some((ver, Vec::new()));
+    }
+    let num_streams = read_u16_le(bytes, cur + 2).unwrap_or(0) as usize;
+    cur += 4;
+    let mut strings_stream: Option<(usize, usize)> = None;
+    for _ in 0..num_streams.min(16) {
+        if cur + 8 >= bytes.len() {
+            break;
+        }
+        let s_off = read_u32_le(bytes, cur).unwrap_or(0) as usize;
+        let s_sz = read_u32_le(bytes, cur + 4).unwrap_or(0) as usize;
+        cur += 8;
+        let nm_start = cur;
+        while cur < bytes.len() && bytes[cur] != 0 && cur - nm_start < 32 {
+            cur += 1;
+        }
+        let sname = String::from_utf8_lossy(&bytes[nm_start..cur]).to_string();
+        cur += 1; // null terminator
+        let pad = (4 - ((cur - nm_start) % 4)) % 4;
+        cur += pad;
+        if sname == "#Strings" {
+            strings_stream = Some((bsjb.saturating_add(s_off), s_sz));
+        }
+    }
+    let mut notable = Vec::new();
+    const CLR_SINKS: [&str; 18] = [
+        "ProcessStartInfo",
+        "BinaryFormatter",
+        "SoapFormatter",
+        "NetDataContractSerializer",
+        "LosFormatter",
+        "JavaScriptSerializer",
+        "XmlSerializer",
+        "AssemblyLoad",
+        "DllImportAttribute",
+        "NamedPipeServerStream",
+        "HttpListener",
+        "WebClient",
+        "SqlCommand",
+        "RegistryKey",
+        "DirectoryDelete",
+        "CreateProcess",
+        "ShellExecute",
+        "UnsafeDeserialize",
+    ];
+    if let Some((off, sz)) = strings_stream {
+        if off < bytes.len() {
+            let end = off.saturating_add(sz.min(2 * 1024 * 1024)).min(bytes.len());
+            for part in bytes[off..end].split(|&b| b == 0) {
+                if part.len() < 4 || part.len() > 96 {
+                    continue;
+                }
+                if let Ok(s) = std::str::from_utf8(part) {
+                    if CLR_SINKS.iter().any(|k| s.contains(k)) && !notable.contains(&s.to_string()) {
+                        notable.push(s.to_string());
+                        if notable.len() >= 24 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some((ver, notable))
+}
+
+/// Pure-Rust Binary & Archive Patch-Diff Engine (`ap read <new> --diff <old>`).
+/// Supports PE/DLL/SYS, ELF/SO, Go binaries, Electron `.asar`, and `.zip`/`.jar`/`.vsix`/`.war`.
+pub fn diff_binaries_or_archives_md(
+    new_bytes: &[u8],
+    old_bytes: &[u8],
+    new_label: &str,
+    old_label: &str,
+    ext: &str,
+) -> String {
+    let mut out = vec![format!(
+        "## Binary/Archive Patch Diff: `{new_label}` ({} B) vs `{old_label}` ({} B, delta={:+} B)",
+        new_bytes.len(),
+        old_bytes.len(),
+        (new_bytes.len() as i64) - (old_bytes.len() as i64)
+    )];
+    let h_new = sha256_hex(new_bytes);
+    let h_old = sha256_hex(old_bytes);
+    if h_new == h_old {
+        out.push(format!("- **IDENTICAL** (SHA-256 `{h_new}`)"));
+        return out.join("\n");
+    }
+    out.push(format!("- New SHA-256: `{h_new}` | Old SHA-256: `{h_old}`"));
+
+    // 1. Archive diff (.asar / .zip / .jar / .vsix / .war)
+    if ext == "asar" {
+        if let (Ok((_, en_new)), Ok((_, en_old))) = (parse_asar_index(new_bytes), parse_asar_index(old_bytes)) {
+            let m_new: std::collections::HashMap<String, usize> = en_new.into_iter().map(|e| (e.path, e.size)).collect();
+            let m_old: std::collections::HashMap<String, usize> = en_old.into_iter().map(|e| (e.path, e.size)).collect();
+            let mut added: Vec<(String, usize)> = m_new.iter().filter(|(k, _)| !m_old.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
+            let mut removed: Vec<(String, usize)> = m_old.iter().filter(|(k, _)| !m_new.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
+            let mut changed: Vec<(String, i64, usize)> = m_new.iter().filter_map(|(k, &v)| {
+                let ov = *m_old.get(k)?;
+                if ov != v { Some((k.clone(), (v as i64) - (ov as i64), v)) } else { None }
+            }).collect();
+            added.sort_by(|a, b| b.1.cmp(&a.1));
+            removed.sort_by(|a, b| b.1.cmp(&a.1));
+            changed.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
+            out.push(format!("### ASAR Member Diff: +{} added, -{} removed, ~{} size-changed", added.len(), removed.len(), changed.len()));
+            for (p, sz) in added.iter().take(20) { out.push(format!("- [ADDED] `{p}` ({sz} B)")); }
+            for (p, sz) in removed.iter().take(15) { out.push(format!("- [REMOVED] `{p}` ({sz} B)")); }
+            for (p, d, sz) in changed.iter().take(25) { out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)")); }
+            return out.join("\n");
+        }
+    }
+    if matches!(ext, "zip" | "jar" | "vsix" | "war" | "apk" | "whl") {
+        if let (Ok(mut zn), Ok(mut zo)) = (ZipArchive::new(Cursor::new(new_bytes)), ZipArchive::new(Cursor::new(old_bytes))) {
+            let mut m_new = std::collections::HashMap::<String, u64>::new();
+            let mut m_old = std::collections::HashMap::<String, u64>::new();
+            for i in 0..zn.len() { if let Ok(f) = zn.by_index(i) { if !f.is_dir() { m_new.insert(f.name().to_string(), f.size()); } } }
+            for i in 0..zo.len() { if let Ok(f) = zo.by_index(i) { if !f.is_dir() { m_old.insert(f.name().to_string(), f.size()); } } }
+            let mut added: Vec<(String, u64)> = m_new.iter().filter(|(k, _)| !m_old.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
+            let mut removed: Vec<(String, u64)> = m_old.iter().filter(|(k, _)| !m_new.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
+            let mut changed: Vec<(String, i64, u64)> = m_new.iter().filter_map(|(k, &v)| {
+                let ov = *m_old.get(k)?;
+                if ov != v { Some((k.clone(), (v as i64) - (ov as i64), v)) } else { None }
+            }).collect();
+            added.sort_by(|a, b| b.1.cmp(&a.1));
+            removed.sort_by(|a, b| b.1.cmp(&a.1));
+            changed.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
+            out.push(format!("### Archive Member Diff: +{} added, -{} removed, ~{} size-changed", added.len(), removed.len(), changed.len()));
+            for (p, sz) in added.iter().take(20) { out.push(format!("- [ADDED] `{p}` ({sz} B)")); }
+            for (p, sz) in removed.iter().take(15) { out.push(format!("- [REMOVED] `{p}` ({sz} B)")); }
+            for (p, d, sz) in changed.iter().take(25) { out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)")); }
+            return out.join("\n");
+        }
+    }
+
+    // 2. Native Binary Diff (PE / ELF / Go): diff extracted strings + Go funcs + RPC interfaces
+    let extract_set = |b: &[u8]| -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let lim = b.len().min(12 * 1024 * 1024);
+        let data = &b[..lim];
+        let mut i = 0usize;
+        while i < data.len() && set.len() < 12000 {
+            if (0x20..=0x7E).contains(&data[i]) {
+                let st = i;
+                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 180 { i += 1; }
+                if i - st >= 8 {
+                    let s = String::from_utf8_lossy(&data[st..i]).to_string();
+                    if s.contains('/') || s.contains('\\') || s.contains("http") || s.contains("err") || s.contains("fail") || s.contains("invalid") || s.contains("deny") || s.contains("check") || s.contains("pipe") || s.contains('%') {
+                        set.insert(s);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut j = 0usize;
+        while j + 1 < data.len() && set.len() < 16000 {
+            if (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 {
+                let mut s = String::new();
+                while j + 1 < data.len() && (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 && s.len() < 160 {
+                    s.push(data[j] as char);
+                    j += 2;
+                }
+                if s.len() >= 7 && (s.contains('/') || s.contains('\\') || s.contains("http") || s.contains("err") || s.contains("fail") || s.contains("invalid") || s.contains("pipe") || s.contains('%')) {
+                    set.insert(s);
+                }
+            } else {
+                j += 1;
+            }
+        }
+        set
+    };
+
+    let s_new = extract_set(new_bytes);
+    let s_old = extract_set(old_bytes);
+    let added_s: Vec<&String> = s_new.difference(&s_old).take(35).collect();
+    let removed_s: Vec<&String> = s_old.difference(&s_new).take(25).collect();
+
+    let g_new: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(new_bytes, None, 2000).into_iter().map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string()).collect();
+    let g_old: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(old_bytes, None, 2000).into_iter().map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string()).collect();
+    if !g_new.is_empty() || !g_old.is_empty() {
+        let ga: Vec<&String> = g_new.difference(&g_old).take(20).collect();
+        let gr: Vec<&String> = g_old.difference(&g_new).take(15).collect();
+        out.push(format!("### Go Function Diff: +{} added, -{} removed", ga.len(), gr.len()));
+        for f in ga { out.push(format!("- [GO+] {f}")); }
+        for f in gr { out.push(format!("- [GO-] {f}")); }
+    }
+
+    let r_new: std::collections::BTreeSet<String> = scan_pe_rpc_interfaces(new_bytes, true).into_iter().map(|s| s.split(" (").next().unwrap_or(&s).to_string()).collect();
+    let r_old: std::collections::BTreeSet<String> = scan_pe_rpc_interfaces(old_bytes, true).into_iter().map(|s| s.split(" (").next().unwrap_or(&s).to_string()).collect();
+    if r_new != r_old {
+        out.push("### MS-RPC Interface Diff".to_string());
+        for r in r_new.difference(&r_old) { out.push(format!("- [RPC+] {r}")); }
+        for r in r_old.difference(&r_new) { out.push(format!("- [RPC-] {r}")); }
+    }
+
+    out.push(format!(
+        "### Security-Relevant Strings Diff (+{} added, -{} removed)",
+        added_s.len(),
+        removed_s.len()
+    ));
+    for s in added_s { out.push(format!("+ {s}")); }
+    for s in removed_s { out.push(format!("- {s}")); }
+    out.join("\n")
+}
+
 pub fn is_binary_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(b"MZ")
         || bytes.starts_with(b"\x7FELF")
         || bytes.starts_with(b"\x00asm")
+        || is_java_class_magic(bytes)
         || bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
         || bytes.starts_with(&[0xCE, 0xFA, 0xED, 0xFE])
         || bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])
@@ -531,6 +983,18 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeCon
             "### Embedded RPC Interfaces ({}): {}",
             rpc_ifaces.len(),
             rpc_ifaces.join(" · ")
+        ));
+    }
+
+    // .NET CLR BSJB metadata scanner (auto-detects managed assemblies & notable managed APIs)
+    if let Some((clr_ver, clr_sinks)) = scan_dotnet_clr_meta(bytes) {
+        let sinks_s = if clr_sinks.is_empty() {
+            "none flagged".to_string()
+        } else {
+            format!("`{}`", clr_sinks.join("`, `"))
+        };
+        out.push(format!(
+            "### .NET CLR Assembly (`{clr_ver}`) | Notable Managed APIs: {sinks_s}"
         ));
     }
 
@@ -1457,6 +1921,8 @@ pub fn inspect_binary_with_xref_md(
         }
     } else if bytes.starts_with(b"\x7FELF") && bytes.len() >= 20 {
         elf_ctx = Some(parse_elf_details(bytes, &mut out));
+    } else if is_java_class_magic(bytes) {
+        return parse_java_class_md(bytes, query);
     } else if bytes.starts_with(b"\x00asm") {
         out.push(format!(
             "## Binary Header: WebAssembly ({} B) | SHA-256: `{}`",
@@ -1828,5 +2294,69 @@ mod tests {
         let funcs = scan_go_pclntab_funcs(&go_blob, None, 10);
         assert_eq!(funcs.len(), 1, "Expected 1 non-stdlib Go func, got {funcs:?}");
         assert!(funcs[0].contains("main.handleRpcRequest") && funcs[0].contains("0x401080"));
+    }
+
+    #[test]
+    fn parses_java_class_dotnet_clr_and_binary_patch_diff() {
+        // 1. Minimal synthetic Java .class (major 55 = Java 11):
+        // CP[1]=Utf8 "com/demo/Runner", CP[2]=Class(1), CP[3]=Utf8 "java/lang/Object", CP[4]=Class(3),
+        // CP[5]=Utf8 "java/lang/Runtime", CP[6]=Class(5), CP[7]=Utf8 "exec", CP[8]=Utf8 "(Ljava/lang/String;)Ljava/lang/Process;",
+        // CP[9]=NameAndType(7,8), CP[10]=Methodref(6,9), CP[11]=Utf8 "/bin/sh -c id", CP[12]=String(11)
+        let mut cls: Vec<u8> = Vec::new();
+        cls.extend_from_slice(b"\xCA\xFE\xBA\xBE");
+        cls.extend_from_slice(&0u16.to_be_bytes());
+        cls.extend_from_slice(&55u16.to_be_bytes());
+        cls.extend_from_slice(&13u16.to_be_bytes()); // cp_count = 13 (1..12)
+        let push_utf8 = |v: &mut Vec<u8>, s: &str| {
+            v.push(1);
+            v.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            v.extend_from_slice(s.as_bytes());
+        };
+        push_utf8(&mut cls, "com/demo/Runner"); // 1
+        cls.push(7); cls.extend_from_slice(&1u16.to_be_bytes()); // 2
+        push_utf8(&mut cls, "java/lang/Object"); // 3
+        cls.push(7); cls.extend_from_slice(&3u16.to_be_bytes()); // 4
+        push_utf8(&mut cls, "java/lang/Runtime"); // 5
+        cls.push(7); cls.extend_from_slice(&5u16.to_be_bytes()); // 6
+        push_utf8(&mut cls, "exec"); // 7
+        push_utf8(&mut cls, "(Ljava/lang/String;)Ljava/lang/Process;"); // 8
+        cls.push(12); cls.extend_from_slice(&7u16.to_be_bytes()); cls.extend_from_slice(&8u16.to_be_bytes()); // 9
+        cls.push(10); cls.extend_from_slice(&6u16.to_be_bytes()); cls.extend_from_slice(&9u16.to_be_bytes()); // 10
+        push_utf8(&mut cls, "/bin/sh -c id"); // 11
+        cls.push(8); cls.extend_from_slice(&11u16.to_be_bytes()); // 12
+        // access_flags, this_class=2, super_class=4
+        cls.extend_from_slice(&0x0021u16.to_be_bytes());
+        cls.extend_from_slice(&2u16.to_be_bytes());
+        cls.extend_from_slice(&4u16.to_be_bytes());
+
+        let jmd = parse_java_class_md(&cls, None);
+        assert!(jmd.contains("com/demo/Runner"), "missing class name:\n{jmd}");
+        assert!(jmd.contains("java/lang/Runtime.exec"), "missing Runtime.exec sink:\n{jmd}");
+        assert!(jmd.contains("/bin/sh -c id"), "missing string constant:\n{jmd}");
+
+        // 2. Synthetic .NET CLR BSJB metadata + #Strings stream
+        let mut clr = vec![0u8; 0x120];
+        let b = 0x10usize;
+        clr[b..b + 4].copy_from_slice(b"BSJB");
+        clr[b + 12..b + 16].copy_from_slice(&12u32.to_le_bytes()); // ver_len=12
+        clr[b + 16..b + 26].copy_from_slice(b"v4.0.30319");
+        // flags (2B) + streams=1 (2B) at b + 28
+        clr[b + 30..b + 32].copy_from_slice(&1u16.to_le_bytes());
+        // stream 0 hdr at b + 32: off=0x60, sz=0x50, name="#Strings\0\0\0\0"
+        clr[b + 32..b + 36].copy_from_slice(&0x60u32.to_le_bytes());
+        clr[b + 36..b + 40].copy_from_slice(&0x50u32.to_le_bytes());
+        clr[b + 40..b + 49].copy_from_slice(b"#Strings\0");
+        // #Strings body at b + 0x60 = 0x70
+        let s_payload = b"\0BinaryFormatter\0ProcessStartInfo\0SafeFn\0";
+        clr[0x70..0x70 + s_payload.len()].copy_from_slice(s_payload);
+        let (ver, sinks) = scan_dotnet_clr_meta(&clr).unwrap();
+        assert_eq!(ver, "v4.0.30319");
+        assert!(sinks.iter().any(|s| s == "BinaryFormatter") && sinks.iter().any(|s| s == "ProcessStartInfo"));
+
+        // 3. Binary patch diff
+        let old_b = b"MZ\0\0____/api/v1/old_route\0invalid_old_check\0";
+        let new_b = b"MZ\0\0____/api/v1/old_route\0/api/v2/admin_exec\0invalid_path_guard\0";
+        let dmd = diff_binaries_or_archives_md(new_b, old_b, "new.dll", "old.dll", "dll");
+        assert!(dmd.contains("+ /api/v2/admin_exec") && dmd.contains("- invalid_old_check"), "unexpected diff:\n{dmd}");
     }
 }

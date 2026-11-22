@@ -227,7 +227,7 @@ fn axis_rules() -> &'static [AxisRule] {
                 axis: "ipc_pipe_proto",
                 base_score: 88,
                 re: Regex::new(
-                    r"\b(?:ipcMain\.(?:handle|on)|contextBridge\.exposeInMainWorld|setAsDefaultProtocolClient|register(?:File|Http|Buffer|Stream|String)?Protocol|protocol\.handle|CreateNamedPipe[AW]?|ConnectNamedPipe|CallNamedPipe|DeviceIoControl|OnRemoteRequest|ReadFileDescriptor|\\\\\.\\pipe\\|postMessage|addEventListener\s*\(\s*['\x22]message['\x22]|registerUriHandler|open-url|second-instance)\b",
+                    r"\b(?:ipcMain\.(?:handle|on)|contextBridge\.exposeInMainWorld|setAsDefaultProtocolClient|register(?:File|Http|Buffer|Stream|String)?Protocol|protocol\.handle|CreateNamedPipe[AW]?|ConnectNamedPipe|CallNamedPipe|DeviceIoControl|IoCreateDevice|IoCreateSymbolicLink|METHOD_NEITHER|OnRemoteRequest|ReadFileDescriptor|\\\\\.\\pipe\\|postMessage|addEventListener\s*\(\s*['\x22]message['\x22]|registerUriHandler|open-url|second-instance)\b",
                 )
                 .unwrap(),
             },
@@ -243,7 +243,7 @@ fn axis_rules() -> &'static [AxisRule] {
                 axis: "deserialize_parse",
                 base_score: 86,
                 re: Regex::new(
-                    r"\b(?:ObjectInputStream|readObject|yaml\.load|pickle\.loads?|marshal\.loads?|vm\.runIn(?:New|This)?Context|new\s+Function\s*\(|\beval\s*\(|DocumentBuilderFactory|SAXParserFactory|XMLDecoder|XStream|innerHTML|outerHTML|dangerouslySetInnerHTML|insertAdjacentHTML|DOMParser|memcpy_s|memmove_s|ReadBuffer|ReadRawData)\b",
+                    r"\b(?:ObjectInputStream|readObject|yaml\.load|pickle\.loads?|marshal\.loads?|vm\.runIn(?:New|This)?Context|new\s+Function\s*\(|\beval\s*\(|DocumentBuilderFactory|SAXParserFactory|XMLDecoder|XStream|BinaryFormatter|innerHTML|outerHTML|dangerouslySetInnerHTML|insertAdjacentHTML|DOMParser|memcpy_s|memmove_s|ReadBuffer|ReadRawData|ProbeForRead|ProbeForWrite|copy_from_user|copy_to_user)\b",
                 )
                 .unwrap(),
             },

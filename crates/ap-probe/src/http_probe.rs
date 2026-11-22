@@ -1151,6 +1151,146 @@ pub fn run_http_auth_matrix(
     0
 }
 
+/// Synchronized Barrier HTTP Race / TOCTOU concurrency burst (`--race N`, 2..=32 threads firing simultaneously).
+#[allow(clippy::too_many_arguments)]
+pub fn run_http_race(
+    req_file: Option<&std::path::Path>,
+    url_opt: Option<&str>,
+    method: &str,
+    headers: &[String],
+    body: Option<&str>,
+    race_n: usize,
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+    as_json: bool,
+) -> i32 {
+    let (m, u, mut hdrs, b) = if let Some(rf) = req_file {
+        match load_saved_request(rf) {
+            Ok(spec) => spec,
+            Err(e) => {
+                eprintln!("[probe http race] {e}");
+                return 2;
+            }
+        }
+    } else if let Some(url) = url_opt.filter(|s| !s.trim().is_empty()) {
+        (
+            method.to_ascii_uppercase(),
+            url.to_string(),
+            Vec::new(),
+            body.map(str::to_string),
+        )
+    } else {
+        eprintln!("[probe http race] Provide a URL or `--vary-request <file>`.");
+        return 2;
+    };
+    hdrs.extend(headers.iter().cloned());
+
+    let n = race_n.clamp(2, 32);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+    let mut handles = Vec::with_capacity(n);
+    for idx in 0..n {
+        let bar = std::sync::Arc::clone(&barrier);
+        let m_c = m.clone();
+        let u_c = u.clone();
+        let h_c = hdrs.clone();
+        let b_c = b.clone();
+        handles.push(std::thread::spawn(move || {
+            bar.wait();
+            let res = execute_http_probe(
+                &m_c,
+                &u_c,
+                &h_c,
+                b_c.as_deref(),
+                timeout_sec,
+                insecure,
+                follow,
+            );
+            (idx, res)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(n);
+    for h in handles {
+        if let Ok(pair) = h.join() {
+            results.push(pair);
+        }
+    }
+    results.sort_by_key(|(i, _)| *i);
+
+    let mut status_counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    let mut ok_2xx = 0usize;
+    let mut err_5xx = 0usize;
+    for (_, r) in &results {
+        *status_counts.entry(r.status).or_insert(0) += 1;
+        if (200..300).contains(&r.status) {
+            ok_2xx += 1;
+        } else if r.status >= 500 {
+            err_5xx += 1;
+        }
+    }
+    let is_mutating = matches!(m.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    let mixed_statuses = status_counts.len() > 1;
+    let race_anomaly = (is_mutating && ok_2xx >= 2) || (mixed_statuses && ok_2xx >= 1) || err_5xx >= 1;
+
+    if as_json {
+        let rows: Vec<Value> = results
+            .iter()
+            .map(|(idx, r)| {
+                json!({
+                    "thread": idx,
+                    "status": r.status,
+                    "elapsed_ms": r.elapsed_ms,
+                    "body_len": r.body_preview.len(),
+                    "error": r.error,
+                    "body_preview": r.body_preview.chars().take(240).collect::<String>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "method": m,
+                "url": u,
+                "threads": n,
+                "ok_2xx": ok_2xx,
+                "err_5xx": err_5xx,
+                "status_histogram": status_counts,
+                "race_anomaly": race_anomaly,
+                "results": rows,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        let badge = if race_anomaly {
+            "[RACE-ANOMALY]"
+        } else {
+            "[UNIFORM]"
+        };
+        println!(
+            "[probe http race] {} {} x{n} {badge} | 2xx={ok_2xx} 5xx={err_5xx} hist={:?}",
+            m, u, status_counts
+        );
+        for (idx, r) in results.iter().take(12) {
+            let prev: String = r
+                .body_preview
+                .replace(['\r', '\n'], " ")
+                .chars()
+                .take(100)
+                .collect();
+            println!(
+                "  #{:02} HTTP {} ({}ms | {}B) — `{prev}`",
+                idx + 1,
+                r.status,
+                r.elapsed_ms,
+                r.body_preview.len()
+            );
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

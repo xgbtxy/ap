@@ -242,6 +242,9 @@ enum SubCmd {
         /// Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps
         #[arg(long)]
         audit_headers: bool,
+        /// Synchronized Barrier concurrency/TOCTOU race burst count (2..=32 parallel threads firing simultaneously)
+        #[arg(long, default_value_t = 0)]
+        race: usize,
         #[arg(long)]
         json: bool,
     },
@@ -594,8 +597,23 @@ pub fn run_cli(args: &[String]) -> i32 {
             dry_run,
             principals,
             audit_headers,
+            race,
             json,
         } => {
+            if race >= 2 {
+                return http_probe::run_http_race(
+                    vary_request.as_deref(),
+                    url.as_deref(),
+                    &method,
+                    &headers,
+                    body.as_deref(),
+                    race,
+                    timeout,
+                    insecure,
+                    follow,
+                    json,
+                );
+            }
             if !principals.is_empty() {
                 return http_probe::run_http_auth_matrix(
                     vary_request.as_deref(),

@@ -553,8 +553,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             return local_matches;
         }
 
-        // Virtual .zip / .vsix / .jar / .whl archive search
-        if matches!(ext.as_str(), "zip" | "vsix" | "jar" | "whl")
+        // Virtual .zip / .vsix / .jar / .war / .ear / .whl archive search (includes Java `.class` Constant Pool scanning!)
+        if matches!(ext.as_str(), "zip" | "vsix" | "jar" | "war" | "ear" | "whl")
             && (explicit_file || !ext_allow.is_empty())
         {
             if let Ok(mut za) = zip::ZipArchive::new(std::io::Cursor::new(&bytes)) {
@@ -583,12 +583,17 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 | "yml"
                                 | "yaml"
                                 | "properties"
+                                | "class"
                         ) {
                             continue;
                         }
                         let mut eb = Vec::new();
                         if std::io::Read::read_to_end(&mut zf, &mut eb).is_ok() {
-                            let txt = decode_any_bytes(&eb).0;
+                            let txt = if eext == "class" {
+                                crate::binary::extract_java_class_searchable_text(&eb)
+                            } else {
+                                decode_any_bytes(&eb).0
+                            };
                             let virt_rel = format!("{rel}::{nm}");
                             for (pl, r) in compiled {
                                 let lbl = if multi_mode { pl.as_str() } else { "" };

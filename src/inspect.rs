@@ -400,3 +400,164 @@ pub fn decode_embedded_payloads(text: &str) -> String {
         )
     }
 }
+
+fn read_pb_varint(b: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    while *pos < b.len() && shift < 64 {
+        let byte = b[*pos];
+        *pos += 1;
+        val |= ((byte & 0x7F) as u64) << shift;
+        if (byte & 0x80) == 0 {
+            return Some(val);
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn decode_pb_fields(b: &[u8], depth: usize, out: &mut Vec<String>) -> bool {
+    if depth > 6 || b.is_empty() {
+        return false;
+    }
+    let indent = "  ".repeat(depth);
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos < b.len() && out.len() < 160 {
+        let Some(tag) = read_pb_varint(b, &mut pos) else {
+            return false;
+        };
+        let field_no = tag >> 3;
+        let wire_type = (tag & 0x7) as u8;
+        if field_no == 0 || field_no > 536_870_911 {
+            return false;
+        }
+        match wire_type {
+            0 => {
+                let Some(v) = read_pb_varint(b, &mut pos) else {
+                    return false;
+                };
+                out.push(format!("{indent}{field_no} (varint): {v} (0x{v:x})"));
+            }
+            1 => {
+                if pos + 8 > b.len() {
+                    return false;
+                }
+                let v = u64::from_le_bytes([
+                    b[pos],
+                    b[pos + 1],
+                    b[pos + 2],
+                    b[pos + 3],
+                    b[pos + 4],
+                    b[pos + 5],
+                    b[pos + 6],
+                    b[pos + 7],
+                ]);
+                pos += 8;
+                out.push(format!("{indent}{field_no} (fixed64): 0x{v:016x} ({v})"));
+            }
+            2 => {
+                let Some(len_u64) = read_pb_varint(b, &mut pos) else {
+                    return false;
+                };
+                let len = len_u64 as usize;
+                if len > b.len().saturating_sub(pos) {
+                    return false;
+                }
+                let slice = &b[pos..pos + len];
+                pos += len;
+                let mut nested = Vec::new();
+                if slice.len() >= 2 && depth < 5 && decode_pb_fields(slice, depth + 1, &mut nested) {
+                    // Prefer UTF-8 string if entire slice is clean printable text and nested only had 1 trivial field
+                    let is_clean_text = std::str::from_utf8(slice)
+                        .map(|s| {
+                            !s.is_empty()
+                                && s.chars()
+                                    .all(|c| (!c.is_control()) || matches!(c, '\n' | '\r' | '\t'))
+                        })
+                        .unwrap_or(false);
+                    if is_clean_text && nested.len() <= 1 {
+                        let s = std::str::from_utf8(slice).unwrap_or("");
+                        out.push(format!(
+                            "{indent}{field_no} (str, {}B): {:?}",
+                            slice.len(),
+                            s.chars().take(180).collect::<String>()
+                        ));
+                    } else {
+                        out.push(format!("{indent}{field_no} (msg, {}B) {{", slice.len()));
+                        out.extend(nested);
+                        out.push(format!("{indent}}}"));
+                    }
+                } else if let Ok(s) = std::str::from_utf8(slice) {
+                    if !s.is_empty()
+                        && s.chars()
+                            .all(|c| (!c.is_control()) || matches!(c, '\n' | '\r' | '\t'))
+                    {
+                        out.push(format!(
+                            "{indent}{field_no} (str, {}B): {:?}",
+                            slice.len(),
+                            s.chars().take(180).collect::<String>()
+                        ));
+                    } else {
+                        let hx: String = slice
+                            .iter()
+                            .take(32)
+                            .map(|x| format!("{x:02x}"))
+                            .collect();
+                        out.push(format!("{indent}{field_no} (bytes, {}B): 0x{hx}", slice.len()));
+                    }
+                } else {
+                    let hx: String = slice
+                        .iter()
+                        .take(32)
+                        .map(|x| format!("{x:02x}"))
+                        .collect();
+                    out.push(format!("{indent}{field_no} (bytes, {}B): 0x{hx}", slice.len()));
+                }
+            }
+            5 => {
+                if pos + 4 > b.len() {
+                    return false;
+                }
+                let v = u32::from_le_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]);
+                pos += 4;
+                out.push(format!("{indent}{field_no} (fixed32): 0x{v:08x} ({v})"));
+            }
+            _ => return false,
+        }
+        count += 1;
+    }
+    count > 0 && pos == b.len()
+}
+
+/// Pure-Rust schema-less raw Protocol Buffers wire-format decoder (`--proto`).
+pub fn decode_raw_protobuf_md(bytes: &[u8]) -> Result<String, String> {
+    let mut lines = Vec::new();
+    let slice = &bytes[..bytes.len().min(512 * 1024)];
+    if !decode_pb_fields(slice, 0, &mut lines) {
+        return Err("payload is not a valid Protocol Buffers wire stream".to_string());
+    }
+    Ok(format!(
+        "## Raw Protobuf Wire Decode ({} B, {} line(s))\n{}",
+        bytes.len(),
+        lines.len(),
+        lines.join("\n")
+    ))
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_nested_raw_protobuf_wire_message() {
+        // field 1 (varint) = 150 (08 96 01), field 2 (nested msg): field 1 (str) = "admin" (12 07 0a 05 61 64 6d 69 6e)
+        let pb: Vec<u8> = vec![
+            0x08, 0x96, 0x01, 0x12, 0x07, 0x0A, 0x05, b'a', b'd', b'm', b'i', b'n',
+        ];
+        let md = decode_raw_protobuf_md(&pb).unwrap();
+        assert!(md.contains("1 (varint): 150"), "missing varint in:\n{md}");
+        assert!(md.contains("2 (msg, 7B)"), "missing nested msg in:\n{md}");
+        assert!(md.contains("\"admin\""), "missing nested str in:\n{md}");
+    }
+}

@@ -29,7 +29,10 @@ fn mcp_tools_schema() -> Value {
                     "map_pos": { "type": "string", "description": "SourceMap v3 generated 'line:col' to resolve back to original source via VLQ" },
                     "decode": { "type": "boolean", "description": "Auto-decode embedded JWT tokens, Base64 blobs, and URL-encoded strings" },
                     "render": { "type": "boolean", "description": "Render JS-driven URLs in real Headless Edge/Chrome" },
-                    "hex": { "type": "boolean", "description": "Emit canonical hex+ASCII dump with SHA-256 & entropy (supports hex/decimal offset)" }
+                    "hex": { "type": "boolean", "description": "Emit canonical hex+ASCII dump with SHA-256 & entropy (supports hex/decimal offset)" },
+                    "xref": { "type": "boolean", "description": "Resolve PE64 (x64 LEA/CALL) & ELF64 (x64 LEA / AArch64 ADRP+ADD) string & IAT XREFs + enclosing function RVAs" },
+                    "proto": { "type": "boolean", "description": "Schema-less raw Protocol Buffers wire decoder (no protoc required)" },
+                    "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) for fast patch-diffing" }
                 }
             }
         },
@@ -297,6 +300,13 @@ fn mcp_tools_schema() -> Value {
                 "rate_ms": { "type": "integer", "description": "Delay in ms between serial `vary_field` requests (default: 0, max: 5000)" },
                 "max_variants": { "type": "integer", "description": "Max variants for `vary_field` (default: 20, max: 100)" },
                 "dry_run": { "type": "boolean", "description": "Generate `vary_field` variants without sending requests" },
+                "principals": {
+                    "type": "array",
+                    "description": "Multi-principal AuthZ/IDOR matrix specs like ['owner=Authorization: Bearer A', 'other=Authorization: Bearer B', 'anon=']",
+                    "items": { "type": "string" }
+                },
+                "audit_headers": { "type": "boolean", "description": "Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps" },
+                "race": { "type": "integer", "description": "Synchronized Barrier concurrency/TOCTOU race burst thread count (2..=32)" },
                 "timeout": { "type": "integer", "description": "Per-request timeout in seconds (default: 15)" },
                 "insecure": { "type": "boolean", "description": "Skip TLS verification (-k)" },
                 "follow": { "type": "boolean", "description": "Follow HTTP redirects (-L)" }
@@ -375,6 +385,8 @@ fn mcp_tools_schema() -> Value {
                 "url": { "type": "string", "description": "Target ws://host:port/path URL" },
                 "send": { "type": "array", "items": { "type": "string" }, "description": "Text frames to send after handshake" },
                 "headers": { "type": "array", "items": { "type": "string" }, "description": "Optional extra HTTP upgrade headers" },
+                "origin_matrix": { "type": "boolean", "description": "Run CSWSH cross-origin WebSocket handshake matrix (omitted / https://evil.example / null / localhost)" },
+                "origins": { "type": "array", "items": { "type": "string" }, "description": "Custom Origin values for origin_matrix" },
                 "wait_ms": { "type": "integer", "description": "Max receive window in ms (default: 1000)" }
             },
             "required": ["url"]
@@ -1067,6 +1079,20 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("hex").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--hex".to_string());
             }
+            if args.get("xref").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--xref".to_string());
+            }
+            if args.get("proto").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--proto".to_string());
+            }
+            if let Some(df) = args
+                .get("diff")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--diff".to_string());
+                cli.push(df.trim().to_string());
+            }
             run_self_captured(&cli, None)
         }
         "ap_query" => {
@@ -1692,6 +1718,25 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             {
                 cli.push("--dry-run".into());
             }
+            if let Some(ps) = args.get("principals").and_then(Value::as_array) {
+                for p in ps.iter().filter_map(Value::as_str) {
+                    cli.push("--principal".into());
+                    cli.push(p.to_string());
+                }
+            }
+            if args
+                .get("audit_headers")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--audit-headers".into());
+            }
+            if let Some(rc) = args.get("race").and_then(Value::as_u64) {
+                if rc >= 2 {
+                    cli.push("--race".into());
+                    cli.push(rc.to_string());
+                }
+            }
             let batch_lines: Vec<&str> = args
                 .get("batch_requests")
                 .and_then(Value::as_array)
@@ -1847,6 +1892,19 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if let Some(wm) = args.get("wait_ms").and_then(Value::as_u64) {
                 cli.push("--wait-ms".into());
                 cli.push(wm.to_string());
+            }
+            if args
+                .get("origin_matrix")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--origin-matrix".into());
+            }
+            if let Some(origs) = args.get("origins").and_then(Value::as_array) {
+                for o in origs.iter().filter_map(Value::as_str) {
+                    cli.push("--origin".into());
+                    cli.push(o.to_string());
+                }
             }
             run_self_captured(&cli, None)
         }

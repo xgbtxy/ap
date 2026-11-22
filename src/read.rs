@@ -62,9 +62,15 @@ struct ReadCli {
     /// Canonical hex + ASCII dump (`xxd`/`hexdump -C`) with SHA-256 & entropy (supports decimal or `0x` `--offset`)
     #[arg(long)]
     hex: bool,
-    /// Resolve PE64 x64 RIP-relative string & IAT import cross-references with enclosing function RVAs
+    /// Resolve PE64/ELF64 (x64 & AArch64) string & IAT import cross-references with enclosing function RVAs
     #[arg(long)]
     xref: bool,
+    /// Schema-less raw Protocol Buffers wire-format decoder (no `protoc` required)
+    #[arg(long)]
+    proto: bool,
+    /// Patch-diff this binary/archive (PE/ELF/Go/.asar/.zip/.jar/.vsix) against an older file path
+    #[arg(long)]
+    diff: Option<String>,
     /// Maximum characters before smart outline + pagination kicks in
     #[arg(long, default_value_t = 8000)]
     max_chars: usize,
@@ -908,6 +914,56 @@ fn read_single_target(
         return Ok((rendered, jv));
     }
 
+    if let Some(ref old_path_str) = cli.diff {
+        let old_p = Path::new(old_path_str);
+        let old_bytes = fs::read(old_p)
+            .map_err(|e| (1, format!("[ap read --diff] failed to read `{old_path_str}`: {e}")))?;
+        let rendered = crate::binary::diff_binaries_or_archives_md(
+            &raw_bytes,
+            &old_bytes,
+            &label,
+            old_path_str,
+            &ext,
+        );
+        record_event(
+            "read",
+            (raw_bytes.len() + old_bytes.len()) as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "binary-diff",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "old_target": old_path_str,
+            "format": "binary-diff",
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if cli.proto {
+        let rendered = crate::inspect::decode_raw_protobuf_md(&raw_bytes)
+            .map_err(|e| (1, format!("[ap read --proto] {e}")))?;
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "protobuf-raw",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "protobuf-raw",
+            "size_bytes": raw_bytes.len(),
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
     let raw_len = raw_bytes.len() as u64;
     let mut win_heals = 0u32;
     let mut format_tag = ext.as_str();
@@ -970,14 +1026,19 @@ fn read_single_target(
                 }
             }
         }
-        "pptx" | "zip" | "vsix" | "jar" | "apk" | "whl" => {
+        "pptx" | "zip" | "vsix" | "jar" | "war" | "ear" | "apk" | "whl" => {
             if let Some(ref ent) = cli.entry {
                 match crate::binary::read_zip_member(&raw_bytes, ent) {
                     Ok(eb) => {
-                        format_tag = "zip-entry";
-                        let (dec, _, healed) = decode_any_bytes(&eb);
-                        win_heals += healed;
-                        dec
+                        if crate::binary::is_java_class_magic(&eb) {
+                            format_tag = "java-class";
+                            crate::binary::parse_java_class_md(&eb, cli.query.as_deref())
+                        } else {
+                            format_tag = "zip-entry";
+                            let (dec, _, healed) = decode_any_bytes(&eb);
+                            win_heals += healed;
+                            dec
+                        }
                     }
                     Err(e) => return Err((1, format!("[ap read] {e}"))),
                 }
@@ -1022,7 +1083,7 @@ fn read_single_target(
                 img_meta
             } else if matches!(
                 ext.as_str(),
-                "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node" | "wasm" | "bin"
+                "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node" | "wasm" | "bin" | "class"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
                 format_tag = "binary";
