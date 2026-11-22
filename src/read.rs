@@ -68,6 +68,12 @@ struct ReadCli {
     /// Schema-less raw Protocol Buffers wire-format decoder (no `protoc` required)
     #[arg(long)]
     proto: bool,
+    /// Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins
+    #[arg(long)]
+    routes: bool,
+    /// Decode JWT header/claims/UTC timestamps & defensive posture flags (accepts file path or inline `eyJ...` token)
+    #[arg(long)]
+    jwt: bool,
     /// Patch-diff this binary/archive (PE/ELF/Go/.asar/.zip/.jar/.vsix) against an older file path
     #[arg(long)]
     diff: Option<String>,
@@ -820,6 +826,19 @@ fn read_single_target(
     } else {
         let p = Path::new(target);
         if !p.exists() {
+            if cli.jwt && (target.contains("eyJ") && target.contains('.')) {
+                let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(target)
+                    .map_err(|e| (1, format!("[ap read --jwt] {e}")))?;
+                record_event("read", target.len() as u64, rendered.len() as u64, 0, 1, "jwt");
+                let jv = json!({
+                    "ok": true,
+                    "target": "<inline-jwt>",
+                    "format": "jwt",
+                    "jwt": jv_inner,
+                    "content": rendered,
+                });
+                return Ok((rendered, jv));
+            }
             return Err((1, format!("[ap read] path not found: {target}")));
         }
         if p.is_dir() {
@@ -959,6 +978,52 @@ fn read_single_target(
             "target": label,
             "format": "protobuf-raw",
             "size_bytes": raw_bytes.len(),
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if cli.jwt {
+        let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
+        let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(&decoded_txt)
+            .map_err(|e| (1, format!("[ap read --jwt] {e}")))?;
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "jwt",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "jwt",
+            "size_bytes": raw_bytes.len(),
+            "jwt": jv_inner,
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if cli.routes {
+        let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
+        let (rendered, jv_inner) =
+            crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "js-routes",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "js-routes",
+            "size_bytes": raw_bytes.len(),
+            "surface": jv_inner,
             "content": rendered,
         });
         return Ok((rendered, jv));

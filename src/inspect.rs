@@ -545,6 +545,521 @@ pub fn decode_raw_protobuf_md(bytes: &[u8]) -> Result<String, String> {
     ))
 }
 
+fn unix_secs_to_iso_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+    // Howard Hinnant civil-from-days algorithm (Gregorian calendar, zero deps)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Pure-Rust JWT token & security posture inspector (`--jwt`).
+/// Accepts a raw JWT string (`eyJ...`, `Bearer eyJ...`) or arbitrary text/JSON containing JWTs.
+pub fn inspect_jwt_md(raw_text: &str) -> Result<(String, serde_json::Value), String> {
+    static JWT_RE: OnceLock<Regex> = OnceLock::new();
+    let jwt_re = JWT_RE.get_or_init(|| {
+        Regex::new(r"(eyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*)").unwrap()
+    });
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut blocks: Vec<String> = Vec::new();
+
+    for cap in jwt_re.captures_iter(raw_text) {
+        if items.len() >= 12 {
+            break;
+        }
+        let tok = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if tok.is_empty() || !seen.insert(tok.to_string()) {
+            continue;
+        }
+        let parts: Vec<&str> = tok.split('.').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let Some(hdr_bytes) = decode_b64_any(parts[0]) else {
+            continue;
+        };
+        let Some(pay_bytes) = decode_b64_any(parts[1]) else {
+            continue;
+        };
+        let Ok(hdr_val) = serde_json::from_slice::<Value>(&hdr_bytes) else {
+            continue;
+        };
+        let Ok(pay_val) = serde_json::from_slice::<Value>(&pay_bytes) else {
+            continue;
+        };
+
+        let alg = hdr_val
+            .get("alg")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let mut risks: Vec<String> = Vec::new();
+        if alg.eq_ignore_ascii_case("none") || alg == "<missing>" {
+            risks.push(format!("WEAK-ALG:{alg}"));
+        } else if alg.to_ascii_uppercase().starts_with("HS") {
+            risks.push(format!("SYMMETRIC-HMAC:{alg}"));
+        }
+        if parts[2].is_empty() {
+            risks.push("EMPTY-SIGNATURE".to_string());
+        }
+        let mut hdr_inj: Vec<&str> = Vec::new();
+        for key in ["jwk", "jku", "x5u", "x5c", "kid"] {
+            if hdr_val.get(key).is_some() {
+                hdr_inj.push(key);
+            }
+        }
+        if !hdr_inj.is_empty() {
+            risks.push(format!("HEADER-INJECTION-SURFACE:{}", hdr_inj.join(",")));
+        }
+
+        let iat = pay_val.get("iat").and_then(Value::as_i64);
+        let nbf = pay_val.get("nbf").and_then(Value::as_i64);
+        let exp = pay_val.get("exp").and_then(Value::as_i64);
+        let mut time_notes: Vec<String> = Vec::new();
+        if let Some(v) = iat {
+            time_notes.push(format!("iat={}", unix_secs_to_iso_utc(v)));
+        }
+        if let Some(v) = nbf {
+            let st = if now_secs > 0 && v > now_secs {
+                " [NOT-YET-VALID]"
+            } else {
+                ""
+            };
+            time_notes.push(format!("nbf={}{st}", unix_secs_to_iso_utc(v)));
+        }
+        if let Some(v) = exp {
+            let expired = now_secs > 0 && v < now_secs;
+            if expired {
+                risks.push("EXPIRED".to_string());
+            }
+            time_notes.push(format!(
+                "exp={} ({})",
+                unix_secs_to_iso_utc(v),
+                if expired { "EXPIRED" } else { "ACTIVE" }
+            ));
+        } else {
+            risks.push("NO-EXP-CLAIM".to_string());
+        }
+
+        let mut priv_keys: Vec<&str> = Vec::new();
+        if let Some(obj) = pay_val.as_object() {
+            for k in obj.keys() {
+                let kl = k.to_ascii_lowercase();
+                if matches!(
+                    kl.as_str(),
+                    "role" | "roles" | "admin" | "is_admin" | "isadmin" | "scope" | "scopes" | "permissions" | "perms" | "tenant" | "tenant_id"
+                ) {
+                    priv_keys.push(k.as_str());
+                }
+            }
+        }
+        if !priv_keys.is_empty() {
+            priv_keys.sort_unstable();
+            risks.push(format!("AUTHZ-CLAIMS:{}", priv_keys.join(",")));
+        }
+
+        let idx = items.len() + 1;
+        let hdr_pretty = serde_json::to_string(&hdr_val).unwrap_or_default();
+        let pay_pretty = serde_json::to_string_pretty(&pay_val).unwrap_or_default();
+        let risk_line = if risks.is_empty() {
+            "none".to_string()
+        } else {
+            risks.join(" | ")
+        };
+        let time_line = if time_notes.is_empty() {
+            "no iat/nbf/exp timestamps".to_string()
+        } else {
+            time_notes.join(", ")
+        };
+        blocks.push(format!(
+            "### JWT #{idx} (alg=`{alg}`, sig_len={})\n- Posture: `{risk_line}`\n- Timestamps: {time_line}\n- Header: `{hdr_pretty}`\n- Payload:\n```json\n{pay_pretty}\n```",
+            parts[2].len()
+        ));
+        items.push(serde_json::json!({
+            "index": idx,
+            "alg": alg,
+            "signature_len": parts[2].len(),
+            "header": hdr_val,
+            "payload": pay_val,
+            "iat_utc": iat.map(unix_secs_to_iso_utc),
+            "nbf_utc": nbf.map(unix_secs_to_iso_utc),
+            "exp_utc": exp.map(unix_secs_to_iso_utc),
+            "posture_flags": risks,
+        }));
+    }
+
+    if items.is_empty() {
+        return Err("no valid JWT token (`eyJ...`) found in input".to_string());
+    }
+    let md = format!(
+        "## JWT Posture Inspector ({} token(s))\n\n{}",
+        items.len(),
+        blocks.join("\n\n")
+    );
+    let jv = serde_json::json!({
+        "count": items.len(),
+        "tokens": items,
+    });
+    Ok((md, jv))
+}
+
+struct JsRouteRegexes {
+    api_path: Regex,
+    http_call: Regex,
+    post_msg: Regex,
+    dom_sink: Regex,
+    ext_origin: Regex,
+}
+
+fn js_route_re() -> &'static JsRouteRegexes {
+    static R: OnceLock<JsRouteRegexes> = OnceLock::new();
+    R.get_or_init(|| JsRouteRegexes {
+        api_path: Regex::new(
+            r#"['"`](/(?:api|v[1-9][0-9]?|rest|graphql|oauth[0-9]*|auth|admin|internal|rpc|gw|gateway|proxy|upload|download|export|import|webhook|console|manage|portal|service|services|backend|bff)/[A-Za-z0-9_./:${}-]{1,180})['"`]"#,
+        )
+        .unwrap(),
+        http_call: Regex::new(
+            r#"(?i)\b(?:axios\.(get|post|put|delete|patch|request)|router\.(get|post|put|delete|patch|use|all)|(fetch)\s*)\(\s*['"`]((?:/|https?://)[^'"`\r\n]{2,180})['"`]"#,
+        )
+        .unwrap(),
+        post_msg: Regex::new(
+            r#"(?:addEventListener\s*\(\s*['"]message['"]|\.onmessage\s*=)"#,
+        )
+        .unwrap(),
+        dom_sink: Regex::new(
+            r#"(?:\.(?:innerHTML|outerHTML)\s*\+?=|dangerouslySetInnerHTML|document\.write(?:ln)?\s*\(|\beval\s*\(|\bnew\s+Function\s*\(|\blocation\.(?:href\s*=|assign\s*\(|replace\s*\()|\bwindow\.open\s*\()"#,
+        )
+        .unwrap(),
+        ext_origin: Regex::new(r#"(?:https?|wss?)://([A-Za-z0-9][A-Za-z0-9.-]{2,100}(?::\d{2,5})?)"#)
+            .unwrap(),
+    })
+}
+
+fn byte_line_col(text: &str, byte_off: usize) -> usize {
+    text[..byte_off.min(text.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
+}
+
+/// Pure-Rust `<20ms` JavaScript/TypeScript/HTML API route, postMessage origin-check & DOM sink extractor (`--routes`).
+pub fn extract_js_routes_md(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+) -> (String, serde_json::Value) {
+    let re = js_route_re();
+    let scan_end = {
+        let limit = text.len().min(24 * 1024 * 1024);
+        let mut e = limit;
+        while e > 0 && !text.is_char_boundary(e) {
+            e -= 1;
+        }
+        e
+    };
+    let slice = &text[..scan_end];
+    let q_low = query.map(|q| q.trim().to_ascii_lowercase()).filter(|q| !q.is_empty());
+    let matches_q = |s: &str| -> bool {
+        match &q_low {
+            Some(q) => s.to_ascii_lowercase().contains(q),
+            None => true,
+        }
+    };
+
+    let mut route_map: std::collections::BTreeMap<String, (String, usize, Vec<&'static str>)> =
+        std::collections::BTreeMap::new();
+
+    let mut add_route = |method: &str, raw_path: &str, off: usize| {
+        let p = raw_path.trim();
+        if p.len() < 3 || p.contains("//") && !p.starts_with("http") {
+            return;
+        }
+        if !matches_q(p) && !matches_q(method) {
+            return;
+        }
+        let mut tags: Vec<&'static str> = Vec::new();
+        if p.contains(':') || p.contains('{') || p.contains("${") {
+            tags.push("PARAM");
+        }
+        let pl = p.to_ascii_lowercase();
+        if ["admin", "delete", "remove", "grant", "role", "perm", "token", "secret", "upload", "export", "import", "proxy", "internal", "transfer", "billing", "passwd", "password"]
+            .iter()
+            .any(|kw| pl.contains(kw))
+        {
+            tags.push("SENSITIVE");
+        }
+        let m_up = method.to_ascii_uppercase();
+        route_map
+            .entry(p.to_string())
+            .and_modify(|e| {
+                if e.0 == "ANY" && m_up != "ANY" {
+                    e.0 = m_up.clone();
+                }
+            })
+            .or_insert((m_up, off, tags));
+    };
+
+    for cap in re.http_call.captures_iter(slice) {
+        let method = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .map(|m| m.as_str())
+            .unwrap_or("FETCH");
+        if let Some(pm) = cap.get(4) {
+            add_route(method, pm.as_str(), pm.start());
+        }
+    }
+    for cap in re.api_path.captures_iter(slice) {
+        if let Some(pm) = cap.get(1) {
+            let start = pm.start();
+            let ctx_start = start.saturating_sub(48);
+            let mut cs = ctx_start;
+            while cs < start && !slice.is_char_boundary(cs) {
+                cs += 1;
+            }
+            let prefix = slice[cs..start].to_ascii_lowercase();
+            let method = if prefix.contains("delete") {
+                "DELETE"
+            } else if prefix.contains("put") {
+                "PUT"
+            } else if prefix.contains("patch") {
+                "PATCH"
+            } else if prefix.contains("post") {
+                "POST"
+            } else if prefix.contains("get") {
+                "GET"
+            } else {
+                "ANY"
+            };
+            add_route(method, pm.as_str(), start);
+        }
+    }
+
+    let mut post_messages: Vec<serde_json::Value> = Vec::new();
+    for m in re.post_msg.find_iter(slice).take(30) {
+        let hard_end = {
+            let mut e = (m.end() + 480).min(slice.len());
+            while e > m.end() && !slice.is_char_boundary(e) {
+                e -= 1;
+            }
+            e
+        };
+        let raw_win = &slice[m.start()..hard_end];
+        // Bound the scan to this listener's own `{ ... }` callback body so adjacent minified
+        // listeners never leak their `.origin` check into an unguarded sibling handler.
+        let bounded_len = if let Some(first_brace) = raw_win.find('{') {
+            let mut depth = 0i32;
+            let mut end_rel = raw_win.len();
+            for (bi, ch) in raw_win[first_brace..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_rel = (first_brace + bi + 1).min(raw_win.len());
+                        break;
+                    }
+                }
+            }
+            end_rel
+        } else {
+            raw_win[m.len()..]
+                .find("addEventListener")
+                .map(|p| m.len() + p)
+                .unwrap_or(raw_win.len())
+        };
+        let window = &raw_win[..bounded_len];
+        let win_low = window.to_ascii_lowercase();
+        let has_origin_check = win_low.contains(".origin")
+            || win_low.contains("allowedorigin")
+            || win_low.contains("trustedorigin")
+            || win_low.contains("origin===")
+            || win_low.contains("origin ==")
+            || win_low.contains("origin!==");
+        let snip: String = window
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .take(120)
+            .collect();
+        if !matches_q(&snip) && !matches_q("postmessage") {
+            continue;
+        }
+        post_messages.push(serde_json::json!({
+            "line": byte_line_col(slice, m.start()),
+            "offset": m.start(),
+            "missing_origin_check": !has_origin_check,
+            "snippet": snip,
+        }));
+    }
+
+    let mut dom_sinks: Vec<serde_json::Value> = Vec::new();
+    let mut seen_sink_off = std::collections::HashSet::new();
+    for m in re.dom_sink.find_iter(slice) {
+        if dom_sinks.len() >= 40 {
+            break;
+        }
+        let w_start = {
+            let mut s = m.start().saturating_sub(24);
+            while s < m.start() && !slice.is_char_boundary(s) {
+                s += 1;
+            }
+            s
+        };
+        let w_end = {
+            let mut e = (m.end() + 96).min(slice.len());
+            while e > m.end() && !slice.is_char_boundary(e) {
+                e -= 1;
+            }
+            e
+        };
+        let snip: String = slice[w_start..w_end]
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .take(110)
+            .collect();
+        if !matches_q(&snip) {
+            continue;
+        }
+        if seen_sink_off.insert(m.start() / 32) {
+            dom_sinks.push(serde_json::json!({
+                "sink": m.as_str().trim(),
+                "line": byte_line_col(slice, m.start()),
+                "offset": m.start(),
+                "snippet": snip,
+            }));
+        }
+    }
+
+    let mut origins: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for cap in re.ext_origin.captures_iter(slice) {
+        if let Some(hm) = cap.get(1) {
+            let host = hm.as_str().to_ascii_lowercase();
+            if matches!(
+                host.as_str(),
+                "www.w3.org" | "schemas.openxmlformats.org" | "purl.org" | "ns.adobe.com" | "example.com"
+            ) {
+                continue;
+            }
+            if matches_q(&host) {
+                origins.insert(host);
+            }
+        }
+    }
+
+    let mut routes_json: Vec<serde_json::Value> = Vec::new();
+    let mut route_lines: Vec<String> = Vec::new();
+    for (p, (method, off, tags)) in route_map.iter().take(120) {
+        let ln = byte_line_col(slice, *off);
+        let tag_str = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(","))
+        };
+        route_lines.push(format!("- `{method}` `{p}`{tag_str} (L{ln}, @{off})"));
+        routes_json.push(serde_json::json!({
+            "method": method,
+            "path": p,
+            "line": ln,
+            "offset": off,
+            "tags": tags,
+        }));
+    }
+
+    let mut out = vec![format!(
+        "# JS/API Surface `{label}` ({} route(s) | {} postMessage | {} DOM sink(s) | {} origin(s))",
+        route_map.len(),
+        post_messages.len(),
+        dom_sinks.len(),
+        origins.len()
+    )];
+    if !route_lines.is_empty() {
+        out.push(format!(
+            "\n## API / HTTP Routes (showing {}/{})\n{}",
+            route_lines.len(),
+            route_map.len(),
+            route_lines.join("\n")
+        ));
+    }
+    if !post_messages.is_empty() {
+        let pm_lines: Vec<String> = post_messages
+            .iter()
+            .map(|p| {
+                let flag = if p["missing_origin_check"].as_bool().unwrap_or(false) {
+                    " **[MISSING-ORIGIN-CHECK]**"
+                } else {
+                    " [origin-checked]"
+                };
+                format!(
+                    "- L{} (@{}){flag}: `{}`",
+                    p["line"],
+                    p["offset"],
+                    p["snippet"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        out.push(format!("\n## postMessage Listeners\n{}", pm_lines.join("\n")));
+    }
+    if !dom_sinks.is_empty() {
+        let sk_lines: Vec<String> = dom_sinks
+            .iter()
+            .take(25)
+            .map(|s| {
+                format!(
+                    "- `{}` (L{}, @{}): `{}`",
+                    s["sink"].as_str().unwrap_or(""),
+                    s["line"],
+                    s["offset"],
+                    s["snippet"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        out.push(format!(
+            "\n## Client-Side DOM / Eval / Navigation Sinks (showing {}/{})\n{}",
+            sk_lines.len(),
+            dom_sinks.len(),
+            sk_lines.join("\n")
+        ));
+    }
+    if !origins.is_empty() {
+        let org_list: Vec<String> = origins.iter().take(40).map(|o| format!("`{o}`")).collect();
+        out.push(format!("\n## External Origins\n{}", org_list.join(", ")));
+    }
+
+    let origins_vec: Vec<String> = origins.into_iter().take(80).collect();
+    let jv = serde_json::json!({
+        "target": label,
+        "counts": {
+            "routes": route_map.len(),
+            "post_message": post_messages.len(),
+            "dom_sinks": dom_sinks.len(),
+            "origins": origins_vec.len(),
+        },
+        "routes": routes_json,
+        "post_message_handlers": post_messages,
+        "client_sinks": dom_sinks,
+        "external_origins": origins_vec,
+    });
+    (out.join("\n"), jv)
+}
+
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
@@ -559,5 +1074,33 @@ mod inspect_tests {
         assert!(md.contains("1 (varint): 150"), "missing varint in:\n{md}");
         assert!(md.contains("2 (msg, 7B)"), "missing nested msg in:\n{md}");
         assert!(md.contains("\"admin\""), "missing nested str in:\n{md}");
+    }
+
+    #[test]
+    fn inspects_jwt_posture_flags_and_timestamps() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let hdr = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT","jku":"https://auth.internal/jwks.json"}"#);
+        let pay = URL_SAFE_NO_PAD.encode(r#"{"sub":"u1","role":"admin","iat":1700000000,"exp":1700003600}"#);
+        let tok = format!("Bearer {hdr}.{pay}.");
+        let (md, jv) = inspect_jwt_md(&tok).unwrap();
+        assert_eq!(jv["count"], 1);
+        assert!(md.contains("WEAK-ALG:none"), "missing WEAK-ALG in:\n{md}");
+        assert!(md.contains("EMPTY-SIGNATURE"), "missing EMPTY-SIGNATURE in:\n{md}");
+        assert!(md.contains("HEADER-INJECTION-SURFACE:jku"), "missing jku flag in:\n{md}");
+        assert!(md.contains("EXPIRED"), "missing EXPIRED in:\n{md}");
+        assert!(md.contains("2023-11-14T22:13:20Z"), "wrong UTC timestamp in:\n{md}");
+    }
+
+    #[test]
+    fn extracts_routes_postmessage_and_sinks_from_minified_js() {
+        let bundle = r#"!function(){axios.post("/api/v2/admin/users/:id",{ok:1});fetch("/rest/v1/export/report");window.addEventListener("message",function(e){el.innerHTML=e.data.html});window.addEventListener("message",function(ev){if(ev.origin!=="https://app.acme.test")return;console.log(ev.data)});const h="https://cdn.acme.test/app.js"}();"#;
+        let (md, jv) = extract_js_routes_md(bundle, "app.min.js", None);
+        assert!(md.contains("/api/v2/admin/users/:id"), "missing route in:\n{md}");
+        assert!(md.contains("[PARAM,SENSITIVE]"), "missing tags in:\n{md}");
+        assert!(md.contains("[MISSING-ORIGIN-CHECK]"), "missing origin gap in:\n{md}");
+        assert!(md.contains("[origin-checked]"), "missing checked handler in:\n{md}");
+        assert!(md.contains("innerHTML"), "missing DOM sink in:\n{md}");
+        assert!(md.contains("cdn.acme.test"), "missing external origin in:\n{md}");
+        assert_eq!(jv["counts"]["post_message"], 2);
     }
 }

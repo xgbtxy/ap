@@ -30,6 +30,11 @@ struct SecPatterns {
     xxe_parser: Regex,
     proto_pollution: Regex,
     weak_jwt_tls: Regex,
+    unbounded_container: Regex,
+    unsigned_underflow: Regex,
+    async_raw_this: Regex,
+    native_raw_sql_concat: Regex,
+    weak_crypto_mode: Regex,
 }
 
 fn sec_re() -> &'static SecPatterns {
@@ -91,6 +96,26 @@ fn sec_re() -> &'static SecPatterns {
         .unwrap(),
         weak_jwt_tls: Regex::new(
             r#"(?i)(?:algorithms\s*:\s*\[\s*['"]none['"]\s*\]|requests\.(?:get|post|put|delete|request)\s*\([^)]*\bverify\s*=\s*False)"#,
+        )
+        .unwrap(),
+        unbounded_container: Regex::new(
+            r"\b[a-z][A-Za-z0-9_]*_\.(?:emplace|emplace_back|insert|push_back)\s*\(",
+        )
+        .unwrap(),
+        unsigned_underflow: Regex::new(
+            r"\b(?:size_t|uint(?:16|32|64)_t|unsigned\s+(?:int|long))\s+[A-Za-z_]\w*\s*=\s*([A-Za-z_][A-Za-z0-9_.\->]*)\s*-\s*([A-Za-z_][A-Za-z0-9_.\->]*)\s*;",
+        )
+        .unwrap(),
+        async_raw_this: Regex::new(
+            r"\b(?:std::thread|std::async|PostTask|postTask|dispatch_async|ScheduleTask)\s*\([^;\n]*\[(?:[^\]]*\bthis\b|&)\s*\]",
+        )
+        .unwrap(),
+        native_raw_sql_concat: Regex::new(
+            r#""[^"]*(?i:SELECT|INSERT|UPDATE|DELETE)\b[^"]*"\s*\+\s*(?:[a-z][A-Za-z0-9_.\->]*)\b"#,
+        )
+        .unwrap(),
+        weak_crypto_mode: Regex::new(
+            r#"(?:\b(?:AES_ECB|EVP_aes_(?:128|192|256)_ecb|DES_ecb|RC4_set_key|MD5_Init)\b|Cipher\.getInstance\s*\(\s*["'](?:AES/ECB|DES|RC4|AES["'])|hashlib\.md5\s*\()"#,
         )
         .unwrap(),
     })
@@ -360,6 +385,90 @@ pub fn scan_security_issues(root: &Path) -> Vec<SecFinding> {
                     fix: "Enforce strong JWT algorithms (never `none`) and keep TLS certificate verification enabled (`verify=True`).".to_string(),
                 });
             }
+            if re.unbounded_container.is_match(ln) {
+                let win_start = idx.saturating_sub(6);
+                let win_ctx = lines[win_start..=idx].join(" ").to_ascii_lowercase();
+                let has_cap = win_ctx.contains(".size() >=")
+                    || win_ctx.contains(".size() >")
+                    || win_ctx.contains("max_")
+                    || win_ctx.contains("quota")
+                    || win_ctx.contains("limit")
+                    || win_ctx.contains("capacity");
+                if !has_cap {
+                    findings.push(SecFinding {
+                        cwe: "CWE-400 Unbounded Container Growth".to_string(),
+                        file: rel.clone(),
+                        line: lineno,
+                        snippet: trim.chars().take(120).collect(),
+                        fix: "Enforce an explicit upper bound / per-caller quota check (e.g. `if (items_.size() >= MAX_ITEMS) return ERR;`) before inserting into member containers.".to_string(),
+                    });
+                }
+            }
+            if re.unsigned_underflow.is_match(ln) {
+                let win_start = idx.saturating_sub(4);
+                let win_ctx = lines[win_start..=idx].join(" ").to_ascii_lowercase();
+                let guarded = win_ctx.contains("if (")
+                    || win_ctx.contains("if(")
+                    || win_ctx.contains("checked_sub")
+                    || win_ctx.contains("saturating_sub")
+                    || win_ctx.contains("std::max")
+                    || win_ctx.contains("std::min");
+                if !guarded {
+                    findings.push(SecFinding {
+                        cwe: "CWE-191 Unsigned Integer Underflow".to_string(),
+                        file: rel.clone(),
+                        line: lineno,
+                        snippet: trim.chars().take(120).collect(),
+                        fix: "Verify `lhs >= rhs` before subtracting unsigned lengths/sizes to prevent wrap-around to huge positive values.".to_string(),
+                    });
+                }
+            }
+            if re.async_raw_this.is_match(ln) {
+                let win_start = idx.saturating_sub(5);
+                let win_ctx = lines[win_start..=idx].join(" ").to_ascii_lowercase();
+                let safe_ref = win_ctx.contains("weak_ptr")
+                    || win_ctx.contains("shared_from_this")
+                    || win_ctx.contains("wptr")
+                    || win_ctx.contains("weak_from_this");
+                if !safe_ref {
+                    findings.push(SecFinding {
+                        cwe: "CWE-416 Async Raw-this Lifetime Risk".to_string(),
+                        file: rel.clone(),
+                        line: lineno,
+                        snippet: trim.chars().take(120).collect(),
+                        fix: "Capture a `std::weak_ptr` / `weak_from_this()` and `lock()` inside the async callback instead of capturing raw `[this]` or `[&]`.".to_string(),
+                    });
+                }
+            }
+            if re.native_raw_sql_concat.is_match(ln)
+                && !ln.contains("to_string(")
+                && !ln.contains("strconv.Itoa")
+                && !ln.contains("String.valueOf")
+            {
+                findings.push(SecFinding {
+                    cwe: "CWE-89 Raw SQL String Concatenation".to_string(),
+                    file: rel.clone(),
+                    line: lineno,
+                    snippet: trim.chars().take(120).collect(),
+                    fix: "Use bound parameters / prepared statements instead of concatenating runtime variables into SQL statements.".to_string(),
+                });
+            }
+            if re.weak_crypto_mode.is_match(ln) {
+                let low_ln = ln.to_ascii_lowercase();
+                let non_sec_hash = low_ln.contains("usedforsecurity=false")
+                    || low_ln.contains("checksum")
+                    || low_ln.contains("etag")
+                    || low_ln.contains("cache_key");
+                if !non_sec_hash {
+                    findings.push(SecFinding {
+                        cwe: "CWE-327 Weak Crypto Algorithm / ECB Mode".to_string(),
+                        file: rel.clone(),
+                        line: lineno,
+                        snippet: trim.chars().take(120).collect(),
+                        fix: "Use authenticated encryption (AES-GCM / ChaCha20-Poly1305) and SHA-256/SHA-3 instead of ECB, DES, RC4, or MD5.".to_string(),
+                    });
+                }
+            }
         }
     }
     findings
@@ -464,5 +573,54 @@ def route(request):
         let findings = scan_security_issues(&dir);
         assert!(findings.is_empty(), "expected 0 findings on guarded code, got: {findings:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_v3_native_and_crypto_cwes_with_guard_precision() {
+        let dir = make_tmp_dir("v3_vuln");
+        fs::write(
+            dir.join("server.cpp"),
+            r#"
+void Service::OnReq(uint32_t total, uint32_t hdr, std::string user) {
+    sessions_.emplace(user, 1);
+    size_t bodyLen = total - hdr;
+    std::thread([this]() { this->Flush(); }).detach();
+    std::string sql = "SELECT * FROM users WHERE name = " + user;
+    EVP_aes_128_ecb();
+}
+"#,
+        )
+        .unwrap();
+        let findings = scan_security_issues(&dir);
+        let cwes: Vec<&str> = findings.iter().map(|f| f.cwe.as_str()).collect();
+        assert!(cwes.iter().any(|c| c.contains("CWE-400")), "missing CWE-400: {cwes:?}");
+        assert!(cwes.iter().any(|c| c.contains("CWE-191")), "missing CWE-191: {cwes:?}");
+        assert!(cwes.iter().any(|c| c.contains("CWE-416")), "missing CWE-416: {cwes:?}");
+        assert!(cwes.iter().any(|c| c.contains("CWE-89")), "missing CWE-89: {cwes:?}");
+        assert!(cwes.iter().any(|c| c.contains("CWE-327")), "missing CWE-327: {cwes:?}");
+        let _ = fs::remove_dir_all(&dir);
+
+        let safe_dir = make_tmp_dir("v3_safe");
+        fs::write(
+            safe_dir.join("safe_server.cpp"),
+            r#"
+void Service::OnReq(uint32_t total, uint32_t hdr, int uid) {
+    if (sessions_.size() >= MAX_SESSIONS) return;
+    sessions_.emplace(uid, 1);
+    if (total < hdr) return;
+    size_t bodyLen = total - hdr;
+    auto weak = weak_from_this();
+    std::thread([weak]() { if (auto s = weak.lock()) s->Flush(); }).detach();
+    std::string sql = "SELECT * FROM " + TABLE_USERS;
+}
+"#,
+        )
+        .unwrap();
+        let safe_findings = scan_security_issues(&safe_dir);
+        assert!(
+            safe_findings.is_empty(),
+            "expected 0 findings on guarded v3 code, got: {safe_findings:?}"
+        );
+        let _ = fs::remove_dir_all(&safe_dir);
     }
 }

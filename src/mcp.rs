@@ -32,6 +32,8 @@ fn mcp_tools_schema() -> Value {
                     "hex": { "type": "boolean", "description": "Emit canonical hex+ASCII dump with SHA-256 & entropy (supports hex/decimal offset)" },
                     "xref": { "type": "boolean", "description": "Resolve PE64 (x64 LEA/CALL) & ELF64 (x64 LEA / AArch64 ADRP+ADD) string & IAT XREFs + enclosing function RVAs" },
                     "proto": { "type": "boolean", "description": "Schema-less raw Protocol Buffers wire decoder (no protoc required)" },
+                    "routes": { "type": "boolean", "description": "Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins" },
+                    "jwt": { "type": "boolean", "description": "Decode JWT header/claims/UTC timestamps & defensive security posture flags (accepts file or inline eyJ... token)" },
                     "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) for fast patch-diffing" }
                 }
             }
@@ -1084,6 +1086,12 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             if args.get("proto").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--proto".to_string());
+            }
+            if args.get("routes").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--routes".to_string());
+            }
+            if args.get("jwt").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--jwt".to_string());
             }
             if let Some(df) = args
                 .get("diff")
