@@ -71,7 +71,7 @@ enum SubCmd {
         #[command(subcommand)]
         action: RuleCmd,
     },
-    /// Sub-5ms AI-code OWASP security & trust-boundary audit (SQLi, Path Traversal, Cmd Injection, DOM XSS)
+    /// Sub-5ms OWASP & native memory/trust-boundary audit (SQLi, Path Traversal, Cmd Inj, DOM XSS, SSRF, Deser, C/C++ memcpy_s/alloc overflow)
     Sec {
         #[arg(default_value = ".")]
         cwd: PathBuf,
@@ -1294,7 +1294,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     .unwrap_or_default()
                 );
             } else if findings.is_empty() {
-                println!("[guard sec] PASS — 0 SQLi, Path Traversal, Command Injection, DOM XSS, or Debug/TLS flaws detected.");
+                println!("[guard sec] PASS — 0 SQLi, Path Traversal, Command Injection, DOM XSS, SSRF, Deser, C/C++ memory-copy/overflow, or Debug/TLS flaws detected.");
             } else {
                 eprintln!(
                     "[GUARD SEC BLOCKED | exit 2] {} security issue(s) found:",

@@ -227,7 +227,7 @@ fn axis_rules() -> &'static [AxisRule] {
                 axis: "ipc_pipe_proto",
                 base_score: 88,
                 re: Regex::new(
-                    r"\b(?:ipcMain\.(?:handle|on)|contextBridge\.exposeInMainWorld|setAsDefaultProtocolClient|register(?:File|Http|Buffer|Stream|String)?Protocol|protocol\.handle|CreateNamedPipe[AW]?|ConnectNamedPipe|CallNamedPipe|\\\\\.\\pipe\\|postMessage|addEventListener\s*\(\s*['\x22]message['\x22]|registerUriHandler|open-url|second-instance)\b",
+                    r"\b(?:ipcMain\.(?:handle|on)|contextBridge\.exposeInMainWorld|setAsDefaultProtocolClient|register(?:File|Http|Buffer|Stream|String)?Protocol|protocol\.handle|CreateNamedPipe[AW]?|ConnectNamedPipe|CallNamedPipe|DeviceIoControl|OnRemoteRequest|ReadFileDescriptor|\\\\\.\\pipe\\|postMessage|addEventListener\s*\(\s*['\x22]message['\x22]|registerUriHandler|open-url|second-instance)\b",
                 )
                 .unwrap(),
             },
@@ -235,7 +235,7 @@ fn axis_rules() -> &'static [AxisRule] {
                 axis: "fs_path_io",
                 base_score: 82,
                 re: Regex::new(
-                    r"\b(?:Files\.newBufferedReader|Files\.readAllBytes|Files\.write|File\.delete|ZipInputStream|ZipFile|extractAllTo|extractTo|tar\.extract|shutil\.(?:unpack_archive|copy|rmtree)|writeFileSync|readFileSync|createWriteStream|createReadStream|fs\.unlink|fs\.rmSync|fs::write|fs::copy|symlinkSync|MoveFileEx[AW]?|CopyFile[AW]?)\b",
+                    r"\b(?:Files\.newBufferedReader|Files\.readAllBytes|Files\.write|File\.delete|ZipInputStream|ZipFile|extractAllTo|extractTo|tar\.extract|shutil\.(?:unpack_archive|copy|rmtree)|writeFileSync|readFileSync|createWriteStream|createReadStream|fs\.unlink|fs\.rmSync|fs::write|fs::copy|symlinkSync|MoveFileEx[AW]?|CopyFile[AW]?|PutObject|GetObject|CreatePresigned|presign(?:ed)?Url|downloadUrl|previewUrl|response-content-type)\b",
                 )
                 .unwrap(),
             },
@@ -243,7 +243,7 @@ fn axis_rules() -> &'static [AxisRule] {
                 axis: "deserialize_parse",
                 base_score: 86,
                 re: Regex::new(
-                    r"\b(?:ObjectInputStream|readObject|yaml\.load|pickle\.loads?|marshal\.loads?|vm\.runIn(?:New|This)?Context|new\s+Function\s*\(|\beval\s*\(|DocumentBuilderFactory|SAXParserFactory|XMLDecoder|XStream|innerHTML|outerHTML|dangerouslySetInnerHTML|insertAdjacentHTML|DOMParser)\b",
+                    r"\b(?:ObjectInputStream|readObject|yaml\.load|pickle\.loads?|marshal\.loads?|vm\.runIn(?:New|This)?Context|new\s+Function\s*\(|\beval\s*\(|DocumentBuilderFactory|SAXParserFactory|XMLDecoder|XStream|innerHTML|outerHTML|dangerouslySetInnerHTML|insertAdjacentHTML|DOMParser|memcpy_s|memmove_s|ReadBuffer|ReadRawData)\b",
                 )
                 .unwrap(),
             },
