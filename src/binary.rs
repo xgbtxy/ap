@@ -844,7 +844,330 @@ fn scan_pe_rpc_interfaces(bytes: &[u8], is_pe64: bool) -> Vec<String> {
     found
 }
 
-fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
+struct ElfSection {
+    name: String,
+    vaddr: u64,
+    raw_ptr: usize,
+    raw_size: usize,
+    flags: u64,
+}
+
+struct ElfContext {
+    is_64: bool,
+    machine: u16,
+    secs: Vec<ElfSection>,
+    func_syms: Vec<(u64, String)>,
+}
+
+fn elf_file_offset_to_vaddr<'a>(off: usize, secs: &'a [ElfSection]) -> Option<(u64, &'a str)> {
+    for s in secs {
+        if s.vaddr == 0 || s.raw_size == 0 {
+            continue;
+        }
+        let end = s.raw_ptr.saturating_add(s.raw_size);
+        if off >= s.raw_ptr && off < end {
+            return Some((s.vaddr.saturating_add((off - s.raw_ptr) as u64), s.name.as_str()));
+        }
+    }
+    None
+}
+
+fn is_notable_elf_symbol(nm: &str) -> bool {
+    const NOTABLE: [&str; 26] = [
+        "system",
+        "popen",
+        "execve",
+        "execl",
+        "execlp",
+        "dlopen",
+        "strcpy",
+        "strcat",
+        "sprintf",
+        "vsprintf",
+        "gets",
+        "memcpy_s",
+        "ioctl",
+        "mprotect",
+        "chmod",
+        "chown",
+        "setuid",
+        "setgid",
+        "symlink",
+        "mktemp",
+        "tmpnam",
+        "OnRemoteRequest",
+        "ReadFileDescriptor",
+        "ReadBuffer",
+        "ReadRawData",
+        "Unmarshalling",
+    ];
+    NOTABLE.iter().any(|k| nm == *k || nm.contains(k))
+}
+
+fn is_go_stdlib_func(nm: &str) -> bool {
+    const STD: [&str; 24] = [
+        "runtime.",
+        "runtime/",
+        "internal/",
+        "reflect.",
+        "syscall.",
+        "sync.",
+        "sync/",
+        "fmt.",
+        "strings.",
+        "strconv.",
+        "bytes.",
+        "bufio.",
+        "io.",
+        "os.",
+        "path.",
+        "sort.",
+        "time.",
+        "unicode",
+        "encoding/",
+        "crypto/",
+        "net/http.",
+        "vendor/",
+        "type:",
+        "go:",
+    ];
+    STD.iter().any(|p| nm.starts_with(p))
+}
+
+/// Pure-Rust Go 1.18+ / 1.20+ `.gopclntab` user function extractor (works on both PE and ELF Go binaries).
+fn scan_go_pclntab_funcs(bytes: &[u8], q_re: Option<&Regex>, max_funcs: usize) -> Vec<String> {
+    // Go 1.20+ magic: 0xFFFFFFF1 (LE: f1 ff ff ff 00 00), Go 1.18-1.19 magic: 0xFFFFFFF0 (LE: f0 ff ff ff 00 00)
+    const MAGICS: [[u8; 6]; 2] = [
+        [0xF1, 0xFF, 0xFF, 0xFF, 0x00, 0x00],
+        [0xF0, 0xFF, 0xFF, 0xFF, 0x00, 0x00],
+    ];
+    let mut tab_off: Option<usize> = None;
+    let scan_end = bytes.len().min(32 * 1024 * 1024);
+    for magic in &MAGICS {
+        let mut pos = 0usize;
+        while pos + 80 <= scan_end {
+            let Some(rel) = bytes[pos..scan_end].windows(6).position(|w| w == magic) else {
+                break;
+            };
+            let cand = pos + rel;
+            let min_lc = bytes[cand + 6];
+            let ptr_sz = bytes[cand + 7];
+            if (min_lc == 1 || min_lc == 2 || min_lc == 4) && (ptr_sz == 4 || ptr_sz == 8) {
+                let nfunc = if ptr_sz == 8 {
+                    read_u64_le(bytes, cand + 8).unwrap_or(0) as usize
+                } else {
+                    read_u32_le(bytes, cand + 8).unwrap_or(0) as usize
+                };
+                if (1..=500_000).contains(&nfunc) {
+                    tab_off = Some(cand);
+                    break;
+                }
+            }
+            pos = cand + 4;
+        }
+        if tab_off.is_some() {
+            break;
+        }
+    }
+    let Some(base) = tab_off else {
+        return Vec::new();
+    };
+    let ptr_sz = bytes[base + 7] as usize;
+    let read_ptr = |off: usize| -> Option<u64> {
+        if ptr_sz == 8 {
+            read_u64_le(bytes, off)
+        } else {
+            read_u32_le(bytes, off).map(|v| v as u64)
+        }
+    };
+    // Go 1.18+ pcHeader layout (8-byte header + 8 pointer-sized fields):
+    // +8: nfunc, +8+1p: nfiles, +8+2p: textStart, +8+3p: funcnameOffset, +8+4p: cuOffset,
+    // +8+5p: filetabOffset, +8+6p: pctabOffset, +8+7p: pclnOffset
+    let nfunc = read_ptr(base + 8).unwrap_or(0) as usize;
+    let text_start = read_ptr(base + 8 + 2 * ptr_sz).unwrap_or(0);
+    let funcname_off = read_ptr(base + 8 + 3 * ptr_sz).unwrap_or(0) as usize;
+    let pcln_off = read_ptr(base + 8 + 7 * ptr_sz).unwrap_or(0) as usize;
+    let fn_tab_base = base.saturating_add(pcln_off);
+    let fn_names_base = base.saturating_add(funcname_off);
+    if fn_tab_base >= bytes.len() || fn_names_base >= bytes.len() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    // In Go 1.18+, each functab entry is two uint32s: (entryoff, funcoff) relative to textStart / pcln_base
+    for idx in 0..nfunc.min(80_000) {
+        let ent = fn_tab_base.saturating_add(idx.saturating_mul(8));
+        if ent + 8 > bytes.len() {
+            break;
+        }
+        let entry_off = read_u32_le(bytes, ent).unwrap_or(0) as u64;
+        let func_info_off = read_u32_le(bytes, ent + 4).unwrap_or(0) as usize;
+        let fi = fn_tab_base.saturating_add(func_info_off);
+        if fi + 8 > bytes.len() {
+            continue;
+        }
+        // _func struct starts with entryOff (u32), nameOff (i32)
+        let name_off = read_u32_le(bytes, fi + 4).unwrap_or(0) as usize;
+        if let Some(nm) = read_cstr(bytes, fn_names_base.saturating_add(name_off), 180) {
+            if nm.len() < 3 || is_go_stdlib_func(&nm) {
+                continue;
+            }
+            if let Some(re) = q_re {
+                if !re.is_match(&nm) {
+                    continue;
+                }
+            }
+            if seen.insert(nm.clone()) {
+                let pc = text_start.saturating_add(entry_off);
+                out.push(format!("`{nm}` (pc=0x{pc:x})"));
+                if out.len() >= max_funcs {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn find_enclosing_elf_func(elf: &ElfContext, vaddr: u64) -> String {
+    // Find nearest symbol <= vaddr within 64 KB
+    let mut best: Option<(u64, &str)> = None;
+    for (sa, nm) in &elf.func_syms {
+        if *sa <= vaddr && vaddr - *sa < 0x10000 {
+            if best.map(|(ba, _)| *sa > ba).unwrap_or(true) {
+                best = Some((*sa, nm.as_str()));
+            }
+        }
+    }
+    if let Some((sa, nm)) = best {
+        format!("`{nm}`+0x{:x} (0x{sa:x})", vaddr - sa)
+    } else {
+        format!("vaddr=0x{vaddr:x}")
+    }
+}
+
+/// Pure-Rust `<20ms` ELF64 x86_64 RIP-relative (`LEA`) & AArch64 (`ADRP+ADD`) string XREF scanner.
+fn scan_elf64_xrefs(
+    bytes: &[u8],
+    elf: &ElfContext,
+    str_vaddrs: &[(u64, String)],
+    max_xrefs: usize,
+) -> Vec<String> {
+    if !elf.is_64 || str_vaddrs.is_empty() {
+        return Vec::new();
+    }
+    let mut str_lookup = std::collections::HashMap::<u64, &str>::new();
+    for (va, s) in str_vaddrs {
+        str_lookup.insert(*va, s.as_str());
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::<(u64, u64)>::new();
+
+    for sec in &elf.secs {
+        // SHF_EXECINSTR (0x4)
+        if (sec.flags & 0x4) == 0 || sec.raw_size < 8 {
+            continue;
+        }
+        let len = sec.raw_size.min(16 * 1024 * 1024);
+        let Some(code) = bytes.get(sec.raw_ptr..sec.raw_ptr.saturating_add(len).min(bytes.len()))
+        else {
+            continue;
+        };
+
+        if elf.machine == 0x3E {
+            // x86_64 RIP-relative LEA reg, [RIP+disp32]
+            let mut i = 0usize;
+            while i + 7 <= code.len() && out.len() < max_xrefs {
+                if (code[i] == 0x48 || code[i] == 0x4C)
+                    && code[i + 1] == 0x8D
+                    && (code[i + 2] & 0xC7) == 0x05
+                {
+                    let disp =
+                        i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
+                    let insn_va = sec.vaddr.saturating_add(i as u64);
+                    let target = (insn_va as i64) + 7 + (disp as i64);
+                    if target > 0 {
+                        let tva = target as u64;
+                        if let Some(sv) = str_lookup.get(&tva) {
+                            if seen.insert((insn_va, tva)) {
+                                let func = find_enclosing_elf_func(elf, insn_va);
+                                let prev: String = sv.chars().take(72).collect();
+                                out.push(format!(
+                                    "- [elf-str-xref] x64 insn=0x{insn_va:x} in {func} -> vaddr=0x{tva:x} `{prev}`"
+                                ));
+                                i += 7;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+        } else if elf.machine == 0xB7 {
+            // AArch64 `ADRP Xd, #page` + `ADD Xd2, Xd, #imm12` within next 1..8 instructions
+            let mut i = 0usize;
+            while i + 8 <= code.len() && out.len() < max_xrefs {
+                let insn = u32::from_le_bytes([code[i], code[i + 1], code[i + 2], code[i + 3]]);
+                if (insn & 0x9F00_0000) == 0x9000_0000 {
+                    let rd = insn & 0x1F;
+                    let immlo = (insn >> 29) & 0x3;
+                    let immhi = (insn >> 5) & 0x7_FFFF;
+                    let raw21 = (immhi << 2) | immlo;
+                    let signed21 = if (raw21 & (1 << 20)) != 0 {
+                        (raw21 | !0x1F_FFFF) as i32 as i64
+                    } else {
+                        raw21 as i64
+                    };
+                    let pc = sec.vaddr.saturating_add(i as u64);
+                    let page = ((pc & !0xFFF) as i64).wrapping_add(signed21 << 12);
+                    // Look ahead up to 8 instructions for `ADD X?, Xrd, #imm12`
+                    for k in 1..=8usize {
+                        let off2 = i + k * 4;
+                        if off2 + 4 > code.len() {
+                            break;
+                        }
+                        let insn2 = u32::from_le_bytes([
+                            code[off2],
+                            code[off2 + 1],
+                            code[off2 + 2],
+                            code[off2 + 3],
+                        ]);
+                        // ADD (immediate, 64-bit, unshifted): sf=1(bit31), op=0(bit30), S=0(bit29), 100010(bits28..23), sh=0(bit22)
+                        if (insn2 & 0xFFC0_0000) == 0x9100_0000 {
+                            let rn = (insn2 >> 5) & 0x1F;
+                            if rn == rd {
+                                let imm12 = ((insn2 >> 10) & 0xFFF) as i64;
+                                let target = page.wrapping_add(imm12);
+                                if target > 0 {
+                                    let tva = target as u64;
+                                    if let Some(sv) = str_lookup.get(&tva) {
+                                        if seen.insert((pc, tva)) {
+                                            let func = find_enclosing_elf_func(elf, pc);
+                                            let prev: String = sv.chars().take(72).collect();
+                                            out.push(format!(
+                                                "- [elf-str-xref] arm64 adrp+add=0x{pc:x} in {func} -> vaddr=0x{tva:x} `{prev}`"
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Stop if rd is overwritten by another ADRP
+                        if (insn2 & 0x9F00_0000) == 0x9000_0000 && (insn2 & 0x1F) == rd {
+                            break;
+                        }
+                    }
+                }
+                i += 4;
+            }
+        }
+    }
+    out
+}
+
+fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
     let is_64 = bytes[4] == 2;
     let bits = if is_64 { "64-bit" } else { "32-bit" };
     let e_type = read_u16_le(bytes, 16).unwrap_or(0);
@@ -912,12 +1235,18 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
         elf_mit.push("Canary");
     }
 
+    let mut ctx = ElfContext {
+        is_64,
+        machine: mach,
+        secs: Vec::new(),
+        func_syms: Vec::new(),
+    };
     if !is_64 || bytes.len() < 64 {
         out.push(format!(
             "- SHA-256: `{}` | Entropy: `{ent:.2}`",
             sha256_hex(bytes)
         ));
-        return;
+        return ctx;
     }
     let shoff = read_u64_le(bytes, 40).unwrap_or(0) as usize;
     let shentsize = read_u16_le(bytes, 58).unwrap_or(0) as usize;
@@ -936,13 +1265,15 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
                 elf_mit.join(", ")
             }
         ));
-        return;
+        return ctx;
     }
     let strtab_hdr = shoff.saturating_add(shstrndx.saturating_mul(shentsize));
     let shstr_off = read_u64_le(bytes, strtab_hdr + 24).unwrap_or(0) as usize;
     let mut sec_names = Vec::new();
     let mut dynstr_slice: Option<(usize, usize)> = None;
     let mut dynsym_slice: Option<(usize, usize, usize)> = None;
+    let mut strtab_slice: Option<(usize, usize)> = None;
+    let mut symtab_slice: Option<(usize, usize, usize)> = None;
     let mut dynamic_slice: Option<(usize, usize)> = None;
 
     for i in 0..shnum.min(64) {
@@ -952,6 +1283,8 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
         }
         let nm_off = read_u32_le(bytes, h).unwrap_or(0) as usize;
         let sh_type = read_u32_le(bytes, h + 4).unwrap_or(0);
+        let sh_flags = read_u64_le(bytes, h + 8).unwrap_or(0);
+        let s_addr = read_u64_le(bytes, h + 16).unwrap_or(0);
         let s_off = read_u64_le(bytes, h + 24).unwrap_or(0) as usize;
         let s_sz = read_u64_le(bytes, h + 32).unwrap_or(0) as usize;
         let entsz = read_u64_le(bytes, h + 56).unwrap_or(0) as usize;
@@ -959,10 +1292,21 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
         if !sname.is_empty() {
             sec_names.push(sname.clone());
         }
+        ctx.secs.push(ElfSection {
+            name: sname.clone(),
+            vaddr: s_addr,
+            raw_ptr: s_off,
+            raw_size: s_sz,
+            flags: sh_flags,
+        });
         if sname == ".dynstr" {
             dynstr_slice = Some((s_off, s_sz));
         } else if sh_type == 11 || sname == ".dynsym" {
             dynsym_slice = Some((s_off, s_sz, entsz.max(24)));
+        } else if sname == ".strtab" {
+            strtab_slice = Some((s_off, s_sz));
+        } else if sh_type == 2 || sname == ".symtab" {
+            symtab_slice = Some((s_off, s_sz, entsz.max(24)));
         } else if sh_type == 6 || sname == ".dynamic" {
             dynamic_slice = Some((s_off, s_sz));
         }
@@ -976,7 +1320,6 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
             if tag == 0 {
                 break;
             }
-            // DT_BIND_NOW (24) or DT_FLAGS(30) DF_BIND_NOW(0x8) or DT_FLAGS_1(0x6ffffffb) DF_1_NOW(0x1)
             if tag == 24 || (tag == 30 && (val & 0x8) != 0) || (tag == 0x6fff_fffb && (val & 0x1) != 0) {
                 has_bind_now = true;
             }
@@ -1025,7 +1368,8 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
         }
         if let Some((sym_off, sym_sz, entsz)) = dynsym_slice {
             let mut syms = Vec::new();
-            let count = (sym_sz / entsz).min(512);
+            let mut notable_syms = Vec::new();
+            let count = (sym_sz / entsz).min(2048);
             for k in 0..count {
                 let p = sym_off + k * entsz;
                 if p + 24 > bytes.len() {
@@ -1033,14 +1377,28 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
                 }
                 let st_name = read_u32_le(bytes, p).unwrap_or(0) as usize;
                 let st_shndx = read_u16_le(bytes, p + 6).unwrap_or(0);
-                if st_name > 0 && st_shndx != 0 {
+                let st_value = read_u64_le(bytes, p + 8).unwrap_or(0);
+                if st_name > 0 {
                     if let Some(nm) = read_cstr(bytes, dstr_off.saturating_add(st_name), 128) {
-                        syms.push(nm);
-                        if syms.len() >= 60 {
-                            break;
+                        if is_notable_elf_symbol(&nm) && notable_syms.len() < 30 && !notable_syms.contains(&nm) {
+                            notable_syms.push(nm.clone());
+                        }
+                        if st_shndx != 0 {
+                            if st_value > 0 && ctx.func_syms.len() < 4096 {
+                                ctx.func_syms.push((st_value, nm.clone()));
+                            }
+                            if syms.len() < 60 {
+                                syms.push(nm);
+                            }
                         }
                     }
                 }
+            }
+            if !notable_syms.is_empty() {
+                out.push(format!(
+                    "- **Notable ELF Symbols**: `{}`",
+                    notable_syms.join("`, `")
+                ));
             }
             if !syms.is_empty() {
                 out.push(format!(
@@ -1051,6 +1409,24 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) {
             }
         }
     }
+    if let (Some((st_off, _)), Some((sym_off, sym_sz, entsz))) = (strtab_slice, symtab_slice) {
+        let count = (sym_sz / entsz).min(4096);
+        for k in 0..count {
+            let p = sym_off + k * entsz;
+            if p + 24 > bytes.len() {
+                break;
+            }
+            let st_name = read_u32_le(bytes, p).unwrap_or(0) as usize;
+            let st_shndx = read_u16_le(bytes, p + 6).unwrap_or(0);
+            let st_value = read_u64_le(bytes, p + 8).unwrap_or(0);
+            if st_name > 0 && st_shndx != 0 && st_value > 0 && ctx.func_syms.len() < 8192 {
+                if let Some(nm) = read_cstr(bytes, st_off.saturating_add(st_name), 128) {
+                    ctx.func_syms.push((st_value, nm));
+                }
+            }
+        }
+    }
+    ctx
 }
 
 /// Inspect PE / ELF / Mach-O / WASM headers, imports/exports, SHA-256, entropy + ASCII & Windows UTF-16LE wide strings.
@@ -1058,7 +1434,7 @@ pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) 
     inspect_binary_with_xref_md(bytes, query, max_strings, false)
 }
 
-/// Inspect native binaries with optional pure-Rust PE64 x64 RIP-relative string & IAT import XREF resolution.
+/// Inspect native binaries with optional pure-Rust PE64/ELF64 (x64 & AArch64) XREF resolution + Go `.gopclntab` extraction.
 pub fn inspect_binary_with_xref_md(
     bytes: &[u8],
     query: Option<&str>,
@@ -1067,6 +1443,7 @@ pub fn inspect_binary_with_xref_md(
 ) -> String {
     let mut out = Vec::new();
     let mut pe_ctx: Option<PeContext> = None;
+    let mut elf_ctx: Option<ElfContext> = None;
     if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
         let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
         if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
@@ -1079,7 +1456,7 @@ pub fn inspect_binary_with_xref_md(
             ));
         }
     } else if bytes.starts_with(b"\x7FELF") && bytes.len() >= 20 {
-        parse_elf_details(bytes, &mut out);
+        elf_ctx = Some(parse_elf_details(bytes, &mut out));
     } else if bytes.starts_with(b"\x00asm") {
         out.push(format!(
             "## Binary Header: WebAssembly ({} B) | SHA-256: `{}`",
@@ -1108,8 +1485,23 @@ pub fn inspect_binary_with_xref_md(
             .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
             .ok()
     });
+    let go_funcs = scan_go_pclntab_funcs(bytes, q_re.as_ref(), 45);
+    if !go_funcs.is_empty() {
+        let go_line = format!(
+            "### Go User Functions (.gopclntab, {} shown): {}",
+            go_funcs.len(),
+            go_funcs.join(", ")
+        );
+        let insert_at = out
+            .iter()
+            .position(|l| l.starts_with("### PE Imports") || l.starts_with("### ELF Exported"))
+            .unwrap_or(out.len());
+        out.insert(insert_at, go_line);
+    }
+
     let mut hits: Vec<String> = Vec::new();
     let mut matched_str_rvas: Vec<(u32, String)> = Vec::new();
+    let mut matched_elf_vaddrs: Vec<(u64, String)> = Vec::new();
     let scan_cap = if query.is_some() || include_xref {
         24 * 1024 * 1024
     } else {
@@ -1132,6 +1524,9 @@ pub fn inspect_binary_with_xref_md(
                     if let Some((rva, sec)) = pe_ctx.as_ref().and_then(|p| file_offset_to_rva(st, &p.secs)) {
                         hits.push(format!("[ascii @0x{st:x} rva=0x{rva:x} ({sec})] {s}"));
                         matched_str_rvas.push((rva, s.into_owned()));
+                    } else if let Some((va, sec)) = elf_ctx.as_ref().and_then(|e| elf_file_offset_to_vaddr(st, &e.secs)) {
+                        hits.push(format!("[ascii @0x{st:x} vaddr=0x{va:x} ({sec})] {s}"));
+                        matched_elf_vaddrs.push((va, s.into_owned()));
                     } else {
                         hits.push(format!("[ascii @0x{st:x}] {s}"));
                     }
@@ -1181,10 +1576,25 @@ pub fn inspect_binary_with_xref_md(
             } else {
                 xref_block.extend(xrefs);
             }
-            // Place XREFs right after PE Sections/RPC/Exports (before bulky full import dump) so hunters see code targets immediately!
             let insert_at = out
                 .iter()
                 .position(|l| l.starts_with("### PE Imports"))
+                .unwrap_or(out.len());
+            out.splice(insert_at..insert_at, xref_block);
+        } else if let Some(ref elf) = elf_ctx {
+            let xrefs = scan_elf64_xrefs(bytes, elf, &matched_elf_vaddrs, 60);
+            let mut xref_block = vec![format!(
+                "### ELF64 Code XREFs ({} found)",
+                xrefs.len()
+            )];
+            if xrefs.is_empty() {
+                xref_block.push("*(no matching x86_64 LEA or AArch64 ADRP+ADD XREFs found in executable sections)*".to_string());
+            } else {
+                xref_block.extend(xrefs);
+            }
+            let insert_at = out
+                .iter()
+                .position(|l| l.starts_with("### ELF Exported"))
                 .unwrap_or(out.len());
             out.splice(insert_at..insert_at, xref_block);
         }
@@ -1202,7 +1612,7 @@ pub fn inspect_binary_with_xref_md(
     if query.is_some() || include_xref {
         let insert_at = out
             .iter()
-            .position(|l| l.starts_with("### PE Imports"))
+            .position(|l| l.starts_with("### PE Imports") || l.starts_with("### ELF Exported"))
             .unwrap_or(out.len());
         out.splice(insert_at..insert_at, str_block);
     } else {
@@ -1336,5 +1746,87 @@ mod tests {
         assert!(md.contains("[str-xref] insn=0x1014 in func_rva=0x1010"), "Expected str-xref in:\n{md}");
         assert!(md.contains("[iat-xref] call insn=0x101b in func_rva=0x1010"), "Expected iat-xref in:\n{md}");
         assert!(md.contains("KERNEL32.dll!CreateProcessW"), "Expected IAT symbol in:\n{md}");
+    }
+
+    #[test]
+    fn scans_elf64_aarch64_adrp_add_string_xrefs_and_go_pclntab() {
+        // 1. Minimal synthetic ELF64 AArch64 binary with .text (vaddr 0x1000, off 0x200), .rodata (vaddr 0x2000, off 0x300),
+        //    .shstrtab (off 0x380), .dynstr (off 0x3C0), .dynsym (off 0x400), shdrs at off 0x480
+        let mut elf = vec![0u8; 0x700];
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2; // 64-bit
+        elf[5] = 1; // LE
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes()); // AArch64
+        elf[40..48].copy_from_slice(&0x480u64.to_le_bytes()); // e_shoff
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[60..62].copy_from_slice(&6u16.to_le_bytes()); // e_shnum (null + 5)
+        elf[62..64].copy_from_slice(&3u16.to_le_bytes()); // e_shstrndx = 3 (.shstrtab)
+
+        // .text @ 0x200 (vaddr 0x1000): ADRP X0, #0x1000 (page 0x1000 + 0x1000 = 0x2000); ADD X0, X0, #0x20 (-> 0x2020)
+        // ADRP X0, +1 page: immlo=1 (bit29), immhi=0, rd=0 -> 0xB000_0000
+        elf[0x200..0x204].copy_from_slice(&0xB000_0000u32.to_le_bytes());
+        // ADD X0, X0, #0x20: 0x9100_0000 | (0x20 << 10) = 0x9100_8000
+        elf[0x204..0x208].copy_from_slice(&0x9100_8000u32.to_le_bytes());
+        // .rodata @ 0x320 (vaddr 0x2020): "/dev/ipc_ctl"
+        elf[0x320..0x32D].copy_from_slice(b"/dev/ipc_ctl\0");
+        // .shstrtab @ 0x380
+        let shstrs = b"\0.text\0.rodata\0.shstrtab\0.dynstr\0.dynsym\0";
+        elf[0x380..0x380 + shstrs.len()].copy_from_slice(shstrs);
+        // .dynstr @ 0x3C0: "\0OnRemoteRequest\0system\0"
+        let dstrs = b"\0OnRemoteRequest\0system\0";
+        elf[0x3C0..0x3C0 + dstrs.len()].copy_from_slice(dstrs);
+        // .dynsym @ 0x400: entry 1 = OnRemoteRequest (exported at vaddr 0x1000), entry 2 = system (imported shndx=0)
+        elf[0x418..0x41C].copy_from_slice(&1u32.to_le_bytes()); // st_name = 1
+        elf[0x41E..0x420].copy_from_slice(&1u16.to_le_bytes()); // st_shndx = 1 (.text)
+        elf[0x420..0x428].copy_from_slice(&0x1000u64.to_le_bytes()); // st_value = 0x1000
+        elf[0x430..0x434].copy_from_slice(&17u32.to_le_bytes()); // st_name = 17 ("system")
+        elf[0x436..0x438].copy_from_slice(&0u16.to_le_bytes()); // st_shndx = 0 (imported)
+
+        let write_shdr = |buf: &mut [u8], idx: usize, name: u32, ty: u32, flags: u64, addr: u64, off: u64, sz: u64, entsz: u64| {
+            let h = 0x480 + idx * 64;
+            buf[h..h + 4].copy_from_slice(&name.to_le_bytes());
+            buf[h + 4..h + 8].copy_from_slice(&ty.to_le_bytes());
+            buf[h + 8..h + 16].copy_from_slice(&flags.to_le_bytes());
+            buf[h + 16..h + 24].copy_from_slice(&addr.to_le_bytes());
+            buf[h + 24..h + 32].copy_from_slice(&off.to_le_bytes());
+            buf[h + 32..h + 40].copy_from_slice(&sz.to_le_bytes());
+            buf[h + 56..h + 64].copy_from_slice(&entsz.to_le_bytes());
+        };
+        write_shdr(&mut elf, 1, 1, 1, 0x6, 0x1000, 0x200, 0x100, 0); // .text
+        write_shdr(&mut elf, 2, 7, 1, 0x2, 0x2000, 0x300, 0x80, 0); // .rodata
+        write_shdr(&mut elf, 3, 15, 3, 0, 0, 0x380, 0x40, 0); // .shstrtab
+        write_shdr(&mut elf, 4, 25, 3, 0, 0, 0x3C0, 0x40, 0); // .dynstr
+        write_shdr(&mut elf, 5, 33, 11, 0, 0, 0x400, 0x60, 24); // .dynsym
+
+        let md = inspect_binary_with_xref_md(&elf, Some("ipc_ctl"), 40, true);
+        assert!(md.contains("vaddr=0x2020 (.rodata)"), "Expected ELF vaddr on string:\n{md}");
+        assert!(md.contains("[elf-str-xref] arm64 adrp+add=0x1000 in `OnRemoteRequest`+0x0"), "Expected ARM64 ADRP+ADD XREF:\n{md}");
+        assert!(md.contains("Notable ELF Symbols") && md.contains("system"), "Expected notable ELF symbols:\n{md}");
+
+        // 2. Synthetic Go 1.20 .gopclntab (magic 0xFFFFFFF1, 64-bit)
+        let mut go_blob = vec![0u8; 0x200];
+        let base = 0x20usize;
+        go_blob[base..base + 8].copy_from_slice(&[0xF1, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x01, 0x08]);
+        go_blob[base + 8..base + 16].copy_from_slice(&2u64.to_le_bytes()); // nfunc = 2
+        go_blob[base + 24..base + 32].copy_from_slice(&0x401000u64.to_le_bytes()); // textStart
+        go_blob[base + 32..base + 40].copy_from_slice(&0x60u64.to_le_bytes()); // funcnameOffset = 0x60
+        go_blob[base + 64..base + 72].copy_from_slice(&0xC0u64.to_le_bytes()); // pclnOffset = 0xC0
+        // funcnames at base + 0x60 = 0x80
+        go_blob[0x80..0x98].copy_from_slice(b"runtime.gcBgMarkWorker\0\0");
+        go_blob[0x98..0xB0].copy_from_slice(b"main.handleRpcRequest\0\0\0");
+        // functab at base + 0xC0 = 0xE0: 2 entries * 8B + _func structs at +0x20 and +0x28
+        go_blob[0xE0..0xE4].copy_from_slice(&0x10u32.to_le_bytes());
+        go_blob[0xE4..0xE8].copy_from_slice(&0x20u32.to_le_bytes());
+        go_blob[0xE8..0xEC].copy_from_slice(&0x80u32.to_le_bytes());
+        go_blob[0xEC..0xF0].copy_from_slice(&0x28u32.to_le_bytes());
+        // _func 0 @ 0x100: nameOff = 0 ("runtime.gcBgMarkWorker")
+        go_blob[0x104..0x108].copy_from_slice(&0u32.to_le_bytes());
+        // _func 1 @ 0x108: nameOff = 0x18 ("main.handleRpcRequest")
+        go_blob[0x10C..0x110].copy_from_slice(&0x18u32.to_le_bytes());
+
+        let funcs = scan_go_pclntab_funcs(&go_blob, None, 10);
+        assert_eq!(funcs.len(), 1, "Expected 1 non-stdlib Go func, got {funcs:?}");
+        assert!(funcs[0].contains("main.handleRpcRequest") && funcs[0].contains("0x401080"));
     }
 }

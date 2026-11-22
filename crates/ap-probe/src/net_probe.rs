@@ -620,6 +620,265 @@ pub fn run_ws_cli(
     0
 }
 
+fn ws_handshake_one_origin(
+    url: &str,
+    origin: Option<&str>,
+    send_msgs: &[String],
+    base_headers: &[String],
+    wait_ms: u64,
+) -> serde_json::Value {
+    let t0 = Instant::now();
+    let label = origin.unwrap_or("(none)");
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return json!({
+            "origin": label,
+            "accepted": false,
+            "status_line": "",
+            "error": "only ws:// supported natively",
+            "elapsed_ms": 0.0,
+            "messages": [],
+        });
+    };
+    let (host_port, req_path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let connect_target = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    let Some(sa) = connect_target.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        return json!({
+            "origin": label,
+            "accepted": false,
+            "status_line": "",
+            "error": format!("resolve failed: {connect_target}"),
+            "elapsed_ms": 0.0,
+            "messages": [],
+        });
+    };
+    let mut stream = match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({
+                "origin": label,
+                "accepted": false,
+                "status_line": "",
+                "error": format!("connect failed: {e}"),
+                "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                "messages": [],
+            });
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let mut req = format!(
+        "GET {req_path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+    );
+    if let Some(orig) = origin {
+        req.push_str(&format!("Origin: {orig}\r\n"));
+    }
+    for h in base_headers {
+        let low = h.trim().to_ascii_lowercase();
+        if low.starts_with("origin:") {
+            continue;
+        }
+        req.push_str(h.trim());
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
+    if let Err(e) = stream.write_all(req.as_bytes()) {
+        return json!({
+            "origin": label,
+            "accepted": false,
+            "status_line": "",
+            "error": format!("write failed: {e}"),
+            "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+            "messages": [],
+        });
+    }
+
+    let mut hbuf = Vec::new();
+    let mut b1 = [0u8; 1];
+    while hbuf.len() < 4096 {
+        match stream.read(&mut b1) {
+            Ok(1) => {
+                hbuf.push(b1[0]);
+                if hbuf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let htxt = String::from_utf8_lossy(&hbuf).to_string();
+    let status_line = htxt.lines().next().unwrap_or("").trim().to_string();
+    let accepted = status_line.contains("101");
+    let mut messages = Vec::new();
+    if accepted && !send_msgs.is_empty() {
+        for msg in send_msgs {
+            if ws_write_text_frame(&mut stream, msg).is_err() {
+                break;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(80, 3000));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        while Instant::now() < deadline && messages.len() < 10 {
+            let mut pb = [0u8; 1];
+            match stream.peek(&mut pb) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+                    let fr = ws_read_one_frame(&mut stream);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                    match fr {
+                        Ok((1 | 2, data)) => {
+                            messages.push(String::from_utf8_lossy(&data).chars().take(600).collect::<String>());
+                        }
+                        Ok((8, _)) | Err(_) => break,
+                        _ => {}
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    json!({
+        "origin": label,
+        "accepted": accepted,
+        "status_line": status_line,
+        "error": "",
+        "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+        "messages": messages,
+    })
+}
+
+/// Probe Cross-Site WebSocket Hijacking (CSWSH) across untrusted/null/omitted/localhost Origin headers.
+pub fn run_ws_origin_matrix(
+    url: &str,
+    send_msgs: &[String],
+    headers: &[String],
+    custom_origins: &[String],
+    wait_ms: u64,
+    as_json: bool,
+) -> i32 {
+    let origin_specs: Vec<Option<String>> = if custom_origins.is_empty() {
+        vec![
+            None,
+            Some("https://evil.example".to_string()),
+            Some("null".to_string()),
+            Some("http://localhost".to_string()),
+        ]
+    } else {
+        custom_origins
+            .iter()
+            .map(|o| {
+                let t = o.trim();
+                if t.is_empty() || t.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            })
+            .collect()
+    };
+
+    let mut rows = Vec::new();
+    let mut untrusted_accepted = Vec::new();
+    for spec in &origin_specs {
+        let row = ws_handshake_one_origin(url, spec.as_deref(), send_msgs, headers, wait_ms);
+        let acc = row["accepted"].as_bool().unwrap_or(false);
+        let is_untrusted = match spec.as_deref() {
+            None => false,
+            Some(o) => {
+                let low = o.to_ascii_lowercase();
+                low == "null"
+                    || (!low.starts_with("http://localhost")
+                        && !low.starts_with("http://127.0.0.1")
+                        && !low.starts_with("https://localhost")
+                        && !low.starts_with("https://127.0.0.1"))
+            }
+        };
+        if acc && is_untrusted {
+            untrusted_accepted.push(row["origin"].as_str().unwrap_or("?").to_string());
+        }
+        rows.push(row);
+    }
+
+    let cswsh_vulnerable = !untrusted_accepted.is_empty();
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "url": url,
+                "cswsh_vulnerable": cswsh_vulnerable,
+                "untrusted_accepted": untrusted_accepted,
+                "results": rows,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        let badge = if cswsh_vulnerable {
+            "[POSSIBLE-CSWSH]"
+        } else {
+            "[ORIGIN-GUARDED]"
+        };
+        println!(
+            "[probe ws origin-matrix] `{url}` {badge} ({} origins tested):",
+            rows.len()
+        );
+        for r in &rows {
+            println!(
+                "  - Origin={:<24} accepted={:<5} ({}) msgs={}",
+                r["origin"].as_str().unwrap_or("?"),
+                r["accepted"].as_bool().unwrap_or(false),
+                r["status_line"].as_str().unwrap_or(""),
+                r["messages"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod ws_tests {
+    use super::*;
+
+    #[test]
+    fn detects_cswsh_cross_origin_ws_acceptance_vs_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    if req.contains("origin: https://evil.example") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        );
+                    } else {
+                        let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+                    }
+                }
+            }
+        });
+        let url = format!("ws://127.0.0.1:{port}/rpc");
+        let evil = ws_handshake_one_origin(&url, Some("https://evil.example"), &[], &[], 200);
+        let null_o = ws_handshake_one_origin(&url, Some("null"), &[], &[], 200);
+        let _ = srv.join();
+        assert_eq!(evil["accepted"], true);
+        assert_eq!(null_o["accepted"], false);
+    }
+}
+
 /// Cross-platform TLS protocol & X.509 certificate inspector (uses native .NET SslStream on Windows / openssl on Unix).
 pub fn run_tls_cli(addr_str: &str, sni: Option<&str>, timeout_sec: u64, as_json: bool) -> i32 {
     let t0 = Instant::now();

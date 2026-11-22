@@ -322,7 +322,7 @@ enum SubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Deadline-bounded RFC 6455 generic WebSocket (`ws://`) send/recv diagnostic client (zero hangs)
+    /// Deadline-bounded RFC 6455 generic WebSocket (`ws://`) send/recv & CSWSH cross-origin handshake auditor (zero hangs)
     Ws {
         url: String,
         #[arg(long = "send")]
@@ -331,6 +331,12 @@ enum SubCmd {
         headers: Vec<String>,
         #[arg(long, default_value_t = 1000)]
         wait_ms: u64,
+        /// Probe cross-origin CSWSH acceptance across omitted/`https://evil.example`/`null`/`http://localhost` (or custom `--origin`)
+        #[arg(long)]
+        origin_matrix: bool,
+        /// Optional custom Origin header(s) for `--origin-matrix` (repeatable)
+        #[arg(long = "origin")]
+        origins: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -699,8 +705,17 @@ pub fn run_cli(args: &[String]) -> i32 {
             send,
             headers,
             wait_ms,
+            origin_matrix,
+            origins,
             json,
-        } => net_probe::run_ws_cli(&url, &send, &headers, wait_ms, json),
+        } => {
+            if origin_matrix || !origins.is_empty() {
+                return net_probe::run_ws_origin_matrix(
+                    &url, &send, &headers, &origins, wait_ms, json,
+                );
+            }
+            net_probe::run_ws_cli(&url, &send, &headers, wait_ms, json)
+        }
         SubCmd::Tls {
             addr,
             sni,
