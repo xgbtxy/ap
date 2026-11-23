@@ -1,4 +1,4 @@
-# Anti-Obsolescence Design Architecture: Cognitive & Physical Boundaries (`ap` v2.41)
+# Anti-Obsolescence Design Architecture: Cognitive & Physical Boundaries (`ap` v2.42)
 
 [English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Playbook](./PLAYBOOK.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 

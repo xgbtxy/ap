@@ -81,6 +81,8 @@ fn mcp_tools_schema() -> Value {
                     "context": { "type": "integer", "description": "Show N surrounding lines before & after each match (like `rg -C N`)" },
                     "files_only": { "type": "boolean", "description": "Return only unique matching file paths (like `rg -l`)" },
                     "count": { "type": "boolean", "description": "Return per-file match counts (like `rg -c`)" },
+                    "only_matching": { "type": "boolean", "description": "Emit ONLY matched substrings from each line (like `grep -o` / `rg -o`)" },
+                    "unique": { "type": "boolean", "description": "Deduplicate matched snippets/tokens and rank by descending frequency" },
                     "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal fixed string instead of regex (like `rg -F`)" },
                     "ignore_case": { "type": "boolean", "description": "Force case-insensitive matching even with uppercase chars (like `rg -i`)" },
                     "include": {
@@ -1396,6 +1398,16 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             if args.get("count").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--count".to_string());
+            }
+            if args
+                .get("only_matching")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--only-matching".to_string());
+            }
+            if args.get("unique").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--unique".to_string());
             }
             if args
                 .get("fixed_strings")

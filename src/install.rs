@@ -824,8 +824,8 @@ const SIEVE_HOME = process.env.SIEVE_HOME || join(homedir(), ".ap", "sieve");
 const DESTRUCTIVE_OR_WRITE =
 	/(?:^|[;&|]\s*)(?:Remove-Item|rm|del|erase|rmdir|rd|Move-Item|Rename-Item|mv|ren|Set-Content|Add-Content|Clear-Content|Out-File|Copy-Item|cpi|copy)\b|shutil\.rmtree|os\.remove|os\.unlink|\.unlink\(|\.rmdir\(|\bgit(?:\.exe)?\b[\s\S]{{0,80}}?\bclean\b/i;
 const BARE_SLOW_GREP =
-	/^\s*grep\s+-([rRnwiEHlc]+)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$/;
-const PY_INVOKE = /\b(?:python3?(?:\.exe)?|py(?:\.exe)?|pytest)\b/i;
+	/^\s*grep\s+-([rRnwiEHlco]+)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$/;
+const PY_INVOKE = /(?:^|[;&|(\s=])(?:python3?(?:\.exe)?|py(?:\.exe)?|pytest)(?=\s|$)/i;
 const HAS_UTF8_ENV = /PYTHONUTF8|PYTHONIOENCODING/i;
 const PY_WIN_BS =
 	/\b(?:python3?(?:\.exe)?|py(?:\.exe)?)\b[\s\S]*(?:-c\b|<<)[\s\S]*(?<![rR])(['"])([A-Za-z]:\\(?!\\)[^'"\r\n]+)\1/;
@@ -1122,7 +1122,13 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 			outText,
 		)
 	) {{
-		return `[ap codemode-tip] TypeError: tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (use (res.output ?? ""), NOT res.split/slice!), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined). Run await describeTool("<name>") to verify exact fields.`;
+		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (read (res.output ?? "")), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined). Run await describeTool("<name>") to verify exact fields.`;
+	}}
+	if (/Unexpected end of JSON input/i.test(outText)) {{
+		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on non-JSON wrappers.`;
+	}}
+	if (/Unexpected identifier|unterminated string/i.test(outText)) {{
+		return `[ap codemode-tip] SyntaxError: unescaped quote or multiline literal inside JS source. Write complex payloads cleanly via tools.write instead of inline escaping.`;
 	}}
 	if (/\bSyntaxError\b|options line/i.test(outText)) {{
 		return `[ap codemode-tip] Pass raw JS body only (no markdown code fences); // @options: {{...}} must be line 1 if used.`;
@@ -1149,8 +1155,8 @@ export function classifyCodemodeFailureTip(outText: string): string {{
  */
 export const AP_DEEPSEEK_GUIDELINES: readonly string[] = [
 	"Parallel-first execution: batch 2+ independent reads/searches/checks in parallel tool calls OR one codemode script via `const res = await Promise.allSettled([tools.read({{path}}), tools.bash({{command}})]);` (cuts latency & thinking tokens ~40%); persist cross-turn state via `store(key, val)`/`load(key)`.",
-	"In codemode (QuickJS sandbox — NO Node fs/path/require/process/fetch; `await sleep(ms)` is available): `tools.bash({{command}})` returns `{{ output, exit_code, truncated }}` (read `.output`), `tools.read({{path}})` returns a string, and `tools.mcp__agent_primitives__*` returns parsed `{{ content, structuredContent, isError }}`.",
-	'Fast local CLI & exact edits: direct `read` shows `L:HH|` hashline anchors (pass `L:HH|` lines in `edit` `oldText` to disambiguate duplicates in 1 shot). In bash, prefer zero-dep `ap` over slow grep/python one-liners: `ap search "<re>" [dir] -e <ext>`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex`, `ap query -f db=<db> "<sql>"`, `ap atlas map .`; keep read-only probes <=90s.',
+	"In codemode (QuickJS sandbox — NO Node fs/path/require/process/fetch; `await sleep(ms)` is available): prefer typed MCP primitives `tools.mcp__agent_primitives__ap_search({{pattern, path, only_matching: true, unique: true, json: true}})`, `ap_read({{target, routes: true, section, json: true}})`, `ap_http`, `ap_cdp` over bash python/grep one-liners; `tools.bash({{command}})` returns `{{ output, exit_code }}`.",
+	'Fast local CLI & exact edits: direct `read` shows `L:HH|` hashline anchors (pass `L:HH|` lines in `edit` `oldText` to disambiguate duplicates in 1 shot). In bash, prefer zero-dep `ap` over slow grep/python: `ap ls <dir>`, `ap search -o -u "<re>" [dir]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex` (`--section`/`--routes`), `ap query -f db=<db> "<sql>"`, `ap atlas map .`.',
 ];
 
 export function injectDeepSeekGuidelines(guidelines: string[]): boolean {{
@@ -1252,9 +1258,10 @@ export function serializeMessagesForCompaction(
 	return parts.join("\n\n");
 }}
 
-export function shouldAutoSieveShellOutput(text: string): boolean {{
+export function shouldAutoSieveShellOutput(text: string, isFastModel = false): boolean {{
 	if (!text) return false;
-	if (text.length >= SIEVE_HARD_CHARS) return true;
+	const hardLimit = isFastModel ? 12000 : SIEVE_HARD_CHARS;
+	if (text.length >= hardLimit) return true;
 	const lines = text.split("\n");
 	if (lines.some((l) => l.length > SIEVE_GIANT_LINE_CHARS)) return true;
 	if (text.length >= SIEVE_STRUCTURED_CHARS) {{
@@ -2102,16 +2109,34 @@ export function formatPostEditLineShiftTip(
 }}
 
 function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undefined {{
-	// Match optional leading `cd <dir> && ` or `cd <dir>; `, recursive `grep -r[nwiEHlcIsF] [--exclude-dir=...] [--include="*.ext"...] [-e] <pat> [path]`,
-	// optional `2>/dev/null` stderr suppression, and optional safe read-only pipe suffix (`| head/tail/wc/sort/cut ...`).
+	// Match optional leading `cd <dir> && ` or `cd <dir>; `, strip `2>/dev/null` & trailing pagers (`| more`/`| less`).
 	const cleaned = cmd
 		.replace(/\s+2>\s*(?:\/dev\/null|NUL)\b/gi, "")
-		.replace(/\s+--exclude-dir=(?:'[^']+'|"[^"]+"|[^\s|&;]+)/g, "");
+		.replace(/\s+--exclude-dir=(?:'[^']+'|"[^"]+"|[^\s|&;]+)/g, "")
+		.replace(/\s*\|\s*(?:more|less)\s*$/i, "");
 	if (/>/.test(cleaned)) return undefined;
+
+	// Fast-path A0: variable-assigned archive/minified grep-o `f="/path/to/app.asar"; [timeout N] grep -a -o ".\{{0,N\}}pat.\{{0,M\}}" "$f" [| head ...]`
+	const varGrep = cleaned.match(
+		/^\s*(?:([A-Za-z_]\w*)=(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*;\s*)(?:timeout\s+\d+\s+)?grep\s+(?:-[aAoEP]+\s+)+(?:"((?:[^"\\]|\\.)+)"|'([^']+)')\s+"\$(\w+)"(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+	);
+	if (varGrep && varGrep[1] === varGrep[7]) {{
+		const fileTarget = varGrep[2] || varGrep[3] || varGrep[4] || "";
+		const rawPat = varGrep[5] || varGrep[6] || "";
+		const bm = rawPat.match(/^(?:\.\\?\{{0,(\d+)\\?\}})?([\s\S]+?)(?:\.\\?\{{0,(\d+)\\?\}})?$/);
+		const leftN = Number(bm?.[1] || 0);
+		const rightN = Number(bm?.[3] || 0);
+		const midPat = (bm?.[2] || rawPat).replace(/"/g, '\\"');
+		if (fileTarget && (leftN > 0 || rightN > 0) && midPat) {{
+			const around = Math.min(800, Math.max(40, leftN, rightN));
+			const prefix = toolName === "powershell" ? "& " : "";
+			return `${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty "${{midPat}}" "${{fileTarget}}"${{varGrep[8] || ""}}`;
+		}}
+	}}
 
 	// Fast-path A: slow minified-JS context regex `grep -oE '.{{0,N}}PAT.{{0,M}}' file [| head ...]` -> `<25ms` `ap search --around`
 	const aroundMatch = cleaned.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-[oEP]+\s+['"]\.\{{0,(\d+)\}}([^'"]+?)(\.\{{0,(\d+)\}})?['"]\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+(?:-[oEP]+\s+)+['"]\.\\?\{{0,(\d+)\\?\}}([^'"]+?)(\.\\?\{{0,(\d+)\\?\}})?['"]\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
 	);
 	if (aroundMatch) {{
 		const cdPrefix = aroundMatch[1] || "";
@@ -2123,27 +2148,91 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const pipeSuffix = aroundMatch[9] || "";
 		if (pat && !pat.includes("{{")) {{
 			const prefix = toolName === "powershell" ? "& " : "";
-			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search --around ${{around}} "${{pat}}" "${{target}}"${{pipeSuffix}}`;
+			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty "${{pat}}" "${{target}}"${{pipeSuffix}}`;
 		}}
+	}}
+
+	// Fast-path A2: `for f in <files>; do [echo "$f";] grep [-a] -o[E] '<pat>' "$f"; done` -> `rg -a --no-ignore -o ...`
+	const forGrep = cleaned.match(
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?for\s+(\w+)\s+in\s+([^;]+);\s*do\s+(?:echo\s+"?\$\2"?\s*;\s*)?grep\s+(?:-[aAoEP]+\s+)+(['"])([\s\S]+?)\4\s+"?\$\2"?\s*;\s*done\s*$/,
+	);
+	if (forGrep) {{
+		const cdPrefix = forGrep[1] || "";
+		const files = forGrep[3].trim();
+		const q = forGrep[4];
+		const erePat = forGrep[5].replace(/\\([{{}}])/g, "$1");
+		return `${{cdPrefix}}rg -a --no-ignore -o ${{q}}${{erePat}}${{q}} ${{files}}`;
+	}}
+
+	// Fast-path A3: `cat <files> | grep -o[E] <pat> [| sort/head...]` -> `rg -a --no-ignore -o --no-filename`
+	const catGrep = cleaned.match(
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:echo\s+[^;]+;\s*)?cat\s+([^|;&]+)\|\s*grep\s+-[aAoEhHn]+\s+('[^']+'|"[^"]+")(\s*\|[\s\S]*)?$/,
+	);
+	if (catGrep) {{
+		const cdPrefix = catGrep[1] || "";
+		const files = catGrep[2].trim();
+		const patTok = catGrep[3];
+		const pipeSuffix = catGrep[4] || "";
+		return `${{cdPrefix}}rg -a --no-ignore -o --no-filename ${{patTok}} ${{files}}${{pipeSuffix}}`;
+	}}
+
+	// Fast-path A4: multi-file `grep -ohE <pat> <2+ targets>` -> `rg -a --no-ignore -o`
+	const multiGrep = cleaned.match(
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+-([ohEia]+)\s+('[^']+'|"[^"]+"|\S+)\s+(\S+\s+\S+[\s\S]*?)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
+	);
+	if (multiGrep && !/[rR]/.test(multiGrep[2]) && multiGrep[2].includes("o")) {{
+		const cdPrefix = multiGrep[1] || "";
+		const noFile = multiGrep[2].includes("h") ? " --no-filename" : "";
+		return `${{cdPrefix}}rg -a --no-ignore -o${{noFile}} ${{multiGrep[3]}} ${{multiGrep[4].trim()}}${{multiGrep[5] || ""}}`;
 	}}
 
 	// Collect one or more `--include=*.ext` flags anywhere in the grep command
 	const exts: string[] = [];
-	let complexGlob = false;
+	const globs: string[] = [];
 	const withoutIncludes = cleaned.replace(
 		/\s+--include=(?:'([^']+)'|"([^"]+)"|([^\s|&;]+))/g,
 		(_m, g1: string, g2: string, g3: string) => {{
 			const glob = g1 || g2 || g3 || "";
 			const em = glob.match(/^\*\.([A-Za-z0-9]+)$/);
 			if (em) exts.push(em[1]);
-			else complexGlob = true;
+			if (glob) globs.push(`-g '${{glob}}'`);
 			return "";
 		}},
 	);
-	if (complexGlob) return undefined;
+
+	// Trailing `-l` / `-c` or AppData / backtick-safe recursive grep -> fast bounded `rg`
+	const complexRec = withoutIncludes.match(
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[rRnwiEHlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))([\s\S]*?)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
+	);
+	if (complexRec && /[rR]/.test(complexRec[2])) {{
+		const cdPrefix = complexRec[1] || "";
+		const rawFlags = complexRec[2];
+		const patRaw = complexRec[3] !== undefined ? `'${{complexRec[3]}}'` : complexRec[4] !== undefined ? `"${{complexRec[4]}}"` : complexRec[5];
+		const restArgs = (complexRec[6] || "").trim();
+		const pipeSuffix = complexRec[7] || "";
+		const hasBacktickPat = complexRec[3]?.includes("`") || complexRec[4]?.includes("`");
+		const hasTrailingFlag = /(?:^|\s)-[lch](?:\s|$)/.test(restArgs);
+		const isAppData = /AppData[/\\]Roaming/i.test(restArgs);
+		const multiTarget = restArgs.split(/\s+/).filter(Boolean).length > 1;
+		if (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget) {{
+			const rFlags = [
+				/[l]/.test(rawFlags) ? "-l" : "",
+				/[c]/.test(rawFlags) ? "-c" : "",
+				/[i]/.test(rawFlags) ? "-i" : "",
+				/[F]/.test(rawFlags) ? "-F" : "",
+				isAppData ? "--max-depth 4" : "",
+				"-g '!node_modules'",
+				"-g '!target'",
+				...globs,
+			]
+				.filter(Boolean)
+				.join(" ");
+			return `${{cdPrefix}}rg ${{rFlags}} ${{patRaw}} ${{restArgs}}${{pipeSuffix}}`;
+		}}
+	}}
 
 	const m = withoutIncludes.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHlcIsF]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHlcIsFo]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
 	);
 	if (!m || !/[rR]/.test(m[2])) return undefined;
 	const cdPrefix = m[1] || "";
@@ -2154,32 +2243,116 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	const pipeSuffix = m[9] || "";
 	const extFlag = exts.length > 0 ? ` -e ${{[...new Set(exts)].join(",")}}` : "";
 	const prefix = toolName === "powershell" ? "& " : "";
-	const extra = flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "";
+	const extra = [
+		flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
+		flags.includes("o") ? " -o" : "",
+		flags.includes("i") ? " -i" : "",
+		flags.includes("h") ? " --no-filename" : "",
+	].join("");
 	return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}} "${{pat}}" "${{target}}"${{pipeSuffix}}`;
+}}
+
+/**
+ * Guard ephemeral background local HTTP/mock servers with a bounded 900s TTL so aborted/orphaned
+ * test runs never leave background Python/Node listeners bound on ports indefinitely.
+ */
+export function guardEphemeralServerCommand(cmd: string): string | undefined {{
+	if (!cmd) return undefined;
+	const trimmed = cmd.trim();
+	const isBgServer =
+		/(?:python3?(?:\.exe)?\s+-m\s+http\.server\b|\bhttp\.server\b|\bap(?:\.exe)?\s+probe\s+listen\b)/.test(trimmed) &&
+		/&\s*$/.test(trimmed);
+	if (!isBgServer || /\btimeout\s+\d+/.test(trimmed)) return undefined;
+	if (/^nohup\s+/i.test(trimmed)) {{
+		return trimmed.replace(/^nohup\s+/i, "nohup timeout 900 ");
+	}}
+	return `timeout 900 ${{trimmed}}`;
+}}
+
+/**
+ * Hint structured reads (`ap read --outline` / `--section`) when opening giant Markdown/text files.
+ */
+export function classifyOversizedDocRead(filePath: string, byteLen: number): string | undefined {{
+	if (!filePath || byteLen < 10_000) return undefined;
+	const norm = filePath.trim().replace(/\\/g, "/").toLowerCase();
+	if (!/\.(?:md|txt|log)$/.test(norm) || /(?:^|\/)readme\.md$/.test(norm)) return undefined;
+	return `[ap read-tip] Large doc (${{byteLen}} chars) — use \`ap read "${{filePath}}" --outline\` or \`--section "<heading>"\` for ~90% fewer tokens.`;
+}}
+
+/**
+ * Track consecutive read-only single bash probes and nudge toward batched `codemode` (`Promise.allSettled`).
+ */
+export function trackReadOnlyBashStreak(
+	currentStreak: number,
+	cmd: string,
+	isDestructive: boolean,
+): {{ nextStreak: number; shouldTip: boolean }} {{
+	if (!cmd || isDestructive) return {{ nextStreak: 0, shouldTip: false }};
+	const clean = cmd.replace(LEADING_SHELL_PREFIX_RE, "").trim();
+	const isReadOnlyProbe =
+		/^(?:ls|dir|cat|head|tail|grep|egrep|fgrep|rg|find|sed|awk|wc|stat|file|strings|python3?|node)\b/i.test(clean);
+	if (!isReadOnlyProbe) return {{ nextStreak: 0, shouldTip: false }};
+	const nextStreak = currentStreak + 1;
+	if (nextStreak >= 4 && nextStreak % 4 === 0) {{
+		return {{ nextStreak, shouldTip: true }};
+	}}
+	return {{ nextStreak, shouldTip: false }};
 }}
 
 export function healCommand(raw: string, toolName: string): string | undefined {{
 	if (!raw) return undefined;
-	const isDestructive = DESTRUCTIVE_OR_WRITE.test(raw);
 	let cmd = raw;
 	let changed = false;
+	if (cmd.includes("\0")) {{
+		cmd = cmd.replace(/\0/g, "");
+		changed = true;
+	}}
+	const isDestructive = DESTRUCTIVE_OR_WRITE.test(cmd);
+	if (isDestructive) {{
+		return changed ? cmd : undefined;
+	}}
 
-	// 1. Recursive GNU `grep -r[nwiEHlc] [--include=*.ext...] <pat> [path]` & minified `grep -oE '.{{0,N}}...'` -> `<50ms` `ap search`
-	if (!isDestructive) {{
-		const fastGrep = rewriteSlowRecursiveGrep(cmd, toolName);
-		if (fastGrep) {{
-			return fastGrep;
+	// 1. Recursive GNU `grep`, minified `grep -oE`, `for ... grep`, `cat | grep -oE` -> `<50ms` `ap search` / `rg`
+	const fastGrep = rewriteSlowRecursiveGrep(cmd, toolName);
+	if (fastGrep) {{
+		return fastGrep;
+	}}
+	if (!/[|;&>]/.test(cmd)) {{
+		const gm = cmd.match(BARE_SLOW_GREP);
+		if (gm && /[rR]/.test(gm[1])) {{
+			const flags = gm[1];
+			const pat = (gm[2] || gm[3] || gm[4] || "").replace(/"/g, '\\"');
+			const target = gm[5] || gm[6] || gm[7] || ".";
+			const prefix = toolName === "powershell" ? "& " : "";
+			const extra = [
+				flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
+				flags.includes("o") ? " -o" : "",
+				flags.includes("i") ? " -i" : "",
+			].join("");
+			return `${{prefix}}"${{AP_BIN}}" search${{extra}} "${{pat}}" "${{target}}"`;
 		}}
-		if (!/[|;&>]/.test(cmd)) {{
-			const gm = cmd.match(BARE_SLOW_GREP);
-			if (gm && /[rR]/.test(gm[1])) {{
-				const flags = gm[1];
-				const pat = (gm[2] || gm[3] || gm[4] || "").replace(/"/g, '\\"');
-				const target = gm[5] || gm[6] || gm[7] || ".";
-				const prefix = toolName === "powershell" ? "& " : "";
-				const extra = flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "";
-				return `${{prefix}}"${{AP_BIN}}" search${{extra}} "${{pat}}" "${{target}}"`;
-			}}
+	}}
+
+	// 1b. Rewrite `cmd //c "where /R <dir> <pat>"` -> fast `.gitignore`-aware `rg --files`
+	if (toolName === "bash") {{
+		const whereM = cmd.match(
+			/^cmd\s+\/\/?c\s+"where\s+\/R\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s+([^"]+)"(\s*2>&1)?(\s*\|[\s\S]*)?$/i,
+		);
+		if (whereM) {{
+			const dirArg = (whereM[1] || whereM[2] || whereM[3] || ".").replace(/\\/g, "/");
+			const globPat = whereM[4].trim();
+			const pipeTail = whereM[6] || "";
+			return `rg --files --max-depth 5 -g "${{globPat}}" "${{dirArg}}"${{pipeTail}}`;
+		}}
+	}}
+
+	// 1c. Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` in Git Bash -> bounded `ap ls`
+	if (toolName === "bash" && !/[|;&>]/.test(cmd)) {{
+		const dirM = cmd.trim().match(/^dir\s+(?:(\/s)\s+\/b|\/b(?:\s+(\/s))?)(?:\s+(?:"([^"]+)"|'([^']+)'|(\S+)))?\s*$/i);
+		if (dirM) {{
+			const depthFlag = dirM[1] || dirM[2] ? " --depth 3" : "";
+			const tgt = dirM[3] || dirM[4] || dirM[5] || ".";
+			return `"${{AP_BIN}}" ls "${{tgt}}"${{depthFlag}}`;
 		}}
 	}}
 
@@ -2189,10 +2362,37 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		changed = true;
 	}}
 
+	// 2a. Strip stray `2>/dev/null` placed inside `for x in *.py 2>/dev/null; do` word lists
+	if (toolName === "bash" && /\bfor\s+\w+\s+in\b[^;]*\s2>\s*\/dev\/null\s*;/.test(cmd)) {{
+		cmd = cmd.replace(/(\bfor\s+\w+\s+in\b[^;]*?)\s+2>\s*\/dev\/null(\s*;)/g, "$1$2");
+		changed = true;
+	}}
+
 	// 2b. Strip Windows cmd `cd /d <path>` flag inside Git Bash -> `cd <path>`
 	if (toolName === "bash" && /(?:^|[;&|]\s*)cd\s+\/d\s+/i.test(cmd)) {{
 		cmd = cmd.replace(/(^|[;&|]\s*)cd\s+\/d\s+/gi, "$1cd ");
 		changed = true;
+	}}
+
+	// 2c. Normalize Git Bash `find` MSYS paths w/ backslash-escaped spaces (`/c/Program\ Files` -> `"C:/Program Files"`)
+	if (toolName === "bash" && /\bfind\s+/.test(cmd)) {{
+		const fixedFind = cmd.replace(/\/([a-zA-Z])\/((?:[^\s\\|;&]|\\ )+)/g, (_m, drv: string, tail: string) => {{
+			const unesc = tail.replace(/\\ /g, " ");
+			return tail.includes("\\ ") ? `"${{drv.toUpperCase()}}:/${{unesc}}"` : `${{drv.toUpperCase()}}:/${{unesc}}`;
+		}});
+		if (fixedFind !== cmd) {{
+			cmd = fixedFind;
+			changed = true;
+		}}
+	}}
+
+	// 2d. Fix Windows trailing backslash inside quotes (`"C:\"` -> `"C:/"` or `"C:\App\"*.dll` -> `"C:/App/"*.dll`)
+	if (toolName === "bash") {{
+		const fixedBs = cmd.replace(/"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
+		if (fixedBs !== cmd) {{
+			cmd = fixedBs;
+			changed = true;
+		}}
 	}}
 
 	// 3. Auto-fix unescaped Windows drive backslashes inside `python -c` & `python <<'PY'` non-raw literals
@@ -2228,7 +2428,7 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 	}}
 
 	// 6. Rewrite Windows cmd `type <file>` inside Git Bash -> `cat <posix-path>` (leaves POSIX `type -a/-t/-p` and bare commands untouched)
-	if (toolName === "bash" && !isDestructive) {{
+	if (toolName === "bash") {{
 		const tm = cmd.match(
 			/^(\s*(?:cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)type\s+(?!-[atpPf]\b)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&>]+))([\s\S]*)$/,
 		);
@@ -2244,12 +2444,13 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 	}}
 
 	// 6b. Wrap bare read-only PowerShell cmdlets accidentally sent to Git Bash (fixes syntax error near unexpected token)
-	if (toolName === "bash" && !isDestructive && !/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd)) {{
+	if (toolName === "bash" && !/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd)) {{
 		const psBare = cmd.match(
 			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String)\b[\s\S]*)$/,
 		);
-		if (psBare && !psBare[2].includes("'")) {{
-			cmd = `${{psBare[1] || ""}}powershell.exe -NoProfile -Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${{psBare[2].trim()}}'`;
+		if (psBare) {{
+			const body = psBare[2].trim().replace(/'/g, `'"'"'`);
+			cmd = `${{psBare[1] || ""}}powershell.exe -NoProfile -Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${{body}}'`;
 			changed = true;
 		}}
 	}}
@@ -2272,6 +2473,13 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		) {{
 			const inner = psDq[3].replace(/\\"/g, '"').replace(/\\\$/g, "$");
 			psFixed = `${{psDq[1]}}${{psDq[2]}}'[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${{inner}}'${{psDq[4]}}`;
+		}} else if (psDq) {{
+			// Inner single quotes prevent outer single-quoting: escape `$var` -> `\$var` so Bash preserves PS vars
+			const innerEsc = psDq[3].replace(/(?<!\\)\$(?=[A-Za-z_])/g, "\\$");
+			psFixed = `${{psDq[1]}}${{psDq[2]}}"${{innerEsc}}"${{psDq[4]}}`.replace(
+				/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
+				"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
+			);
 		}} else {{
 			psFixed = cmd.replace(
 				/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
@@ -2321,12 +2529,22 @@ const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{
 	codemake: "codemode",
 	code_mode: "codemode",
 	"code-mode": "codemode",
+	codemodep: "codemode",
+	codemodocode: "codemode",
+	codemodode: "codemode",
+	codemask: "codemode",
+	code_exec: "codemode",
+	code: "codemode",
+	codemap_placeholder: "codemode",
 	read_file: "read",
 	view_file: "read",
 	edit_file: "edit",
 	replace_in_file: "edit",
 	write_file: "write",
 	create_file: "write",
+	grep_search: "grep",
+	bashexec: "bash",
+	bash_run: "bash",
 	run_command: "bash",
 	run_shell: "bash",
 	shell: "bash",
@@ -2351,29 +2569,47 @@ export function repairHallucinatedToolName(
 	return undefined;
 }}
 
-function normalizeRepairedToolArgs(
+export function normalizeRepairedToolArgs(
 	targetName: string,
 	rawArgs: unknown,
-): Record<string, unknown> {{
+): {{ changed: boolean; args: Record<string, unknown> }} {{
 	const args: Record<string, unknown> =
 		rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
 			? {{ ...(rawArgs as Record<string, unknown>) }}
 			: {{}};
+	let changed = false;
 	if (targetName === "bash" && typeof args.command !== "string" && typeof args.cmd === "string") {{
 		args.command = args.cmd;
 		delete args.cmd;
-	}} else if (
-		(targetName === "read" || targetName === "edit" || targetName === "write") &&
-		typeof args.path !== "string" &&
-		typeof args.file_path === "string"
-	) {{
-		args.path = args.file_path;
-		delete args.file_path;
+		changed = true;
+	}} else if (targetName === "read" || targetName === "edit" || targetName === "write") {{
+		if (typeof args.path !== "string") {{
+			const altPath = typeof args.file_path === "string" ? args.file_path : typeof args.filePath === "string" ? args.filePath : undefined;
+			if (altPath !== undefined) {{
+				args.path = altPath;
+				delete args.file_path;
+				delete args.filePath;
+				changed = true;
+			}}
+		}}
+		if (targetName === "edit") {{
+			if (typeof args.oldText !== "string" && typeof args.old_string === "string") {{
+				args.oldText = args.old_string;
+				delete args.old_string;
+				changed = true;
+			}}
+			if (typeof args.newText !== "string" && typeof args.new_string === "string") {{
+				args.newText = args.new_string;
+				delete args.new_string;
+				changed = true;
+			}}
+		}}
 	}} else if (targetName === "codemode" && typeof args.code !== "string" && typeof args.script === "string") {{
 		args.code = args.script;
 		delete args.script;
+		changed = true;
 	}}
-	return args;
+	return {{ changed, args }};
 }}
 
 export interface DsmlRecoveredCall {{
@@ -2430,7 +2666,7 @@ export function extractDsmlToolCalls(
 			type: "toolCall",
 			id: `ap_dsml_${{Date.now()}}_${{seq}}`,
 			name: toolName,
-			arguments: toolName !== rawToolName ? normalizeRepairedToolArgs(toolName, args) : args,
+			arguments: toolName !== rawToolName ? normalizeRepairedToolArgs(toolName, args).args : args,
 		}});
 	}}
 	if (calls.length === 0) return undefined;
@@ -2471,7 +2707,7 @@ export function extractXmlJsonToolCalls(
 				rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
 					? (rawArgs as Record<string, unknown>)
 					: {{}};
-			const args = name !== rawName ? normalizeRepairedToolArgs(name, baseArgs) : baseArgs;
+			const args = name !== rawName ? normalizeRepairedToolArgs(name, baseArgs).args : baseArgs;
 			seq += 1;
 			calls.push({{
 				type: "toolCall",
@@ -2924,6 +3160,7 @@ export default function (pi: ExtensionAPI) {{
 	let pendingBatchNudge = false;
 	let largeReadTipShown = false;
 	let codemodeParallelTipsShown = 0;
+	let readOnlyBashStreak = 0;
 	let lastCodemodeParallelTipTurn = -CODEMODE_PARALLEL_COOLDOWN_TURNS;
 	let sessionTurnCount = 0;
 	let lastMaskTurn = -MASK_COOLDOWN_TURNS;
@@ -3680,7 +3917,7 @@ export default function (pi: ExtensionAPI) {{
 						return {{
 							...blk,
 							name: fixedName,
-							arguments: normalizeRepairedToolArgs(fixedName, blk.arguments),
+							arguments: normalizeRepairedToolArgs(fixedName, blk.arguments).args,
 						}};
 					}}
 				}}
@@ -4086,6 +4323,7 @@ export default function (pi: ExtensionAPI) {{
 			return undefined;
 		}}
 		if (event.toolName === "codemode" && event.input && typeof event.input === "object") {{
+			readOnlyBashStreak = 0;
 			const code = typeof event.input.code === "string" ? event.input.code : "";
 			const healedCode = healCodemodeSource(code);
 			if (healedCode && healedCode !== code) {{
@@ -4098,9 +4336,12 @@ export default function (pi: ExtensionAPI) {{
 		if (DESTRUCTIVE_OR_WRITE.test(cmd)) {{
 			unchangedReads.clear();
 		}}
-		const healed = healCommand(cmd, event.toolName);
-		if (healed && healed !== cmd) {{
-			event.input.command = healed;
+		const ephGuarded = event.toolName === "bash" ? guardEphemeralServerCommand(cmd) : undefined;
+		const cmdStage1 = ephGuarded ?? cmd;
+		const healed = healCommand(cmdStage1, event.toolName);
+		const finalCmd = healed ?? cmdStage1;
+		if (finalCmd !== cmd) {{
+			event.input.command = finalCmd;
 		}}
 		const safeTimeout = resolveSafeShellTimeout(
 			typeof event.input?.command === "string" ? event.input.command : cmd,
@@ -4246,6 +4487,13 @@ export default function (pi: ExtensionAPI) {{
 					largeReadTipShown = true;
 					textMutated = true;
 					mutated = true;
+				}} else {{
+					const docTip = classifyOversizedDocRead(p, outText.length);
+					if (docTip) {{
+						outText += `\n${{docTip}}`;
+						textMutated = true;
+						mutated = true;
+					}}
 				}}
 			}}
 		}}
@@ -4371,7 +4619,8 @@ export default function (pi: ExtensionAPI) {{
 			const skipSieve =
 				cmd.includes("ap.exe") ||
 				/\bap\s+(?:read|search|query|atlas|probe|guard|sieve|baton|splice|recall)\b/.test(cmd);
-			if (!skipSieve && shouldAutoSieveShellOutput(outText)) {{
+			const isFast = isDeepCacheDiscountModel((ctx as {{ model?: {{ id?: string; api?: string }} }} | undefined)?.model);
+			if (!skipSieve && shouldAutoSieveShellOutput(outText, isFast)) {{
 				const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-bash"], {{
 					input: outText,
 					encoding: "utf8",
@@ -4382,6 +4631,15 @@ export default function (pi: ExtensionAPI) {{
 				if (res.status === 0 && res.stdout && res.stdout.length > 40 && res.stdout.length < outText.length * 0.78) {{
 					outText = res.stdout;
 					sievedCount += 1;
+					mutated = true;
+				}}
+			}}
+
+			if (event.toolName === "bash") {{
+				const st = trackReadOnlyBashStreak(readOnlyBashStreak, cmd, DESTRUCTIVE_OR_WRITE.test(cmd));
+				readOnlyBashStreak = st.nextStreak;
+				if (st.shouldTip && (pi.getActiveTools?.() ?? []).includes("codemode")) {{
+					outText += `\n[ap batch-tip] ${{readOnlyBashStreak}} consecutive single bash probes; batch the next 3-5 checks in ONE codemode Promise.allSettled([tools.mcp__agent_primitives__ap_search(...), tools.read(...)]) script.`;
 					mutated = true;
 				}}
 			}}

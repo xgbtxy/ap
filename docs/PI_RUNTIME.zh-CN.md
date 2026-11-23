@@ -25,7 +25,7 @@ ap pi restore
 1. **`before_agent_start_entries`**：扩展 `emitBeforeAgentStart` 与 `AgentSession._prepareRun`，允许 `before_agent_start` 钩子返回 `entries?: SessionBoundaryDraft[]`，实现 0ms 原位清脑边界且保留完整日志与前缀缓存。
 2. **`windows_python_utf8`**：在 Windows 子进程环境中自动注入 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`、`LANG=C.UTF-8` 与 `LC_ALL=C.UTF-8`，根治 GBK 编解码崩溃。
 3. **`codemode_sleep_and_workers`**：向 QuickJS `codemode` 沙箱注入可中止的 `await sleep(ms)`（上限 30s），并将并发 worker 上限从 `2` 提升至 `4`。
-4. **`http_keepalive_and_transient_retry`**：加固 HTTP/TCP Keep-Alive（15s/28s/10s）、250ms Happy-Eyeballs 故障转移，及瞬时 TLS/Socket/网关断流的抖动指数退避重试。
+4. **`http_keepalive_and_transient_retry`**：加固 HTTP/TCP Keep-Alive（15s/28s/10s）、250ms Happy-Eyeballs 故障转移，及瞬时 TLS/DNS/Socket/网关断流（`ENOTFOUND`、`EAI_AGAIN`、`ENETUNREACH`、`EHOSTUNREACH`、`fetch failed`、`socket hang up`）的抖动指数退避重试。
 5. **`virtual_model_cache_warmer`**：让虚拟模型（`api === "pi-virtual"`，如 `deepseek/flash-auto`）正确匹配物理会话的 `CacheWarmer` 保温。
 6. **`codemode_web_builtins`**：向 QuickJS `codemode` 沙箱注入 `setTimeout`/`clearTimeout`/`atob`/`btoa`/`TextEncoder`/`TextDecoder`/`Buffer`，且避免包装器遮蔽全局 prelude。
 7. **`sequential_shell_tool_barrier`**：将 `bash`/`powershell` 作为串行屏障执行，同时保持相邻只读 `read`/搜索调用并行，消除 `bash`+`read` 竞态 `ENOENT`。

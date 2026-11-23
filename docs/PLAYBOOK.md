@@ -1,4 +1,4 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.41)
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.42)
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 

@@ -77,7 +77,7 @@ fn heal_re() -> &'static HealRegexes {
         )
         .unwrap(),
         slow_grep: Regex::new(
-            r#"^\s*grep\s+(-[rR][lnwiEH]*)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$"#,
+            r#"^\s*grep\s+(-[rR][A-Za-z]*)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$"#,
         )
         .unwrap(),
         py_win_backslash: Regex::new(r#"(?i)\b(?:python3?|py)\s+-c\s+.*['"][A-Za-z]:\\"#).unwrap(),
@@ -118,13 +118,71 @@ pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|| "ap".to_string());
     let pat_esc = pat.replace('"', "\\\"");
+    let mut args_out = String::new();
     if flags.contains('l') {
-        Some(format!(
-            "\"{ap_bin}\" search --files-only \"{pat_esc}\" \"{target}\""
-        ))
-    } else {
-        Some(format!("\"{ap_bin}\" search \"{pat_esc}\" \"{target}\""))
+        args_out.push_str(" --files-only");
+    } else if flags.contains('c') {
+        args_out.push_str(" --count");
     }
+    if flags.contains('o') {
+        args_out.push_str(" --only-matching");
+    }
+    if flags.contains('h') {
+        args_out.push_str(" --no-filename");
+    }
+    if flags.contains('i') {
+        args_out.push_str(" --ignore-case");
+    }
+    if flags.contains('F') {
+        args_out.push_str(" --fixed-strings");
+    }
+    Some(format!(
+        "\"{ap_bin}\" search{args_out} \"{pat_esc}\" \"{target}\""
+    ))
+}
+
+/// Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` (which fails in Git Bash with `dir: cannot access '/b'`)
+/// cleanly to bounded `ap ls` with optional depth for `/s`.
+pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
+    if raw.contains('|') || raw.contains(';') || raw.contains("&&") || raw.contains('>') {
+        return None;
+    }
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower == "dir /b"
+        || lower.starts_with("dir /b ")
+        || lower == "dir /s /b"
+        || lower.starts_with("dir /s /b ")
+        || lower == "dir /b /s"
+        || lower.starts_with("dir /b /s "))
+    {
+        return None;
+    }
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut recursive = false;
+    let mut target: Option<&str> = None;
+    for tok in toks.into_iter().skip(1) {
+        if tok.eq_ignore_ascii_case("/s") {
+            recursive = true;
+        } else if tok.starts_with('/') && tok.len() <= 4 {
+            continue;
+        } else {
+            target = Some(tok.trim_matches('"').trim_matches('\''));
+        }
+    }
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+    let depth_flag = if recursive { " --depth 3" } else { "" };
+    let tgt_arg = target.unwrap_or(".");
+    Some(format!("\"{ap_bin}\" ls \"{tgt_arg}\"{depth_flag}"))
 }
 
 /// Retry bare `rg <pattern>` commands that exited 2 with `rg: regex parse error` as literal `rg -F <pattern>`.
@@ -256,6 +314,18 @@ pub fn heal_windows_command(
                 ShellKind::PowerShell5
             },
             format!("& {fast_search}"),
+            heals,
+        );
+    }
+    if let Some(fast_ls) = try_heal_windows_dir_cmd(raw) {
+        heals.push("dir-/b->ap-ls");
+        return (
+            if has_pwsh7 {
+                ShellKind::Pwsh7
+            } else {
+                ShellKind::PowerShell5
+            },
+            format!("& {fast_ls}"),
             heals,
         );
     }
@@ -862,6 +932,15 @@ mod tests {
         let (_, h7, tags7) = heal_windows_command("grep -rl 'authToken' src", true, true);
         assert!(h7.contains("search --files-only \"authToken\" \"src\""));
         assert!(tags7.contains(&"slow-grep->ap-search"));
+
+        // `grep -rhoE` forwards `--only-matching --no-filename`, and `dir /s /b` routes to `ap ls`
+        let (_, h8, tags8) = heal_windows_command("grep -rhoE 'api/[a-z]+' src", true, true);
+        assert!(h8.contains("--only-matching") && h8.contains("--no-filename"));
+        assert!(tags8.contains(&"slow-grep->ap-search"));
+
+        let (_, h9, tags9) = heal_windows_command("dir /s /b src", true, true);
+        assert!(h9.contains("ls \"src\" --depth 3"));
+        assert!(tags9.contains(&"dir-/b->ap-ls"));
 
         // `try_build_rg_fixed_retry` inserts `-F` cleanly on bare `rg` commands only
         assert_eq!(

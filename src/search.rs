@@ -93,6 +93,18 @@ struct SearchCli {
     /// Only list unique matching file paths (like `rg -l`)
     #[arg(short = 'l', long)]
     files_only: bool,
+    /// Emit ONLY the matched substring(s) from each line (like `grep -o` / `rg -o`)
+    #[arg(short = 'o', long = "only-matching")]
+    only_matching: bool,
+    /// Deduplicate matching snippets/tokens and sort by frequency descending
+    #[arg(short = 'u', long)]
+    unique: bool,
+    /// Omit file paths and scopes in text output (like `grep -h` / `rg --no-filename`)
+    #[arg(long = "no-filename", alias = "no-path")]
+    no_filename: bool,
+    /// Accepted for `grep -E` muscle-memory compatibility (regex is enabled by default)
+    #[arg(short = 'E', long = "extended-regexp")]
+    _extended_regexp: bool,
     /// Emit per-file match counts (like `rg -c`)
     #[arg(short = 'c', long)]
     count: bool,
@@ -120,6 +132,7 @@ struct SearchOpts {
     max_hits: usize,
     code_only: bool,
     no_tests: bool,
+    only_matching: bool,
 }
 
 fn is_non_code_ext(ext: &str) -> bool {
@@ -325,7 +338,9 @@ fn push_text_matches(
                     )
                 })
                 .unwrap_or_default();
-            let snip = if opts.block {
+            let snip = if opts.only_matching {
+                m.as_str().trim().chars().take(300).collect()
+            } else if opts.block {
                 if let Some(sp) = enc {
                     let s = sp.start_line.saturating_sub(1);
                     let e = sp.end_line.min(all_lines.len()).min(s + 30);
@@ -355,7 +370,39 @@ fn push_text_matches(
         let ln_clean = ln.strip_suffix('\r').unwrap_or(ln);
         let ln_no = idx + 1;
         if re.is_match(ln_clean) {
-            if ln_clean.len() > 300 {
+            if opts.only_matching {
+                let enc = ast_spans
+                    .iter()
+                    .filter(|sp| sp.start_line <= ln_no && ln_no <= sp.end_line)
+                    .min_by_key(|sp| sp.end_line.saturating_sub(sp.start_line));
+                let scope = enc
+                    .map(|sp| {
+                        format!(
+                            "{} {} L{}-L{}",
+                            sp.kind, sp.qual, sp.start_line, sp.end_line
+                        )
+                    })
+                    .unwrap_or_default();
+                for m in re.find_iter(ln_clean) {
+                    if !allow_span(line_byte_start + m.start(), line_byte_start + m.end()) {
+                        continue;
+                    }
+                    let tok = m.as_str().trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    matches.push(SearchMatch {
+                        pattern: pat_label.to_string(),
+                        file: rel.to_string(),
+                        line: ln_no,
+                        scope: scope.clone(),
+                        snippet: tok.chars().take(300).collect(),
+                    });
+                    if matches.len() >= opts.max_hits {
+                        return;
+                    }
+                }
+            } else if ln_clean.len() > 300 {
                 // Minified / giant single-line bundle: emit every match as a byte-window slice!
                 for m in re.find_iter(ln_clean) {
                     if !allow_span(line_byte_start + m.start(), line_byte_start + m.end()) {
@@ -542,13 +589,14 @@ pub fn run_cli(args: &[String]) -> i32 {
         multiline: cli.multiline,
         block: cli.block,
         context: cli.context,
-        max_hits: if cli.count || cli.files_only {
+        max_hits: if cli.count || cli.files_only || cli.unique {
             cli.max_hits.max(500)
         } else {
             cli.max_hits
         },
         code_only: cli.code_only,
         no_tests: cli.no_tests,
+        only_matching: cli.only_matching,
     };
 
     let norm_root_str = crate::ls::normalize_cli_path(&cli.path);
@@ -1051,7 +1099,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             .then_with(|| a.line.cmp(&b.line))
             .then_with(|| a.pattern.cmp(&b.pattern))
     });
-    if !cli.count && !cli.files_only && matches.len() > cli.max_hits {
+    if !cli.count && !cli.files_only && !cli.unique && matches.len() > cli.max_hits {
         matches.truncate(cli.max_hits);
     }
 
@@ -1059,6 +1107,19 @@ pub fn run_cli(args: &[String]) -> i32 {
     let mut per_file_counts: BTreeMap<String, usize> = BTreeMap::new();
     for m in &matches {
         *per_file_counts.entry(m.file.clone()).or_insert(0) += 1;
+    }
+
+    let mut unique_entries: Vec<(String, usize)> = Vec::new();
+    if cli.unique {
+        let mut freq: BTreeMap<String, usize> = BTreeMap::new();
+        for m in &matches {
+            *freq.entry(m.snippet.clone()).or_insert(0) += 1;
+        }
+        unique_entries = freq.into_iter().collect();
+        unique_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if unique_entries.len() > cli.max_hits {
+            unique_entries.truncate(cli.max_hits);
+        }
     }
 
     let rendered = if cli.files_only {
@@ -1080,12 +1141,30 @@ pub fn run_cli(args: &[String]) -> i32 {
             out_lines.push(format!("- `{f}`: {c}"));
         }
         out_lines.join("\n")
+    } else if cli.unique {
+        let mut out_lines = vec![format!(
+            "# SEARCH UNIQUE `{combined_label}` ({} unique from {} hit(s) across {scanned_files} files in {elapsed_ms}ms){filter_tag}",
+            unique_entries.len(),
+            matches.len()
+        )];
+        for (txt, cnt) in &unique_entries {
+            if cli.no_filename {
+                out_lines.push(txt.clone());
+            } else {
+                out_lines.push(format!("- [{cnt}x] `{txt}`"));
+            }
+        }
+        out_lines.join("\n")
     } else {
         let mut out_lines = vec![format!(
             "# SEARCH `{combined_label}` ({} hit(s) across {scanned_files} files in {elapsed_ms}ms){filter_tag}",
             matches.len()
         )];
         for m in &matches {
+            if cli.no_filename {
+                out_lines.push(m.snippet.clone());
+                continue;
+            }
             let ptag = if m.pattern.is_empty() {
                 String::new()
             } else {
@@ -1146,6 +1225,24 @@ pub fn run_cli(args: &[String]) -> i32 {
                     "filtered_tests": filtered_tests,
                     "total_matches": matches.len(),
                     "counts": per_file_counts,
+                }))
+                .unwrap_or_default()
+            );
+        } else if cli.unique {
+            let ujson: Vec<serde_json::Value> = unique_entries
+                .iter()
+                .map(|(txt, cnt)| json!({"text": txt, "count": cnt}))
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "elapsed_ms": elapsed_ms,
+                    "scanned_files": scanned_files,
+                    "filtered_non_code": filtered_non_code,
+                    "filtered_tests": filtered_tests,
+                    "total_matches": matches.len(),
+                    "unique_matches": ujson,
                 }))
                 .unwrap_or_default()
             );

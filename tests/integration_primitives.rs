@@ -6881,3 +6881,173 @@ fn test_v241_ls_aliases_read_section_search_ergonomics_and_exec_rg_heal() {
     assert_eq!(r2["ok"], true);
     assert_eq!(r2["matches"].as_array().unwrap().len(), 2, "{r2}");
 }
+
+#[test]
+fn test_v242_search_only_matching_unique_exec_dir_heal_and_pi_accelerator() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let home = root.join("home");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(home.join(".pi").join("agent")).unwrap();
+
+    fs::write(
+        root.join("src/routes.min.js"),
+        "const a='/api/v1/users',b='/api/v1/orders',c='/api/v1/users';export const x=['/api/v1/users','/api/v1/billing'];\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/extra.ts"),
+        "fetch('/api/v1/billing'); fetch('/api/v1/audit');\n",
+    )
+    .unwrap();
+
+    // 1. `ap search -o -u --no-filename --json`: extracts multiple matches per minified line & ranks unique tokens
+    let sr = run_ap(
+        root,
+        &[
+            "search",
+            "-o",
+            "-u",
+            "--no-filename",
+            "/api/v1/[a-z]+",
+            "src",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        sr.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sr.stderr)
+    );
+    let sj: Value = serde_json::from_slice(&sr.stdout).unwrap();
+    assert_eq!(sj["ok"], true);
+    assert_eq!(sj["total_matches"], 7, "{sj}");
+    let uq = sj["unique_matches"].as_array().unwrap();
+    assert_eq!(uq[0]["text"], "/api/v1/users", "{sj}");
+    assert_eq!(uq[0]["count"], 3, "{sj}");
+    assert_eq!(uq[1]["text"], "/api/v1/billing", "{sj}");
+    assert_eq!(uq[1]["count"], 2, "{sj}");
+
+    let sr_txt = run_ap(
+        root,
+        &[
+            "search",
+            "-o",
+            "--no-filename",
+            "/api/v1/[a-z]+",
+            "src/extra.ts",
+        ],
+        None,
+        &[],
+    );
+    assert!(sr_txt.status.success());
+    let txt_out = String::from_utf8_lossy(&sr_txt.stdout);
+    assert!(
+        txt_out.contains("/api/v1/billing") && txt_out.contains("/api/v1/audit"),
+        "{txt_out}"
+    );
+    assert!(!txt_out.contains("extra.ts:"), "{txt_out}");
+
+    // 2. MCP `ap_search` exposes `only_matching` and `unique`
+    let mut mcp_cmd = std::process::Command::new(ap_bin());
+    mcp_cmd
+        .args(["mcp", "--profile", "deferred"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = mcp_cmd.spawn().unwrap();
+    let rpc_in = format!(
+        "{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_call",
+                "arguments": {
+                    "tool": "ap_search",
+                    "arguments": {
+                        "pattern": "/api/v1/[a-z]+",
+                        "path": "src",
+                        "only_matching": true,
+                        "unique": true,
+                        "json": true
+                    }
+                }
+            }
+        })
+    );
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(rpc_in.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let mcp_out = child.wait_with_output().unwrap();
+    assert!(mcp_out.status.success());
+    let resp: Value = serde_json::from_slice(&mcp_out.stdout).unwrap();
+    let sc = &resp["result"]["structuredContent"];
+    assert_eq!(sc["ok"], true);
+    assert_eq!(sc["unique_matches"][0]["text"], "/api/v1/users");
+
+    // 3. `ap exec -c "grep -rhoE ..."` auto-accelerates with `--only-matching --no-filename`
+    let ex = run_ap(
+        root,
+        &["exec", "-c", "grep -rhoE '/api/v1/[a-z]+' src"],
+        None,
+        &[],
+    );
+    assert!(
+        ex.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ex.stderr)
+    );
+    let ex_out = String::from_utf8_lossy(&ex.stdout);
+    assert!(
+        ex_out.contains("/api/v1/orders") && ex_out.contains("/api/v1/audit"),
+        "{ex_out}"
+    );
+
+    // 4. `zz-ap-accelerator.ts` contains v2.42 exports & generic rewrites
+    let home_s = home.to_string_lossy().to_string();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let acc_src =
+        fs::read_to_string(home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    for needle in [
+        "export function guardEphemeralServerCommand",
+        "export function classifyOversizedDocRead",
+        "export function trackReadOnlyBashStreak",
+        "export function normalizeRepairedToolArgs",
+        "codemodode",
+        "grep_search",
+        "VOID output printer",
+        "hardLimit = isFastModel ? 12000 : SIEVE_HARD_CHARS",
+    ] {
+        assert!(
+            acc_src.contains(needle),
+            "Missing v2.42 accelerator symbol: {needle}"
+        );
+    }
+}
