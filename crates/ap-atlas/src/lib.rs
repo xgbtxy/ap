@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use ignore::WalkBuilder;
 pub mod changes;
+pub mod deps;
 pub mod history;
 pub mod impact;
 pub mod locate;
@@ -218,6 +219,17 @@ enum SubCmd {
         lines: String,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cross-file module dependency, reverse importer blast radius & circular-import detector (<40ms)
+    Deps {
+        /// File path or '.' for workspace cycle detection
+        target: String,
+        #[arg(default_value = ".")]
+        root: String,
+        #[arg(short = 'd', long, default_value_t = 2)]
+        depth: usize,
         #[arg(long)]
         json: bool,
     },
@@ -1538,6 +1550,25 @@ pub fn run_cli(args: &[String]) -> i32 {
                 println!("{}", history::render_history_md(&rep));
             }
             return if file_p.exists() { 0 } else { 1 };
+        }
+        Some(SubCmd::Deps {
+            target,
+            root,
+            depth,
+            json,
+        }) => {
+            let root_p = PathBuf::from(&root);
+            if !root_p.exists() {
+                eprintln!("[atlas] path not found: {root}");
+                return 1;
+            }
+            let rep = deps::analyze_module_deps(&root_p, &target, depth, SKIP_DIRS);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+            } else {
+                println!("{}", deps::render_deps_md(&rep));
+            }
+            return 0;
         }
         Some(SubCmd::Surface {
             root,

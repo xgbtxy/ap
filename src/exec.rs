@@ -499,6 +499,160 @@ pub fn try_accelerate_select_string(raw: &str) -> Option<String> {
     ))
 }
 
+fn has_unsafe_shell_meta(body: &str) -> bool {
+    body.contains('|')
+        || body.contains(';')
+        || body.contains("&&")
+        || body.contains('>')
+        || body.contains('<')
+        || body.contains('{')
+        || body.contains('}')
+        || body.contains("$(")
+        || body.contains('`')
+}
+
+/// Rewrite bare PowerShell `Get-Content` / `gc` calls cleanly to UTF-8-safe `ap read`
+/// (with optional `--limit` for `-Head`/`-TotalCount`/`-First`), while safely passing through pipes,
+/// globs, `-Tail`, `-Wait`, or complex switches.
+pub fn try_accelerate_get_content(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if has_unsafe_shell_meta(body) {
+        return None;
+    }
+    let toks = split_ps_args(body.trim())?;
+    let head = toks.first()?.to_ascii_lowercase();
+    if head != "get-content" && head != "gc" {
+        return None;
+    }
+    let mut path: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    let mut i = 1usize;
+    while i < toks.len() {
+        let tok = &toks[i];
+        let low = tok.to_ascii_lowercase();
+        if low == "-path" || low == "-literalpath" {
+            let val = toks.get(i + 1)?;
+            if val.contains(',') || val.contains('*') || val.contains('?') {
+                return None;
+            }
+            path = Some(val.clone());
+            i += 2;
+        } else if low == "-totalcount" || low == "-head" || low == "-first" {
+            let n: usize = toks.get(i + 1)?.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            limit = Some(n);
+            i += 2;
+        } else if low == "-raw" {
+            i += 1;
+        } else if low == "-encoding" {
+            let enc = toks.get(i + 1)?.to_ascii_lowercase();
+            if enc != "utf8" && enc != "utf8nobom" {
+                return None;
+            }
+            i += 2;
+        } else if tok.starts_with('-') {
+            return None;
+        } else if path.is_none() {
+            if tok.contains(',') || tok.contains('*') || tok.contains('?') {
+                return None;
+            }
+            path = Some(tok.clone());
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    let tgt = path?;
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+    let limit_flag = limit.map(|n| format!(" --limit {n}")).unwrap_or_default();
+    let tgt_esc = tgt.replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" read \"{tgt_esc}\"{limit_flag}",
+        cd_pfx.unwrap_or("")
+    ))
+}
+
+/// Rewrite bare PowerShell `Get-ChildItem` / `gci` calls cleanly to bounded `ap ls`
+/// (with `--depth`), while safely passing through pipes, `-Filter`/`-Include`, or globs.
+pub fn try_accelerate_get_child_item(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if has_unsafe_shell_meta(body) {
+        return None;
+    }
+    let toks = split_ps_args(body.trim())?;
+    let head = toks.first()?.to_ascii_lowercase();
+    if head != "get-childitem" && head != "gci" {
+        return None;
+    }
+    let mut path: Option<String> = None;
+    let mut recurse = false;
+    let mut depth: Option<usize> = None;
+    let mut i = 1usize;
+    while i < toks.len() {
+        let tok = &toks[i];
+        let low = tok.to_ascii_lowercase();
+        if low == "-path" || low == "-literalpath" {
+            let val = toks.get(i + 1)?;
+            if val.contains(',') || val.contains('*') || val.contains('?') {
+                return None;
+            }
+            path = Some(val.clone());
+            i += 2;
+        } else if low == "-recurse" {
+            recurse = true;
+            i += 1;
+        } else if low == "-name" {
+            i += 1;
+        } else if low == "-depth" {
+            let d: usize = toks.get(i + 1)?.parse().ok()?;
+            depth = Some(d.max(1));
+            i += 2;
+        } else if tok.starts_with('-') {
+            return None;
+        } else if path.is_none() {
+            if tok.contains(',') || tok.contains('*') || tok.contains('?') {
+                return None;
+            }
+            path = Some(tok.clone());
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    let tgt = path.unwrap_or_else(|| ".".to_string());
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+    let depth_flag = match depth {
+        Some(d) => format!(" --depth {d}"),
+        None if recurse => " --depth 3".to_string(),
+        None => String::new(),
+    };
+    let tgt_esc = tgt.replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" ls \"{tgt_esc}\"{depth_flag}",
+        cd_pfx.unwrap_or("")
+    ))
+}
+
 /// Retry bare `rg <pattern>` commands (including after leading `cd <dir> &&`) that exited 2 with `rg: regex parse error` as literal `rg -F <pattern>`.
 pub fn try_build_rg_fixed_retry(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
@@ -786,6 +940,16 @@ pub fn heal_windows_command(
     if let Some(fast_sls) = try_accelerate_select_string(raw) {
         heals.push("select-string->ap-search");
         let (kind, cmd_out) = route_accelerated_cmd(fast_sls, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_gc) = try_accelerate_get_content(raw) {
+        heals.push("get-content->ap-read");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_gc, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_gci) = try_accelerate_get_child_item(raw) {
+        heals.push("get-childitem->ap-ls");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_gci, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -1556,5 +1720,27 @@ mod tests {
             "Select-String -Pattern foo -Path app.py | Select-Object Line"
         )
         .is_none());
+
+        // `Get-Content` / `gc` and `Get-ChildItem` / `gci` PowerShell accelerators (safe passthrough when piped/tail/filtered)
+        let (_, h17, tags17) =
+            heal_windows_command("Get-Content src/app.py -TotalCount 40", true, true);
+        assert!(h17.contains("read \"src/app.py\" --limit 40"), "{h17}");
+        assert!(tags17.contains(&"get-content->ap-read"));
+
+        let (k18, h18, tags18) = heal_windows_command("cd sub && gc -Raw README.md", true, true);
+        assert_eq!(k18, ShellKind::GitBash);
+        assert!(
+            h18.starts_with("cd sub && ") && h18.contains("read \"README.md\""),
+            "{h18}"
+        );
+        assert!(tags18.contains(&"get-content->ap-read"));
+
+        let (_, h19, tags19) =
+            heal_windows_command("Get-ChildItem src -Recurse -Depth 2", true, true);
+        assert!(h19.contains("ls \"src\" --depth 2"), "{h19}");
+        assert!(tags19.contains(&"get-childitem->ap-ls"));
+
+        assert!(try_accelerate_get_content("Get-Content -Tail 20 app.log").is_none());
+        assert!(try_accelerate_get_child_item("Get-ChildItem -Filter *.rs src").is_none());
     }
 }

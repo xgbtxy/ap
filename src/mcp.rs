@@ -111,11 +111,17 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "ap_undo",
-            "description": "Safety net for non-Git folders (Desktop, Documents, notes, configs): atomically restores files modified by the most recent `ap_edit` checkpoint, or lists checkpoints.",
+            "description": "Named checkpoints, diff-before-restore, and atomic file restore (works inside or outside Git). Supports `action`: `'restore'` (default), `'list'`, `'save'` (`label` + optional `files`/`cwd`), or `'diff'` (`id` or `label`), plus `keep` to preserve checkpoints.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "list": { "type": "boolean", "description": "If true, list available checkpoints without restoring" }
+                    "action": { "type": "string", "description": "Action: 'restore' (default), 'list', 'save', or 'diff'" },
+                    "list": { "type": "boolean", "description": "Legacy alias for action='list'" },
+                    "label": { "type": "string", "description": "Checkpoint label when saving (`action='save'`)" },
+                    "id": { "type": "string", "description": "Checkpoint ID prefix or exact label for `diff` / `restore`" },
+                    "cwd": { "type": "string", "description": "Workspace directory for `save` (default: '.')" },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Files to include when `action='save'` (defaults to git dirty files in `cwd`)" },
+                    "keep": { "type": "boolean", "description": "Keep checkpoint instead of deleting it after `restore`" }
                 }
             }
         },
@@ -131,14 +137,16 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "ap_impact",
-            "description": "Call BEFORE changing any shared function, class, struct, interface, or route across multiple files. Maps exact Tree-sitter AST definitions, downstream callers/references (ignoring comments & strings), and related test files in <15ms so you never ship a partial refactor.",
+            "description": "Call BEFORE changing any shared function, class, struct, interface, route, or file across modules. Maps exact Tree-sitter AST callers (`symbol`) OR cross-file outbound imports, multi-hop inbound importers, exported symbols & dependency cycles (`file`) in <25ms.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Workspace root directory (default: '.')" },
-                    "symbol": { "type": "string", "description": "Symbol name or comma-separated symbols (e.g. 'computeTotal,OrderItem')" }
+                    "symbol": { "type": "string", "description": "Symbol name or comma-separated symbols (e.g. 'computeTotal,OrderItem')" },
+                    "file": { "type": "string", "description": "File path (or '.') to inspect cross-file module dependency graph, reverse blast radius & circular imports" },
+                    "depth": { "type": "integer", "description": "Traversal hops 1..5 when `file` is given (default: 2)" }
                 },
-                "required": ["symbol"]
+                "required": []
             }
         },
         {
@@ -1550,9 +1558,72 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             run_self_captured(&cli, None)
         }
         "ap_undo" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
             let mut cli = vec!["undo".to_string()];
-            if args.get("list").and_then(Value::as_bool).unwrap_or(false) {
+            if action == "list" || args.get("list").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--list".to_string());
+                cli.push("--json".to_string());
+            } else if action == "save" {
+                let lbl = args
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if lbl.is_empty() {
+                    return (
+                        false,
+                        "Pass non-empty `label` for `ap_undo(action='save')`.".to_string(),
+                    );
+                }
+                cli.push("--save".to_string());
+                cli.push(lbl.to_string());
+                if let Some(cwd) = args.get("cwd").and_then(Value::as_str) {
+                    if !cwd.trim().is_empty() {
+                        cli.push("--cwd".to_string());
+                        cli.push(cwd.to_string());
+                    }
+                }
+                cli.push("--json".to_string());
+                if let Some(arr) = args.get("files").and_then(Value::as_array) {
+                    for f in arr {
+                        if let Some(s) = f.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                            cli.push(s.to_string());
+                        }
+                    }
+                }
+            } else if action == "diff" {
+                cli.push("--diff".to_string());
+                if let Some(id_s) = args
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| args.get("label").and_then(Value::as_str))
+                {
+                    if !id_s.trim().is_empty() {
+                        cli.push("--id".to_string());
+                        cli.push(id_s.trim().to_string());
+                    }
+                }
+                cli.push("--json".to_string());
+            } else {
+                if let Some(id_s) = args
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| args.get("label").and_then(Value::as_str))
+                {
+                    if !id_s.trim().is_empty() {
+                        cli.push("--id".to_string());
+                        cli.push(id_s.trim().to_string());
+                    }
+                }
+                if args.get("keep").and_then(Value::as_bool).unwrap_or(false) {
+                    cli.push("--keep".to_string());
+                }
+                cli.push("--json".to_string());
             }
             run_self_captured(&cli, None)
         }
@@ -1696,17 +1767,41 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
         }
         "ap_impact" => {
             let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let root_p = std::path::Path::new(root);
+            if !root_p.exists() {
+                return (false, format!("[atlas] path not found: {root}"));
+            }
+            let file_arg = args
+                .get("file")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !file_arg.is_empty() {
+                let depth = args
+                    .get("depth")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+                    .unwrap_or(2);
+                let rep = ap_atlas::deps::analyze_module_deps(
+                    root_p,
+                    file_arg,
+                    depth,
+                    ap_atlas::SKIP_DIRS,
+                );
+                let out = ap_atlas::deps::render_deps_md(&rep);
+                crate::stats::record_event("impact", 0, out.len() as u64, 0, 1, "mcp-deps");
+                return (true, out);
+            }
             let sym = args
                 .get("symbol")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim();
             if sym.is_empty() {
-                return (false, "Pass non-empty `symbol` to `ap_impact`.".to_string());
-            }
-            let root_p = std::path::Path::new(root);
-            if !root_p.exists() {
-                return (false, format!("[atlas] path not found: {root}"));
+                return (
+                    false,
+                    "Pass non-empty `symbol` or `file` to `ap_impact`.".to_string(),
+                );
             }
             let rep = ap_atlas::impact::analyze_symbol_impact(
                 root_p,

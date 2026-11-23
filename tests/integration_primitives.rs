@@ -8469,3 +8469,151 @@ export function poll() {
         );
     }
 }
+
+#[test]
+fn test_v252_module_deps_graph_named_checkpoints_and_ps_accel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 1. Multi-hop TS dependency graph (`ap atlas deps`) + cycle detection
+    fs::write(
+        root.join("src/core.ts"),
+        "import { boot } from './entry';\nexport function baseVal() { return 10 + (boot ? 0 : 1); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/svc.ts"),
+        "import { baseVal } from './core';\nexport function runSvc() { return baseVal(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/entry.ts"),
+        "import { runSvc } from './svc';\nexport function boot() { return runSvc(); }\n",
+    )
+    .unwrap();
+
+    let root_s = root.to_string_lossy().to_string();
+    let deps_out = run_ap(
+        root,
+        &[
+            "atlas",
+            "deps",
+            "src/core.ts",
+            &root_s,
+            "--depth",
+            "2",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        deps_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deps_out.stderr)
+    );
+    let dv: Value = serde_json::from_slice(&deps_out.stdout).unwrap();
+    assert!(dv["exported_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s == "baseVal"));
+    assert!(dv["outbound_imports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|h| h["file"] == "src/entry.ts" && h["depth"] == 1));
+    assert!(dv["inbound_importers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|h| h["file"] == "src/svc.ts" && h["depth"] == 1));
+    assert!(dv["inbound_importers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|h| h["file"] == "src/entry.ts" && h["depth"] == 2));
+    assert!(!dv["cycles"].as_array().unwrap().is_empty(), "{dv}");
+
+    // 2. Named checkpoints (`ap undo --save`, `--diff`, `--id`, `--keep`) via isolated AP_HOME + MCP 37 tools
+    let ap_home = root.join("ap_home");
+    let ap_envs = [("AP_HOME", ap_home.as_path())];
+    let save_out = run_ap(
+        root,
+        &[
+            "undo",
+            "--save",
+            "pre-exp",
+            "--cwd",
+            &root_s,
+            "src/core.ts",
+            "--json",
+        ],
+        None,
+        &ap_envs,
+    );
+    assert!(save_out.status.success());
+    let save_v: Value = serde_json::from_slice(&save_out.stdout).unwrap();
+    assert_eq!(save_v["ok"], true);
+    assert_eq!(save_v["label"], "pre-exp");
+
+    let orig_core = fs::read_to_string(root.join("src/core.ts")).unwrap();
+    fs::write(
+        root.join("src/core.ts"),
+        "export function mutated() { return 0; }\n",
+    )
+    .unwrap();
+
+    let diff_out = run_ap(
+        root,
+        &["undo", "--diff", "--id", "pre-exp", "--json"],
+        None,
+        &ap_envs,
+    );
+    assert!(diff_out.status.success());
+    let diff_v: Value = serde_json::from_slice(&diff_out.stdout).unwrap();
+    assert_eq!(diff_v["changed_files"], 1);
+    assert_eq!(diff_v["files"][0]["status"], "modified");
+
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_impact",
+            "arguments": { "path": root_s, "file": "src/core.ts", "depth": 2 }
+        }}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "ap_undo",
+            "arguments": { "action": "restore", "id": "pre-exp", "keep": true }
+        }}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "ap_undo",
+            "arguments": { "action": "list" }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &ap_envs);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    assert_eq!(resps[2]["result"]["isError"], false, "{}", resps[2]);
+    let imp_txt = resps[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(imp_txt.contains("MODULE DEPENDENCY GRAPH") && imp_txt.contains("src/svc.ts"));
+    assert_eq!(resps[3]["result"]["isError"], false, "{}", resps[3]);
+    assert_eq!(
+        fs::read_to_string(root.join("src/core.ts")).unwrap(),
+        orig_core
+    );
+    let list_txt = resps[4]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(list_txt.contains("pre-exp"), "{list_txt}");
+}
