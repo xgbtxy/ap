@@ -243,6 +243,25 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
     Ok(ops)
 }
 
+fn extract_unified_hunk_hint(hdr: &str) -> Option<String> {
+    let body = hdr.strip_prefix("@@ ")?;
+    let end = body.find("@@")?;
+    let range_part = body[..end].trim();
+    let old_tok = range_part
+        .split_whitespace()
+        .find(|t| t.starts_with('-'))?
+        .trim_start_matches('-');
+    let (s_str, c_str) = old_tok.split_once(',').unwrap_or((old_tok, "1"));
+    let start = s_str.parse::<usize>().ok()?;
+    let count = c_str.parse::<usize>().unwrap_or(1).max(1);
+    if start == 0 {
+        return None;
+    }
+    let lo = start.saturating_sub(8).max(1);
+    let hi = start + count + 12;
+    Some(format!("{lo}-{hi}"))
+}
+
 fn parse_unified_diff(raw_diff: &str) -> Result<Vec<EditOp>, String> {
     let norm = raw_diff.replace("\r\n", "\n");
     let lines: Vec<&str> = norm.split('\n').collect();
@@ -269,6 +288,7 @@ fn parse_unified_diff(raw_diff: &str) -> Result<Vec<EditOp>, String> {
             continue;
         }
         if ln.starts_with("@@ ") && ln[3..].contains("@@") && !cur_path.is_empty() {
+            let hunk_hint = extract_unified_hunk_hint(ln);
             i += 1;
             let mut old_buf = Vec::new();
             let mut new_buf = Vec::new();
@@ -320,7 +340,7 @@ fn parse_unified_diff(raw_diff: &str) -> Result<Vec<EditOp>, String> {
                     content: None,
                     symbol: String::new(),
                     all: false,
-                    line_hint: None,
+                    line_hint: hunk_hint,
                 });
             }
             continue;
@@ -334,8 +354,130 @@ fn parse_unified_diff(raw_diff: &str) -> Result<Vec<EditOp>, String> {
     }
 }
 
+fn parse_codex_patch(raw: &str) -> Result<Vec<EditOp>, String> {
+    let norm = raw.replace("\r\n", "\n");
+    let lines: Vec<&str> = norm.split('\n').collect();
+    let mut ops = Vec::new();
+    let mut i = 0usize;
+    let n = lines.len();
+
+    while i < n {
+        let trimmed = lines[i].trim();
+        if trimmed == "*** Begin Patch" || trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        if trimmed == "*** End Patch" {
+            break;
+        }
+        if let Some(path_raw) = trimmed.strip_prefix("*** Add File:") {
+            let path = path_raw.trim().to_string();
+            i += 1;
+            let mut add_lines = Vec::new();
+            while i < n {
+                let l = lines[i];
+                let lt = l.trim();
+                if lt.starts_with("*** ") {
+                    break;
+                }
+                if let Some(rest) = l.strip_prefix('+') {
+                    add_lines.push(rest);
+                } else if !l.is_empty() {
+                    add_lines.push(l);
+                }
+                i += 1;
+            }
+            let content = if add_lines.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", add_lines.join("\n"))
+            };
+            ops.push(EditOp {
+                path,
+                op: "write".to_string(),
+                old: String::new(),
+                new: String::new(),
+                content: Some(content),
+                symbol: String::new(),
+                all: false,
+                line_hint: None,
+            });
+            continue;
+        }
+        if let Some(path_raw) = trimmed.strip_prefix("*** Update File:") {
+            let path = path_raw.trim().to_string();
+            i += 1;
+            while i < n {
+                let lt = lines[i].trim();
+                if lt == "*** End Patch"
+                    || lt.starts_with("*** Update File:")
+                    || lt.starts_with("*** Add File:")
+                {
+                    break;
+                }
+                if lt.starts_with("*** Move to:") || lt == "*** End of File" || lt.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                if lines[i].starts_with("@@") {
+                    let hunk_hint = extract_unified_hunk_hint(lines[i]);
+                    i += 1;
+                    let mut old_buf = Vec::new();
+                    let mut new_buf = Vec::new();
+                    while i < n {
+                        let hl = lines[i];
+                        let hlt = hl.trim();
+                        if hl.starts_with("@@") || hlt.starts_with("*** ") {
+                            break;
+                        }
+                        if let Some(add) = hl.strip_prefix('+') {
+                            new_buf.push(add);
+                        } else if let Some(del) = hl.strip_prefix('-') {
+                            old_buf.push(del);
+                        } else if let Some(ctx) = hl.strip_prefix(' ') {
+                            old_buf.push(ctx);
+                            new_buf.push(ctx);
+                        } else if hl.is_empty() {
+                            old_buf.push("");
+                            new_buf.push("");
+                        } else {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !old_buf.is_empty() {
+                        ops.push(EditOp {
+                            path: path.clone(),
+                            op: "replace".to_string(),
+                            old: old_buf.join("\n"),
+                            new: new_buf.join("\n"),
+                            content: None,
+                            symbol: String::new(),
+                            all: false,
+                            line_hint: hunk_hint,
+                        });
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    if ops.is_empty() {
+        Err("`*** Begin Patch` envelope contained no applicable hunks.".to_string())
+    } else {
+        Ok(ops)
+    }
+}
+
 pub fn parse_edit_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
     let stripped = raw_spec.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+    if stripped.starts_with("*** Begin Patch") {
+        return parse_codex_patch(stripped);
+    }
     if stripped.starts_with("diff --git ")
         || stripped.starts_with("--- ")
         || stripped.starts_with("Index: ")
@@ -916,5 +1058,69 @@ mod tests {
             replace_crlf_tolerant_with_hint(src, old, new, false, None).expect("unicode rescue");
         assert_eq!(cnt, 1);
         assert_eq!(out, "let msg = \"fixed-world\";");
+    }
+
+    #[test]
+    fn codex_begin_patch_parses_update_and_add_file_multi_hunks() {
+        let patch = r#"*** Begin Patch
+*** Update File: src/app.ts
+@@
+ const a = 1;
+-const b = 2;
++const b = 20;
+@@
+ function tail() {
+-  return false;
++  return true;
+ }
+*** Add File: src/extra.ts
++export const EXTRA = 42;
+*** End Patch
+"#;
+        let ops = parse_edit_spec(patch).expect("codex begin patch");
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert_eq!(ops[0].op, "replace");
+        assert_eq!(ops[0].path, "src/app.ts");
+        assert!(ops[0].new.contains("const b = 20;"));
+        assert_eq!(ops[1].op, "replace");
+        assert!(ops[1].new.contains("return true;"));
+        assert_eq!(ops[2].op, "write");
+        assert_eq!(ops[2].path, "src/extra.ts");
+        assert_eq!(
+            ops[2].content.as_deref(),
+            Some("export const EXTRA = 42;\n")
+        );
+    }
+
+    #[test]
+    fn unified_diff_sets_hunk_line_hint_to_disambiguate_duplicate_blocks() {
+        let src = [
+            "fn first() {",
+            "    return 1;",
+            "}",
+            "fn pad1() { let a = 1; }",
+            "fn pad2() { let b = 2; }",
+            "fn pad3() { let c = 3; }",
+            "fn pad4() { let d = 4; }",
+            "fn pad5() { let e = 5; }",
+            "fn second() {",
+            "    return 1;",
+            "}",
+        ]
+        .join("\n");
+        let diff = "--- a/demo.rs\n+++ b/demo.rs\n@@ -9,3 +9,3 @@\n fn second() {\n-    return 1;\n+    return 99;\n";
+        let ops = parse_edit_spec(diff).expect("unified diff");
+        assert!(ops[0].line_hint.is_some(), "{ops:?}");
+        let (out, cnt) = replace_crlf_tolerant_with_hint(
+            &src,
+            &ops[0].old,
+            &ops[0].new,
+            false,
+            ops[0].line_hint.as_deref(),
+        )
+        .expect("line-hint disambiguation");
+        assert_eq!(cnt, 1);
+        assert!(out.starts_with("fn first() {\n    return 1;\n}"));
+        assert!(out.ends_with("fn second() {\n    return 99;\n}"));
     }
 }

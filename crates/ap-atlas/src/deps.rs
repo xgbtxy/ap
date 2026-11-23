@@ -17,6 +17,13 @@ pub struct DepHop {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnusedExport {
+    pub file: String,
+    pub line: usize,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepsReport {
     pub target: String,
     pub root: String,
@@ -29,6 +36,10 @@ pub struct DepsReport {
     pub inbound_importers: Vec<DepHop>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cycles: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub orphan_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unused_exports: Vec<UnusedExport>,
 }
 
 struct DepRegexes {
@@ -564,10 +575,253 @@ fn extract_exported_symbols(full_path: &Path, ext: &str) -> Vec<String> {
     syms
 }
 
+fn is_test_or_entry_rel(rel: &str) -> bool {
+    let low = rel.to_ascii_lowercase();
+    if low.starts_with("tests/")
+        || low.starts_with("test/")
+        || low.contains("/tests/")
+        || low.contains("/test/")
+        || low.contains("/__tests__/")
+        || low.contains(".test.")
+        || low.contains(".spec.")
+        || low.ends_with(".d.ts")
+        || low.contains(".config.")
+    {
+        return true;
+    }
+    let fname = low.rsplit('/').next().unwrap_or(low.as_str());
+    let stem = fname.split('.').next().unwrap_or(fname);
+    fname.starts_with("test_")
+        || fname.ends_with("_test.go")
+        || fname.ends_with("_test.py")
+        || matches!(
+            stem,
+            "main"
+                | "index"
+                | "lib"
+                | "mod"
+                | "build"
+                | "__init__"
+                | "__main__"
+                | "app"
+                | "cli"
+                | "server"
+                | "manage"
+                | "setup"
+                | "conftest"
+        )
+}
+
+fn load_manifest_blob(root: &Path) -> String {
+    let mut out = String::new();
+    for cand in ["package.json", "Cargo.toml", "pyproject.toml", "index.html"] {
+        let p = root.join(cand);
+        if let Ok(bytes) = fs::read(p) {
+            let take = bytes.len().min(256 * 1024);
+            out.push_str(&String::from_utf8_lossy(&bytes[..take]));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn collect_code_ident_counts(text: &str, ext: &str) -> HashMap<String, usize> {
+    let b = text.as_bytes();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let is_py = ext == "py";
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            continue;
+        }
+        if is_py && b[i] == b'#' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(b[i], b'"' | b'\'' | b'`') {
+            let q = b[i];
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == q {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let ident = &text[start..i];
+            if ident.len() >= 4 {
+                *counts.entry(ident.to_string()).or_insert(0) += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    counts
+}
+
+fn extract_symbol_lines(full_path: &Path, ext: &str) -> Vec<(String, usize)> {
+    let Some(lang) = lang_for_ext(ext) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = fs::read(full_path) else {
+        return Vec::new();
+    };
+    let body = String::from_utf8_lossy(&bytes);
+    let mut parser = Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(body.as_ref(), None) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    collect_symbol_spans(tree.root_node(), body.as_bytes(), &mut spans);
+    spans.into_iter().map(|(nm, s, _)| (nm, s)).collect()
+}
+
+fn collect_dead_code(
+    root: &Path,
+    file_bodies: &[(String, String, String)],
+    file_map: &HashMap<String, (PathBuf, String)>,
+    inbound_adj: &BTreeMap<String, Vec<(String, String)>>,
+    focus_rel: Option<&str>,
+) -> (Vec<String>, Vec<UnusedExport>) {
+    let manifest_blob = load_manifest_blob(root);
+    let mut orphan_files: Vec<String> = Vec::new();
+    for (rel, _, _) in file_bodies {
+        if orphan_files.len() >= 40 {
+            break;
+        }
+        if is_test_or_entry_rel(rel) {
+            continue;
+        }
+        let has_inbound = inbound_adj.get(rel).map(|v| !v.is_empty()).unwrap_or(false);
+        if has_inbound {
+            continue;
+        }
+        let fname = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        if !manifest_blob.is_empty()
+            && (manifest_blob.contains(rel.as_str()) || manifest_blob.contains(fname))
+        {
+            continue;
+        }
+        orphan_files.push(rel.clone());
+    }
+
+    let mut per_file_counts: HashMap<&str, HashMap<String, usize>> = HashMap::new();
+    let mut ident_file_count: HashMap<String, usize> = HashMap::new();
+    for (rel, ext, body) in file_bodies {
+        let counts = collect_code_ident_counts(body, ext);
+        for k in counts.keys() {
+            *ident_file_count.entry(k.clone()).or_insert(0) += 1;
+        }
+        per_file_counts.insert(rel.as_str(), counts);
+    }
+
+    const LIFECYCLE_SKIP: &[&str] = &[
+        "main",
+        "init",
+        "default",
+        "drop",
+        "clone",
+        "from",
+        "into",
+        "render",
+        "setup",
+        "teardown",
+        "constructor",
+        "toString",
+        "valueOf",
+        "serialize",
+        "deserialize",
+        "index",
+        "handler",
+        "middleware",
+        "test",
+    ];
+
+    let mut unused_exports: Vec<UnusedExport> = Vec::new();
+    let mut seen_decl: HashSet<(String, String)> = HashSet::new();
+    for (rel, ext, _) in file_bodies {
+        if unused_exports.len() >= 40 {
+            break;
+        }
+        if let Some(tgt) = focus_rel {
+            if rel != tgt {
+                continue;
+            }
+        }
+        if is_test_or_entry_rel(rel) && focus_rel.is_none() {
+            continue;
+        }
+        let Some((fp, _)) = file_map.get(rel) else {
+            continue;
+        };
+        let Some(local_counts) = per_file_counts.get(rel.as_str()) else {
+            continue;
+        };
+        for (sym, line) in extract_symbol_lines(fp, ext) {
+            if sym.len() < 4 || sym.starts_with('_') || LIFECYCLE_SKIP.contains(&sym.as_str()) {
+                continue;
+            }
+            let global_files = ident_file_count.get(&sym).copied().unwrap_or(0);
+            let local_hits = local_counts.get(&sym).copied().unwrap_or(0);
+            if global_files <= 1 && local_hits <= 1 && seen_decl.insert((rel.clone(), sym.clone()))
+            {
+                unused_exports.push(UnusedExport {
+                    file: rel.clone(),
+                    line,
+                    symbol: sym,
+                });
+                if unused_exports.len() >= 40 {
+                    break;
+                }
+            }
+        }
+    }
+
+    (orphan_files, unused_exports)
+}
+
 pub fn analyze_module_deps(
     root: &Path,
     target: &str,
     max_depth: usize,
+    skip_dirs: &'static [&'static str],
+) -> DepsReport {
+    analyze_module_deps_with_opts(root, target, max_depth, false, skip_dirs)
+}
+
+pub fn analyze_module_deps_with_opts(
+    root: &Path,
+    target: &str,
+    max_depth: usize,
+    include_dead: bool,
     skip_dirs: &'static [&'static str],
 ) -> DepsReport {
     let t0 = Instant::now();
@@ -652,6 +906,7 @@ pub fn analyze_module_deps(
     let mut inbound_adj: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut total_edges = 0usize;
     let mut file_map: HashMap<String, (PathBuf, String)> = HashMap::new();
+    let mut file_bodies: Vec<(String, String, String)> = Vec::new();
 
     for p in &files {
         let Ok(rel_p) = p.strip_prefix(&root_canon) else {
@@ -670,7 +925,7 @@ pub fn analyze_module_deps(
         if bytes.contains(&0) {
             continue;
         }
-        let body = String::from_utf8_lossy(&bytes);
+        let body = String::from_utf8_lossy(&bytes).into_owned();
         let edges = collect_file_edges(
             &root_canon,
             &rel,
@@ -686,7 +941,10 @@ pub fn analyze_module_deps(
                 .or_default()
                 .push((rel.clone(), format!("via `{rel}` ({via})")));
         }
-        outbound_adj.insert(rel, edges);
+        outbound_adj.insert(rel.clone(), edges);
+        if include_dead {
+            file_bodies.push((rel, ext, body));
+        }
     }
 
     let (exported_symbols, outbound_imports, inbound_importers, focus_rel) =
@@ -703,6 +961,17 @@ pub fn analyze_module_deps(
         };
 
     let cycles = find_cycles(&outbound_adj, focus_rel, 12);
+    let (orphan_files, unused_exports) = if include_dead {
+        collect_dead_code(
+            &root_canon,
+            &file_bodies,
+            &file_map,
+            &inbound_adj,
+            focus_rel,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
 
     DepsReport {
@@ -715,6 +984,8 @@ pub fn analyze_module_deps(
         outbound_imports,
         inbound_importers,
         cycles,
+        orphan_files,
+        unused_exports,
     }
 }
 
@@ -752,6 +1023,24 @@ pub fn render_deps_md(rep: &DepsReport) -> String {
         out.push(format!("\n## Circular Dependencies ({})", rep.cycles.len()));
         for cyc in &rep.cycles {
             out.push(format!("- `{}`", cyc.join(" -> ")));
+        }
+    }
+    if !rep.orphan_files.is_empty() {
+        out.push(format!(
+            "\n## Orphan Source Modules ({})",
+            rep.orphan_files.len()
+        ));
+        for f in &rep.orphan_files {
+            out.push(format!("- `{f}` (0 inbound imports)"));
+        }
+    }
+    if !rep.unused_exports.is_empty() {
+        out.push(format!(
+            "\n## Unused Declared Symbols / Ghost Exports ({})",
+            rep.unused_exports.len()
+        ));
+        for u in &rep.unused_exports {
+            out.push(format!("- `{}:{}` `{}`", u.file, u.line, u.symbol));
         }
     }
     out.join("\n")
@@ -875,5 +1164,48 @@ mod tests {
             .outbound_imports
             .iter()
             .any(|h| h.depth == 1 && h.file == "src/auth.rs"));
+    }
+
+    #[test]
+    fn dead_code_audit_finds_orphan_modules_and_unused_exports() {
+        let td = mk_tmp("dead_audit");
+        fs::create_dir_all(td.0.join("src")).unwrap();
+        fs::create_dir_all(td.0.join("tests")).unwrap();
+        fs::write(
+            td.0.join("src/index.ts"),
+            "import { liveHelper } from './used';\nexport function start() { return liveHelper(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("src/used.ts"),
+            "export function liveHelper() { return 1; }\nexport function ghostHelper() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("src/orphan.ts"),
+            "export function orphanFn() { return 99; }\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("tests/app.test.ts"),
+            "import { liveHelper } from '../src/used';\nif (liveHelper() !== 1) throw new Error('bad');\n",
+        )
+        .unwrap();
+
+        let rep = analyze_module_deps_with_opts(&td.0, ".", 2, true, crate::SKIP_DIRS);
+        assert!(
+            rep.orphan_files.iter().any(|f| f == "src/orphan.ts"),
+            "{rep:?}"
+        );
+        assert!(!rep.orphan_files.iter().any(|f| f == "src/index.ts"));
+        assert!(!rep.orphan_files.iter().any(|f| f == "src/used.ts"));
+        assert!(!rep.orphan_files.iter().any(|f| f == "tests/app.test.ts"));
+        assert!(
+            rep.unused_exports
+                .iter()
+                .any(|u| u.file == "src/used.ts" && u.symbol == "ghostHelper"),
+            "{rep:?}"
+        );
+        assert!(!rep.unused_exports.iter().any(|u| u.symbol == "liveHelper"));
     }
 }

@@ -230,6 +230,9 @@ enum SubCmd {
         root: String,
         #[arg(short = 'd', long, default_value_t = 2)]
         depth: usize,
+        /// Also audit orphan source modules and unused/ghost exports
+        #[arg(long)]
+        dead: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1555,6 +1558,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             target,
             root,
             depth,
+            dead,
             json,
         }) => {
             let root_p = PathBuf::from(&root);
@@ -1562,7 +1566,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 eprintln!("[atlas] path not found: {root}");
                 return 1;
             }
-            let rep = deps::analyze_module_deps(&root_p, &target, depth, SKIP_DIRS);
+            let rep = deps::analyze_module_deps_with_opts(&root_p, &target, depth, dead, SKIP_DIRS);
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
             } else {

@@ -575,10 +575,65 @@ pub fn try_accelerate_get_content(raw: &str) -> Option<String> {
         })
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|| "ap".to_string());
-    let limit_flag = limit.map(|n| format!(" --limit {n}")).unwrap_or_default();
+    let limit_flag = limit.map(|n| format!(" --lines 1-{n}")).unwrap_or_default();
     let tgt_esc = tgt.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" read \"{tgt_esc}\"{limit_flag}",
+        cd_pfx.unwrap_or("")
+    ))
+}
+
+/// Rewrite bare `sed -n '<start>,<end>p' <file>` (with optional leading `cd <dir> &&`) cleanly
+/// to bounded `ap read "<file>" --lines <start>-<end>`. Passes through piped or complex sed expressions.
+pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if has_unsafe_shell_meta(body) {
+        return None;
+    }
+    static SED_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SED_RE.get_or_init(|| {
+        Regex::new(
+            r#"^\s*sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s*$"#,
+        )
+        .unwrap()
+    });
+    let cap = re.captures(body.trim())?;
+    let s_str = cap
+        .get(1)
+        .or_else(|| cap.get(3))
+        .or_else(|| cap.get(5))?
+        .as_str();
+    let e_str = cap
+        .get(2)
+        .or_else(|| cap.get(4))
+        .or_else(|| cap.get(6))?
+        .as_str();
+    let start: usize = s_str.parse().ok()?;
+    let end: usize = e_str.parse().ok()?;
+    if start == 0 || end < start {
+        return None;
+    }
+    let file = cap
+        .get(7)
+        .or_else(|| cap.get(8))
+        .or_else(|| cap.get(9))?
+        .as_str();
+    if file.contains('*') || file.contains('?') || file.contains(',') {
+        return None;
+    }
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+    let file_esc = file.replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" read \"{file_esc}\" --lines {start}-{end}",
         cd_pfx.unwrap_or("")
     ))
 }
@@ -950,6 +1005,11 @@ pub fn heal_windows_command(
     if let Some(fast_gci) = try_accelerate_get_child_item(raw) {
         heals.push("get-childitem->ap-ls");
         let (kind, cmd_out) = route_accelerated_cmd(fast_gci, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_sed) = try_accelerate_sed_slice(raw) {
+        heals.push("sed-slice->ap-read");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_sed, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -1724,7 +1784,7 @@ mod tests {
         // `Get-Content` / `gc` and `Get-ChildItem` / `gci` PowerShell accelerators (safe passthrough when piped/tail/filtered)
         let (_, h17, tags17) =
             heal_windows_command("Get-Content src/app.py -TotalCount 40", true, true);
-        assert!(h17.contains("read \"src/app.py\" --limit 40"), "{h17}");
+        assert!(h17.contains("read \"src/app.py\" --lines 1-40"), "{h17}");
         assert!(tags17.contains(&"get-content->ap-read"));
 
         let (k18, h18, tags18) = heal_windows_command("cd sub && gc -Raw README.md", true, true);
@@ -1742,5 +1802,20 @@ mod tests {
 
         assert!(try_accelerate_get_content("Get-Content -Tail 20 app.log").is_none());
         assert!(try_accelerate_get_child_item("Get-ChildItem -Filter *.rs src").is_none());
+
+        // `try_accelerate_sed_slice` accelerates bare `sed -n '<A>,<B>p' <file>` cleanly
+        let (_, h20, tags20) = heal_windows_command("sed -n '10,40p' src/app.py", true, true);
+        assert!(h20.contains("read \"src/app.py\" --lines 10-40"), "{h20}");
+        assert!(tags20.contains(&"sed-slice->ap-read"));
+
+        let (k21, h21, tags21) =
+            heal_windows_command("cd sub && sed -n \"1,25p\" README.md", true, true);
+        assert_eq!(k21, ShellKind::GitBash);
+        assert!(
+            h21.starts_with("cd sub && ") && h21.contains("read \"README.md\" --lines 1-25"),
+            "{h21}"
+        );
+        assert!(tags21.contains(&"sed-slice->ap-read"));
+        assert!(try_accelerate_sed_slice("sed -n '1,10p' app.py | grep foo").is_none());
     }
 }

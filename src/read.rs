@@ -29,6 +29,9 @@ struct ReadCli {
     /// Optional line range or comma-separated batch ranges (e.g. `1-120` or `10-40,120-160,300-340`)
     #[arg(long)]
     lines: Option<String>,
+    /// Read only the first N lines (convenience alias for `--lines 1-N`)
+    #[arg(long)]
+    limit: Option<usize>,
     /// Filter or search rows/paragraphs matching keyword or regex
     #[arg(short = 'q', long)]
     query: Option<String>,
@@ -745,7 +748,7 @@ fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn run_cli(args: &[String]) -> i32 {
-    let cli = match ReadCli::try_parse_from(args) {
+    let mut cli = match ReadCli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
             let code = if e.use_stderr() { 2 } else { 0 };
@@ -753,6 +756,11 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
+    if cli.lines.is_none() {
+        if let Some(n) = cli.limit.filter(|&n| n > 0) {
+            cli.lines = Some(format!("1-{n}"));
+        }
+    }
 
     if !cli.extra_targets.is_empty() {
         let mut all_targets = vec![crate::ls::normalize_cli_path(&cli.target)];

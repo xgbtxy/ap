@@ -1,8 +1,8 @@
-# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.52）
+# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.53）
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives`（`v2.52`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP `2025-11-25` / `2025-06-18`（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
+`agent-primitives`（`v2.53`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP `2025-11-25` / `2025-06-18`（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
 
 ---
 
@@ -45,8 +45,8 @@ ap uninstall          # 或卸载当前项目：ap uninstall --here
 | 能力域（`ap mcp` + CLI） | 直接消除的模型思考与 OS 卡点 | 典型延迟 |
 | :--- | :--- | ---: |
 | **万能直读 / 结构化 AST 检索 / SQL**（`ap read`、`ap search --ast --pat`、`ap query`） | Tree-sitter `--symbol`/`--outline` + 12 文件批读；`--ast` 元变量与节点检索（`fetch($URL, $$$)`、`$X == $X`、`kind:call`）+ `--code-only --no-tests --exclude` 过滤注释/字符串/单测噪音；Office/PDF/SQLite/`.asar`/`.map` VLQ；PE32+/ELF64（`--xref`/缓解审计/MS-RPC UUID/Go `.gopclntab`）；Java `.class`/`.jar`/`.NET CLR`/`--proto`/`--diff`/`--hex`；JS `--routes`/chunks/`--jwt`/脱敏 `--secrets`；免 Python 跨表 SQLite SQL。 | `1–20 ms` |
-| **定向 / 模块依赖图 / 定位 / 选择性单测**（`ap_orient`、`ap_impact(file=...)`、`atlas map/surface/locate/trace/deps/changes/history`） | Personalized PageRank 核心地图、`<40ms` 跨文件 `atlas deps`（出站导入/多跳被引用爆炸半径/循环依赖）、`<60ms` 9 轴表面图、`<25ms` 零提示故障定位、`atlas changes` 精选待跑单测命令（`suggested_test_cmds`）及 `atlas history --symbol`。 | `6–60 ms` |
-| **AST 改写、结构化重写与命名检查点**（`ap_edit`、`ap splice view/apply/rename/rewrite/check --hook`、`ap undo`） | 弹性链式补丁（`@L<start>-L<end>` 消歧、弯引号自愈、Hashline `L:HH\|`）、Tree-sitter `rename` 与跨文件结构化 `rewrite`（`$VAR` 与 `, $$$ARGS` 自动消去）、6 语言+JSON/TOML 预检、`<5ms` `PostToolUse` 钩子，以及 `ap undo --save/--diff/--keep` 命名快照与差异核验回滚。 | `0.7–15 ms` |
+| **定向 / 依赖图 / 死代码审计 / 单测**（`ap_orient`、`ap_impact(file=..., dead=true)`、`atlas deps/changes/history`） | Personalized PageRank 核心地图、`<40ms` 跨文件 `atlas deps --dead`（出站导入/多跳被引用/循环依赖 + 孤立模块与未用符号）、`<60ms` 9 轴表面图、`<25ms` 故障定位、`atlas changes` 精选单测及 `atlas history`。 | `6–60 ms` |
+| **AST 改写、Codex Diff 与检查点**（`ap_edit`、`ap splice view/apply/rename/rewrite/check --hook`、`ap undo`） | Codex `*** Begin Patch` 与 Unified Diff 行窗消歧补丁（`@L`/弯引号/Hashline）、Tree-sitter `rename` 与 `rewrite`（`, $$$ARGS` 自动消去）、6 语言预检、`<5ms` `PostToolUse` 钩子，以及 `ap undo --save/--diff/--keep` 命名快照。 | `0.7–15 ms` |
 | **运行时、网络与双端 UI 质检**（`ap_smoke`、`ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`） | 空闲端口托管 + 进程树清零；无头 Edge/Chrome 桌面+移动 UI/4xx-5xx 巡检；非侵入式实时 `cdp --watch-ms`；单发/批量/并发竞态/CORS/CDP 会话复用 `http` 质检；RFC 6455 `ws --origin-matrix`；AST 变异测试与接口混沌 Fuzz。 | `0.2–4.5 s` |
 | **深度六门禁、护栏与压缩**（`ap_verify`、`ap guard verify --deep/sec/diff/pack`、`ap exec`、`ap sieve`） | 单次跑通 6 重门禁（测试 + `.only`/零断言拦截 + OWASP C/C++/Java/TS/Py/Go/Rust `sec` + 语义 `diff` + 跨文件契约 + 活跃文件 `mutate`）、3 次死循环熔断、Windows UTF-8/长 `PATH` 治愈与 FTS5 无损日志压缩（`-98.8%`）。 | `<2 ms` (+测试) |
 | **Pi 运行时、接力棒与微记忆**（`ap pi`、`ap baton frontier/claim/dedup`、`ap recall`） | 12 项幂等 Pi v1.5+/v1.6 运行时补丁（`codemode` `text()`/`.output` 兼容、Keep-Alive、串行 Shell 屏障、CJK 校准压缩、工具序锁缓存）、正交探索前沿调度、原子租约与 `3.3ms` CJK+BM25 微记忆。 | `<15 ms` |

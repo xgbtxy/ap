@@ -144,7 +144,8 @@ fn mcp_tools_schema() -> Value {
                     "path": { "type": "string", "description": "Workspace root directory (default: '.')" },
                     "symbol": { "type": "string", "description": "Symbol name or comma-separated symbols (e.g. 'computeTotal,OrderItem')" },
                     "file": { "type": "string", "description": "File path (or '.') to inspect cross-file module dependency graph, reverse blast radius & circular imports" },
-                    "depth": { "type": "integer", "description": "Traversal hops 1..5 when `file` is given (default: 2)" }
+                    "depth": { "type": "integer", "description": "Traversal hops 1..5 when `file` is given (default: 2)" },
+                    "dead": { "type": "boolean", "description": "When `file` is set (e.g. '.' or a file path), also audit orphan source modules and unused/ghost exports" }
                 },
                 "required": []
             }
@@ -1782,10 +1783,12 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     .and_then(Value::as_u64)
                     .map(|n| n as usize)
                     .unwrap_or(2);
-                let rep = ap_atlas::deps::analyze_module_deps(
+                let dead = args.get("dead").and_then(Value::as_bool).unwrap_or(false);
+                let rep = ap_atlas::deps::analyze_module_deps_with_opts(
                     root_p,
                     file_arg,
                     depth,
+                    dead,
                     ap_atlas::SKIP_DIRS,
                 );
                 let out = ap_atlas::deps::render_deps_md(&rep);

@@ -8617,3 +8617,166 @@ fn test_v252_module_deps_graph_named_checkpoints_and_ps_accel() {
         .unwrap_or("");
     assert!(list_txt.contains("pre-exp"), "{list_txt}");
 }
+
+#[test]
+fn test_v253_dead_code_audit_codex_patch_read_limit_and_sed_accel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 1. Dead-code & ghost-export audit via `ap atlas deps . --dead --json` + MCP `ap_impact(file=".", dead=true)`
+    fs::write(
+        root.join("src/index.ts"),
+        "import { liveFn } from './used';\nexport function boot() { return liveFn(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/used.ts"),
+        "export function liveFn() { return 1; }\nexport function ghostExportFn() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/orphan.ts"),
+        "export function orphanModuleFn() { return 3; }\n",
+    )
+    .unwrap();
+
+    let root_s = root.to_string_lossy().to_string();
+    let dead_out = run_ap(
+        root,
+        &["atlas", "deps", ".", &root_s, "--dead", "--json"],
+        None,
+        &[],
+    );
+    assert!(dead_out.status.success());
+    let dv: Value = serde_json::from_slice(&dead_out.stdout).unwrap();
+    assert!(dv["orphan_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "src/orphan.ts"));
+    assert!(!dv["orphan_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "src/index.ts" || f == "src/used.ts"));
+    assert!(dv["unused_exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["symbol"] == "ghostExportFn"));
+    assert!(!dv["unused_exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["symbol"] == "liveFn"));
+
+    // 2. Codex `*** Begin Patch` envelope (`*** Update File:` multi-hunk + `*** Add File:`) via `ap splice apply --stdin`
+    let codex_patch = r#"*** Begin Patch
+*** Update File: src/used.ts
+@@
+-export function liveFn() { return 1; }
++export function liveFn() { return 100; }
+@@
+-export function ghostExportFn() { return 2; }
++export function ghostExportFn() { return 200; }
+*** Add File: src/added.ts
++export const ADDED_TOKEN = "ok";
+*** End Patch
+"#;
+    let apply_codex = run_ap(
+        root,
+        &["splice", "apply", "--cwd", &root_s, "--stdin", "--json"],
+        Some(codex_patch),
+        &[],
+    );
+    assert!(
+        apply_codex.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply_codex.stderr)
+    );
+    let used_after = fs::read_to_string(root.join("src/used.ts")).unwrap();
+    assert!(used_after.contains("return 100;") && used_after.contains("return 200;"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/added.ts")).unwrap(),
+        "export const ADDED_TOKEN = \"ok\";\n"
+    );
+
+    // 3. Unified diff hunk header `@@ -9,3 +9,3 @@` disambiguates duplicate blocks cleanly
+    let dup_rs = [
+        "fn first() {",
+        "    return 1;",
+        "}",
+        "fn p1() { let _ = 1; }",
+        "fn p2() { let _ = 2; }",
+        "fn p3() { let _ = 3; }",
+        "fn p4() { let _ = 4; }",
+        "fn p5() { let _ = 5; }",
+        "fn second() {",
+        "    return 1;",
+        "}",
+    ]
+    .join("\n")
+        + "\n";
+    fs::write(root.join("src/dup.rs"), dup_rs).unwrap();
+    let udiff = "--- a/src/dup.rs\n+++ b/src/dup.rs\n@@ -9,3 +9,3 @@\n fn second() {\n-    return 1;\n+    return 77;\n";
+    let apply_ud = run_ap(
+        root,
+        &["splice", "apply", "--cwd", &root_s, "--stdin", "--json"],
+        Some(udiff),
+        &[],
+    );
+    assert!(
+        apply_ud.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply_ud.stderr)
+    );
+    let dup_after = fs::read_to_string(root.join("src/dup.rs")).unwrap();
+    assert!(dup_after.starts_with("fn first() {\n    return 1;\n}"));
+    assert!(dup_after.contains("fn second() {\n    return 77;\n}"));
+
+    // 4. `ap read --limit 3` reads only lines 1-3 + MCP `tools/list` still exact 37 + `ap_impact(file=".", dead=true)`
+    let rd_lim = run_ap(
+        root,
+        &[
+            "read",
+            root.join("src/dup.rs").to_str().unwrap(),
+            "--limit",
+            "3",
+        ],
+        None,
+        &[],
+    );
+    assert!(rd_lim.status.success());
+    let rd_txt = String::from_utf8_lossy(&rd_lim.stdout);
+    assert!(
+        rd_txt.contains("fn first()") && !rd_txt.contains("fn p2()"),
+        "{rd_txt}"
+    );
+
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_impact",
+            "arguments": { "path": root_s, "file": ".", "dead": true }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    let dead_md = resps[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        dead_md.contains("src/orphan.ts") && dead_md.contains("ghostExportFn"),
+        "{dead_md}"
+    );
+}
