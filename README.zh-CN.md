@@ -31,7 +31,7 @@ curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | ie
 curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 ```
 
-> **喜欢直接下载单文件？** 点击直链下载（**[Windows 64位 `ap.exe` (.zip)](https://github.com/xgbtxy/ap/releases/latest/download/ap-x86_64-pc-windows-msvc.zip)** · **[macOS M芯片](https://github.com/xgbtxy/ap/releases/latest/download/ap-aarch64-apple-darwin.tar.gz)** · **[macOS Intel](https://github.com/xgbtxy/ap/releases/latest/download/ap-x86_64-apple-darwin.tar.gz)** · **[Linux x64](https://github.com/xgbtxy/ap/releases/latest/download/ap-x86_64-unknown-linux-musl.tar.gz)**），解压运行 `ap init` 即可。随时可用 `ap uninstall` 一键干净还原。
+> **喜欢直接下载单文件？** 点击直链下载（**[Windows 64位 `ap.exe` (.zip)](https://github.com/xgbtxy/ap/releases/latest/download/ap-x86_64-pc-windows-msvc.zip)** · **[macOS M芯片](https://github.com/xgbtxy/ap/releases/latest/download/ap-aarch64-apple-darwin.tar.gz)** · **[macOS Intel](https://github.com/xgbtxy/ap/releases/latest/download/ap-x86_64-apple-darwin.tar.gz)** · **[Linux x64](https://github.com/xgbtxy/ap/releases/latest/download/ap-x86_64-unknown-linux-musl.tar.gz)** · **[Linux ARM64](https://github.com/xgbtxy/ap/releases/latest/download/ap-aarch64-unknown-linux-gnu.tar.gz)**），解压运行 `ap init` 即可。随时可用 `ap uninstall` 一键干净还原。
 
 ---
 
@@ -39,15 +39,15 @@ curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 
 省 Token 只是水到渠成的副产物。**AI Coding 真正决定体验的，是模型能不能不卡壳、不被带偏、写错了也能自己发现并改过来。**
 
-复盘本机 **101,108 次真实工具调用** 与大模型原始 `<thinking>` 轨迹后，我们发现 AI 变慢、变蠢、写出烂代码（AI Slop），往往不是因为模型智商不够，而是它在干活的 **4 个关键节点被打断了工作记忆**：
+复盘本机 **101,108 次真实工具调用** 与大模型原始 `<thinking>` 轨迹后，我们发现 AI 变慢、变蠢、写出烂代码（AI Slop），往往不是因为模型智商不够，而是它在干活的 **5 个关键节点被打断了工作记忆**：
 
-| AI `<thinking>` 真实卡点 | 没装 `ap` 时为什么会越干越乱？ | `ap` 怎么在底层顺着思考链路提效？（用户零感知） |
+| AI `<thinking>` 真实卡点 | 没装 `ap` 时为什么会越干越乱？ | `ap` 怎么自动铺平？（完整命令清单见 [实战手册](./docs/PLAYBOOK.zh-CN.md)） |
 | :--- | :--- | :--- |
-| **1. AST 符号/批量直读、二进制/归档/前端审计、多核搜索与 SQL**<br>*(通用办公、前端排障、原生二进制、桌面端与编程)* | 读 2000 行大代码文件盲猜行号，缺 `pefile`/`javap`/`protoc`/`xxd` 解析不了 DLL/SO/JAR/Protobuf，或被 GNU `grep -rn` 卡死。 | **`ap read`** 原生支持 **Tree-sitter `--symbol` / `--outline` 与单次批量读 12 文件**、**PE32+/ELF64 (`x64` &amp; `AArch64`) `--xref`/缓解审计/MS-RPC UUID + Go `.gopclntab` + Java `.class`/`.jar` &amp; `.NET CLR` + `--proto` 原始 Protobuf + `--diff` 补丁差量 + `--hex`**、**JS/HTML `--routes`（路由、懒加载 chunk、本地 HTTP/IPC 服务校验与自定义头）、`--jwt` 姿势、脱敏 `--secrets`**、Office/SQLite/`.map` VLQ/`.asar`（最高 `256 MB`）/`--json-path`/SPA；**`ap search --pat`** 多核单遍扫 20 模式；**`ap query --json`** 直接输出按列名组织的 `records`（免 Python）。 |
-| **2. 开局盲猜、守卫感知 9 轴表面图、HTTP/WS 质检与多跳调用链**<br>*(全域 X 光、正交探索前沿、Git Diff 影响面与故障定位)* | 面对多文件客诉靠 `ls`/`rg` 盲搜，手写脆弱 `curl`/Python 鉴权/CORS/并发脚本，长会话漏探正交轴线，或重构漏改下游调用方。 | **<15 ms 全域 X 光 (`atlas map`)** + **<60 ms 守卫感知 9 轴表面图 (`atlas surface --include-binaries`)** 与 **跨会话正交探索前沿 (`baton frontier`)** + **`ap probe http`**（**`--principal`/`--principal-cdp` 0 标签复用本地回环会话、`--cors-origin` 跨源反射审计、`--select` JSON 路径、`--audit-headers`、`--vary-field`、`--race`**）与 **`ap probe ws --origin-matrix`** + **<25 ms 症状直达 (`atlas locate`)** + **<30 ms Git 变更影响简报 (`atlas changes`)** 与多跳调用链 (`atlas trace`)。 |
-| **3. 跨文件创造断链、AST 全局重命名与自愈补丁**<br>*(跨模块契约、JSONC/TOML 与安全重构)* | 跨文件重构靠全局替换误伤注释/字符串/子串，改错 1 个字符导致补丁失配被迫重读整文件，或写坏 `Cargo.toml`/`tsconfig.json`。 | **Tree-sitter 语法树 `ap splice rename`**（严格避开注释/字符串/子串，支持 `--dry-run` 与失败回滚）+ **失配补丁滑窗相似度直出真行** + **JSON/JSONC/TOML + 6 语言语法门禁** + **<5 ms 跨文件静态链接** + **`ap undo`**。 |
-| **4. 终端水土不服、慢 `grep`、编译/测试洪流与死循环**<br>*(Windows/Mac Shell 与语义压缩)* | 撞上 **528+ 次 OS/Shell 崩溃**、60s+ GNU `grep -rn` 假死、40KB 带 ANSI 色的编译/测试噪音日志，以及连续重复重试命令的“死循环空转”。 | **Base64 Hook + `ap exec`** 自动加速 `grep -rn` → `<50ms` 多核并行 `ap search`，安全修复非 raw 字符串 `python -c` 路径，锁死 UTF-8 + **Win32 Job Object**，自动剥离 ANSI 语义提纯 **`compiler`/`test`/`diff`** 日志 95%+，并内置 **3 次重复死循环熔断提示**。 |
-| **5. 全栈 MCP 2025-06-18、`ap audit --maintainer` 与 Pi v1.5+ 加速器**<br>*(36 强类型 `outputSchema` MCP 工具 + `ap pi` 11 项运行时补丁器 + 零隐私泄露自演进 + 50:1 缓存经济学)* | 重复行/标点漂移致 `edit` 失配、`bash` 与 `read` 竞态报 `ENOENT`、CJK 压缩过留 2–3 倍、中段缓存击穿，或 `codemode` `text(x).slice()` 报 `TypeError`。 | **全栈 MCP 2025-06-18**（**36** 个强类型 **`outputSchema`** 工具 + Resources + `5` 套 Prompts），**`ap pi status\|patch\|restore`**（纯 Rust 幂等 **11 项** Pi v1.5+ 运行时补丁器：含 `codemode` `text()` 返回值、15s/28s Keep-Alive + 250ms Happy-Eyeballs、`before_agent_start` 清脑 `entries`、Windows UTF-8、`sleep(ms)` + Web 内建、Shell 串行屏障、CJK 校准压缩与工具字典序锁缓存），**`ap guard verify --deep`** + **`ap guard sec`**（覆盖 C/C++/Java/TS/Py/Go/Rust）+ **`ap guard diff`**，**`ap doctor`**，**`ap audit --maintainer`**（100% 本地零隐私脱敏的“卡点→源码”维护简报，覆盖 6 款智能体），及 **Pi `zz-ap-accelerator.ts`**。 |
+| **1. 复杂代码、办公文档与二进制读取**<br>*(AST、Office、归档、PE/ELF、前端)* | 缺 Python/`pefile` 读不了 Word/Excel/PDF/SQLite/`.asar`/DLL，读大文件盲猜行号，或被 GNU `grep -rn` 卡死。 | **`ap read` / `ap search` / `ap query`**：支持 AST `--symbol` 与 12 文件批读、Office/PDF/压缩包/PE·ELF·Java·.NET·Protobuf 与 JS `--routes`/`--jwt`/`--secrets` 解析、多模式并发检索与免 Python SQL 查询。 |
+| **2. 开局盲猜、表面图与真机接口/UI 质检**<br>*(定向、故障定位、HTTP/WS 鉴权)* | 面对多文件客诉靠 `ls`/`rg` 盲搜，手写脆弱 `curl`/Python 鉴权/CORS/并发脚本，或长会话遗漏测试维度。 | **`ap atlas` + `ap probe`**：`<15 ms` 全局骨架图、`<60 ms` 守卫感知 9 轴表面图、`<25 ms` 症状直达定位、零标签复用本地回环 CDP 会话（`--principal-cdp`）、HTTP `--race`/`--cors-origin` 与 WebSocket 跨源矩阵测试。 |
+| **3. 安全创造与跨文件精确重构**<br>*(跨模块契约、AST 改写与撤回)* | 全局替换误伤注释/字符串，重构漏改调用方，或写错 1 个缩进字符导致补丁失配被迫重读整文件。 | **`ap splice` + `ap undo`**：避开注释/字符串的 Tree-sitter `rename`、4 级缩进容错 + Hashline 补丁、6 语言+JSON/TOML 预检门禁、`<5 ms` 跨文件静态链接与无 Git 安全快照。 |
+| **4. 终端水土不服、慢搜索与死循环**<br>*(Windows/Mac Shell 与噪音日志)* | 撞上 **`528+` 次 OS/Shell 崩溃**（GBK/BOM、PS `&&`、长 `PATH` 截断）、60s+ `grep` 假死、40KB 日志刷屏与原地重试空转。 | **`ap exec` + `ap sieve` + `ap guard`**：透明 Hook 自动修复 UTF-8、`curl.exe`、超长 `PATH` 与慢 `grep`，Win32 Job Object 清理孤儿进程，日志无损脱水 **-98.8%**，并内置 `3x` 死循环熔断。 |
+| **5. 深度六门禁、MCP 与 Pi 缓存经济学**<br>*(36 MCP 工具、11 项 Pi 补丁、共维护)* | 产出假绿灯测试或安全隐患、中文压缩过留或中途打穿 KV-Cache，或让 `$0` 免费小模型硬刚脆弱命令行。 | **全栈 MCP 2025-06-18（36 强类型工具）** + **`ap guard verify --deep`**（单测/OWASP 安全/语义 Diff/契约/AST 变异）+ **`ap pi`**（11 项幂等 Pi 运行时补丁）+ **`ap audit --maintainer`**。 |
 
 ---
 
@@ -71,12 +71,23 @@ $ ap stats
 
 ## Windows 11 真机端到端提效实测（零水分）
 
-在 Windows 11 真机上用 `$0` 免费智能体与主流商业 CLI 同题盲测（覆盖小白一句话需求、全栈升级 `WorkPulse`、空目录从零开发随机项目 `SplitMate`）：
+在 Windows 11 真机上用 `$0` 免费智能体与主流商业 CLI 同题盲测（覆盖小白一句话需求、无 Python 非编程办公、存量跨模块重构、空目录从零新建与专项全栈实测）：
 
 | 测试 Agent 与真实任务 | 未装 `ap` → **安装 `ap` 后**（速度与步数） | 代码质量与自纠错结果 | 顺带避免的冤枉 Token |
 | :--- | :--- | :---: | :--- |
 | **`OpenCode` 免费版 (`$0` `big-pickle`)** · *小白一句话需求* | `430.2s`（乱撞 `60` 步）→ **`182.4s`（`23` 步直达，快 2.36 倍）** | `7/8` *(留吞错 Slop)* → **`8/8`（0 Slop）** | **`-75.1%`** (`1.61M → 402k`) |
 | **非编程日常办公（无 Python 电脑）** · *核对 `.docx` + `.xlsx` + `GBK` 流水* | `70.5s` *(读出乱码+调 Python 报错)* → **`46.5s`（快 1.52 倍）** | **`5/5` → `5/5`** *(`ap read` 一次直读零报错)* | **`-54.3%`** (`127k → 58k`) |
+| **`Codex CLI` (`gpt-6-astra`)** · *14 文件跨模块函数签名重构* | `151.6s` → **`96.6s`（快 1.57 倍）** | **`7/7` → `7/7`** *(5 处下游调用与无头 Edge 一次全通)* | **`-57.4%`** (`296k → 126k`) |
+| **`Codex CLI` (`gpt-6-astra`)** · *空目录随机新项目* | `345.3s`（`23` 步）→ **`244.6s`（`9` 步完成，少走 61% 弯路）** | **`6/6` → `6/6`** *(1 次无头 Edge 验通)* | **`-83.3%`** (`1.12M → 186k`) |
+| **`Pi CLI` (`deepseek-flash`)** · *全栈功能升级* | `483.0s`（`81` 步）→ **`271.5s`（`70` 步，提速 1.78 倍）** | **`8/8` → `8/8`** *(`<thinking>` 空转降 42.7%)* | **`-36.7%`** (`3.63M → 2.30M`) |
+
+<details>
+<summary><strong>展开查看其余 12 项专项真机实测（SQL 对账、PE/ELF、异步 CDP、SourceMap、变异测试等）</strong></summary>
+
+<br/>
+
+| 测试 Agent 与真实任务 | 未装 `ap` → **安装 `ap` 后**（速度与步数） | 代码质量与自纠错结果 | 顺带避免的冤枉 Token |
+| :--- | :--- | :---: | :--- |
 | **复杂财务跨表与动态内网对账** · *2500 行双表 `.xlsx` + `GBK` 流水 + 动态 SPA* | `118.4s` *(连写 5 遍 XML 解析脚本)* → **`94.3s`（快 1.26 倍）** | **`5/5` → `5/5`** *(`ap query` 精确到分 + 无头 Edge 渲染)* | **`-35.1%`** (`212k → 138k`) |
 | **无 Python 全栈排障与跨库稽核** · *`.sqlite` + 3000 行 `.xlsx` + `.log.gz` + 代码单测* | `112.0s` *(手拼 .NET 解压+4 遍脚本)* → **`94.3s`（快 1.19 倍）** | **`6/6` → `6/6`** *(`.gz` 首屏抓 `[FATAL]` + SQLite↔Excel 联表 + `APPEND`)* | **`-28.7%`** (`235k → 167k`) |
 | **原生 PE 插件、在线 TCP Worker、目录 Diff 与 Webhook 捕获** · *PE32+ 导出/导入/Hex + 命令行/TCP + 原子目录对比 + 回调捕获* | `77.70s` *(手写 120 行 Python `struct`/socket/HTTP 脚本)* → **`73.23s`（快 1.06 倍，单步直出 PE 导入导出与 SHA-256）** | **`4/4` → `4/4`** *（`ap read *.dll` 一次直出导出/导入表；Worker 进程零中断）* | *免手写 PE/ELF 解析器* |
@@ -87,11 +98,26 @@ $ ap stats
 | **18 模块零提示客诉排障定位** · *`CommerceCore` 优惠券叠加资损（零文件名提示）* | `123.37s` → **`107.59s`（快 1.15 倍，`atlas locate` + `--deep` 一次直通）** | **`5/5` + 变异率 `100%`** *（联动 `atlas impact` 与活跃文件变异门禁）* | **`-7.2%`** (`111k → 103k`) |
 | **从零创造高并发服务与深度自测** · *秒杀与钱包引擎 `FlashVault`（10 路并发压测）* | 仅 `7` 步完成创造 + 五合一深度门禁 | **单测变异杀伤率：`62.5%` (`5/8`) → `100.0%` (`8/8` 全杀，黑盒 `10/10`)** | *自主揪出并消灭 3 处漏测边界缺陷* |
 | **“假绿灯”存量仓库排雷加固** · *`OrderGate`（含 `.only` 跳测 + 损坏 JSON `500` + 差一错误）* | `200.6s` → **`183.2s`（反超原生且多跑 5 重门禁）** | **`6/6` + 变异率 `100%` + 接口混沌 Fuzz 全绿** | *单次 `--deep` 替代 5 轮串行验证（步数 `-43%`）* |
-| **`Codex CLI` (`gpt-6-astra`)** · *14 文件跨模块函数签名重构* | `151.6s` → **`96.6s`（快 1.57 倍）** | **`7/7` → `7/7`** *(5 处下游调用与无头 Edge 一次全通)* | **`-57.4%`** (`296k → 126k`) |
-| **`Codex CLI` (`gpt-6-astra`)** · *空目录随机新项目* | `345.3s`（`23` 步）→ **`244.6s`（`9` 步完成，少走 61% 弯路）** | **`6/6` → `6/6`** *(1 次无头 Edge 验通)* | **`-83.3%`** (`1.12M → 186k`) |
-| **`Codex CLI` (`gpt-6-astra`)** · *全栈功能升级* | `333.6s`（`24` 步）→ **`294.3s`（`11` 步完成，少调 54% 工具）** | **`8/8` → `8/8`** | **`-65.4%`** (`1.05M → 365k`) |
-| **`Pi CLI` (`deepseek-flash`)** · *全栈功能升级* | `483.0s`（`81` 步）→ **`271.5s`（`70` 步，提速 1.78 倍）** | **`8/8` → `8/8`** *(`<thinking>` 空转降 42.7%)* | **`-36.7%`** (`3.63M → 2.30M`) |
+| **`Codex CLI` (`gpt-6-astra`)** · *全栈功能升级* | `333.6s`（`24` 步）→ **`294.3s`（`11` 步，少调 54% 工具）** | **`8/8` → `8/8`** | **`-65.4%`** (`1.05M → 365k`) |
 | **`Pi CLI` (`deepseek-flash`)** · *空目录随机新项目* | `1,821.1s` → **`1,499.3s`（快 322 秒）** | `5/6` *(2 处空 `catch {}`)* → **`6/6`（0 Slop）** | *模型主动加跑了子集和暴力对拍* |
+
+</details>
+
+---
+
+## 和你的 AI 一起维护 `ap`
+
+`ap` 依靠一条**四源递归自我改进闭环**持续进化：调研外部社区与成熟工具经验 → 离线分析本地 AI 运行过程卡点（只看过程、不碰业务）→ 纯 Rust 最小化沉淀 → 脱敏真实实践对照验证并提交可秒审的 PR：
+
+```bash
+# 先在本机离线生成脱敏纯数字“卡点→源码”简报（覆盖 6 款智能体，零提示词/路径/业务内容，安全可先自查）：
+ap audit --maintainer
+```
+
+- **复制现成提示词让你的 AI 参与维护**：查看 **[CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)**（内置完整「四源递归自我改进」提示词、**“介意扫本机日志”**的零隐私替代方案，以及**严禁误用**红线）。
+- **PR 规范免读全仓**：提 PR 严格对齐 **[.github/PULL_REQUEST_TEMPLATE.md](./.github/PULL_REQUEST_TEMPLATE.md)**，由提交方 AI 标注精确到 `文件:符号/行号` 的改动地图与前后实测对照表，维护者几分钟即可拍板合入。
+
+---
 
 <details>
 <summary><strong>给想看源码的开发者：纯 Rust 架构、微基准与研发手册</strong></summary>
@@ -112,7 +138,7 @@ $ ap stats
 ## 隐私边界与合法使用声明
 
 - **100% 本地离线、零云端上传**：`ap stats` 与 `ap audit --maintainer` 完全在本机离线运行；`ap audit --maintainer` 仅输出脱敏后的纯数字过程卡点统计，绝不输出或上传任何提示词、业务源码、本机路径或凭据。
-- **合理使用边界与四源递归共维护（严禁误用）**：`ap` 仅用于通用软件工程、排障调试、QA 自动化测试以及对自有或已获明确授权系统的防御性安全配置核查，严禁用于未授权访问或恶意用途。想让你的 AI 一起参与递归改进，请查看 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（含外部调研+本地过程审计+实践测试的完整提示词与“介意扫日志”替代方案）及 [`.github/PULL_REQUEST_TEMPLATE.md`](./.github/PULL_REQUEST_TEMPLATE.md)（要求 PR 自带精确改动地图与前后实测对照表）。
+- **合理使用边界（严禁误用）**：`ap` 仅用于通用软件工程、排障调试、QA 自动化测试以及对自有或已获明确授权系统的防御性安全配置核查，严禁用于未授权访问或恶意用途。
 
 ## 开源协议
 
