@@ -1,6 +1,6 @@
 # 1-Line Zero-Config Windows Installer for `ap` (agent-primitives)
 # Usage:
-#   irm https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | iex
+#   curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -9,6 +9,24 @@ $Repo = if ($env:AP_REPO) { $env:AP_REPO } else { "xgbtxy/ap" }
 $Version = if ($env:AP_VERSION) { $env:AP_VERSION } else { "latest" }
 $BinDir = if ($env:AP_INSTALL_DIR) { $env:AP_INSTALL_DIR } else { Join-Path $HOME ".local\bin" }
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+function Install-ApBinary([string]$SourcePath, [string]$DestPath) {
+    $OldPath = "$DestPath.old"
+    if (Test-Path $OldPath) {
+        Remove-Item -Force -Path $OldPath -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $DestPath) {
+        try {
+            Move-Item -Path $DestPath -Destination $OldPath -Force -ErrorAction Stop
+        } catch {
+            # Fallback if destination cannot be renamed cleanly
+        }
+    }
+    Copy-Item -Path $SourcePath -Destination $DestPath -Force
+    if (Test-Path $OldPath) {
+        Remove-Item -Force -Path $OldPath -ErrorAction SilentlyContinue
+    }
+}
 
 $Archive = "ap-x86_64-pc-windows-msvc.zip"
 $BaseUrl = if ($Version -eq "latest") {
@@ -37,8 +55,16 @@ try {
 
     if ($Downloaded) {
         $SumsPath = Join-Path $TmpDir "SHA256SUMS"
+        $SumsOk = $false
         if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
             & curl.exe -fsSL "$BaseUrl/SHA256SUMS" -o $SumsPath 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $SumsPath)) { $SumsOk = $true }
+        }
+        if (-not $SumsOk) {
+            try {
+                Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile $SumsPath -UseBasicParsing
+                if (Test-Path $SumsPath) { $SumsOk = $true }
+            } catch {}
         }
         if (Test-Path $SumsPath) {
             $MatchLine = Get-Content $SumsPath | Where-Object { $_ -match "\s$([regex]::Escape($Archive))$" } | Select-Object -First 1
@@ -51,12 +77,12 @@ try {
             }
         }
         Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
-        Copy-Item -Path (Join-Path $TmpDir "ap.exe") -Destination (Join-Path $BinDir "ap.exe") -Force
+        Install-ApBinary (Join-Path $TmpDir "ap.exe") (Join-Path $BinDir "ap.exe")
     } elseif (Get-Command cargo -ErrorAction SilentlyContinue) {
         Write-Host "[ap install] Building from Rust source via cargo ..." -ForegroundColor Cyan
         $CargoRoot = Join-Path $TmpDir "cargo"
         & cargo install --git "https://github.com/$Repo.git" --bin ap --locked --root $CargoRoot
-        Copy-Item -Path (Join-Path $CargoRoot "bin\ap.exe") -Destination (Join-Path $BinDir "ap.exe") -Force
+        Install-ApBinary (Join-Path $CargoRoot "bin\ap.exe") (Join-Path $BinDir "ap.exe")
     } else {
         throw "Could not download prebuilt binary from $BaseUrl/$Archive and cargo is not installed."
     }

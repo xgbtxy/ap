@@ -1,7 +1,7 @@
 {
   "name": "agent-primitives",
-  "version": "1.2.0",
-  "description": "Single-binary Rust OS/Tree-sitter-AST/Heap/SQLite micro-infrastructure primitives for coding agents & personal assistant agents",
+  "version": "2.39.0",
+  "description": "Single-binary zero-dependency Rust engine & 36-tool MCP 2025-06-18 server for AI coding and desktop agents (Tree-sitter AST, SQLite FTS5, headless CDP, shell auto-heal)",
   "license": "MIT",
   "repository": {
     "type": "git",

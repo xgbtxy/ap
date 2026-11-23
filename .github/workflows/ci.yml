@@ -21,6 +21,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Format check (rustfmt)
+        run: cargo fmt --all -- --check
       - name: Strict Clippy lint gate (-D warnings across all 8 workspace crates)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run standalone crate isolation & end-to-end integration tests

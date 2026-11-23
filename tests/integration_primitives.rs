@@ -6396,3 +6396,35 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
         assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 11);
     }
 }
+
+#[test]
+fn test_manifest_versions_match_workspace_package() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let expected = env!("CARGO_PKG_VERSION");
+
+    for rel in [
+        "package.json",
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        ".antigravity-plugin/plugin.json",
+    ] {
+        let raw = fs::read_to_string(manifest_dir.join(rel))
+            .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"));
+        let parsed: Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("invalid JSON in {rel}: {e}"));
+        assert_eq!(
+            parsed["version"].as_str(),
+            Some(expected),
+            "{rel} version drift (expected {expected})"
+        );
+    }
+
+    let market_raw =
+        fs::read_to_string(manifest_dir.join(".claude-plugin/marketplace.json")).unwrap();
+    let market: Value = serde_json::from_str(&market_raw).unwrap();
+    assert_eq!(
+        market["plugins"][0]["version"].as_str(),
+        Some(expected),
+        ".claude-plugin/marketplace.json version drift (expected {expected})"
+    );
+}

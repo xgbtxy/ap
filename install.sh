@@ -78,6 +78,7 @@ if [ "$INSTALLED" -eq 0 ]; then
   fi
 fi
 
+ORIG_PATH="${PATH:-}"
 export PATH="${BIN_DIR}:${PATH}"
 if [ "$#" -gt 0 ]; then
   "${BIN_DIR}/ap" init "$@"
@@ -91,4 +92,8 @@ echo "[ap] Ready! Your coding agents are now accelerated."
 echo "  -> Next step : Open your coding agent and chat normally (0 new commands needed)"
 echo "  -> Check env : ap doctor"
 echo "  -> View gains: ap stats   (see saved tokens & compressed logs)"
+case ":${ORIG_PATH}:" in
+  *":${BIN_DIR}:"*) ;;
+  *) echo "  -> Add to PATH (restart shell or run): export PATH=\"${BIN_DIR}:\$PATH\"" ;;
+esac
 echo "----------------------------------------------------------------"
