@@ -233,11 +233,43 @@ pub fn parse_asar_index(bytes: &[u8]) -> Result<(usize, Vec<AsarEntry>), String>
 
 pub fn read_asar_member(bytes: &[u8], entry_path: &str) -> Result<Vec<u8>, String> {
     let (base, entries) = parse_asar_index(bytes)?;
-    let norm = entry_path.trim_start_matches("./").trim_start_matches('/');
+    let norm = entry_path
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+    let suffix = format!("/{norm}");
     let hit = entries
         .iter()
-        .find(|e| e.path.eq_ignore_ascii_case(norm) || e.path.ends_with(&format!("/{norm}")))
-        .ok_or_else(|| format!("entry `{entry_path}` not found in .asar"))?;
+        .find(|e| e.path.eq_ignore_ascii_case(&norm))
+        .or_else(|| {
+            entries.iter().find(|e| {
+                let p = e.path.to_ascii_lowercase();
+                p.ends_with(&suffix.to_ascii_lowercase())
+            })
+        })
+        .ok_or_else(|| {
+            let needle = norm.to_ascii_lowercase();
+            let base_name = needle.rsplit('/').next().unwrap_or(&needle);
+            let hints: Vec<&str> = entries
+                .iter()
+                .filter(|e| {
+                    let pl = e.path.to_ascii_lowercase();
+                    pl.contains(&needle) || (!base_name.is_empty() && pl.contains(base_name))
+                })
+                .take(8)
+                .map(|e| e.path.as_str())
+                .collect();
+            if hints.is_empty() {
+                format!("entry `{entry_path}` not found in .asar ({} total entries)", entries.len())
+            } else {
+                format!(
+                    "entry `{entry_path}` not found in .asar; closest matches: {}",
+                    hints.join(", ")
+                )
+            }
+        })?;
     if hit.unpacked {
         return Err(format!(
             "entry `{}` is marked unpacked (lives in app.asar.unpacked)",
@@ -282,19 +314,51 @@ pub fn list_asar_md(bytes: &[u8], query: Option<&str>) -> Result<String, String>
 
 pub fn read_zip_member(bytes: &[u8], entry_path: &str) -> Result<Vec<u8>, String> {
     let mut za = ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("zip error: {e}"))?;
-    let norm = entry_path.trim_start_matches("./").trim_start_matches('/');
-    let mut matched_name = None;
+    let norm = entry_path
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+    let suffix_low = format!("/{}", norm.to_ascii_lowercase());
+    let mut exact_name: Option<String> = None;
+    let mut suffix_name: Option<String> = None;
+    let mut all_names: Vec<String> = Vec::new();
     for i in 0..za.len() {
         if let Ok(f) = za.by_index(i) {
-            let nm = f.name().replace('\\', "/");
-            if nm.eq_ignore_ascii_case(norm) || nm.ends_with(&format!("/{norm}")) {
-                matched_name = Some(f.name().to_string());
+            let orig = f.name().to_string();
+            let nm = orig.replace('\\', "/");
+            if nm.eq_ignore_ascii_case(&norm) {
+                exact_name = Some(orig);
                 break;
+            }
+            if suffix_name.is_none() && nm.to_ascii_lowercase().ends_with(&suffix_low) {
+                suffix_name = Some(orig.clone());
+            }
+            if all_names.len() < 4000 {
+                all_names.push(nm);
             }
         }
     }
-    let Some(name) = matched_name else {
-        return Err(format!("entry `{entry_path}` not found in archive"));
+    let Some(name) = exact_name.or(suffix_name) else {
+        let needle = norm.to_ascii_lowercase();
+        let base_name = needle.rsplit('/').next().unwrap_or(&needle);
+        let hints: Vec<&str> = all_names
+            .iter()
+            .filter(|n| {
+                let nl = n.to_ascii_lowercase();
+                nl.contains(&needle) || (!base_name.is_empty() && nl.contains(base_name))
+            })
+            .take(8)
+            .map(String::as_str)
+            .collect();
+        if hints.is_empty() {
+            return Err(format!("entry `{entry_path}` not found in archive"));
+        }
+        return Err(format!(
+            "entry `{entry_path}` not found in archive; closest matches: {}",
+            hints.join(", ")
+        ));
     };
     let f = za.by_name(&name).map_err(|e| format!("zip entry: {e}"))?;
     let mut buf = Vec::new();

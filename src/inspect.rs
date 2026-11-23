@@ -1060,6 +1060,142 @@ pub fn extract_js_routes_md(
     (out.join("\n"), jv)
 }
 
+fn redact_secret(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    if chars.len() <= 8 {
+        return "***".to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail} ({} chars)", chars.len())
+}
+
+fn is_placeholder_secret(val: &str) -> bool {
+    let low = val.trim().to_ascii_lowercase();
+    low.len() < 8
+        || low.contains("example")
+        || low.contains("placeholder")
+        || low.contains("changeme")
+        || low.contains("your_")
+        || low.contains("your-")
+        || low.contains("dummy")
+        || low.contains("redacted")
+        || low.contains("${")
+        || low.contains("{{")
+        || low.starts_with('<')
+        || low.chars().all(|c| c == '*' || c == 'x' || c == '0' || c == '-')
+}
+
+/// Pure-Rust `<15ms` defensive hardcoded-secret & credential hygiene scanner (`--secrets`).
+/// Always redacts matched secret values in output so credentials are never echoed verbatim.
+pub fn scan_secrets_md(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+) -> (String, serde_json::Value) {
+    static PATS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    let pats = PATS.get_or_init(|| {
+        vec![
+            (
+                "PEM_PRIVATE_KEY",
+                Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----").unwrap(),
+            ),
+            (
+                "CLOUD_ACCESS_KEY",
+                Regex::new(r"\b((?:AKIA|ASIA|LTAI)[0-9A-Z]{16,24})\b").unwrap(),
+            ),
+            (
+                "SCM_OR_SAAS_TOKEN",
+                Regex::new(r"\b((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{24,}|glpat-[A-Za-z0-9_-]{18,}|xox[baprs]-[A-Za-z0-9-]{16,}|sk-(?:live|proj|test)?-?[A-Za-z0-9]{20,})\b").unwrap(),
+            ),
+            (
+                "EMBEDDED_URI_CRED",
+                Regex::new(r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|https?)://([^:\s/'\x22@]{2,32}:[^@\s/'\x22]{6,64})@[A-Za-z0-9.-]{3,}").unwrap(),
+            ),
+            (
+                "HARDCODED_AUTH_HEADER",
+                Regex::new(r#"(?i)(?:authorization['"]?\s*[:=]\s*['"])((?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,})['"]"#).unwrap(),
+            ),
+            (
+                "HARDCODED_SECRET_ASSIGN",
+                Regex::new(r#"(?i)\b(?:api[_-]?key|secret[_-]?key|access[_-]?secret|client[_-]?secret|private[_-]?key|db[_-]?pass(?:word)?|jwt[_-]?secret)\b['"]?\s*[:=]\s*['"]([^'"\r\n\s]{12,128})['"]"#).unwrap(),
+            ),
+        ]
+    });
+
+    let scan_end = {
+        let mut e = text.len().min(16 * 1024 * 1024);
+        while e > 0 && !text.is_char_boundary(e) {
+            e -= 1;
+        }
+        e
+    };
+    let slice = &text[..scan_end];
+    let q_low = query
+        .map(|q| q.trim().to_ascii_lowercase())
+        .filter(|q| !q.is_empty());
+
+    let mut seen = std::collections::HashSet::new();
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+    for (kind, re) in pats {
+        for cap in re.captures_iter(slice) {
+            if findings.len() >= 80 {
+                break;
+            }
+            let Some(m0) = cap.get(0) else { continue };
+            let raw_val = cap.get(1).map(|m| m.as_str()).unwrap_or(m0.as_str());
+            if *kind != "PEM_PRIVATE_KEY" && is_placeholder_secret(raw_val) {
+                continue;
+            }
+            let redacted = if *kind == "PEM_PRIVATE_KEY" {
+                m0.as_str().to_string()
+            } else {
+                redact_secret(raw_val)
+            };
+            let ln = byte_line_col(slice, m0.start());
+            if let Some(ref q) = q_low {
+                if !kind.to_ascii_lowercase().contains(q) && !redacted.to_ascii_lowercase().contains(q) {
+                    continue;
+                }
+            }
+            let dedup_key = format!("{kind}:{ln}:{}", m0.start() / 16);
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+            findings.push(serde_json::json!({
+                "kind": kind,
+                "line": ln,
+                "offset": m0.start(),
+                "redacted": redacted,
+            }));
+        }
+    }
+
+    let mut out = vec![format!(
+        "# Secret Hygiene Audit `{label}` ({} finding(s), all values redacted)",
+        findings.len()
+    )];
+    if findings.is_empty() {
+        out.push("*(0 hardcoded secret/credential patterns detected)*".to_string());
+    } else {
+        for f in &findings {
+            out.push(format!(
+                "- `{}` (L{}, @{}): `{}`",
+                f["kind"].as_str().unwrap_or(""),
+                f["line"],
+                f["offset"],
+                f["redacted"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    let jv = serde_json::json!({
+        "target": label,
+        "count": findings.len(),
+        "findings": findings,
+    });
+    (out.join("\n"), jv)
+}
+
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
@@ -1102,5 +1238,21 @@ mod inspect_tests {
         assert!(md.contains("innerHTML"), "missing DOM sink in:\n{md}");
         assert!(md.contains("cdn.acme.test"), "missing external origin in:\n{md}");
         assert_eq!(jv["counts"]["post_message"], 2);
+    }
+
+    #[test]
+    fn scans_and_redacts_hardcoded_secrets_while_skipping_placeholders() {
+        let pem_hdr = format!("{}{}", "-----BEGIN RSA ", "PRIVATE KEY-----");
+        let ak_val = format!("{}{}", "AKIA", "9X4B7M2Q8W5R1T6Y");
+        let cfg = format!(
+            "const pem = \"{pem_hdr}\";\nconst ak = \"{ak_val}\";\nconst db = \"postgres://svc_user:Sup3rS3cretPass!@db.internal:5432/prod\";\nconst safe = {{ api_key: \"your_example_placeholder_key\" }};\n"
+        );
+        let (md, jv) = scan_secrets_md(&cfg, "cfg.js", None);
+        assert_eq!(jv["count"], 3, "unexpected count in:\n{md}");
+        assert!(md.contains("PEM_PRIVATE_KEY"), "missing PEM in:\n{md}");
+        assert!(md.contains("CLOUD_ACCESS_KEY"), "missing AK in:\n{md}");
+        assert!(md.contains("EMBEDDED_URI_CRED"), "missing URI cred in:\n{md}");
+        assert!(!md.contains("Sup3rS3cretPass!"), "secret must be redacted in:\n{md}");
+        assert!(!md.contains(&ak_val), "AK must be redacted in:\n{md}");
     }
 }

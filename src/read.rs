@@ -74,6 +74,9 @@ struct ReadCli {
     /// Decode JWT header/claims/UTC timestamps & defensive posture flags (accepts file path or inline `eyJ...` token)
     #[arg(long)]
     jwt: bool,
+    /// Defensive hardcoded-secret & credential hygiene audit (PEM keys, cloud AKs, embedded URI creds, tokens; auto-redacted)
+    #[arg(long)]
+    secrets: bool,
     /// Patch-diff this binary/archive (PE/ELF/Go/.asar/.zip/.jar/.vsix) against an older file path
     #[arg(long)]
     diff: Option<String>,
@@ -983,7 +986,7 @@ fn read_single_target(
         return Ok((rendered, jv));
     }
 
-    if cli.jwt {
+    if cli.jwt && cli.entry.is_none() {
         let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
         let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(&decoded_txt)
             .map_err(|e| (1, format!("[ap read --jwt] {e}")))?;
@@ -1006,7 +1009,7 @@ fn read_single_target(
         return Ok((rendered, jv));
     }
 
-    if cli.routes {
+    if cli.routes && cli.entry.is_none() {
         let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
         let (rendered, jv_inner) =
             crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());
@@ -1024,6 +1027,29 @@ fn read_single_target(
             "format": "js-routes",
             "size_bytes": raw_bytes.len(),
             "surface": jv_inner,
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if cli.secrets && cli.entry.is_none() {
+        let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
+        let (rendered, jv_inner) =
+            crate::inspect::scan_secrets_md(&decoded_txt, &label, cli.query.as_deref());
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "secrets",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "secrets",
+            "size_bytes": raw_bytes.len(),
+            "secrets": jv_inner,
             "content": rendered,
         });
         return Ok((rendered, jv));
@@ -1187,6 +1213,50 @@ fn read_single_target(
             }
         }
     };
+
+    // Compose `--entry` on virtual archives (.asar/.zip/.vsix/.jar/.map) with `--routes`/`--secrets`/`--jwt`
+    if cli.entry.is_some() {
+        let entry_label = format!("{label}!{}", cli.entry.as_deref().unwrap_or(""));
+        if cli.jwt {
+            let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(&converted)
+                .map_err(|e| (1, format!("[ap read --entry --jwt] {e}")))?;
+            record_event("read", raw_len, rendered.len() as u64, win_heals, 1, "entry-jwt");
+            let jv = json!({
+                "ok": true,
+                "target": entry_label,
+                "format": "jwt",
+                "jwt": jv_inner,
+                "content": rendered,
+            });
+            return Ok((rendered, jv));
+        }
+        if cli.routes {
+            let (rendered, jv_inner) =
+                crate::inspect::extract_js_routes_md(&converted, &entry_label, cli.query.as_deref());
+            record_event("read", raw_len, rendered.len() as u64, win_heals, 1, "entry-routes");
+            let jv = json!({
+                "ok": true,
+                "target": entry_label,
+                "format": "js-routes",
+                "surface": jv_inner,
+                "content": rendered,
+            });
+            return Ok((rendered, jv));
+        }
+        if cli.secrets {
+            let (rendered, jv_inner) =
+                crate::inspect::scan_secrets_md(&converted, &entry_label, cli.query.as_deref());
+            record_event("read", raw_len, rendered.len() as u64, win_heals, 1, "entry-secrets");
+            let jv = json!({
+                "ok": true,
+                "target": entry_label,
+                "format": "secrets",
+                "secrets": jv_inner,
+                "content": rendered,
+            });
+            return Ok((rendered, jv));
+        }
+    }
 
     let all_lines: Vec<&str> = converted.lines().collect();
     let total_lines = all_lines.len();
