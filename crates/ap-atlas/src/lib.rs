@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use ignore::WalkBuilder;
 pub mod changes;
+pub mod history;
 pub mod impact;
 pub mod locate;
 pub mod product;
@@ -204,6 +205,19 @@ enum SubCmd {
         root: String,
         #[arg(long, default_value = "HEAD")]
         base: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Git symbol/line history, blame authorship & temporal co-change coupling in <50ms
+    History {
+        /// File path inside git repository
+        file: String,
+        #[arg(long, default_value = "")]
+        symbol: String,
+        #[arg(long, default_value = "")]
+        lines: String,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -1506,6 +1520,24 @@ pub fn run_cli(args: &[String]) -> i32 {
                 println!("{}", changes::render_changes_md(&rep));
             }
             return 0;
+        }
+        Some(SubCmd::History {
+            file,
+            symbol,
+            lines,
+            limit,
+            json,
+        }) => {
+            let file_p = PathBuf::from(&file);
+            let sym_opt = (!symbol.trim().is_empty()).then_some(symbol.as_str());
+            let lines_opt = (!lines.trim().is_empty()).then_some(lines.as_str());
+            let rep = history::analyze_file_history(&file_p, sym_opt, lines_opt, limit);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+            } else {
+                println!("{}", history::render_history_md(&rep));
+            }
+            return if file_p.exists() { 0 } else { 1 };
         }
         Some(SubCmd::Surface {
             root,

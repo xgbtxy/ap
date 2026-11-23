@@ -1077,7 +1077,7 @@ pub fn build_adapter_recommendations(
             "layer": "Layer 3: Non-Codemode CLI MCP Profile",
             "target": "cli_harnesses",
             "command": "ap profile set --mcp-profile core --apply",
-            "reason": "Keep 8 everyday MCP tools loaded + on-demand `ap_discover`/`ap_call` (or `--mcp-profile deferred` for small models to trim ~94% upfront schema tokens)",
+            "reason": "Wires native TOML/JSON MCP (`--mcp-profile core`: 8 everyday tools + `ap_discover`/`ap_call`, or `deferred` for ~94% fewer schema tokens) + <5ms PostToolUse AST checks across Codex, Claude Code, Grok, Gemini CLI & Antigravity",
         }));
     }
     recs

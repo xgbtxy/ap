@@ -7814,3 +7814,310 @@ fn test_v248_layered_profile_init_mcp_profile_and_fast_audit() {
     assert!(!aud_str.contains("FAKE_SECRET_999"));
     assert!(!aud_str.contains("deepseek-flash-private-alias"));
 }
+
+#[test]
+fn test_v249_multi_harness_mcp_git_history_and_post_edit_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".grok")).unwrap();
+    let home_s = home.to_string_lossy().to_string();
+
+    // Pre-seed user tables/settings to guarantee 100% lossless upsert & uninstall
+    fs::write(
+        home.join(".codex").join("config.toml"),
+        "# keep user codex comment\nmodel = \"gpt-5-codex\"\n\n[features]\nshell_tool = true\n",
+    )
+    .unwrap();
+    fs::write(
+        home.join(".grok").join("config.toml"),
+        "# keep user grok comment\n\n[models]\ndefault = \"grok-code\"\n",
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "numStartups": 42,
+            "mcpServers": {
+                "existing-server": { "command": "node", "args": ["srv.js"] }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 1. Multi-harness TOML + JSON MCP + PostToolUse AST hook wiring
+    let init_res = run_ap(
+        dir.path(),
+        &[
+            "init",
+            "--home",
+            &home_s,
+            "-a",
+            "codex,grok,claude,antigravity",
+            "--mcp-profile",
+            "core",
+            "--with-hooks",
+            "--no-rules",
+        ],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+
+    let codex_toml = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+    assert!(
+        codex_toml.contains("[features]\nshell_tool = true")
+            && codex_toml.contains("[mcp_servers.agent-primitives]")
+            && codex_toml.contains("\"--profile\", \"core\""),
+        "{codex_toml}"
+    );
+    let grok_toml = fs::read_to_string(home.join(".grok").join("config.toml")).unwrap();
+    assert!(
+        grok_toml.contains("[models]\ndefault = \"grok-code\"")
+            && grok_toml.contains("[mcp_servers.agent-primitives]")
+            && grok_toml.contains("\"--profile\", \"core\""),
+        "{grok_toml}"
+    );
+    let claude_json: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(claude_json["numStartups"], 42);
+    assert_eq!(
+        claude_json["mcpServers"]["existing-server"]["command"],
+        "node"
+    );
+    assert_eq!(
+        claude_json["mcpServers"]["agent-primitives"]["type"],
+        "stdio"
+    );
+    assert_eq!(
+        claude_json["mcpServers"]["agent-primitives"]["args"][2],
+        "core"
+    );
+    let agy_mcp: Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".gemini").join("config").join("mcp_config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(agy_mcp["mcpServers"]["agent-primitives"]["args"][2], "core");
+
+    let claude_settings = fs::read_to_string(home.join(".claude").join("settings.json")).unwrap();
+    let codex_hooks = fs::read_to_string(home.join(".codex").join("hooks.json")).unwrap();
+    let agy_hooks =
+        fs::read_to_string(home.join(".gemini").join("config").join("hooks.json")).unwrap();
+    assert!(
+        claude_settings.contains("PostToolUse") && claude_settings.contains("splice check --hook"),
+        "{claude_settings}"
+    );
+    assert!(
+        codex_hooks.contains("PostToolUse") && codex_hooks.contains("splice check --hook"),
+        "{codex_hooks}"
+    );
+    assert!(
+        agy_hooks.contains("PostToolUse") && agy_hooks.contains("splice check --hook"),
+        "{agy_hooks}"
+    );
+
+    let prof_res = run_ap(
+        dir.path(),
+        &["profile", "show", "--home", &home_s, "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(prof_res.status.success());
+    let prof_v: Value = serde_json::from_slice(&prof_res.stdout).unwrap();
+    let wired = prof_v["wired_harnesses"].as_array().unwrap();
+    for hid in ["codex", "grok", "claude", "antigravity"] {
+        let row = wired
+            .iter()
+            .find(|r| r["harness"].as_str() == Some(hid))
+            .unwrap_or_else(|| panic!("missing harness {hid} in {wired:?}"));
+        assert_eq!(row["mcp_profile"], "core");
+    }
+
+    // Uninstall removes agent-primitives cleanly while preserving pre-seeded config
+    let un_res = run_ap(
+        dir.path(),
+        &["uninstall", "--home", &home_s],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(un_res.status.success());
+    let codex_after = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+    assert!(!codex_after.contains("agent-primitives") && codex_after.contains("[features]"));
+    let grok_after = fs::read_to_string(home.join(".grok").join("config.toml")).unwrap();
+    assert!(!grok_after.contains("agent-primitives") && grok_after.contains("[models]"));
+    let claude_after: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(claude_after["numStartups"], 42);
+    assert!(claude_after["mcpServers"].get("agent-primitives").is_none());
+    assert!(claude_after["mcpServers"].get("existing-server").is_some());
+
+    // 2. Sub-5ms `ap splice check --hook` PostToolUse gate
+    let hook_dir = dir.path().join("hook_repo");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let valid_py = hook_dir.join("ok.py");
+    let broken_py = hook_dir.join("broken.py");
+    let broken_js = hook_dir.join("broken.js");
+    fs::write(&valid_py, "def ok_fn(x):\n    return x + 1\n").unwrap();
+    fs::write(&broken_py, "def broken(:\n    pass\n").unwrap();
+    fs::write(&broken_js, "function f() { return ;;; ( }\n").unwrap();
+
+    let hook_ok = run_ap(
+        &hook_dir,
+        &["splice", "check", "--hook"],
+        Some(
+            &serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": valid_py }
+            })
+            .to_string(),
+        ),
+        &[],
+    );
+    assert!(hook_ok.status.success());
+    assert!(String::from_utf8_lossy(&hook_ok.stdout).trim().is_empty());
+
+    let hook_bad = run_ap(
+        &hook_dir,
+        &["splice", "check", "--hook"],
+        Some(
+            &serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": broken_py }
+            })
+            .to_string(),
+        ),
+        &[],
+    );
+    assert!(hook_bad.status.success());
+    let hook_bad_out: Value = serde_json::from_slice(&hook_bad.stdout).unwrap();
+    let ctx = hook_bad_out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        ctx.contains("SyntaxError") && ctx.contains("broken.py"),
+        "{hook_bad_out}"
+    );
+
+    let agy_bad = run_ap(
+        &hook_dir,
+        &["splice", "check", "--hook"],
+        Some(
+            &serde_json::json!({
+                "hookEventName": "PostToolUse",
+                "toolCall": { "name": "edit_file", "args": { "Path": broken_js } }
+            })
+            .to_string(),
+        ),
+        &[],
+    );
+    assert!(agy_bad.status.success());
+    assert_eq!(String::from_utf8_lossy(&agy_bad.stdout).trim(), "{}");
+    assert!(String::from_utf8_lossy(&agy_bad.stderr).contains("SyntaxError"));
+
+    // 3. `ap atlas history` + MCP `ap_changes(history_file=...)` keeping exact 37 tools
+    let grepo = dir.path().join("git_hist");
+    fs::create_dir_all(grepo.join("src")).unwrap();
+    fs::create_dir_all(grepo.join("tests")).unwrap();
+    let git_ok = |args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&grepo)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git_ok(&["init"]);
+    git_ok(&["config", "user.name", "Ada Lovelace"]);
+    git_ok(&["config", "user.email", "ada@example.com"]);
+    fs::write(
+        grepo.join("src/engine.py"),
+        "def score_item(x):\n    return x * 2\n",
+    )
+    .unwrap();
+    fs::write(
+        grepo.join("tests/test_engine.py"),
+        "def test_score():\n    assert True\n",
+    )
+    .unwrap();
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-m", "feat: initial score_item"]);
+    fs::write(
+        grepo.join("src/engine.py"),
+        "def score_item(x, bonus=1):\n    return x * 2 + bonus\n",
+    )
+    .unwrap();
+    fs::write(
+        grepo.join("tests/test_engine.py"),
+        "def test_score():\n    assert True\n\ndef test_bonus():\n    assert True\n",
+    )
+    .unwrap();
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-m", "feat: add bonus to score_item"]);
+
+    let hist_out = run_ap(
+        &grepo,
+        &[
+            "atlas",
+            "history",
+            "src/engine.py",
+            "--symbol",
+            "score_item",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(hist_out.status.success());
+    let hist_v: Value = serde_json::from_slice(&hist_out.stdout).unwrap();
+    assert_eq!(hist_v["resolved_symbol"], "score_item");
+    assert_eq!(hist_v["owners"][0]["author"], "Ada Lovelace");
+    assert_eq!(
+        hist_v["co_changed_files"][0]["path"],
+        "tests/test_engine.py"
+    );
+    assert!(hist_v["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["subject"].as_str().unwrap_or("").contains("bonus")));
+
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_changes",
+            "arguments": {
+                "path": grepo.to_string_lossy(),
+                "history_file": "src/engine.py",
+                "symbol": "score_item"
+            }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(&grepo, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let lines: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    let hist_sc = &lines[2]["result"]["structuredContent"];
+    assert_eq!(hist_sc["resolved_symbol"], "score_item");
+    assert_eq!(
+        hist_sc["co_changed_files"][0]["path"],
+        "tests/test_engine.py"
+    );
+}

@@ -623,12 +623,16 @@ fn mcp_tools_schema() -> Value {
         }),
         json!({
             "name": "ap_changes",
-            "description": "Git-diff-aware Change Impact Brief (<30ms in-process): inspects modified files, extracts exact modified Tree-sitter AST symbols, maps untouched downstream callers across the repo, and lists related tests to run.",
+            "description": "Git-diff & symbol history impact brief (<35ms in-process): maps modified AST symbols, untouched callers & related tests for working-tree changes, OR when `history_file` is provided, extracts symbol/line commit history, blame authorship & temporal co-change files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Git repository root directory (default: '.')" },
-                    "base": { "type": "string", "description": "Git base ref to diff against (default: 'HEAD')" }
+                    "base": { "type": "string", "description": "Git base ref to diff against (default: 'HEAD')" },
+                    "history_file": { "type": "string", "description": "Optional file path for git symbol/line history, blame authorship & temporal co-change coupling" },
+                    "symbol": { "type": "string", "description": "Optional AST symbol inside history_file (e.g. 'computeTotal')" },
+                    "lines": { "type": "string", "description": "Optional line range inside history_file (e.g. '10-45')" },
+                    "limit": { "type": "integer", "description": "Max commits returned for history_file (default: 8, max: 25)" }
                 }
             }
         }),
@@ -2840,6 +2844,33 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
         }
         "ap_changes" => {
             let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            if let Some(hf) = args
+                .get("history_file")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let hf_raw = std::path::Path::new(hf);
+                let hf_p = if hf_raw.is_absolute() || hf_raw.exists() {
+                    hf_raw.to_path_buf()
+                } else {
+                    std::path::Path::new(root).join(hf_raw)
+                };
+                if !hf_p.exists() {
+                    return (false, format!("[atlas] history_file not found: {hf}"));
+                }
+                let symbol = args.get("symbol").and_then(Value::as_str);
+                let lines = args.get("lines").and_then(Value::as_str);
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8)
+                    .clamp(1, 25) as usize;
+                let rep = ap_atlas::history::analyze_file_history(&hf_p, symbol, lines, limit);
+                let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
+                crate::stats::record_event("history", 0, js.len() as u64, 0, 1, "mcp-history");
+                return (true, js);
+            }
             let root_p = std::path::Path::new(root);
             if !root_p.exists() {
                 return (false, format!("[atlas] path not found: {root}"));

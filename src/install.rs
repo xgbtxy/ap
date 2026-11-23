@@ -424,12 +424,24 @@ fn merge_claude_or_codex_hooks(
             .entry(event)
             .or_insert_with(|| json!([]));
         if let Some(vec) = arr.as_array_mut() {
+            let role_tag = if cmd_str.contains("guard shield") {
+                " guard shield"
+            } else if cmd_str.contains("guard stop-gate") {
+                " guard stop-gate"
+            } else if cmd_str.contains("baton checkpoint") {
+                " baton checkpoint"
+            } else if cmd_str.contains("splice check --hook") {
+                " splice check --hook"
+            } else {
+                cmd_str.as_str()
+            };
             // Remove any legacy python guard.py/baton.py or stale ap hook for the same role
             vec.retain(|item| {
                 let s = item.to_string();
                 !s.contains("guard/scripts/guard.py")
                     && !s.contains("baton/scripts/baton.py")
                     && !s.contains(&cmd_str)
+                    && !s.contains(role_tag)
             });
             let mut entry = json!({
                 "hooks": [{"type": "command", "command": cmd_str}]
@@ -448,6 +460,13 @@ fn merge_claude_or_codex_hooks(
             Some("Bash"),
         );
         ensure_hook("Stop", format!("\"{ap_bin_posix}\" guard stop-gate"), None);
+    }
+    if sel.contains("splice") {
+        ensure_hook(
+            "PostToolUse",
+            format!("\"{ap_bin_posix}\" splice check --hook"),
+            Some("Edit|Write|MultiEdit|edit_file|write_file|apply_patch"),
+        );
     }
     if include_precompact && sel.contains("baton") {
         ensure_hook(
@@ -492,6 +511,7 @@ fn remove_claude_or_codex_hooks(settings_path: &Path) -> bool {
                     && !s.contains(" guard shield")
                     && !s.contains(" guard stop-gate")
                     && !s.contains(" baton checkpoint")
+                    && !s.contains(" splice check --hook")
             });
             if arr.len() != before {
                 changed = true;
@@ -528,7 +548,9 @@ fn merge_antigravity_hooks(
     ap_bin_posix: &str,
     selected: &[&str],
 ) -> Option<String> {
-    if !selected.contains(&"guard") {
+    let want_guard = selected.contains(&"guard");
+    let want_splice = selected.contains(&"splice");
+    if !want_guard && !want_splice {
         return None;
     }
     let mut data: Value = if hooks_path.exists() {
@@ -543,22 +565,43 @@ fn merge_antigravity_hooks(
     if !data.is_object() {
         data = json!({});
     }
-    data["agent-primitives-guard"] = json!({
-        "enabled": true,
-        "PreToolUse": [{
-            "matcher": "run_command",
-            "hooks": [{
+    let mut entry = serde_json::Map::new();
+    entry.insert("enabled".to_string(), json!(true));
+    if want_guard {
+        entry.insert(
+            "PreToolUse".to_string(),
+            json!([{
+                "matcher": "run_command",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("\"{ap_bin_posix}\" guard shield"),
+                    "timeout": 10
+                }]
+            }]),
+        );
+        entry.insert(
+            "Stop".to_string(),
+            json!([{
                 "type": "command",
-                "command": format!("\"{ap_bin_posix}\" guard shield"),
-                "timeout": 10
-            }]
-        }],
-        "Stop": [{
-            "type": "command",
-            "command": format!("\"{ap_bin_posix}\" guard stop-gate"),
-            "timeout": 15
-        }]
-    });
+                "command": format!("\"{ap_bin_posix}\" guard stop-gate"),
+                "timeout": 15
+            }]),
+        );
+    }
+    if want_splice {
+        entry.insert(
+            "PostToolUse".to_string(),
+            json!([{
+                "matcher": "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("\"{ap_bin_posix}\" splice check --hook"),
+                    "timeout": 10
+                }]
+            }]),
+        );
+    }
+    data["agent-primitives-guard"] = Value::Object(entry);
     if let Some(parent) = hooks_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -685,6 +728,257 @@ fn remove_opencode_mcp(cfg_path: &Path) {
             ),
         );
     }
+}
+
+fn toml_escape_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        if in_dq {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == b'"' {
+                in_dq = false;
+            }
+        } else if in_sq {
+            if b[i] == b'\'' {
+                in_sq = false;
+            }
+        } else if b[i] == b'"' {
+            in_dq = true;
+        } else if b[i] == b'\'' {
+            in_sq = true;
+        } else if b[i] == b'#' {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+fn is_toml_table_header(line: &str) -> bool {
+    let head = strip_toml_comment(line).trim();
+    if head.starts_with("[[") && head.ends_with("]]") && head.len() > 4 {
+        return true;
+    }
+    if head.starts_with('[') && head.ends_with(']') && head.len() > 2 && !head.starts_with("[[") {
+        let inner = &head[1..head.len() - 1];
+        let mut in_dq = false;
+        let mut in_sq = false;
+        let bytes = inner.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if in_dq {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    in_dq = false;
+                }
+            } else if in_sq {
+                if bytes[i] == b'\'' {
+                    in_sq = false;
+                }
+            } else if bytes[i] == b'"' {
+                in_dq = true;
+            } else if bytes[i] == b'\'' {
+                in_sq = true;
+            } else if matches!(bytes[i], b',' | b'=') {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+    false
+}
+
+fn is_ap_toml_mcp_header(line: &str) -> bool {
+    let head = strip_toml_comment(line).trim();
+    matches!(
+        head,
+        "[mcp_servers.agent-primitives]"
+            | "[mcp_servers.\"agent-primitives\"]"
+            | "[mcp_servers.'agent-primitives']"
+    )
+}
+
+fn render_toml_ap_section(ap_bin_posix: &str, mcp_profile: &str) -> Vec<String> {
+    let args_list: String = mcp_args_for_profile(mcp_profile)
+        .into_iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        "[mcp_servers.agent-primitives]".to_string(),
+        format!("command = \"{}\"", toml_escape_str(ap_bin_posix)),
+        format!("args = [{args_list}]"),
+    ]
+}
+
+fn merge_toml_mcp_server(cfg_path: &Path, ap_bin_posix: &str, mcp_profile: &str) -> String {
+    let section_lines = render_toml_ap_section(ap_bin_posix, mcp_profile);
+    let orig = fs::read_to_string(cfg_path).unwrap_or_default();
+    let lines: Vec<String> = orig.lines().map(ToString::to_string).collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + section_lines.len() + 2);
+    let mut replaced = false;
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if is_ap_toml_mcp_header(&lines[i]) {
+            if !replaced {
+                out.extend(section_lines.iter().cloned());
+                replaced = true;
+            }
+            i += 1;
+            while i < lines.len() && !is_toml_table_header(&lines[i]) {
+                i += 1;
+            }
+            if i < lines.len() && out.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+                out.push(String::new());
+            }
+            continue;
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+
+    if !replaced {
+        if out.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+            out.push(String::new());
+        }
+        out.extend(section_lines);
+    }
+
+    if let Some(p) = cfg_path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+    let body = if out.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", out.join("\n"))
+    };
+    let _ = fs::write(cfg_path, body);
+    posix(cfg_path)
+}
+
+fn remove_toml_mcp_server(cfg_path: &Path) -> bool {
+    let Ok(orig) = fs::read_to_string(cfg_path) else {
+        return false;
+    };
+    let lines: Vec<&str> = orig.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        if is_ap_toml_mcp_header(lines[i]) {
+            changed = true;
+            i += 1;
+            while i < lines.len() && !is_toml_table_header(lines[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        let cur = lines[i];
+        if cur.trim().is_empty() && out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+            i += 1;
+            continue;
+        }
+        out.push(cur.to_string());
+        i += 1;
+    }
+    if !changed {
+        return false;
+    }
+    while out.first().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out.remove(0);
+    }
+    while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out.pop();
+    }
+    if out.is_empty() {
+        let _ = fs::remove_file(cfg_path);
+    } else {
+        let _ = fs::write(cfg_path, format!("{}\n", out.join("\n")));
+    }
+    true
+}
+
+fn extract_mcp_profile_from_toml(cfg_path: &Path) -> Option<&'static str> {
+    let raw = fs::read_to_string(cfg_path).ok()?;
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut in_sec = false;
+    for ln in lines {
+        if is_ap_toml_mcp_header(ln) {
+            in_sec = true;
+            continue;
+        }
+        if in_sec {
+            if is_toml_table_header(ln) {
+                break;
+            }
+            let body = strip_toml_comment(ln).trim();
+            if body.starts_with("args") && body.contains("--profile") {
+                if body.contains("\"core\"") || body.contains("'core'") {
+                    return Some("core");
+                }
+                if body.contains("\"deferred\"") || body.contains("'deferred'") {
+                    return Some("deferred");
+                }
+            }
+        }
+    }
+    in_sec.then_some("full")
+}
+
+fn merge_claude_mcp_json(cfg_path: &Path, ap_bin_posix: &str, mcp_profile: &str) -> String {
+    let mut data: Value = if cfg_path.exists() {
+        fs::read_to_string(cfg_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
+    if !data.is_object() {
+        data = json!({});
+    }
+    let servers = data
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}));
+    if !servers.is_object() {
+        *servers = json!({});
+    }
+    servers.as_object_mut().unwrap().insert(
+        "agent-primitives".to_string(),
+        json!({
+            "type": "stdio",
+            "command": ap_bin_posix,
+            "args": mcp_args_for_profile(mcp_profile)
+        }),
+    );
+    if let Some(p) = cfg_path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+    let _ = fs::write(
+        cfg_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&data).unwrap_or_default()
+        ),
+    );
+    posix(cfg_path)
 }
 
 fn merge_mcp_servers_json(
@@ -5517,12 +5811,45 @@ pub fn cmd_init(
                 ));
             }
         }
-        if with_mcp {
+        if with_mcp
+            || (explicit_agents && harnesses.contains(&"codex"))
+            || repo_dir.join(".codex").is_dir()
+        {
+            mcp_paths.push(merge_toml_mcp_server(
+                &repo_dir.join(".codex").join("config.toml"),
+                &ap_abs_here,
+                mcp_for("codex"),
+            ));
+        }
+        if with_mcp
+            || (explicit_agents && harnesses.contains(&"grok"))
+            || repo_dir.join(".grok").is_dir()
+        {
+            mcp_paths.push(merge_toml_mcp_server(
+                &repo_dir.join(".grok").join("config.toml"),
+                &ap_abs_here,
+                mcp_for("grok"),
+            ));
+        }
+        if with_mcp || (explicit_agents && harnesses.contains(&"antigravity")) {
+            mcp_paths.push(merge_mcp_servers_json(
+                &repo_dir.join(".agents").join("mcp_config.json"),
+                &ap_abs_here,
+                false,
+                mcp_for("antigravity"),
+            ));
+        }
+        if with_mcp || (explicit_agents && harnesses.contains(&"claude")) {
+            let prof = if explicit_agents && harnesses.contains(&"claude") {
+                mcp_for("claude")
+            } else {
+                explicit_mcp.unwrap_or("full")
+            };
             mcp_paths.push(merge_mcp_servers_json(
                 &repo_dir.join(".mcp.json"),
                 &ap_abs_here,
                 false,
-                explicit_mcp.unwrap_or("full"),
+                prof,
             ));
         }
 
@@ -5664,13 +5991,42 @@ pub fn cmd_init(
         }
     }
 
-    // Zero-flag automatic MCP registration for free/open coding agents (OpenCode, Qwen Code, Gemini CLI, Pi codemode)
+    // Zero-flag automatic MCP registration for supported CLIs & IDEs (Pi codemode, OpenCode, Codex, Grok, Claude Code, Antigravity, Qwen, Gemini CLI, Cursor, Windsurf, Claude Desktop)
     let mut mcp_paths = Vec::new();
     if harnesses.contains(&"pi") {
         mcp_paths.push(merge_pi_mcp(
             &home.join(".pi").join("agent").join("mcp.json"),
             &global_bin_posix,
             mcp_for("pi"),
+        ));
+    }
+    if harnesses.contains(&"codex") {
+        mcp_paths.push(merge_toml_mcp_server(
+            &home.join(".codex").join("config.toml"),
+            &global_bin_posix,
+            mcp_for("codex"),
+        ));
+    }
+    if harnesses.contains(&"grok") {
+        mcp_paths.push(merge_toml_mcp_server(
+            &home.join(".grok").join("config.toml"),
+            &global_bin_posix,
+            mcp_for("grok"),
+        ));
+    }
+    if harnesses.contains(&"claude") {
+        mcp_paths.push(merge_claude_mcp_json(
+            &home.join(".claude.json"),
+            &global_bin_posix,
+            mcp_for("claude"),
+        ));
+    }
+    if harnesses.contains(&"antigravity") {
+        mcp_paths.push(merge_mcp_servers_json(
+            &home.join(".gemini").join("config").join("mcp_config.json"),
+            &global_bin_posix,
+            false,
+            mcp_for("antigravity"),
         ));
     }
     if harnesses.contains(&"opencode") {
@@ -5820,6 +6176,9 @@ pub fn cmd_uninstall(here: bool, dir_opt: Option<&str>, home_opt: Option<&str>) 
         remove_antigravity_hooks(&repo_dir.join(".agents").join("hooks.json"));
         remove_claude_or_codex_hooks(&repo_dir.join(".claude").join("settings.json"));
         remove_claude_or_codex_hooks(&repo_dir.join(".codex").join("hooks.json"));
+        remove_toml_mcp_server(&repo_dir.join(".codex").join("config.toml"));
+        remove_toml_mcp_server(&repo_dir.join(".grok").join("config.toml"));
+        remove_mcp_servers_json(&repo_dir.join(".agents").join("mcp_config.json"));
         remove_opencode_mcp(&repo_dir.join("opencode.json"));
         remove_mcp_servers_json(&repo_dir.join(".mcp.json"));
         remove_mcp_servers_json(&repo_dir.join(".cursor").join("mcp.json"));
@@ -5890,6 +6249,10 @@ pub fn cmd_uninstall(here: bool, dir_opt: Option<&str>, home_opt: Option<&str>) 
     remove_claude_or_codex_hooks(&home.join(".claude").join("settings.json"));
     remove_claude_or_codex_hooks(&home.join(".codex").join("hooks.json"));
     remove_antigravity_hooks(&home.join(".gemini").join("config").join("hooks.json"));
+    remove_toml_mcp_server(&home.join(".codex").join("config.toml"));
+    remove_toml_mcp_server(&home.join(".grok").join("config.toml"));
+    remove_mcp_servers_json(&home.join(".claude.json"));
+    remove_mcp_servers_json(&home.join(".gemini").join("config").join("mcp_config.json"));
     remove_opencode_mcp(&home.join(".config").join("opencode").join("opencode.json"));
     remove_mcp_servers_json(&home.join(".qwen").join("settings.json"));
     remove_mcp_servers_json(&home.join(".gemini").join("settings.json"));
@@ -6281,7 +6644,14 @@ fn extract_mcp_profile_from_entry(entry: &Value, arr_ptr: &str) -> &'static str 
 
 fn has_ap_hook_file(path: &Path) -> bool {
     fs::read_to_string(path)
-        .map(|s| s.contains("agent-primitives") || s.contains("ap exec") || s.contains("ap.exe"))
+        .map(|s| {
+            s.contains("agent-primitives")
+                || s.contains("ap exec")
+                || s.contains("ap.exe")
+                || s.contains(" guard shield")
+                || s.contains(" guard stop-gate")
+                || s.contains(" splice check --hook")
+        })
         .unwrap_or(false)
 }
 
@@ -6302,7 +6672,7 @@ pub fn inspect_wired_harness_profiles(home: &Path) -> Value {
         ".config/Claude"
     });
 
-    let mcp_specs: [(&str, PathBuf, &str, &str); 7] = [
+    let mcp_specs: [(&str, PathBuf, &str, &str); 9] = [
         (
             "pi",
             home.join(".pi").join("agent").join("mcp.json"),
@@ -6314,6 +6684,18 @@ pub fn inspect_wired_harness_profiles(home: &Path) -> Value {
             home.join(".config").join("opencode").join("opencode.json"),
             "/mcp/agent-primitives",
             "/command",
+        ),
+        (
+            "claude",
+            home.join(".claude.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+        (
+            "antigravity",
+            home.join(".gemini").join("config").join("mcp_config.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
         ),
         (
             "cursor",
@@ -6349,7 +6731,25 @@ pub fn inspect_wired_harness_profiles(home: &Path) -> Value {
         ),
     ];
 
+    let hook_for = |hid: &str| -> bool {
+        match hid {
+            "pi" => home
+                .join(".pi")
+                .join("agent")
+                .join("extensions")
+                .join("zz-ap-accelerator.ts")
+                .is_file(),
+            "claude" => has_ap_hook_file(&home.join(".claude").join("settings.json")),
+            "codex" => has_ap_hook_file(&home.join(".codex").join("hooks.json")),
+            "antigravity" => {
+                has_ap_hook_file(&home.join(".gemini").join("config").join("hooks.json"))
+            }
+            _ => false,
+        }
+    };
+
     let mut rows = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for (hid, cfg_p, entry_ptr, arr_ptr) in mcp_specs {
         let Ok(raw) = fs::read_to_string(&cfg_p) else {
             continue;
@@ -6363,32 +6763,32 @@ pub fn inspect_wired_harness_profiles(home: &Path) -> Value {
         let mcp_profile = extract_mcp_profile_from_entry(entry, arr_ptr);
         let codemode_deferred =
             hid == "pi" && entry.get("exposure").and_then(Value::as_str) == Some("codemode");
-        let hooks = if hid == "pi" {
-            home.join(".pi")
-                .join("agent")
-                .join("extensions")
-                .join("zz-ap-accelerator.ts")
-                .is_file()
-        } else {
-            false
-        };
+        seen.insert(hid);
         rows.push(json!({
             "harness": hid,
             "mcp_profile": mcp_profile,
             "codemode_deferred": codemode_deferred,
-            "hooks": hooks,
+            "hooks": hook_for(hid),
         }));
     }
 
-    for (hid, hook_p) in [
-        ("claude", home.join(".claude").join("settings.json")),
-        ("codex", home.join(".codex").join("hooks.json")),
-        (
-            "antigravity",
-            home.join(".gemini").join("config").join("hooks.json"),
-        ),
+    for (hid, toml_p) in [
+        ("codex", home.join(".codex").join("config.toml")),
+        ("grok", home.join(".grok").join("config.toml")),
     ] {
-        if has_ap_hook_file(&hook_p) {
+        if let Some(mcp_profile) = extract_mcp_profile_from_toml(&toml_p) {
+            seen.insert(hid);
+            rows.push(json!({
+                "harness": hid,
+                "mcp_profile": mcp_profile,
+                "codemode_deferred": false,
+                "hooks": hook_for(hid),
+            }));
+        }
+    }
+
+    for hid in ["claude", "codex", "antigravity"] {
+        if !seen.contains(hid) && hook_for(hid) {
             rows.push(json!({
                 "harness": hid,
                 "mcp_profile": "hook-only",
@@ -6464,6 +6864,10 @@ pub fn cmd_doctor(as_json: bool) -> i32 {
     let mcp_candidates = [
         home.join(".pi").join("agent").join("mcp.json"),
         home.join(".config").join("opencode").join("opencode.json"),
+        home.join(".codex").join("config.toml"),
+        home.join(".grok").join("config.toml"),
+        home.join(".claude.json"),
+        home.join(".gemini").join("config").join("mcp_config.json"),
         home.join(".cursor").join("mcp.json"),
         home.join(".gemini").join("settings.json"),
         home.join(".qwen").join("settings.json"),
@@ -6491,13 +6895,7 @@ pub fn cmd_doctor(as_json: bool) -> i32 {
     ];
     let wired_hooks_count = hook_candidates
         .iter()
-        .filter(|p| {
-            fs::read_to_string(p)
-                .map(|s| {
-                    s.contains("agent-primitives") || s.contains("ap exec") || s.contains("ap.exe")
-                })
-                .unwrap_or(false)
-        })
+        .filter(|p| has_ap_hook_file(p))
         .count();
 
     let sieve_dir = home.join(".ap").join("sieve");
@@ -6716,4 +7114,60 @@ pub fn cmd_status(dir_opt: Option<&str>, home_opt: Option<&str>) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_mcp_upsert_and_remove_preserves_existing_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let seed = "\
+# user comment preserved
+model = \"gpt-5-codex\"
+
+[features]
+shell_tool = true
+
+[plugins.\"sample@bundled\"]
+enabled = true
+";
+        fs::write(&cfg, seed).unwrap();
+
+        merge_toml_mcp_server(&cfg, "/usr/local/bin/ap", "full");
+        assert_eq!(extract_mcp_profile_from_toml(&cfg), Some("full"));
+        let after_full = fs::read_to_string(&cfg).unwrap();
+        assert!(after_full.contains("# user comment preserved"));
+        assert!(after_full.contains("[features]\nshell_tool = true"));
+        assert!(after_full.contains("[plugins.\"sample@bundled\"]\nenabled = true"));
+        assert!(after_full.contains("[mcp_servers.agent-primitives]"));
+
+        merge_toml_mcp_server(&cfg, "/usr/local/bin/ap", "core");
+        assert_eq!(extract_mcp_profile_from_toml(&cfg), Some("core"));
+        let after_core = fs::read_to_string(&cfg).unwrap();
+        assert_eq!(
+            after_core.matches("[mcp_servers.agent-primitives]").count(),
+            1
+        );
+        assert!(after_core.contains("args = [\"mcp\", \"--profile\", \"core\"]"));
+
+        merge_toml_mcp_server(&cfg, "/usr/local/bin/ap", "deferred");
+        assert_eq!(extract_mcp_profile_from_toml(&cfg), Some("deferred"));
+
+        assert!(remove_toml_mcp_server(&cfg));
+        assert_eq!(extract_mcp_profile_from_toml(&cfg), None);
+        let after_rm = fs::read_to_string(&cfg).unwrap();
+        assert!(!after_rm.contains("agent-primitives"));
+        assert!(after_rm.contains("# user comment preserved"));
+        assert!(after_rm.contains("[features]\nshell_tool = true"));
+        assert!(after_rm.contains("[plugins.\"sample@bundled\"]\nenabled = true"));
+
+        let standalone = dir.path().join("only_ap.toml");
+        merge_toml_mcp_server(&standalone, "/usr/local/bin/ap", "core");
+        assert!(standalone.is_file());
+        assert!(remove_toml_mcp_server(&standalone));
+        assert!(!standalone.exists());
+    }
 }

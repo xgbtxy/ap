@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -80,7 +80,7 @@ enum SubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Sub-50ms UTF-8, Tree-sitter syntax, conflict-marker & local-import verifier (+ optional --test)
+    /// Sub-50ms UTF-8, Tree-sitter syntax, conflict-marker & local-import verifier (+ optional --test or --hook)
     Check {
         #[arg(default_value = ".")]
         root: PathBuf,
@@ -88,6 +88,9 @@ enum SubCmd {
         test: bool,
         #[arg(long, default_value = "")]
         test_cmd: String,
+        /// PostToolUse hook mode: reads Claude/Codex/Antigravity stdin JSON and checks edited file syntax in <10ms
+        #[arg(long)]
+        hook: bool,
         #[arg(long)]
         json: bool,
     },
@@ -709,6 +712,197 @@ fn apply_spec_inner(
     }
 }
 
+fn push_unique_candidate_path(out: &mut Vec<PathBuf>, base_dir: &Path, raw: &str) {
+    let t = raw.trim();
+    if t.is_empty() || t.contains('\n') || t.contains('\r') {
+        return;
+    }
+    let p = Path::new(t);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base_dir.join(p)
+    };
+    if !out.contains(&resolved) {
+        out.push(resolved);
+    }
+}
+
+fn collect_hook_paths_from_value(v: &serde_json::Value, base_dir: &Path, out: &mut Vec<PathBuf>) {
+    let Some(obj) = v.as_object() else {
+        return;
+    };
+    for key in ["file_path", "path", "TargetFile", "Path"] {
+        if let Some(s) = obj.get(key).and_then(|x| x.as_str()) {
+            push_unique_candidate_path(out, base_dir, s);
+        }
+    }
+    if let Some(arr) = obj.get("paths").and_then(|x| x.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                push_unique_candidate_path(out, base_dir, s);
+            }
+        }
+    }
+    if let Some(edits) = obj.get("edits").and_then(|x| x.as_array()) {
+        for ed in edits {
+            if let Some(eo) = ed.as_object() {
+                for key in ["file_path", "path", "TargetFile", "Path"] {
+                    if let Some(s) = eo.get(key).and_then(|x| x.as_str()) {
+                        push_unique_candidate_path(out, base_dir, s);
+                    }
+                }
+            }
+        }
+    }
+    for key in ["patch", "input"] {
+        if let Some(txt) = obj.get(key).and_then(|x| x.as_str()) {
+            for ln in txt.lines() {
+                let lt = ln.trim();
+                if let Some(rest) = lt
+                    .strip_prefix("*** Update File:")
+                    .or_else(|| lt.strip_prefix("*** Add File:"))
+                {
+                    push_unique_candidate_path(out, base_dir, rest);
+                }
+            }
+        }
+    }
+}
+
+fn is_post_edit_supported_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "py" | "ts"
+            | "mts"
+            | "cts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "go"
+            | "rs"
+            | "c"
+            | "h"
+            | "json"
+            | "jsonc"
+            | "toml"
+    )
+}
+
+fn run_post_edit_hook(explicit_root: &Path) -> i32 {
+    let mut payload = String::new();
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::stdin().read_to_string(&mut payload);
+    }
+    let trimmed = payload.trim();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut mode = "cli";
+
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            let hook_cwd = map
+                .get("cwd")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cwd.clone());
+            if map.contains_key("hookEventName") || map.contains_key("toolCall") {
+                mode = "antigravity";
+                if let Some(args) = map.get("toolCall").and_then(|tc| tc.get("args")) {
+                    collect_hook_paths_from_value(args, &hook_cwd, &mut candidates);
+                }
+            } else if map.contains_key("hook_event_name") || map.contains_key("tool_input") {
+                mode = "claude";
+                if let Some(ti) = map.get("tool_input") {
+                    collect_hook_paths_from_value(ti, &hook_cwd, &mut candidates);
+                }
+            }
+        }
+    } else if !trimmed.is_empty() {
+        push_unique_candidate_path(&mut candidates, &cwd, trimmed);
+    }
+    if candidates.is_empty() && explicit_root.is_file() {
+        candidates.push(explicit_root.to_path_buf());
+    }
+
+    let mut issues: Vec<String> = Vec::new();
+    for path in candidates {
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() >= 2_000_000 {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !is_post_edit_supported_ext(ext) {
+            continue;
+        }
+        let Ok(raw) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            issues.push(format!("{}: non-UTF-8 bytes after edit", path.display()));
+            continue;
+        };
+        if text.lines().any(|l| {
+            l.starts_with("<<<<<<< ") || l.trim_end() == "=======" || l.starts_with(">>>>>>> ")
+        }) {
+            issues.push(format!(
+                "{}: unresolved git conflict marker (`<<<<<<<` / `=======` / `>>>>>>>`)",
+                path.display()
+            ));
+            continue;
+        }
+        if let Err(err) = verify_syntax(text, ext) {
+            let disp = path.to_string_lossy().replace('\\', "/");
+            issues.push(format!("{disp}: {err}"));
+        }
+    }
+
+    match mode {
+        "claude" => {
+            if !issues.is_empty() {
+                let ctx = format!(
+                    "[ap splice check] Syntax issue detected immediately after edit:\n- {}\nFix before proceeding.",
+                    issues.join("\n- ")
+                );
+                println!(
+                    "{}",
+                    json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": ctx
+                        }
+                    })
+                );
+            }
+            0
+        }
+        "antigravity" => {
+            println!("{{}}");
+            if !issues.is_empty() {
+                eprintln!("[ap splice check] {}", issues.join("; "));
+            }
+            0
+        }
+        _ => {
+            if issues.is_empty() {
+                0
+            } else {
+                for iss in &issues {
+                    eprintln!("[ap splice check] {iss}");
+                }
+                2
+            }
+        }
+    }
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
@@ -833,8 +1027,12 @@ pub fn run_cli(args: &[String]) -> i32 {
             root,
             test,
             test_cmd,
+            hook,
             json: as_json,
         } => {
+            if hook {
+                return run_post_edit_hook(&root);
+            }
             let payload = collect_check_payload(&root, test, &test_cmd);
             if as_json {
                 println!(

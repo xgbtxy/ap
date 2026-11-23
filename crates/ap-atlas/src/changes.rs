@@ -28,7 +28,7 @@ pub struct ChangesReport {
     pub related_tests: Vec<String>,
 }
 
-fn lang_for_ext(ext: &str) -> Option<Language> {
+pub(crate) fn lang_for_ext(ext: &str) -> Option<Language> {
     match ext.to_ascii_lowercase().as_str() {
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
         "ts" | "mts" | "cts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
@@ -59,7 +59,7 @@ fn extract_node_name<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
     None
 }
 
-fn collect_symbol_spans(node: Node, src: &[u8], out: &mut Vec<(String, usize, usize)>) {
+pub(crate) fn collect_symbol_spans(node: Node, src: &[u8], out: &mut Vec<(String, usize, usize)>) {
     let k = node.kind();
     let is_decl = matches!(
         k,

@@ -1,4 +1,4 @@
-# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.48）
+# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.49）
 
 [English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -16,8 +16,8 @@
 
 | `<thinking>` 思考链与系统边界 | 本机 `11.3 万+` 次调用与真实推理流实测损耗 | 纯 Rust 确定性器官与开源顶尖算法融合（`v2.47`） |
 | :--- | :--- | :--- |
-| **1. 冷启动高熵盲猜、二进制盲区与旧屎山污染** | `3 万+` 次超 `8 KB` 输出刷屏；`650+` 次裸 `ls` 刷屏；反复手写脆弱 `node -e`/`python -c` 解析 Office/PDF/SQLite/`.asar`/PE/ELF/Java/.NET/Protobuf/SourceMap/Markdown 章节。 | **`ap ls`**（限深列目录 + MSYS2 路径规范化）+ **`ap-atlas`**（Aider **Personalized PageRank**、`<60ms` 守卫感知 9 轴 `surface --include-binaries`、`<25ms` `locate`、`<30ms` `trace`/`changes`、DOM `#id`/路由与 Slop 雷达）+ **`ap read`**（`--section`/`--around`/C++ `--outline`）/ **`ap search`**（`-F`/`-i`/`--max`/`--include`/`--code-only --no-tests`）/ **`ap query`** + **`ap-sieve`**（`-98.8%` 日志、FTS5 `search`/`peek`、300 行错误洪流封顶）+ **`ap-probe slice`** |
-| **2. 跨文件记忆漂移、补丁失配与 Shell 转义崩溃** | 跨文件写串 `#id`/路由；`735+` 次缩进/空行漂移补丁失配；`528+` 次 Windows PowerShell `$_` 变量剥离、`rg` 正则报错、GBK 编码与超长 `PATH` 截断崩溃。 | **`ap-splice`**（`view`、避开注释字符串的 `rename`、Aider 三级 + 四级空行容错与 Hashline `L:HH\|` `apply`、`<5ms` 跨文件静态链接 `check`、`ap undo`）+ **`ap exec`**（UTF-8 锁死、PS 单引号自愈、慢 `grep -rl`/`rg -F` 自愈、Win32 Job Object）+ **`ap mcp`**（`37` 个强类型 `outputSchema` 工具 = `0` Shell 转义） |
+| **1. 冷启动高熵盲猜、二进制盲区与旧屎山污染** | `3 万+` 次超 `8 KB` 输出刷屏；`650+` 次裸 `ls` 刷屏；反复手写脆弱 `node -e`/`python -c` 解析 Office/PDF/SQLite/`.asar`/PE/ELF/Java/.NET/Protobuf/SourceMap/Markdown 章节或缺少符号历史与时间耦合上下文。 | **`ap ls`**（限深列目录 + MSYS2 路径规范化）+ **`ap-atlas`**（Aider **Personalized PageRank**、`<60ms` 守卫感知 9 轴 `surface --include-binaries`、`<25ms` `locate`、`<30ms` `trace`/`changes`/`history` 符号提交/Blame/共变耦合、DOM `#id`/路由与 Slop 雷达）+ **`ap read`**（`--section`/`--around`/C++ `--outline`）/ **`ap search`**（`-F`/`-i`/`--max`/`--include`/`--code-only --no-tests`）/ **`ap query`** + **`ap-sieve`**（`-98.8%` 日志、FTS5 `search`/`peek`、300 行错误洪流封顶）+ **`ap-probe slice`** |
+| **2. 跨文件记忆漂移、补丁失配与 Shell 转义崩溃** | 跨文件写串 `#id`/路由；`735+` 次缩进/空行漂移补丁失配；`528+` 次 Windows PowerShell `$_` 变量剥离、`rg` 正则报错、GBK 编码与超长 `PATH` 截断崩溃。 | **`ap-splice`**（`view`、避开注释字符串的 `rename`、Aider 三级 + 四级空行容错与 Hashline `L:HH\|` `apply`、`<5ms` 跨文件静态链接与 `PostToolUse` `check --hook`、`ap undo`）+ **`ap exec`**（UTF-8 锁死、PS 单引号自愈、慢 `grep -rl`/`rg -F` 自愈、Win32 Job Object）+ **`ap mcp`**（`37` 个强类型 `outputSchema` 工具 + 11 宿主 TOML/JSON 无损接线） |
 | **3. Windows 验证税、网络/浏览器实测与内存脑补** | **71%–75% 的原生步骤**耗在服务挂死、残留端口、手写 150 行浏览器/WS/HTTP 鉴权与 CORS/并发脚本、零断言假绿灯测试。 | **`ap-probe`**（空闲端口 `smoke`、桌面/移动双端 `ui` 巡检、非侵入式 `cdp --watch-ms`、`http --principal/--principal-cdp/--cors-origin/--select/--race/--batch-stdin`、RFC 6455 `ws --origin-matrix`、`tls`/`tcp`/`listen`/`ps`/`fs`、AST 变异 `mutate`、`fuzz`、`run`/`diff`）+ **`ap guard verify --deep`** |
 | **4. 叮嘱失灵、死循环、压缩失忆与长程 KV-Cache 跌落** | 长会话下模型无视文字规则；相同命令反复报错空转；QuickJS `codemode` `.output.slice()` `TypeError`；中文压缩超留 2–3 倍或中途打穿 KV-Cache。 | **`ap-guard`**（`<2ms` `exit 2` 硬规则、`sec` C/C++/Java/TS/Py/Go/Rust CWE 检测、语义 `diff`、交付门禁 `pack`、3 次死循环熔断）+ **`ap-baton`**（正交 `frontier` 调度、`claim` 租约、CJK+BM25 `dedup`）+ **`ap-recall`** + **`ap pi`**（14 项 Pi 运行时补丁 + `zz-ap-accelerator.ts`）+ **`ap audit --maintainer`**（100% 离线零隐私 6 智能体简报） |
 
@@ -36,7 +36,7 @@
 `ap` 有意把**通用能力底座**、**跨宿主实证运行日志**与**按需适配层**解耦，保证能力上限持续推高的同时，绝不退化成臃肿、易碎的重型包装器：
 
 ```text
-第 3 层 · 按需适配层（Model × Harness）--> 宿主挂载（`ap init -a <harness>`、`ap pi patch`）
+第 3 层 · 按需适配层（Model × Harness）--> 11 宿主 TOML/JSON MCP 与 Hook 挂载（`ap init -a <harness>`、`ap pi patch`）
                                           + 模型档位调优（`--profile core|deferred`、KV-Cache/脱水阈值）
 第 2 层 · 实证驱动层（真实过程日志）  --> 汇集各家 Harness 与各代模型在真机执行中的真实卡点
                                           （通过离线零隐私 `ap audit --maintainer` 量化沉淀）
