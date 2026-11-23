@@ -1,11 +1,11 @@
-# `agent-primitives` Repository Operating Rules (`v2.38+` Pure-Rust Edition)
+# `agent-primitives` Repository Operating Rules (`v2.39+` Pure-Rust Edition)
 
-Before proposing, adding, or modifying anything in this repository, read **[docs/HANDBOOK.md](./docs/HANDBOOK.md)** / **[docs/HANDBOOK.zh-CN.md](./docs/HANDBOOK.zh-CN.md)** and **[CONTRIBUTING.md](./CONTRIBUTING.md)** / **[CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)**.
+Before proposing, adding, or modifying anything in this repository, read **[docs/HANDBOOK.md](./docs/HANDBOOK.md)** / **[docs/HANDBOOK.zh-CN.md](./docs/HANDBOOK.zh-CN.md)**, **[CONTRIBUTING.md](./CONTRIBUTING.md)** / **[CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)**, and **[.github/PULL_REQUEST_TEMPLATE.md](./.github/PULL_REQUEST_TEMPLATE.md)**.
 
-## Core Philosophy
-1. **Observe Real Coding-Agent Runs First**: Ground every upgrade in actual agent execution logs and `<thinking>` traces across free and commercial harnesses (`OpenCode`, `Codex`, `Pi`, `Claude Code`, `Antigravity`, `Qwen Code`, `Gemini CLI`, `Grok`).
-2. **Synthesize Mature Open-Source Engineering (Never Reinvent Slop)**: Study and distill proven open-source mechanisms (`Aider`, `RTK`, `SWE-agent`, `MCP`, Tree-sitter, SQLite FTS5, Chromium CDP, ecosystem typecheckers/linters) into lean, zero-dependency Rust rather than inventing bloated 0-to-1 wrappers or prompt walls.
-3. **Elevate Core Coding Capability for Everyone**: Judge every change by measurable gains in speed, token efficiency, first-try pass rate, and zero-slop code quality—even for complete beginners using `$0` free coding agents via 1-line setup.
+## Core Philosophy (4-Source Recursive Self-Improvement)
+1. **Observe Real Coding-Agent Runs & Survey Mature OSS First**: Ground every upgrade in (a) external community pain points & proven open-source mechanisms (`Aider`, `RTK`, `SWE-agent`, `ripgrep`, `ast-grep`, `oh-my-pi`, Tree-sitter, SQLite FTS5, Chromium CDP) and (b) actual process friction across agent execution logs (`ap audit --maintainer` zero-PII numeric brief across `OpenCode`, `Codex`, `Pi`, `Claude Code`, `Antigravity`, `Qwen Code`, `Gemini CLI`, `Grok`) — strictly anonymized mechanics only, zero private data or misuse.
+2. **Synthesize Lean Pure-Rust Primitives (Never Reinvent Slop)**: Distill battle-tested mechanisms into zero-dependency Pure Rust rather than bloated wrappers or verbose prompt walls.
+3. **Empirical Verification & Reviewer-First PR Delivery**: Validate every improvement with synthetic tests AND realistic Before-vs-After practical measurements, keeping English (`*.md`) & Simplified Chinese (`*.zh-CN.md`) aligned, and documenting exact `file :: symbol (lines)` change maps in PRs matching **[.github/PULL_REQUEST_TEMPLATE.md](./.github/PULL_REQUEST_TEMPLATE.md)**.
 
 ## Six Non-Negotiable Engineering Invariants
 1. **Zero AI Slop**: Zero pure-prompt checklists, zero `Regex::new` inside hot loops (`OnceLock` DFAs), zero swallowed errors, `0` `clippy -D warnings`.

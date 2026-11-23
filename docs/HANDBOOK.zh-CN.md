@@ -1,6 +1,6 @@
-# `agent-primitives` (`ap` v2.25) — 核心研发理念与持续演进手册
+# `agent-primitives` (`ap` v2.39) — 核心研发理念与持续演进手册
 
-[English](./HANDBOOK.md) | [简体中文](./HANDBOOK.zh-CN.md) · [首页](../README.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md)
+[English](./HANDBOOK.md) | [简体中文](./HANDBOOK.zh-CN.md) · [首页](../README.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
 > **项目定位**：本仓库不做花哨的多智能体外壳，也不写冗长易被忽略的提示词套路（AI Slop）。我们坚持一条朴素而硬核的工程路线——**持续观察真实 Coding Agent 的运行过程与思考链，深度调研并吸收各个成熟开源项目的实战经验，用高性能单文件纯 Rust 夯实大模型的底层 Coding 基础能力**，让哪怕是零基础小白使用免费 Coding Agent 也能获得实打实的效率与代码质量提升。
 
@@ -28,26 +28,27 @@
 
 ---
 
-## 2. 持续演进的四步工程闭环
+## 2. 持续演进的四源递归闭环
 
-后续围绕本仓库的每一次迭代更新，严格执行以下四步：
+后续围绕本仓库的每一次迭代更新，严格按 [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md) 执行以下四步闭环：
 
-1. **第 1 步：观察实跑过程（Observe）** —— 运行 `ap audit --compare`，并在真实 Coding Agent（含 `$0` 免费智能体）上跑通普通用户任务，拆解工具调用链与 `<thinking>` 损耗点。
-2. **第 2 步：调研成熟方案（Survey）** —— 横向调研顶尖开源项目解决同类工程痛点的成熟算法与交互协议，拒绝闭门造车与提示词堆砌。
-3. **第 3 步：纯 Rust 精炼实现（Craft）** —— 以最小代码复杂度合入对应独立 Crate（同时覆盖 CLI 与 `ap mcp`），通过 `rustfmt`、`clippy -D warnings` 与跨平台集成测试。
-4. **第 4 步：真机对照验效（Verify）** —— 在原生未接入 vs. `+ ap` 条件下做受控实测，核验速度、Token 消耗、一次跑通率与代码洁净度的真实增益，如实记入演进台账。
+1. **第 1 步：观察本地运行过程（Observe）** —— 运行离线零隐私的 `ap audit --maintainer` / `ap audit --compare`，并在真实 Coding Agent（含 `$0` 免费智能体）上拆解工具调用链与 `<thinking>` 过程损耗点。
+2. **第 2 步：调研外部社区与成熟工具（Survey）** —— 横向调研开发者社区高频痛点与顶尖开源项目（`Aider`、`RTK`、`SWE-agent`、`ripgrep`、`ast-grep`、`oh-my-pi`、Tree-sitter、SQLite FTS5）的成熟机制，拒绝闭门造车与提示词堆砌。
+3. **第 3 步：纯 Rust 精炼实现（Craft）** —— 以最小复杂度合入 `src/` 或对应独立 Crate（同步保持 36 工具 `ap mcp` 与中英文文档一致），通过 `rustfmt`、`clippy -D warnings` 与跨平台测试。
+4. **第 4 步：真实实践对照 + 审阅友好型 PR（Verify）** —— 不只过单元测试，还必须做脱敏真实场景 Before vs After 实测对照，并写出精确到 `文件:符号/行号` 的改动地图与实测对照表，让维护者快速核验合并并开启下一轮递归改进。
 
 ---
 
 ## 3. 架构映射与版本演进台账
 
 ```text
-[一行接入 ap init] ──► 自动接线 OpenCode / Qwen / Gemini CLI / Goose / Pi / Codex / Claude / Antigravity / Grok
-   ├── 定向与排雷 (ap_orient) ──► ap-atlas (PPR 核心地图 + 宿主指纹 + DOM #id/路由断链与防 Slop 雷达) + ap-probe slice
-   ├── 精准修改   (ap_edit)   ──► ap-splice (Aider 三级缩进容错 + 零转义多文件原子修改 + 落盘前 Tree-sitter 语法校验)
-   ├── 真机自验   (ap_smoke)  ──► ap-probe smoke (空闲端口托管 + 纯 Rust 无头 Edge/Chrome 交互式点击输入 + 杀净进程树)
-   ├── 质量硬门禁 (ap_verify) ──► ap-guard (exit-2 防 Slop 规则 + 自动联动 tsc/biome/cargo/测试 + RTK 式自动脱水)
-   └── 诊断与续航 (ap_probe)  ──► ap-probe run/diff + ap-sieve (-98.8% 日志压缩) + ap-recall (3.4ms BM25) + ap-baton
+[一行接入 ap init] ──► 自动接入 15+ 智能体（OpenCode/Qwen/Gemini/Goose/Pi+ap pi/Codex/Claude/Antigravity/Grok/Cursor/Windsurf/VSCode/OpenClaw/Hermes）
+   ├── 万能直读与 SQL (ap read/search/query) ──► AST --symbol、12 文件批读、Office/PDF/SQLite/.asar/.map/PE/ELF/Java/.NET/Protobuf、JS --routes/--jwt/--secrets
+   ├── 定向与表面图 (ap_orient) ──► ap-atlas (PPR 核心地图、<60ms 9 轴 surface --include-binaries、locate、trace、changes、product) + ap-probe slice
+   ├── 精准改写与撤回 (ap_edit) ──► ap-splice (rename、Aider 3 级+4 级+Hashline apply、6 语言+JSON/TOML AST 门禁) + ap undo
+   ├── 运行与 UI 质检 (ap_smoke) ──► ap-probe (smoke、双端 ui、cdp --watch-ms、http AuthZ/CORS/select/race/CDP、ws --origin-matrix、tls/tcp/listen/ps/fs)
+   ├── 深度门禁与护盾 (ap_verify) ──► ap-guard (6 合 1 verify --deep、C/C++/Java/TS/Py/Go/Rust sec、diff、pack、3x 死循环熔断) + ap exec + ap-sieve
+   └── 续航与自演进 (ap pi/baton/audit) ──► ap pi 11 项运行时补丁 + ap-baton frontier/claim/dedup + ap-recall (3.4ms BM25) + ap audit --maintainer
 ```
 
 | 里程碑 | 观察到的真实过程卡点 & 融合的开源经验 | 真机实测提效结果 |
@@ -68,3 +69,4 @@
 | **`v2.3.0` (2026-11-19)** | 对 **160 个历史会话（`18,346` 次工具调用）** 做残差需求挖掘，精准锁定最后 4 大未覆盖高频刚需（`717` 次二进制导入导出 + `547` 次 Hexdump + `134` 次 `pefile`、`731` 次进程命令行/过滤排查且受 Win11 `wmic` 移除影响、`1,120` 次 `<thinking>`「文件发生了什么变化」与 `361` 次目录 Diff、以及 `270` 次原始 TCP Socket + `109` 次临时 HTTP 回调捕获脚本）：零新增依赖打造 **纯 Rust PE32/PE32+ 与 ELF64 导入导出表/节区熵/ASLR-NX-CFG/SHA-256 深度解析 + `--hex` 标准十六进制视图（`src/binary.rs`、`src/read.rs`）**、**跨平台进程树 + 完整命令行 + 监听端口联合查询（`ap probe ps` / `ap_ps` 及 `ap probe ports --port` 命令行自动富化）**、**原子目录前后快照 Diff 与近期变更雷达（`ap probe fs` / `ap_fs_diff`，支持 `--run`/`--snapshot`/`--diff`/`--recent`）**，以及 **限时防挂死原始 TCP 探针（`ap probe tcp` / `ap_tcp`）+ 限时临时 Webhook/回调捕获服务（`ap probe listen --run` / `ap_listen`）** | **`SysBinOpsSim`（PE32+ DLL 导出/导入/SHA-256/Hex + 在线 TCP Worker 命令行与原始协议 + 原子目录 Diff + Webhook 回调捕获）**：原生（`77.70s`，手写 120 行 Python `struct`/socket/HTTP 脚本）→ **`+ ap v2.3.0`**：**`73.23s`（快 `1.06 倍`）、`4/4` 满分**，`ap read *.dll` 一步直出导出/导入表与 SHA-256，免手写 PE 解析器且 Worker 进程零中断 |
 | **`v2.4.0` (2026-11-19)** | 深入剖析 **多智能体协同流水线与 Pi 运行时机制**（`codemode` 沙盒利用率仅 `0.86%`、共享测试机依赖易竞态的文本锁、台账查重耗费多轮 LLM 翻页、交付物 SHA-256 与密钥/路径缺少 `<10ms` 机械预检、非 CDP WebSocket 与 TLS 证书排查缺零挂死工具）：零新增外部依赖打造 **零提示词膨胀 Pi 原生融合（`~/.pi/agent/mcp.json` `exposure: "codemode"` + `zz-ap-accelerator.ts` 透明加速扩展，自动加速 `grep -rn`、锁定 Python UTF-8/反斜杠/`> NUL` 并对直返 LLM 的 `>28KB` 噪声自动 `ap sieve`，且 100% 透传 `codemode` 与破坏性护栏）**、**多智能体原子 TTL 资源租约（`ap baton claim`/`release`/`claims`）与 `<15ms` BM25+CJK 2-gram 语义查重（`ap baton dedup`）**、**交付包确定性核验门（`ap guard pack`：实算 64 位 SHA-256 + 密钥/下载绝对路径扫描）**，以及 **通用 RFC 6455 WebSocket（`ap probe ws`）+ TLS/X.509 证书检查（`ap probe tls`）** | **27/27 端到端集成测试**跨 Ubuntu/macOS/Windows 全绿验证（`baton claim` exit-2 锁冲突、中文语义查重 Top-1 命中、`guard pack` 哈希篡改与密钥泄漏拦截、RFC 6455 WS 回显、Pi `codemode` MCP 与扩展装卸），常驻前导词预算继续锁定 **`390` Tokens** |
 | **`v2.5.0`–`v2.25.0` (2026-11-20)** | 结合 **910+ 真实会话 / 112,920+ 回合** 量化退化曲线、Pi v1.5+ 运行时源码审计与顶尖开源 Harness（*The Harness Problem* / `oh-my-pi` Hashline、`dsh-compaction`、`pi-edit-guard`、`pi-deepseek-cache`、Claude Code `PostToolUse` & Microcompact）：落地 **全栈 MCP 2025-06-18（34 强类型 `outputSchema` + `structuredContent` + Resources + 5 Prompts）**、**内置 `read` Hashline `L:HH\|` 行锚点标注 + `edit` 校验锚点对称扩窗、相邻多块重叠自动合并、主动 `read` EOF 防越界钳位（`[ap read-clamped]`）与 `[ap edit-lines]` 改后行偏移提示**、**全类型截断 `read` 自动目录（代码 Tree-sitter AST + Markdown/TOML/YAML/JSON 目录 + 单文件去重）**、**`ap-sieve` 300 行错误洪流单块上限封顶 + SQLite `busy_timeout(2000ms)` + `codemode` `isError` 多块无损自筛与 `setTimeout`→`sleep(ms)` 自动垫片**、**管道/链式/`--include`/`--exclude-dir`/`2>/dev/null` 慢速 `grep -rn` → `<50ms` `ap search` 自动加速**、**摊销深扫两阶峰值智商护盾 `context_edit` 观察掩码（彻底杜绝 `<180k` 误伤热缓存 + 冷重建零二次冷预填保护）**、**实证驱动具象化 Turn-0 准则 + 无错连击 `[ap batch-tip]` 与冷却限流 `[ap codemode-parallel]`**、**`ap doctor` `retry.provider.timeoutMs` 僵尸超时覆写体检**、**DeepSeek 49× ROI 原生 `CacheWarmer`（`>=51k` Token / 90s TTL）**、**改后 `<12ms` 即时语法告警 `[ap syntax-alert]`**、**`before_provider_request` 工具前缀锁缓存**、**`streamSimple` `reasoning: "low"` 极速保死胡同压缩**、**只读探针 90s 封顶**、**`agent_before_settle`**、**`deepseek/flash-auto`** 与 **`/ap`** | **48/48 Rust 测试 + 9/9 Pi v1.5.2 SDK 套件实机验证 + 真机 `api.deepseek.com` A/B（墙钟 `-32.6%` `18.03s→12.15s` / 步数 `-33.3%` / 未命中输入 `-34.2%` / 缓存重放 `-24.2%` / 思考 `-66.1%`）+ 873 轮整夜生产实跑**：**`0/873` API/套接字/编码报错**、**`98.32%` KV-Cache 命中率**（`19` 次原生 `CacheWarmer` 总花费仅 `$0.0166`，保活 `95k–167k` tok 约 `48×` ROI）、**`0` 压缩（峰值 `232k`）**、**`0` 二次冷预填**、`ap-sieve` 错误洪流 **`110% → 8.2%`**，静默前导词锁定 **`390` Tokens** |
+| **`v2.26.0`–`v2.39.0` (2026-11-20–2026-11-23)** | 围绕长程正交探索、原生二进制/前端审计、无侵入浏览器复用、Pi v1.6.0 对齐与开源共同维护持续推进：落地 **守卫感知 9 轴表面图 `atlas surface --include-binaries` 与 `baton frontier`（`v2.26`–`v2.29`）**；**PE64/ELF64（`x64` 与 `AArch64` ADRP+ADD）`--xref`、PE RWX/MS-RPC UUID 与 ELF 安全缓解审计、Go `.gopclntab`、Java `.class`/`.jar`、`.NET CLR`、`--proto` 原始 Protobuf、`--diff` 与 `256 MB` 归档/驱动检索（`v2.30`–`v2.34`）**；**纯 Rust JS/HTML `--routes`（REST 路由/懒加载 chunk/本地 HTTP·IPC 鉴权缺口与自定义头）、`--jwt` 姿势、脱敏 `--secrets` 及双遍精确 `--entry` 组合过滤（`v2.35`–`v2.37`）**；**`ap probe http` 多主体 AuthZ 矩阵、安全头审计、TOCTOU `--race`、`--cors-origin` 跨源反射审计、`--select` JSON 路径与 `--principal-cdp` 零标签复用本地回环 Cookie + RFC 6455 `probe ws --origin-matrix`（`v2.32`–`v2.38`）**；**全栈 36 工具 MCP 2025-06-18 对齐与 Pi v1.6.0 11/11 运行时补丁**；并在 **`v2.39.0`** 新增 **覆盖 6 款 Agent（含 `gemini_cli`）的 100% 离线零隐私 `ap audit --maintainer` 简报、双语四源递归共维护指南与审阅直达 PR 模板（`.github/PULL_REQUEST_TEMPLATE.md`）、`ap-probe` 大参数堆装箱修复 Windows 1MB Debug 栈溢出及 Windows 超长 `PATH` 自动裁剪防截断** | **Ubuntu / macOS / Windows 三平台 CI `76/76` 测试 + 严格 `clippy -D warnings` + `rustfmt` 全绿，GitHub Releases 5 平台预编译二进制自动构建成功；单文件 `ap` / `ap.exe`（约 `15.65 MB`、0 外部依赖、0 隐私泄露） + `ap audit --maintainer`（0 PII 输出 8 大映射目标）+ Pi v1.6.0 `11/11` 补丁全绿**，静默前导词继续锁定 **`390` Tokens** |

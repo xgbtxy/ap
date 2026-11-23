@@ -101,7 +101,7 @@ $ ap stats
 - **纯 Rust 零耦合单文件架构**：1 个原生二进制内聚 7 个物理隔离 crate（`crates/ap-{atlas,splice,probe,sieve,guard,recall,baton}`），子 crate 之间 `0` 相互依赖，内置 SQLite FTS5 与 6 语言编译态 Tree-sitter C 语法树，常驻提示词仅 `390` Tokens。
 - **一键复现底层微基准**：运行 `ap bench`（详见 [`bench/results.json`](./bench/results.json)）。
 - **深度工程文档**：
-  - [基于本地摩擦日志共同维护指南 (`CONTRIBUTING.zh-CN.md`)](./CONTRIBUTING.zh-CN.md) | [Contributing (`CONTRIBUTING.md`)](./CONTRIBUTING.md)
+  - [四源递归共维护指南与一键提示词 (`CONTRIBUTING.zh-CN.md`)](./CONTRIBUTING.zh-CN.md) | [Contributing (`CONTRIBUTING.md`)](./CONTRIBUTING.md) | [PR 交付规范 (`.github/PULL_REQUEST_TEMPLATE.md`)](./.github/PULL_REQUEST_TEMPLATE.md)
   - [核心研发理念与演进手册 (`docs/HANDBOOK.zh-CN.md`)](./docs/HANDBOOK.zh-CN.md) | [R&D Philosophy (`docs/HANDBOOK.md`)](./docs/HANDBOOK.md)
   - [系统架构设计 (`docs/DESIGN.zh-CN.md`)](./docs/DESIGN.zh-CN.md) | [Architecture (`docs/DESIGN.md`)](./docs/DESIGN.md)
   - [高阶实战手册 (`docs/PLAYBOOK.zh-CN.md`)](./docs/PLAYBOOK.zh-CN.md) | [Playbook (`docs/PLAYBOOK.md`)](./docs/PLAYBOOK.md)
@@ -112,7 +112,7 @@ $ ap stats
 ## 隐私边界与合法使用声明
 
 - **100% 本地离线、零云端上传**：`ap stats` 与 `ap audit --maintainer` 完全在本机离线运行；`ap audit --maintainer` 仅输出脱敏后的纯数字过程卡点统计，绝不输出或上传任何提示词、业务源码、本机路径或凭据。
-- **合理使用边界（严禁误用）**：`ap` 仅用于通用软件工程、排障调试、QA 自动化测试以及对自有或已获明确授权系统的防御性安全配置核查，严禁用于未授权访问或恶意用途。如果你也想让自己的 AI 一起参与维护，请查看 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（内含一键可用的维护者提示词，介意扫描本地历史记录也可直接跳过）。
+- **合理使用边界与四源递归共维护（严禁误用）**：`ap` 仅用于通用软件工程、排障调试、QA 自动化测试以及对自有或已获明确授权系统的防御性安全配置核查，严禁用于未授权访问或恶意用途。想让你的 AI 一起参与递归改进，请查看 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（含外部调研+本地过程审计+实践测试的完整提示词与“介意扫日志”替代方案）及 [`.github/PULL_REQUEST_TEMPLATE.md`](./.github/PULL_REQUEST_TEMPLATE.md)（要求 PR 自带精确改动地图与前后实测对照表）。
 
 ## 开源协议
 

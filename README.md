@@ -101,7 +101,7 @@ Measured head-to-head on Windows 11 across `$0` free coding agents and commercia
 - **Zero-Coupling Single Binary**: 1 native Rust binary backed by 7 isolated crates (`crates/ap-{atlas,splice,probe,sieve,guard,recall,baton}`) with `0` sibling crate dependencies, bundled SQLite FTS5, 6 compiled Tree-sitter C grammars (Py/TS/JS/Go/Rust/C), and `390` total idle frontmatter tokens.
 - **Reproduce Micro-Benchmarks**: Run `ap bench` (see [`bench/results.json`](./bench/results.json)).
 - **Engineering Docs**:
-  - [Co-Maintaining `ap` from Local Friction Logs (`CONTRIBUTING.md`)](./CONTRIBUTING.md) | [共同维护指南 (`CONTRIBUTING.zh-CN.md`)](./CONTRIBUTING.zh-CN.md)
+  - [Co-Maintaining `ap` & 4-Source Recursive Prompt (`CONTRIBUTING.md`)](./CONTRIBUTING.md) | [共同维护指南 (`CONTRIBUTING.zh-CN.md`)](./CONTRIBUTING.zh-CN.md) | [PR Spec (`.github/PULL_REQUEST_TEMPLATE.md`)](./.github/PULL_REQUEST_TEMPLATE.md)
   - [Core R&D Philosophy & Evolution (`docs/HANDBOOK.md`)](./docs/HANDBOOK.md) | [中文研发手册 (`docs/HANDBOOK.zh-CN.md`)](./docs/HANDBOOK.zh-CN.md)
   - [System Architecture (`docs/DESIGN.md`)](./docs/DESIGN.md) | [架构设计 (`docs/DESIGN.zh-CN.md`)](./docs/DESIGN.zh-CN.md)
   - [Workflow Playbook (`docs/PLAYBOOK.md`)](./docs/PLAYBOOK.md) | [实战手册 (`docs/PLAYBOOK.zh-CN.md`)](./docs/PLAYBOOK.zh-CN.md)
@@ -112,7 +112,7 @@ Measured head-to-head on Windows 11 across `$0` free coding agents and commercia
 ## Privacy, Scope & Responsible Use
 
 - **100% Local & Offline Telemetry**: `ap stats` and `ap audit --maintainer` run strictly locally with zero cloud uploads; `ap audit --maintainer` emits anonymized numeric friction counters only (never prompts, code, file paths, or credentials).
-- **Responsible Engineering Scope**: `ap` is built exclusively for software engineering, debugging, QA verification, and authorized defensive security/configuration hygiene on systems you own or have permission to test. Do not misuse it for unauthorized access or harmful activity. See [CONTRIBUTING.md](./CONTRIBUTING.md) to co-maintain `ap` safely with your own AI agent.
+- **Responsible Engineering Scope & 4-Source Recursive Co-Maintenance**: `ap` is built exclusively for software engineering, debugging, QA verification, and authorized defensive security/configuration hygiene on systems you own or have permission to test. Do not misuse it for unauthorized access or harmful activity. See [CONTRIBUTING.md](./CONTRIBUTING.md) (4-source recursive self-improvement prompt + privacy opt-out options) and [`.github/PULL_REQUEST_TEMPLATE.md`](./.github/PULL_REQUEST_TEMPLATE.md) (reviewer-first `file:symbol/line` change map & Before/After PR spec).
 
 ## License
 

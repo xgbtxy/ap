@@ -1,30 +1,30 @@
-# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v1.2）
+# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.39）
 
-[English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md)
+[English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
 ## 1. 为什么 95% 的开源 Agent 项目活不过半年？
 
 - **纯提示词角色扮演与套路清单最先消亡**：前沿模型每次强化学习后训练都会吸收这些软套路，冗长的 `AGENTS.md` 说教反而退化为注意力噪音与延迟税。
-- **重型多智能体包装器其次消亡**：各大官方宿主（`codex`、`opencode`、`pi`、`claude`、`agy`、`qwen`、`gemini`、`grok`）原生掌控对话循环与子智能体调度。
+- **重型多智能体包装器其次消亡**：各大官方宿主（`codex`、`opencode`、`pi`、`claude`、`agy`、`qwen`、`gemini`、`grok`、`hermes`、`openclaw`）原生掌控对话循环与子智能体调度。
 - **有损向量 RAG 包装器随之淘汰**：近似语义切片不仅需要 Docker 与 API Key，更比不上毫秒级精确语法树地图与确定性检索。
 
-**架构铁律**：绝不生产 AI Slop，只在**自回归 Token 生成与操作系统/具体语法树/浏览器进程发生物理错位的四道边界**上，用**纯 Rust 单文件二进制（`ap` / `ap.exe`）** 同时输出 **Unix CLI** 与 **标准 `ap mcp` JSON-RPC 服务**。
+**架构铁律**：绝不生产 AI Slop，只在**自回归 Token 生成与操作系统/语法树/二进制/网络/浏览器进程发生物理错位的四道边界**上，用**纯 Rust 单文件二进制（`ap` / `ap.exe`）** 同时输出 **Unix CLI** 与 **标准 `ap mcp` JSON-RPC 服务**。
 
 ---
 
-## 2. 大模型不可逾越的四道认知与物理边界
+## 2. 大模型不可逾越的四道认知与物理边界（`v2.39`）
 
-| `<thinking>` 思考链与系统边界 | 本机 `10.1 万+` 次调用与真实推理流实测损耗 | 纯 Rust 确定性器官与开源顶尖算法融合（`v1.2`） |
+| `<thinking>` 思考链与系统边界 | 本机 `10.1 万+` 次调用与真实推理流实测损耗 | 纯 Rust 确定性器官与开源顶尖算法融合（`v2.39`） |
 | :--- | :--- | :--- |
-| **1. 冷启动高熵盲猜与旧屎山污染** | `3 万+` 次超 `8 KB` 输出刷屏；开局耗费 `10k–35k` 思考字符盲猜环境；误读历史废文件照抄 `: any` 与空 `catch {}`。 | **`ap-atlas`**（融合 Aider **Personalized PageRank** + 宿主运行时指纹 + DOM `#id`/API 断链与防屎山雷达）+ **`ap-sieve`**（日志 `-98.8%`、`5.2ms` FTS5）+ **`ap-probe slice`**（`6.3ms` 死代码剪除） |
-| **2. 跨文件记忆漂移与补丁缩进/转义报错** | 跨 6+ 文件写串 HTML `#id` ↔ JS `getElementById`；因 2 空格缩进偏差产生 `735` 次补丁报错；Windows PowerShell 转义崩溃。 | **`ap-splice`**（`0.7ms` Tree-sitter 精读 + `2.3ms` 零转义及 **Aider 三级精确→行尾去空→相对缩进平移** 语法树预检 `apply`）+ **`ap mcp`**（`ap_edit` 纯 JSON 零转义） |
-| **3. Windows 70% 手工验证税与内存脑补** | **71%–75% 的步骤（`85 万+` Token）** 耗在 Windows 后台服务卡死、残留端口及手写 150 行 CDP 脚本；单次内存别名脑补空烧 `55k` 思考 Token。 | **`ap-probe smoke`**（自动绑空闲 `PORT` + 文件日志防死锁 + **纯 Rust `TcpStream` 交互式无头 Edge/Chrome CDP** `OPEN`/`FILL`/`SELECT`/`CLICK`/`EVAL` + `taskkill /T /F`）+ **`ap-probe run/diff`** |
-| **4. `AGENTS.md` 叮嘱失灵与上下文压缩失忆** | 长会话下模型无视文字叮嘱写出吞异常空 `catch {}`；`/compact` 擦除已证伪的死胡同。 | **`ap-guard`**（`<2ms` `exit 2` `.agents/guard.json` 硬规则 + 自动联动 `tsc`/`biome`/`cargo` + **`rtk` 式 `PreToolUse` `updatedInput` 自动脱水**）+ **`ap-baton`** + **`ap-recall`**（`3.4ms` BM25） |
+| **1. 冷启动高熵盲猜、二进制盲区与旧屎山污染** | `3 万+` 次超 `8 KB` 输出刷屏；开局耗费 `10k–35k` 思考字符盲猜环境；反复手写脆弱的 `python -c` 解析 Office/PDF/SQLite/`.asar`/PE/ELF/Java/.NET/Protobuf/SourceMap/JWT 与压缩 JS。 | **`ap-atlas`**（Aider **Personalized PageRank**、`<60ms` 守卫感知 9 轴 `surface --include-binaries`、`<25ms` `locate`、`<30ms` `trace`/`changes`、DOM `#id`/路由与 Slop 雷达）+ **`ap read`** / **`ap search --pat`** / **`ap query`** + **`ap-sieve`**（`-98.8%` 日志、FTS5 `search`/`peek`、300 行错误洪流封顶）+ **`ap-probe slice`** |
+| **2. 跨文件记忆漂移、补丁失配与 Shell 转义崩溃** | 跨文件写串 `#id`/路由；`735+` 次缩进/空行漂移补丁失配；`528+` 次 Windows PowerShell 引号、GBK 编码与超长 `PATH` 截断崩溃。 | **`ap-splice`**（`view`、避开注释字符串的 `rename`、Aider 三级 + 四级空行容错与 Hashline `L:HH\|` `apply`、`<5ms` 跨文件静态链接 `check`、`ap undo`）+ **`ap exec`**（UTF-8 锁死、慢 `grep -rn` → `ap search` 自动改写、Win32 Job Object）+ **`ap mcp`**（`36` 个强类型 `outputSchema` 工具 = `0` Shell 转义） |
+| **3. Windows 验证税、网络/浏览器实测与内存脑补** | **71%–75% 的原生步骤**耗在服务挂死、残留端口、手写 150 行浏览器/WS/HTTP 鉴权与 CORS/并发脚本、零断言假绿灯测试。 | **`ap-probe`**（空闲端口 `smoke`、桌面/移动双端 `ui` 巡检、非侵入式 `cdp --watch-ms`、`http --principal/--principal-cdp/--cors-origin/--select/--race/--batch-stdin`、RFC 6455 `ws --origin-matrix`、`tls`/`tcp`/`listen`/`ps`/`fs`、AST 变异 `mutate`、`fuzz`、`run`/`diff`）+ **`ap guard verify --deep`** |
+| **4. 叮嘱失灵、死循环、压缩失忆与长程 KV-Cache 跌落** | 长会话下模型无视文字规则；相同命令反复报错空转；`/compact` 后遗忘死胡同；中文压缩超留 2–3 倍或中途打穿 KV-Cache。 | **`ap-guard`**（`<2ms` `exit 2` 硬规则、`sec` C/C++/Java/TS/Py/Go/Rust CWE 检测、语义 `diff`、交付门禁 `pack`、3 次死循环熔断）+ **`ap-baton`**（正交 `frontier` 调度、`claim` 租约、CJK+BM25 `dedup`）+ **`ap-recall`** + **`ap pi`**（11 项 Pi 运行时补丁 + `zz-ap-accelerator.ts`）+ **`ap audit --maintainer`**（100% 离线零隐私 6 智能体简报） |
 
 ---
 
-## 3. 为什么选择纯 Rust（`v1.2`）+ 原生内置 `ap mcp`？
+## 3. 为什么选择纯 Rust（`v2.39`）+ 原生内置 `ap mcp`？
 
-1. **编译期零开销安全与微秒启动（`Rust > C & Python`）**：所有权安全、`OnceLock` 全局单次编译自动机（热循环零正则重编译）、零 GC 停顿、告别 Python Hook 每次 `45ms` 冷启动税。
-2. **让 `$0` 免费模型与小白直接满血提效（`ap mcp`）**：免费轻量模型（`opencode/big-pickle`、`glm-5.3-flash-free`、`deepseek-flash`、`qwen`）在 Windows Shell 下极易撞上引号转义地狱；通过原生 MCP 暴露 `ap_orient`、`ap_edit`、`ap_smoke`、`ap_verify`、`ap_probe`，100% 抹平跨平台命令摩擦。
-3. **7 个物理隔离 Crate（`0` 兄弟依赖）**：每个 `crates/ap-*` 均可独立编译安装，合体为单个约 `11 MB` 原生可执行文件（全量 7 技能静默仅占 **`390 tokens`**）。
+1. **编译期零开销安全与微秒启动（`Rust > C & Python`）**：所有权安全、`OnceLock` 全局单次编译自动机（热循环零正则重编译）、零 GC 停顿、零外部运行时依赖，内置 Windows 长 `PATH` 裁剪、UTF-8 锁定与 Win32 Job Object 进程树回收。
+2. **让 `$0` 免费模型与主流智能体直接满血提效（`ap mcp`）**：完整支持 **MCP 2025-06-18** stdio JSON-RPC，提供 **36 个带强类型 `outputSchema` 的工具**、Resources 与 5 套 Prompts（`ap init` 一键接入 15+ 智能体），彻底抹平跨平台 Shell 语法摩擦。
+3. **7 个物理隔离 Crate（`0` 兄弟依赖）**：每个 `crates/ap-*` 均可独立编译安装，与根模块共同编译为单个约 `15 MB` 原生二进制（全量 7 技能静默描述仅占 **`390 tokens`**）。

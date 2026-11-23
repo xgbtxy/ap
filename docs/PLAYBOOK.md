@@ -1,56 +1,68 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup for Free & Frontier Agents
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.39)
 
-[English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md)
+[English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives` (`v1.2`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars**, **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, and a **built-in Model Context Protocol (`ap mcp`) stdio server**—requiring **zero Python, Node, or Rust toolchain on user machines**.
+`agent-primitives` (`v2.39`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP 2025-06-18 (`36`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
 
 ---
 
-## 1. Zero-Config 1-Line Onboarding (Even for Complete Beginners)
+## 1. Zero-Config 1-Line Onboarding (15+ Agents)
 
 ```bash
-# macOS / Linux (auto-detects OpenCode, Qwen, Gemini CLI, Goose, Pi, Codex, Antigravity, Claude, Grok):
+# macOS / Linux (auto-detects OpenCode, Qwen, Gemini CLI, Goose, Pi, Codex, Antigravity, Claude, Grok, Cursor, Windsurf, VS Code, OpenClaw, Hermes):
 curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 ```
 
 ```powershell
 # Windows PowerShell:
-irm https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | iex
+curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | iex
 ```
 
 ```bash
-# Onboard ONLY the current directory (auto-wires opencode.json / .qwen / .gemini MCP when targeted):
+# Onboard ONLY the current directory (or enable optional Pi runtime patches):
 ap init --here -a opencode
 ap init --here --with-hooks --with-mcp
+ap pi patch           # Applies 11 idempotent Pi v1.5+/v1.6 runtime patches (see docs/PI_RUNTIME.md)
 
-# Clean 1-command uninstall (restores your original configs untouched):
+# Clean 1-command uninstall (restores original configs untouched):
 ap uninstall          # or: ap uninstall --here
 ```
 
-### Free & Open-Source Coding Agents Supported Out-of-the-Box (`$0` Cost Ready)
-- **OpenCode (`opencode`)**: Auto-wires `"agent-primitives": { "type": "local", "command": [".../ap", "mcp"], "enabled": true }` into `~/.config/opencode/opencode.json` (or repo `opencode.json`) + `AGENTS.md`. Even free models (`opencode/big-pickle`, `glm-5.3-flash-free`, `deepseek-v4.1-flash-free`) call `ap_orient`, `ap_edit`, `ap_smoke`, and `ap_verify` natively with zero shell quoting!
-- **Qwen Code (`qwen`) & Google Gemini CLI (`gemini`)**: Auto-wires `"mcpServers": { "agent-primitives": { "command": ".../ap", "args": ["mcp"], "trust": true } }` into `~/.qwen/settings.json` and `~/.gemini/settings.json` (`"trust": true` eliminates confirmation popups).
-- **Pi (`pi` / `pi-coding-agent`) & Goose (`goose`)**: Syncs `~/.pi/agent/skills/` + `~/.pi/agent/AGENTS.md` + `package.json` manifest.
-- **Claude Code (`claude`), OpenAI Codex (`codex`), Antigravity (`agy`) & Grok (`grok`)**: Syncs skills, `<140-token` self-contained routing rules, and (`--with-hooks`) `<2ms` native `exit 2` / JSON hooks + `rtk`-style transparent `PreToolUse` auto-sieve compression for Claude `Bash` test runs.
+### Supported Agents Out-of-the-Box (`$0` Free & Commercial)
+- **OpenCode (`opencode`)**: Auto-wires `"agent-primitives"` MCP into `~/.config/opencode/opencode.json` (or repo `opencode.json`). Free models (`opencode/big-pickle`, `glm-5.3-flash-free`, `deepseek-flash`) call native MCP tools with zero shell quoting.
+- **Qwen Code (`qwen`) & Google Gemini CLI (`gemini`)**: Auto-wires `"trust": true` MCP config into `~/.qwen/settings.json` & `~/.gemini/settings.json`.
+- **Pi (`pi` / `pi-coding-agent`) & Goose (`goose`)**: Syncs `~/.pi/agent/skills/`, `"exposure": "codemode"` in `mcp.json`, zero-prompt-bloat `zz-ap-accelerator.ts`, plus **11 idempotent runtime patches** via `ap pi status|patch|restore`.
+- **Claude Code (`claude`), OpenAI Codex (`codex`), Antigravity (`agy`), Grok (`grok`), Cursor, Windsurf, VS Code, Claude Desktop, OpenClaw, Hermes**: Auto-wires MCP, minimal routing rules, and `<2ms` `exit 2` / JSON hooks with `rtk`-style test output auto-sieving.
 
 ---
 
-## 2. How the 5 Native MCP Tools (`ap mcp`) & CLI Primitives Work Together
+## 2. How the 36 MCP 2025-06-18 Tools & CLI Primitives Work Together
 
-| MCP Tool / CLI Command | Cognitive / OS Bottleneck Eliminated | Latency |
+| Capability Group (`ap mcp` + CLI) | Cognitive / OS Bottleneck Eliminated | Typical Latency |
 | :--- | :--- | ---: |
-| **`ap_orient`** / `ap atlas map` + `atlas product` + `probe slice --bundle` | Cold-start runtime guessing, dead slop file reading, and missing HTML `#id` ↔ JS selector or `fetch()` ↔ backend route links | `6–18 ms` |
-| **`ap_edit`** / `ap splice apply --cwd . --stdin --test` | Multi-file edit waterfalls, 2-space indentation drift (Aider 3-tier fallback), PowerShell quoting traps, and broken AST writes | `2.3 ms` |
-| **`ap_smoke`** / `ap probe smoke --cwd . --stdin` | **The 70% Windows verification tax**: auto-binds free `PORT`, drives interactive headless Edge/Chrome CDP (`OPEN`, `FILL`, `SELECT`, `CLICK`, `EVAL`), checks `0` `pageerror`/stderr crashes, and kills Windows process trees (`taskkill /T /F`) | `2.5–4.5 s` |
-| **`ap_verify`** / `ap guard verify` + `guard rule add` | Prose rule amnesia & AI slop (`: any`, `@ts-ignore`, empty `catch {}`), delegating automatically to `tsc`/`biome`/`cargo`/tests (`exit 2`) | `<2 ms` (+ tests) |
-| **`ap_probe`** / `ap probe run` · `ap sieve` · `ap recall` · `ap baton` | Heap-aliasing prose guessing, `200 KB` CI log floods (`-98.8%`), `AGENTS.md` rule bloat (`3.4ms` SQLite FTS5), and `/compact` amnesia | `3–29 ms` |
+| **Universal Read / Search / SQL** (`ap read`, `ap search --pat`, `ap query`) | Tree-sitter `--symbol`/`--outline` + 12-file batch read; Office/PDF/SQLite/`.asar`/`.map` VLQ; PE32+/ELF64 (`--xref`, mitigations, MS-RPC UUID, Go `.gopclntab`); Java `.class`/`.jar`, `.NET CLR`, `--proto`, `--diff`, `--hex`; JS `--routes`/chunks/`--jwt`/redacted `--secrets`; zero-Python SQLite SQL over `.sqlite`/`.xlsx`/`GBK .csv`. | `1–20 ms` |
+| **Orient / Surface / Locate / Trace** (`ap_orient`, `atlas map/surface/locate/trace/changes`) | Personalized PageRank repo map, `<60ms` guard-aware 9-axis surface frontier (source + binaries + web routes), `<25ms` zero-hint fault localization, and `<30ms` multi-hop call-chain & Git-diff blast radius. | `6–60 ms` |
+| **AST Edit & Refactor** (`ap_edit`, `ap splice view/apply/rename/check`, `ap undo`) | Aider 3-tier + Tier-4 blank-line-resilient & Hashline `L:HH\|` patching, Tree-sitter `rename` ignoring comments/strings, 6-lang + JSON/JSONC/TOML pre-write AST syntax gate, `<5ms` cross-file linker, and non-Git snapshots. | `0.7–5 ms` |
+| **Runtime, Network & UI QA** (`ap_smoke`, `ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`) | Ephemeral `PORT` + process-tree cleanup; headless Edge/Chrome dual-viewport UI/network audit; non-destructive live `cdp --watch-ms`; single/batch/race/CORS/CDP-session `http` QA; RFC 6455 `ws --origin-matrix`; AST mutation testing & chaos fuzzing. | `0.2–4.5 s` |
+| **Deep Verify, Guard, Shell & Sieve** (`ap_verify`, `ap guard verify --deep/sec/diff/pack`, `ap exec`, `ap sieve`) | 1-call fused 6-gate verification (tests + vacuous/`.only` block + OWASP C/C++/Java/TS/Py/Go/Rust `sec` + semantic `diff` + cross-file contracts + active-file `mutate`), `3x` doom-loop breaker, Windows UTF-8/long-`PATH` healing & FTS5 log compression (`-98.8%`). | `<2 ms` (+ tests) |
+| **Pi Runtime, Baton & Recall** (`ap pi`, `ap baton frontier/claim/dedup`, `ap recall`) | 11 idempotent Pi v1.5+/v1.6 runtime patches (`codemode` `text()` return, keep-alive, serial shell barrier, CJK compaction, tool-order cache lock), orthogonal exploration frontier, atomic TTL leases, and `3.3ms` CJK+BM25 recall. | `<15 ms` |
 
 ---
 
-## 3. Step Zero Diagnostics (`ap audit`)
-
-Measure your own local agent waste across `~/.codex`, `~/.pi`, `~/.claude`, `~/.grok`, and `~/.gemini/antigravity-cli` (`0` bytes uploaded):
+## 3. Diagnostics & Friction-Driven Maintenance (`ap doctor`, `ap stats`, `ap audit`)
 
 ```bash
+# 1. Verify environment, compiled grammars, headless Edge/Chrome, agent wiring & Pi patch parity:
+ap doctor
+
+# 2. View 100% offline prevented crashes, filtered noise & token savings:
+ap stats
+
+# 3. Compare agent waste across harnesses (0 bytes uploaded):
 ap audit --compare
+
+# 4. Generate a 100% local, zero-PII numeric Friction-to-Source Brief for co-maintainers (6 harnesses):
+ap audit --maintainer
 ```
+
+Want to co-maintain `ap` with your own AI using our 4-source recursive loop & reviewer-first PR spec? Read **[CONTRIBUTING.md](../CONTRIBUTING.md)** and **[.github/PULL_REQUEST_TEMPLATE.md](../.github/PULL_REQUEST_TEMPLATE.md)**.

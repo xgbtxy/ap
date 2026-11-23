@@ -1,56 +1,68 @@
-# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南
+# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.39）
 
-[English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md)
+[English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives`（`v1.2`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**、**内置 SQLite FTS5/BM25**、**纯 Rust 交互式无头 Edge/Chrome CDP 引擎**以及**标准 `ap mcp` JSON-RPC 服务**——用户电脑**无需安装 Python、Node 或 Rust 编译器**。
+`agent-primitives`（`v2.39`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP 2025-06-18（36 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
 
 ---
 
-## 1. 零配置一行命令接入（小白开箱即用）
+## 1. 零配置一行命令接入（15+ 智能体开箱即用）
 
 ```bash
-# macOS / Linux（自动识别并接线 OpenCode、Qwen、Gemini CLI、Goose、Pi、Codex、Antigravity、Claude、Grok）：
+# macOS / Linux（自动识别并接线 OpenCode、Qwen、Gemini CLI、Goose、Pi、Codex、Antigravity、Claude、Grok、Cursor、Windsurf、VS Code、OpenClaw、Hermes）：
 curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 ```
 
 ```powershell
 # Windows PowerShell：
-irm https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | iex
+curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | iex
 ```
 
 ```bash
-# 仅接入当前项目目录（指定 opencode/qwen/gemini-cli 时自动生成项目级 MCP 配置）：
+# 仅接入当前项目目录（或一键应用 Pi 运行时补丁）：
 ap init --here -a opencode
 ap init --here --with-hooks --with-mcp
+ap pi patch           # 幂等应用 11 项 Pi v1.5+/v1.6 运行时补丁（详见 docs/PI_RUNTIME.zh-CN.md）
 
 # 随时一行无损卸载（完整保留你原有的个人配置）：
 ap uninstall          # 或卸载当前项目：ap uninstall --here
 ```
 
-### 原生支持的免费开源与商业智能体矩阵（$0 零 Key 直接提效）
-- **OpenCode（`opencode`，MIT 开源含免费模型）**：自动写入 `~/.config/opencode/opencode.json`（或项目 `opencode.json`）启用 `ap mcp`。哪怕使用 `$0` 免费模型（`opencode/big-pickle`、`glm-5.3-flash-free`、`deepseek-v4.1-flash-free`），也能直接调用结构化工具 `ap_orient`、`ap_edit`、`ap_smoke`、`ap_verify`，彻底告别 Windows 命令引号报错！
-- **Qwen Code（`qwen`）与 Google Gemini CLI（`gemini`）**：自动向 `~/.qwen/settings.json` 与 `~/.gemini/settings.json` 注入 `"trust": true` 的 `ap mcp` 配置，免除每次弹窗确认。
-- **Pi（`pi`）与 Goose（`goose`）**：自动同步 `~/.pi/agent/skills/`、`~/.pi/agent/AGENTS.md` 与 `package.json` 插件声明。
-- **Claude Code（`claude`）、Codex（`codex`）、Antigravity（`agy`）与 Grok（`grok`）**：同步技能、`~130 Token` 极简路由及 `<2ms` 原生 `exit 2` / JSON Hook（并在 Claude `Bash` 下启用 `rtk` 式测试输出自动脱水）。
+### 原生支持的免费开源与商业智能体矩阵（$0 零 Key 即可提效）
+- **OpenCode（`opencode`）**：自动写入 `opencode.json` 启用 `ap mcp`。哪怕使用 `$0` 免费模型（`opencode/big-pickle`、`glm-5.3-flash-free`、`deepseek-flash`），也能直接调用结构化工具，彻底告别 Windows 引号报错。
+- **Qwen Code（`qwen`）与 Google Gemini CLI（`gemini`）**：自动向 `~/.qwen/settings.json` 与 `~/.gemini/settings.json` 注入 `"trust": true` 的 `ap mcp` 配置，免去每次弹窗确认。
+- **Pi（`pi`）与 Goose（`goose`）**：自动同步 `~/.pi/agent/skills/`、`"exposure": "codemode"` 的 `mcp.json`、零前导词膨胀的 `zz-ap-accelerator.ts`，以及 **`ap pi status|patch|restore` 11 项运行时补丁**。
+- **Claude Code、Codex、Antigravity、Grok、Cursor、Windsurf、VS Code、Claude Desktop、OpenClaw、Hermes**：自动接入 MCP、极简路由及 `<2ms` `exit 2` / JSON Hook（含 `rtk` 式测试日志自动脱水）。
 
 ---
 
-## 2. 5 大原生 MCP 工具（`ap mcp`）与 CLI 原语协同机制
+## 2. 36 个原生 MCP 2025-06-18 工具与 CLI 原语协同矩阵
 
-| MCP 工具 / CLI 命令 | 直接消除的大模型思考与系统卡点 | 原生延迟 |
+| 能力域（`ap mcp` + CLI） | 直接消除的模型思考与 OS 卡点 | 典型延迟 |
 | :--- | :--- | ---: |
-| **`ap_orient`** / `ap atlas map` + `atlas product` + `probe slice --bundle` | 消除空仓环境盲猜、误读历史废文件，静态抓出 HTML `#id` ↔ JS 选择器及 `fetch()` ↔ 后端路由断链（Personalized PageRank 排序） | `6–18 ms` |
-| **`ap_edit`** / `ap splice apply --cwd . --stdin --test` | 消除多文件串行编辑瀑布、2 空格缩进偏差（Aider 三级容错匹配）、PowerShell 转义崩溃，落盘前强制过 Tree-sitter 语法树 | `2.3 ms` |
-| **`ap_smoke`** / `ap probe smoke --cwd . --stdin` | **砍掉 Windows 70% 手工验证税**：自动绑空闲 `PORT`、驱动本机无头 Edge/Chrome 真实点击输入（`OPEN`/`FILL`/`SELECT`/`CLICK`/`EVAL`）、查 `0` 页面/服务端报错并 `taskkill /T /F` 杀净进程树 | `2.5–4.5 s` |
-| **`ap_verify`** / `ap guard verify` + `guard rule add` | 根治 `AGENTS.md` 叮嘱失灵与 AI Slop（拦截 `: any`、`@ts-ignore`、空 `catch {}`），自动调用 `tsc`/`biome`/`cargo`/测试（`exit 2` 硬门禁） | `<2 ms` (+测试) |
-| **`ap_probe`** / `ap probe run` · `ap sieve` · `ap recall` · `ap baton` | 消除内存别名脑补、`200 KB` 测试日志刷屏（`-98.8%`）、长规则库膨胀（`3.4ms` SQLite FTS5）与上下文压缩失忆 | `3–29 ms` |
+| **万能直读 / 多核检索 / SQL**（`ap read`、`ap search --pat`、`ap query`） | Tree-sitter `--symbol`/`--outline` + 12 文件批读；Office/PDF/SQLite/`.asar`/`.map` VLQ；PE32+/ELF64（`--xref`/缓解审计/MS-RPC UUID/Go `.gopclntab`）；Java `.class`/`.jar`/`.NET CLR`/`--proto`/`--diff`/`--hex`；JS `--routes`/chunks/`--jwt`/脱敏 `--secrets`；免 Python 跨表 SQLite SQL（`.sqlite`/`.xlsx`/`GBK .csv`）。 | `1–20 ms` |
+| **定向 / 9 轴表面图 / 定位追踪**（`ap_orient`、`atlas map/surface/locate/trace/changes`） | Personalized PageRank 核心地图、`<60ms` 守卫感知 9 轴表面图（源码+二进制+Web 路由）、`<25ms` 零提示故障定位、`<30ms` 多跳调用链与 Git Diff 影响面分析。 | `6–60 ms` |
+| **AST 改写与全局重构**（`ap_edit`、`ap splice view/apply/rename/check`、`ap undo`） | Aider 三级 + 四级空行容错与 Hashline `L:HH\|` 锚点补丁、严格避开注释/字符串的 Tree-sitter `rename`、6 语言+JSON/JSONC/TOML 预检门禁、`<5ms` 跨文件静态链接及非 Git 快照撤回。 | `0.7–5 ms` |
+| **运行时、网络与双端 UI 质检**（`ap_smoke`、`ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`） | 空闲端口托管 + 进程树清零；无头 Edge/Chrome 桌面+移动 UI/4xx-5xx 巡检；非侵入式实时 `cdp --watch-ms`；单发/批量/并发竞态/CORS/CDP 会话复用 `http` 质检；RFC 6455 `ws --origin-matrix`；AST 变异测试与接口混沌 Fuzz。 | `0.2–4.5 s` |
+| **深度六门禁、护栏与压缩**（`ap_verify`、`ap guard verify --deep/sec/diff/pack`、`ap exec`、`ap sieve`） | 单次跑通 6 重门禁（测试 + `.only`/零断言拦截 + OWASP C/C++/Java/TS/Py/Go/Rust `sec` + 语义 `diff` + 跨文件契约 + 活跃文件 `mutate`）、3 次死循环熔断、Windows UTF-8/长 `PATH` 治愈与 FTS5 无损日志压缩（`-98.8%`）。 | `<2 ms` (+测试) |
+| **Pi 运行时、接力棒与微记忆**（`ap pi`、`ap baton frontier/claim/dedup`、`ap recall`） | 11 项幂等 Pi v1.5+/v1.6 运行时补丁（`codemode` `text()` 返回、Keep-Alive、串行 Shell 屏障、CJK 校准压缩、工具序锁缓存）、正交探索前沿调度、原子租约与 `3.3ms` CJK+BM25 微记忆。 | `<15 ms` |
 
 ---
 
-## 3. 本地过程损耗体检（`ap audit`）
-
-一键扫描本机 `~/.codex`、`~/.pi`、`~/.claude`、`~/.grok`、`~/.gemini/antigravity-cli` 日志（`0` 字节外传）：
+## 3. 自检体检与基于本地日志的共同维护（`ap doctor` / `ap stats` / `ap audit`）
 
 ```bash
+# 1. 一键核验运行环境、6 语言语法器、无头浏览器、智能体接线与 Pi 11 项补丁状态：
+ap doctor
+
+# 2. 查看 100% 本地离线省流与防翻车账本：
+ap stats
+
+# 3. 多 Agent 横向对比过程损耗（0 字节外传）：
 ap audit --compare
+
+# 4. 生成 100% 离线、零隐私泄露的纯数字“卡点→源码”共同维护简报（覆盖 6 款 Agent）：
+ap audit --maintainer
 ```
+
+如果你想让自己的 AI 基于「四源递归自我改进闭环 + 高可读性 PR 规范」一起维护 `ap`，请看 **[CONTRIBUTING.zh-CN.md](../CONTRIBUTING.zh-CN.md)** 与 **[.github/PULL_REQUEST_TEMPLATE.md](../.github/PULL_REQUEST_TEMPLATE.md)**。
