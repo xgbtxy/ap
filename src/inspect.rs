@@ -1449,6 +1449,323 @@ fn byte_line_col(text: &str, byte_off: usize) -> usize {
 }
 
 /// Pure-Rust `<20ms` JavaScript/TypeScript/HTML API route, postMessage origin-check & DOM sink extractor (`--routes`).
+fn is_sensitive_param_name(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    [
+        "id", "uid", "user", "account", "tenant", "org", "role", "admin", "file", "path", "url",
+        "uri", "redirect", "next", "callback", "cmd", "exec", "token", "key", "secret", "filter",
+        "query", "sql", "domain", "project",
+    ]
+    .iter()
+    .any(|k| low == *k || low.contains(k))
+}
+
+fn normalize_har_path(raw_path: &str) -> String {
+    static UUID_RE: OnceLock<Regex> = OnceLock::new();
+    let uuid_re = UUID_RE.get_or_init(|| {
+        Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
+    });
+    let no_q = raw_path.split(['?', '#']).next().unwrap_or("/");
+    let mut segs = Vec::new();
+    for seg in no_q.split('/').filter(|s| !s.is_empty()) {
+        if uuid_re.is_match(seg)
+            || seg.bytes().all(|b| b.is_ascii_digit())
+            || (seg.len() >= 16 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            segs.push(":id");
+        } else {
+            segs.push(seg);
+        }
+    }
+    if segs.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segs.join("/"))
+    }
+}
+
+/// Analyze HTTP Archive (`.har`) traffic into a normalized API endpoint & AuthZ/CORS posture surface matrix (never emits raw tokens/cookies).
+pub fn extract_har_routes_md(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    let trimmed = text.trim_start_matches('\u{FEFF}').trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let root = serde_json::from_str::<Value>(trimmed).ok()?;
+    let entries = root.pointer("/log/entries").and_then(Value::as_array)?;
+
+    #[derive(Default)]
+    struct EpStat {
+        hits: usize,
+        statuses: std::collections::BTreeSet<u64>,
+        auth_headers: std::collections::BTreeSet<String>,
+        params: std::collections::BTreeSet<String>,
+        min_body: Option<u64>,
+        max_body: u64,
+        unauth_2xx: bool,
+        cors_creds: bool,
+    }
+
+    let mut grouped: std::collections::BTreeMap<(String, String), EpStat> =
+        std::collections::BTreeMap::new();
+    let mut hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let q_low = query
+        .map(|q| q.trim().to_ascii_lowercase())
+        .filter(|q| !q.is_empty());
+
+    for ent in entries {
+        let method = ent
+            .pointer("/request/method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        let raw_url = ent
+            .pointer("/request/url")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if raw_url.is_empty() {
+            continue;
+        }
+        let (host, raw_path_and_q) = if let Some(after) = raw_url.split_once("://").map(|x| x.1) {
+            match after.find('/') {
+                Some(idx) => (after[..idx].to_string(), &after[idx..]),
+                None => (after.to_string(), "/"),
+            }
+        } else {
+            (String::new(), raw_url)
+        };
+        if !host.is_empty() {
+            hosts.insert(host.clone());
+        }
+        let norm_path = normalize_har_path(raw_path_and_q);
+        let endpoint = if host.is_empty() {
+            norm_path
+        } else {
+            format!("{host}{norm_path}")
+        };
+
+        let status = ent
+            .pointer("/response/status")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        let mut req_auth: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(hdrs) = ent.pointer("/request/headers").and_then(Value::as_array) {
+            for h in hdrs {
+                let nm = h.get("name").and_then(Value::as_str).unwrap_or("").trim();
+                let low = nm.to_ascii_lowercase();
+                if matches!(
+                    low.as_str(),
+                    "authorization"
+                        | "cookie"
+                        | "x-auth-token"
+                        | "x-csrf-token"
+                        | "x-xsrf-token"
+                        | "x-api-key"
+                        | "proxy-authorization"
+                ) || low.contains("token")
+                {
+                    req_auth.insert(nm.to_string());
+                }
+            }
+        }
+        let mut params: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some((_, qs)) = raw_path_and_q.split_once('?') {
+            for kv in qs.split('&') {
+                let k = kv.split('=').next().unwrap_or("").trim();
+                if !k.is_empty() {
+                    params.insert(k.to_string());
+                }
+            }
+        }
+        if let Some(qarr) = ent
+            .pointer("/request/queryString")
+            .and_then(Value::as_array)
+        {
+            for q in qarr {
+                if let Some(nm) = q.get("name").and_then(Value::as_str).map(str::trim) {
+                    if !nm.is_empty() {
+                        params.insert(nm.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(post_txt) = ent
+            .pointer("/request/postData/text")
+            .and_then(Value::as_str)
+        {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(post_txt) {
+                for k in map.keys().take(24) {
+                    params.insert(k.clone());
+                }
+            }
+        }
+
+        let mut acao = String::new();
+        let mut acac = false;
+        if let Some(rhdrs) = ent.pointer("/response/headers").and_then(Value::as_array) {
+            for h in rhdrs {
+                let low = h
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let val = h.get("value").and_then(Value::as_str).unwrap_or("").trim();
+                if low == "access-control-allow-origin" {
+                    acao = val.to_string();
+                } else if low == "access-control-allow-credentials"
+                    && val.eq_ignore_ascii_case("true")
+                {
+                    acac = true;
+                }
+            }
+        }
+
+        if let Some(ref q) = q_low {
+            let p_joined = params.iter().cloned().collect::<Vec<_>>().join(" ");
+            let hay = format!("{method} {endpoint} {p_joined}").to_ascii_lowercase();
+            if !hay.contains(q) {
+                continue;
+            }
+        }
+
+        let st = grouped.entry((method, endpoint)).or_default();
+        st.hits += 1;
+        if status > 0 {
+            st.statuses.insert(status);
+        }
+        st.auth_headers.extend(req_auth.iter().cloned());
+        st.params.extend(params);
+        if (200..=299).contains(&status) && req_auth.is_empty() {
+            st.unauth_2xx = true;
+        }
+        if !acao.is_empty() && acac {
+            st.cors_creds = true;
+        }
+        if let Some(bsz) = ent
+            .pointer("/response/bodySize")
+            .and_then(Value::as_i64)
+            .filter(|&v| v >= 0)
+            .map(|v| v as u64)
+            .or_else(|| {
+                ent.pointer("/response/content/size")
+                    .and_then(Value::as_u64)
+            })
+        {
+            st.min_body = Some(st.min_body.map(|m| m.min(bsz)).unwrap_or(bsz));
+            st.max_body = st.max_body.max(bsz);
+        }
+    }
+
+    let mut rows: Vec<(u8, String, String, EpStat)> = grouped
+        .into_iter()
+        .map(|((m, ep), st)| {
+            let sens = st.params.iter().any(|p| is_sensitive_param_name(p));
+            let score = (st.cors_creds as u8) * 8
+                + (st.unauth_2xx as u8) * 6
+                + (matches!(m.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") as u8) * 4
+                + (sens as u8) * 2;
+            (score, m, ep, st)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+
+    let total_eps = rows.len();
+    let mut unauth_n = 0usize;
+    let mut cors_n = 0usize;
+    let mut sens_n = 0usize;
+    let mut md_lines = vec![format!(
+        "## HAR API Attack Surface `{label}` ({} entries -> {total_eps} normalized endpoints | {} host(s))",
+        entries.len(),
+        hosts.len()
+    )];
+    let mut ep_json = Vec::new();
+    for (_, method, ep, st) in rows.into_iter().take(80) {
+        let mut flags = Vec::new();
+        if st.unauth_2xx {
+            unauth_n += 1;
+            flags.push("UNAUTH-2XX");
+        }
+        if st.cors_creds {
+            cors_n += 1;
+            flags.push("CORS-CREDS-EXPOSED");
+        }
+        let sens_params: Vec<String> = st
+            .params
+            .iter()
+            .filter(|p| is_sensitive_param_name(p))
+            .cloned()
+            .collect();
+        if !sens_params.is_empty() {
+            sens_n += 1;
+            flags.push("SENSITIVE-PARAMS");
+        }
+        let flag_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join(","))
+        };
+        let status_s = st
+            .statuses
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        let auth_s = if st.auth_headers.is_empty() {
+            "none".to_string()
+        } else {
+            st.auth_headers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let param_s = if st.params.is_empty() {
+            "-".to_string()
+        } else {
+            st.params
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let size_s = match st.min_body {
+            Some(mn) if mn != st.max_body => format!("{mn}..{}B", st.max_body),
+            Some(mn) => format!("{mn}B"),
+            None => "?B".to_string(),
+        };
+        md_lines.push(format!(
+            "- `{method}` `{ep}` (hits={} status=[{status_s}] size={size_s} auth=[{auth_s}] params=[{param_s}]){flag_str}",
+            st.hits
+        ));
+        ep_json.push(serde_json::json!({
+            "method": method,
+            "endpoint": ep,
+            "hits": st.hits,
+            "statuses": st.statuses.into_iter().collect::<Vec<_>>(),
+            "auth_headers": st.auth_headers.into_iter().collect::<Vec<_>>(),
+            "params": st.params.into_iter().collect::<Vec<_>>(),
+            "flags": flags,
+        }));
+    }
+    let jv = serde_json::json!({
+        "entries_total": entries.len(),
+        "endpoints_total": total_eps,
+        "hosts": hosts.into_iter().collect::<Vec<_>>(),
+        "counts": {
+            "unauth_2xx": unauth_n,
+            "cors_creds_exposed": cors_n,
+            "sensitive_params": sens_n,
+        },
+        "endpoints": ep_json,
+    });
+    Some((md_lines.join("\n"), jv))
+}
+
 pub fn extract_js_routes_md(
     text: &str,
     label: &str,
@@ -2273,5 +2590,48 @@ mod inspect_tests {
             xmd.contains("2026-01-01T00:00:00Z") && xmd.contains("ecdsa-SHA256"),
             "{xmd}"
         );
+    }
+
+    #[test]
+    fn extracts_har_api_attack_surface_without_leaking_secrets() {
+        let har = r#"{
+          "log": {
+            "entries": [
+              {
+                "request": {
+                  "method": "POST",
+                  "url": "https://api.example.com/v1/users/550e8400-e29b-41d4-a716-446655440000/profile?debug=1",
+                  "headers": [{"name": "Content-Type", "value": "application/json"}],
+                  "postData": {"text": "{\"role\":\"admin\",\"target_url\":\"http://127.0.0.1\"}"}
+                },
+                "response": {
+                  "status": 200,
+                  "bodySize": 312,
+                  "headers": [
+                    {"name": "Access-Control-Allow-Origin", "value": "https://evil.test"},
+                    {"name": "Access-Control-Allow-Credentials", "value": "true"}
+                  ]
+                }
+              },
+              {
+                "request": {
+                  "method": "GET",
+                  "url": "https://api.example.com/v1/users/987654/profile",
+                  "headers": [{"name": "Authorization", "value": "Bearer TOP_SECRET_JWT_NEVER_EMIT"}]
+                },
+                "response": {"status": 200, "bodySize": 180, "headers": []}
+              }
+            ]
+          }
+        }"#;
+        let (md, jv) = extract_har_routes_md(har, "cap.har", None).unwrap();
+        assert!(md.contains("api.example.com/v1/users/:id/profile"), "{md}");
+        assert!(md.contains("UNAUTH-2XX"), "{md}");
+        assert!(md.contains("CORS-CREDS-EXPOSED"), "{md}");
+        assert!(md.contains("SENSITIVE-PARAMS"), "{md}");
+        assert!(md.contains("Authorization"), "{md}");
+        assert!(!md.contains("TOP_SECRET_JWT_NEVER_EMIT"), "{md}");
+        assert_eq!(jv["counts"]["unauth_2xx"], 1);
+        assert_eq!(jv["counts"]["cors_creds_exposed"], 1);
     }
 }

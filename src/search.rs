@@ -90,6 +90,15 @@ struct SearchCli {
     /// Show N surrounding context lines before & after each match (like `rg -C N`)
     #[arg(short = 'C', long, default_value_t = 0)]
     context: usize,
+    /// Show N lines BEFORE each match (like `rg -B N`)
+    #[arg(short = 'B', long = "before-context", default_value_t = 0)]
+    before_context: usize,
+    /// Show N lines AFTER each match (like `rg -A N`)
+    #[arg(short = 'A', long = "after-context", default_value_t = 0)]
+    after_context: usize,
+    /// Invert match: emit non-matching lines (like `rg -v`)
+    #[arg(short = 'v', long = "invert-match")]
+    invert_match: bool,
     /// Only list unique matching file paths (like `rg -l`)
     #[arg(short = 'l', long)]
     files_only: bool,
@@ -128,7 +137,9 @@ struct SearchOpts {
     pretty: bool,
     multiline: bool,
     block: bool,
-    context: usize,
+    before_ctx: usize,
+    after_ctx: usize,
+    invert: bool,
     max_hits: usize,
     code_only: bool,
     no_tests: bool,
@@ -284,7 +295,7 @@ fn push_text_matches(
     filtered_tests: &AtomicUsize,
     matches: &mut Vec<SearchMatch>,
 ) {
-    if !re.is_match(text) {
+    if !opts.invert && !re.is_match(text) {
         return;
     }
     let can_ast = !is_office
@@ -320,7 +331,7 @@ fn push_text_matches(
     };
     let all_lines: Vec<&str> = text.lines().collect();
 
-    if opts.multiline {
+    if opts.multiline && !opts.invert {
         for m in re.find_iter(text) {
             if !allow_span(m.start(), m.end()) {
                 continue;
@@ -369,8 +380,14 @@ fn push_text_matches(
     for (idx, ln) in text.split('\n').enumerate() {
         let ln_clean = ln.strip_suffix('\r').unwrap_or(ln);
         let ln_no = idx + 1;
-        if re.is_match(ln_clean) {
-            if opts.only_matching {
+        let line_matched = re.is_match(ln_clean);
+        let emit_line = if opts.invert {
+            !line_matched
+        } else {
+            line_matched
+        };
+        if emit_line {
+            if opts.only_matching && !opts.invert {
                 let enc = ast_spans
                     .iter()
                     .filter(|sp| sp.start_line <= ln_no && ln_no <= sp.end_line)
@@ -402,7 +419,7 @@ fn push_text_matches(
                         return;
                     }
                 }
-            } else if ln_clean.len() > 300 {
+            } else if !opts.invert && ln_clean.len() > 300 {
                 // Minified / giant single-line bundle: emit every match as a byte-window slice!
                 for m in re.find_iter(ln_clean) {
                     if !allow_span(line_byte_start + m.start(), line_byte_start + m.end()) {
@@ -429,7 +446,7 @@ fn push_text_matches(
                     }
                 }
             } else {
-                if !non_code_ranges.is_empty() || !test_ranges.is_empty() {
+                if !opts.invert && (!non_code_ranges.is_empty() || !test_ranges.is_empty()) {
                     let mut kept_any = false;
                     for m in re.find_iter(ln_clean) {
                         if allow_span(line_byte_start + m.start(), line_byte_start + m.end()) {
@@ -467,9 +484,9 @@ fn push_text_matches(
                     } else {
                         ln_clean.trim().chars().take(180).collect()
                     }
-                } else if opts.context > 0 && !all_lines.is_empty() {
-                    let s = idx.saturating_sub(opts.context);
-                    let e = (idx + opts.context + 1).min(all_lines.len());
+                } else if (opts.before_ctx > 0 || opts.after_ctx > 0) && !all_lines.is_empty() {
+                    let s = idx.saturating_sub(opts.before_ctx);
+                    let e = (idx + opts.after_ctx + 1).min(all_lines.len());
                     (s..e)
                         .map(|k| {
                             let mark = if k == idx { '>' } else { ' ' };
@@ -588,7 +605,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         pretty: cli.pretty,
         multiline: cli.multiline,
         block: cli.block,
-        context: cli.context,
+        before_ctx: cli.before_context.max(cli.context),
+        after_ctx: cli.after_context.max(cli.context),
+        invert: cli.invert_match,
         max_hits: if cli.count || cli.files_only || cli.unique {
             cli.max_hits.max(500)
         } else {
@@ -732,7 +751,10 @@ pub fn run_cli(args: &[String]) -> i32 {
         let Ok(meta) = p.metadata() else {
             return local_matches;
         };
-        let is_archive_ext = matches!(ext.as_str(), "asar" | "zip" | "vsix" | "jar" | "whl");
+        let is_archive_ext = matches!(
+            ext.as_str(),
+            "asar" | "zip" | "vsix" | "jar" | "whl" | "tar" | "tgz" | "gz"
+        );
         let size_cap = if explicit_file {
             if is_archive_ext {
                 256 * 1024 * 1024
@@ -921,6 +943,65 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            return local_matches;
+        }
+
+        // Virtual `.tar` / `.tgz` / `.tar.gz` archive search (supports GNU @LongLink!)
+        let rel_low = rel.to_ascii_lowercase();
+        if (ext == "tar" || ext == "tgz" || rel_low.ends_with(".tar.gz"))
+            && (explicit_file || !ext_allow.is_empty())
+        {
+            let tar_buf: std::borrow::Cow<[u8]> = if ext == "tgz" || rel_low.ends_with(".tar.gz") {
+                let mut ubuf = Vec::new();
+                let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(&bytes));
+                let _ = std::io::Read::read_to_end(
+                    &mut std::io::Read::take(dec, 16 * 1024 * 1024),
+                    &mut ubuf,
+                );
+                std::borrow::Cow::Owned(ubuf)
+            } else {
+                std::borrow::Cow::Borrowed(&bytes)
+            };
+            for ent in crate::binary::parse_tar_index(&tar_buf) {
+                if ent.size == 0 || ent.size > 4 * 1024 * 1024 {
+                    continue;
+                }
+                let Some(eb) = tar_buf.get(ent.offset..ent.offset + ent.size) else {
+                    continue;
+                };
+                if crate::binary::is_binary_magic(eb) && !crate::binary::is_java_class_magic(eb) {
+                    continue;
+                }
+                let eext = Path::new(&ent.path)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let txt = if crate::binary::is_java_class_magic(eb) {
+                    crate::binary::extract_java_class_searchable_text(eb)
+                } else {
+                    decode_any_bytes(eb).0
+                };
+                let virt_rel = format!("{rel}::{}", ent.path);
+                for (pl, r) in compiled {
+                    let lbl = if multi_mode { pl.as_str() } else { "" };
+                    push_text_matches(
+                        lbl,
+                        &txt,
+                        &virt_rel,
+                        &eext,
+                        false,
+                        r,
+                        s_opts,
+                        filtered_non_code,
+                        filtered_tests,
+                        &mut local_matches,
+                    );
+                    if local_matches.len() >= s_opts.max_hits {
+                        return local_matches;
                     }
                 }
             }

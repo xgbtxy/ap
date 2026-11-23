@@ -83,6 +83,9 @@ fn mcp_tools_schema() -> Value {
                     "multiline": { "type": "boolean", "description": "Enable cross-line multiline regex matching" },
                     "block": { "type": "boolean", "description": "Emit full enclosing Tree-sitter AST function/class block around each hit" },
                     "context": { "type": "integer", "description": "Show N surrounding lines before & after each match (like `rg -C N`)" },
+                    "before_context": { "type": "integer", "description": "Show N lines BEFORE each match (like `rg -B N`)" },
+                    "after_context": { "type": "integer", "description": "Show N lines AFTER each match (like `rg -A N`)" },
+                    "invert_match": { "type": "boolean", "description": "Return non-matching lines instead of matching lines (like `rg -v`)" },
                     "files_only": { "type": "boolean", "description": "Return only unique matching file paths (like `rg -l`)" },
                     "count": { "type": "boolean", "description": "Return per-file match counts (like `rg -c`)" },
                     "only_matching": { "type": "boolean", "description": "Emit ONLY matched substrings from each line (like `grep -o` / `rg -o`)" },
@@ -1436,6 +1439,25 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     cli.push("--context".to_string());
                     cli.push(ctx.to_string());
                 }
+            }
+            if let Some(bc) = args.get("before_context").and_then(Value::as_u64) {
+                if bc > 0 {
+                    cli.push("--before-context".to_string());
+                    cli.push(bc.to_string());
+                }
+            }
+            if let Some(ac) = args.get("after_context").and_then(Value::as_u64) {
+                if ac > 0 {
+                    cli.push("--after-context".to_string());
+                    cli.push(ac.to_string());
+                }
+            }
+            if args
+                .get("invert_match")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--invert-match".to_string());
             }
             if args
                 .get("files_only")

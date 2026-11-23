@@ -7525,3 +7525,175 @@ fn test_v246_pe_deep_meta_rva_bytes_json_x509_and_shell_heals() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
 }
+
+#[test]
+fn test_v247_elf_macho_tar_cpp_symbol_search_ctx_and_har_routes() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Virtual `.tar.gz` archive read `--entry` & virtual `ap search`
+    let mut tar = vec![0u8; 512 * 3];
+    let payload = b"const TOKEN_ENDPOINT = '/v2/internal/rotate_key';\n";
+    tar[0..14].copy_from_slice(b"src/service.js");
+    tar[124..136].copy_from_slice(format!("{:011o}\0", payload.len()).as_bytes());
+    tar[156] = b'0';
+    tar[512..512 + payload.len()].copy_from_slice(payload);
+
+    let tgz_path = root.join("bundle.tar.gz");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&tar).unwrap();
+    fs::write(&tgz_path, enc.finish().unwrap()).unwrap();
+
+    let tgz_list = run_ap(root, &["read", &tgz_path.to_string_lossy()], None, &[]);
+    assert!(tgz_list.status.success());
+    assert!(String::from_utf8_lossy(&tgz_list.stdout).contains("src/service.js"));
+
+    let tgz_ent = run_ap(
+        root,
+        &[
+            "read",
+            &tgz_path.to_string_lossy(),
+            "--entry",
+            "src/service.js",
+        ],
+        None,
+        &[],
+    );
+    assert!(tgz_ent.status.success());
+    assert!(String::from_utf8_lossy(&tgz_ent.stdout).contains("rotate_key"));
+
+    let tgz_srch = run_ap(
+        root,
+        &["search", "TOKEN_ENDPOINT", &tgz_path.to_string_lossy()],
+        None,
+        &[],
+    );
+    assert!(tgz_srch.status.success());
+    let srch_s = String::from_utf8_lossy(&tgz_srch.stdout);
+    assert!(srch_s.contains("bundle.tar.gz::src/service.js"), "{srch_s}");
+
+    // 2. Multi-line C++ `--outline` & `--symbol` + search `-A`/`-B`/`-v`
+    let cpp_path = root.join("handler.cpp");
+    fs::write(
+        &cpp_path,
+        "namespace Api {\nint MyHandler::HandleReq(\n  int id,\n  const char* role\n) {\n  if (id > 0) {\n    return 1;\n  }\n  return 0;\n}\n}\n",
+    )
+    .unwrap();
+    let cpp_out = run_ap(
+        root,
+        &["read", &cpp_path.to_string_lossy(), "--outline"],
+        None,
+        &[],
+    );
+    assert!(cpp_out.status.success());
+    assert!(String::from_utf8_lossy(&cpp_out.stdout).contains("MyHandler::HandleReq"));
+
+    let cpp_sym = run_ap(
+        root,
+        &[
+            "read",
+            &cpp_path.to_string_lossy(),
+            "--symbol",
+            "MyHandler::HandleReq",
+        ],
+        None,
+        &[],
+    );
+    assert!(cpp_sym.status.success());
+    let cpp_sym_s = String::from_utf8_lossy(&cpp_sym.stdout);
+    assert!(
+        cpp_sym_s.contains("fn MyHandler::HandleReq [L2-L10]") && cpp_sym_s.contains("return 1;"),
+        "{cpp_sym_s}"
+    );
+
+    let inv_only = run_ap(
+        root,
+        &["search", "return 0", &cpp_path.to_string_lossy(), "-v"],
+        None,
+        &[],
+    );
+    assert!(inv_only.status.success());
+    let inv_only_s = String::from_utf8_lossy(&inv_only.stdout);
+    assert!(
+        inv_only_s.contains("HandleReq")
+            && !inv_only_s.contains("return 0;")
+            && !inv_only_s.contains("handler.cpp:9"),
+        "{inv_only_s}"
+    );
+
+    let ctx_ab = run_ap(
+        root,
+        &[
+            "search",
+            "return 1",
+            &cpp_path.to_string_lossy(),
+            "-B",
+            "1",
+            "-A",
+            "2",
+        ],
+        None,
+        &[],
+    );
+    assert!(ctx_ab.status.success());
+    let ctx_s = String::from_utf8_lossy(&ctx_ab.stdout);
+    assert!(
+        ctx_s.contains("if (id > 0)") && ctx_s.contains("return 0"),
+        "{ctx_s}"
+    );
+
+    // 3. HAR `--routes` attack surface matrix with header secret redaction
+    let har_path = root.join("trace.har");
+    fs::write(
+        &har_path,
+        r#"{"log":{"entries":[{"request":{"method":"POST","url":"https://api.example.com/v1/users/42/role","headers":[],"postData":{"text":"{\"role\":\"admin\"}"}},"response":{"status":200,"bodySize":64,"headers":[{"name":"Access-Control-Allow-Origin","value":"*"},{"name":"Access-Control-Allow-Credentials","value":"true"}]}},{"request":{"method":"GET","url":"https://api.example.com/v1/users/99/role","headers":[{"name":"Authorization","value":"Bearer SUPER_SECRET_XYZ"}]},"response":{"status":200,"bodySize":32,"headers":[]}}]}}"#,
+    )
+    .unwrap();
+    let har_rt = run_ap(
+        root,
+        &["read", &har_path.to_string_lossy(), "--routes"],
+        None,
+        &[],
+    );
+    assert!(har_rt.status.success());
+    let h_s = String::from_utf8_lossy(&har_rt.stdout);
+    assert!(
+        h_s.contains("api.example.com/v1/users/:id/role")
+            && h_s.contains("UNAUTH-2XX")
+            && h_s.contains("CORS-CREDS-EXPOSED")
+            && !h_s.contains("SUPER_SECRET_XYZ"),
+        "{h_s}"
+    );
+
+    // 4. Synthetic Mach-O 64-bit read + `--va`
+    let mut mo = vec![0u8; 0x200];
+    mo[0..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]);
+    mo[4..8].copy_from_slice(&0x0100_000Cu32.to_le_bytes());
+    mo[12..16].copy_from_slice(&6u32.to_le_bytes());
+    mo[16..20].copy_from_slice(&1u32.to_le_bytes());
+    mo[20..24].copy_from_slice(&72u32.to_le_bytes());
+    mo[32..36].copy_from_slice(&0x19u32.to_le_bytes());
+    mo[36..40].copy_from_slice(&72u32.to_le_bytes());
+    mo[40..46].copy_from_slice(b"__TEXT");
+    mo[56..64].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+    mo[64..72].copy_from_slice(&0x100u64.to_le_bytes());
+    mo[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+    mo[80..88].copy_from_slice(&0x80u64.to_le_bytes());
+    mo[92..96].copy_from_slice(&5u32.to_le_bytes());
+    let mo_path = root.join("libdemo.dylib");
+    fs::write(&mo_path, &mo).unwrap();
+
+    let mo_va = run_ap(
+        root,
+        &["read", &mo_path.to_string_lossy(), "--va", "0x100000010"],
+        None,
+        &[],
+    );
+    assert!(mo_va.status.success());
+    let mo_s = String::from_utf8_lossy(&mo_va.stdout);
+    assert!(
+        mo_s.contains("Mach-O va=0x100000010") && mo_s.contains("offset=0x110"),
+        "{mo_s}"
+    );
+}

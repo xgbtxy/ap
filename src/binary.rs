@@ -2207,6 +2207,8 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
     let mut has_bind_now = false;
     let mut has_nx = false;
     let mut has_exec_stack = false;
+    let mut elf_interp: Option<String> = None;
+    let mut elf_build_id: Option<String> = None;
     if is_64 && bytes.len() >= 64 {
         if e_type == 3 {
             elf_mit.push("PIE");
@@ -2224,7 +2226,48 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
                 }
                 let p_type = read_u32_le(bytes, p).unwrap_or(0);
                 let p_flags = read_u32_le(bytes, p + 4).unwrap_or(0);
-                if p_type == 0x6474_e551 {
+                let p_off = read_u64_le(bytes, p + 8).unwrap_or(0) as usize;
+                let p_fsz = read_u64_le(bytes, p + 32).unwrap_or(0) as usize;
+                if p_type == 3 && p_fsz > 0 && p_fsz < 256 {
+                    // PT_INTERP
+                    if let Some(s) = read_cstr(bytes, p_off, p_fsz) {
+                        if !s.is_empty() {
+                            elf_interp = Some(s);
+                        }
+                    }
+                } else if p_type == 4 && (16..=4096).contains(&p_fsz) && elf_build_id.is_none() {
+                    // PT_NOTE (look for NT_GNU_BUILD_ID type=3, name="GNU\0")
+                    if let Some(note_b) =
+                        bytes.get(p_off..p_off.saturating_add(p_fsz).min(bytes.len()))
+                    {
+                        let mut noff = 0usize;
+                        while noff + 12 <= note_b.len() {
+                            let namesz = read_u32_le(note_b, noff).unwrap_or(0) as usize;
+                            let descsz = read_u32_le(note_b, noff + 4).unwrap_or(0) as usize;
+                            let ntype = read_u32_le(note_b, noff + 8).unwrap_or(0);
+                            let name_start = noff + 12;
+                            let name_end = name_start.saturating_add((namesz + 3) & !3);
+                            let desc_end = name_end.saturating_add((descsz + 3) & !3);
+                            if desc_end > note_b.len() {
+                                break;
+                            }
+                            if ntype == 3
+                                && descsz > 0
+                                && descsz <= 64
+                                && note_b.get(name_start..name_start + 4) == Some(b"GNU\0")
+                            {
+                                elf_build_id = Some(
+                                    note_b[name_end..name_end + descsz]
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect(),
+                                );
+                                break;
+                            }
+                            noff = desc_end.max(noff + 12);
+                        }
+                    }
+                } else if p_type == 0x6474_e551 {
                     // PT_GNU_STACK
                     if (p_flags & 1) != 0 {
                         has_exec_stack = true;
@@ -2280,6 +2323,12 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
                 elf_mit.join(", ")
             }
         ));
+        if let Some(ref interp) = elf_interp {
+            out.push(format!("- Interpreter: `{interp}`"));
+        }
+        if let Some(ref bid) = elf_build_id {
+            out.push(format!("- Build-ID: `{bid}`"));
+        }
         return ctx;
     }
     let strtab_hdr = shoff.saturating_add(shstrndx.saturating_mul(shentsize));
@@ -2361,12 +2410,20 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
             elf_mit.join(", ")
         }
     ));
+    if let Some(ref interp) = elf_interp {
+        out.push(format!("- Interpreter: `{interp}`"));
+    }
+    if let Some(ref bid) = elf_build_id {
+        out.push(format!("- Build-ID: `{bid}`"));
+    }
     if !sec_names.is_empty() {
         out.push(format!("### ELF Sections: `[{}]`", sec_names.join(", ")));
     }
     if let Some((dstr_off, _)) = dynstr_slice {
         if let Some((dyn_off, dyn_sz)) = dynamic_slice {
             let mut needed = Vec::new();
+            let mut soname: Option<String> = None;
+            let mut rpaths = Vec::new();
             let count = (dyn_sz / 16).min(128);
             for k in 0..count {
                 let p = dyn_off + k * 16;
@@ -2379,7 +2436,30 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
                     if let Some(lib) = read_cstr(bytes, dstr_off.saturating_add(val), 128) {
                         needed.push(lib);
                     }
+                } else if tag == 14 {
+                    soname = read_cstr(bytes, dstr_off.saturating_add(val), 128);
+                } else if tag == 15 || tag == 29 {
+                    if let Some(rp) = read_cstr(bytes, dstr_off.saturating_add(val), 256) {
+                        if !rp.is_empty() {
+                            rpaths.push(rp);
+                        }
+                    }
                 }
+            }
+            if let Some(ref sn) = soname {
+                out.push(format!("- SONAME: `{sn}`"));
+            }
+            if !rpaths.is_empty() {
+                let joined = rpaths.join(":");
+                let warn = if joined.contains("$ORIGIN")
+                    || joined.contains("/tmp")
+                    || joined.starts_with('.')
+                {
+                    " [RPATH-CHECK]"
+                } else {
+                    ""
+                };
+                out.push(format!("- RPATH/RUNPATH: `{joined}`{warn}"));
             }
             if !needed.is_empty() {
                 out.push(format!(
@@ -2390,6 +2470,7 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
         }
         if let Some((sym_off, sym_sz, entsz)) = dynsym_slice {
             let mut syms = Vec::new();
+            let mut imp_syms = Vec::new();
             let mut notable_syms = Vec::new();
             let count = (sym_sz / entsz).min(2048);
             for k in 0..count {
@@ -2408,7 +2489,11 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
                         {
                             notable_syms.push(nm.clone());
                         }
-                        if st_shndx != 0 {
+                        if st_shndx == 0 {
+                            if imp_syms.len() < 60 && !imp_syms.contains(&nm) {
+                                imp_syms.push(nm);
+                            }
+                        } else {
                             if st_value > 0 && ctx.func_syms.len() < 4096 {
                                 ctx.func_syms.push((st_value, nm.clone()));
                             }
@@ -2423,6 +2508,13 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
                 out.push(format!(
                     "- **Notable ELF Symbols**: `{}`",
                     notable_syms.join("`, `")
+                ));
+            }
+            if !imp_syms.is_empty() {
+                out.push(format!(
+                    "### ELF Imported Symbols ({} shown): {}",
+                    imp_syms.len(),
+                    imp_syms.join(", ")
                 ));
             }
             if !syms.is_empty() {
@@ -2454,6 +2546,414 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
     ctx
 }
 
+pub struct TarEntry {
+    pub path: String,
+    pub offset: usize,
+    pub size: usize,
+}
+
+/// Pure-Rust USTAR + GNU `@LongLink` TAR archive indexer (skips directories & PAX metadata).
+pub fn parse_tar_index(tar_bytes: &[u8]) -> Vec<TarEntry> {
+    let mut pos = 0usize;
+    let mut entries = Vec::new();
+    let mut long_name: Option<String> = None;
+    while pos + 512 <= tar_bytes.len() {
+        let blk = &tar_bytes[pos..pos + 512];
+        if blk.iter().all(|&b| b == 0) {
+            break;
+        }
+        let size_s = String::from_utf8_lossy(&blk[124..136]);
+        let oct = size_s.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+        let size = usize::from_str_radix(oct, 8).unwrap_or(0);
+        let data_start = pos + 512;
+        let padded = size.div_ceil(512).saturating_mul(512);
+        let next_pos = data_start.saturating_add(padded);
+        let typeflag = blk[156];
+        if typeflag == b'L' {
+            if let Some(lb) =
+                tar_bytes.get(data_start..data_start.saturating_add(size).min(tar_bytes.len()))
+            {
+                let s = String::from_utf8_lossy(lb)
+                    .trim_matches(|c: char| c == '\0' || c == '\n' || c == '\r')
+                    .to_string();
+                if !s.is_empty() {
+                    long_name = Some(s);
+                }
+            }
+            pos = next_pos;
+            continue;
+        }
+        let path = if let Some(ln) = long_name.take() {
+            ln
+        } else {
+            let name_end = blk[..100].iter().position(|&b| b == 0).unwrap_or(100);
+            let nm = String::from_utf8_lossy(&blk[..name_end]).trim().to_string();
+            let pfx_end = blk[345..500].iter().position(|&b| b == 0).unwrap_or(155);
+            let pfx = String::from_utf8_lossy(&blk[345..345 + pfx_end])
+                .trim()
+                .to_string();
+            if pfx.is_empty() {
+                nm
+            } else {
+                format!("{pfx}/{nm}")
+            }
+        };
+        if !path.is_empty()
+            && !matches!(typeflag, b'5' | b'x' | b'g' | b'K')
+            && data_start.saturating_add(size) <= tar_bytes.len()
+        {
+            entries.push(TarEntry {
+                path: path.replace('\\', "/"),
+                offset: data_start,
+                size,
+            });
+        }
+        if next_pos <= pos {
+            break;
+        }
+        pos = next_pos;
+    }
+    entries
+}
+
+pub fn list_tar_md(tar_bytes: &[u8], query: Option<&str>) -> String {
+    let entries = parse_tar_index(tar_bytes);
+    let q_low = query
+        .map(|q| q.trim().to_ascii_lowercase())
+        .filter(|q| !q.is_empty());
+    let mut shown = Vec::new();
+    let mut matched = 0usize;
+    for ent in &entries {
+        if let Some(ref q) = q_low {
+            if !ent.path.to_ascii_lowercase().contains(q) {
+                continue;
+            }
+        }
+        matched += 1;
+        if shown.len() < 120 {
+            shown.push(format!("  - `{}` ({} B)", ent.path, ent.size));
+        }
+    }
+    format!(
+        "## TAR Archive ({matched} matched / {} total entries)\n{}",
+        entries.len(),
+        shown.join("\n")
+    )
+}
+
+pub fn read_tar_member(tar_bytes: &[u8], entry_path: &str) -> Result<Vec<u8>, String> {
+    let entries = parse_tar_index(tar_bytes);
+    let norm_want = entry_path
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/");
+    let found = entries
+        .iter()
+        .find(|e| e.path.trim_start_matches("./") == norm_want)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.path.ends_with(&format!("/{norm_want}")))
+        })
+        .or_else(|| {
+            entries.iter().find(|e| {
+                e.path
+                    .to_ascii_lowercase()
+                    .contains(&norm_want.to_ascii_lowercase())
+            })
+        })
+        .ok_or_else(|| format!("entry `{entry_path}` not found in TAR archive"))?;
+    tar_bytes
+        .get(found.offset..found.offset + found.size)
+        .map(|s| s.to_vec())
+        .ok_or_else(|| format!("TAR entry `{}` out of bounds", found.path))
+}
+
+#[allow(dead_code)]
+struct MachoSegment {
+    name: String,
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: usize,
+    filesize: usize,
+    initprot: u32,
+}
+
+struct MachoContext {
+    slice_off: usize,
+    segs: Vec<MachoSegment>,
+}
+
+fn macho_file_offset_to_vmaddr(off: usize, m: &MachoContext) -> Option<(u64, &str)> {
+    let rel = off.checked_sub(m.slice_off)?;
+    for s in &m.segs {
+        if s.filesize == 0 {
+            continue;
+        }
+        if rel >= s.fileoff && rel < s.fileoff.saturating_add(s.filesize) {
+            return Some((
+                s.vmaddr.saturating_add((rel - s.fileoff) as u64),
+                s.name.as_str(),
+            ));
+        }
+    }
+    None
+}
+
+fn resolve_macho_slice(bytes: &[u8]) -> Option<(usize, usize, Vec<String>)> {
+    if bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) && bytes.len() >= 32 {
+        return Some((0, bytes.len(), Vec::new()));
+    }
+    if bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE]) && bytes.len() >= 28 {
+        let nfat = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        if (1..=8).contains(&nfat) && bytes.len() >= 8 + nfat * 20 {
+            let mut arches = Vec::new();
+            let mut chosen: Option<(usize, usize)> = None;
+            for idx in 0..nfat {
+                let base = 8 + idx * 20;
+                let cpu = u32::from_be_bytes([
+                    bytes[base],
+                    bytes[base + 1],
+                    bytes[base + 2],
+                    bytes[base + 3],
+                ]);
+                let off = u32::from_be_bytes([
+                    bytes[base + 8],
+                    bytes[base + 9],
+                    bytes[base + 10],
+                    bytes[base + 11],
+                ]) as usize;
+                let sz = u32::from_be_bytes([
+                    bytes[base + 12],
+                    bytes[base + 13],
+                    bytes[base + 14],
+                    bytes[base + 15],
+                ]) as usize;
+                let label = match cpu {
+                    0x0100_000C => "arm64",
+                    0x0100_0007 => "x86_64",
+                    0x0000_0007 => "x86",
+                    _ => "other",
+                };
+                arches.push(label.to_string());
+                if off.saturating_add(sz) <= bytes.len()
+                    && sz >= 32
+                    && bytes.get(off..off + 4) == Some(&[0xCF, 0xFA, 0xED, 0xFE])
+                    && chosen.is_none()
+                {
+                    chosen = Some((off, sz));
+                }
+            }
+            if let Some((off, sz)) = chosen {
+                return Some((off, sz, arches));
+            }
+        }
+    }
+    None
+}
+
+fn parse_macho_details(bytes: &[u8], out: &mut Vec<String>) -> Option<MachoContext> {
+    let (slice_off, slice_len, fat_arches) = resolve_macho_slice(bytes)?;
+    let slice = bytes.get(slice_off..slice_off + slice_len)?;
+    if slice.len() < 32 {
+        return None;
+    }
+    let cputype = read_u32_le(slice, 4).unwrap_or(0);
+    let filetype = read_u32_le(slice, 12).unwrap_or(0);
+    let ncmds = read_u32_le(slice, 16).unwrap_or(0) as usize;
+    let sizeofcmds = read_u32_le(slice, 20).unwrap_or(0) as usize;
+    let flags = read_u32_le(slice, 24).unwrap_or(0);
+    let arch = match cputype {
+        0x0100_000C => "ARM64",
+        0x0100_0007 => "x86_64",
+        _ => "64-bit",
+    };
+    let ftype_s = match filetype {
+        2 => "MH_EXECUTE",
+        6 => "MH_DYLIB",
+        8 => "MH_BUNDLE",
+        _ => "Mach-O",
+    };
+    let fat_tag = if fat_arches.is_empty() {
+        String::new()
+    } else {
+        format!(" | Universal FAT: [{}]", fat_arches.join(", "))
+    };
+    out.push(format!(
+        "## Binary Header: macOS Mach-O {arch} ({ftype_s}, {} B){fat_tag}",
+        bytes.len()
+    ));
+    let mut mits = Vec::new();
+    if (flags & 0x0020_0000) != 0 {
+        mits.push("PIE");
+    }
+    if (flags & 0x0100_0000) != 0 {
+        mits.push("NO-HEAP-EXEC");
+    }
+    if (flags & 0x0002_0000) != 0 {
+        mits.push("ALLOW-STACK-EXEC!");
+    }
+    out.push(format!(
+        "- SHA-256: `{}` | Entropy: `{:.2}` | Flags: `[{}]`",
+        sha256_hex(bytes),
+        shannon_entropy(&bytes[..bytes.len().min(4 * 1024 * 1024)]),
+        if mits.is_empty() {
+            "none".to_string()
+        } else {
+            mits.join(", ")
+        }
+    ));
+
+    let mut ctx = MachoContext {
+        slice_off,
+        segs: Vec::new(),
+    };
+    let mut dylibs = Vec::new();
+    let mut rpaths = Vec::new();
+    let mut seg_rows = Vec::new();
+    let mut entitlements = Vec::new();
+    let mut sym_names = Vec::new();
+    let mut sig_len = 0usize;
+
+    let cmds_end = (32 + sizeofcmds).min(slice.len());
+    let mut pos = 32usize;
+    for _ in 0..ncmds.min(256) {
+        if pos + 8 > cmds_end {
+            break;
+        }
+        let cmd = read_u32_le(slice, pos).unwrap_or(0);
+        let cmdsize = read_u32_le(slice, pos + 4).unwrap_or(0) as usize;
+        if cmdsize < 8 || pos + cmdsize > cmds_end {
+            break;
+        }
+        let lc = &slice[pos..pos + cmdsize];
+        if cmd == 0x19 && lc.len() >= 72 {
+            // LC_SEGMENT_64
+            let nm = String::from_utf8_lossy(&lc[8..24])
+                .trim_end_matches('\0')
+                .to_string();
+            let vmaddr = read_u64_le(lc, 24).unwrap_or(0);
+            let vmsize = read_u64_le(lc, 32).unwrap_or(0);
+            let fileoff = read_u64_le(lc, 40).unwrap_or(0) as usize;
+            let filesize = read_u64_le(lc, 48).unwrap_or(0) as usize;
+            let initprot = read_u32_le(lc, 60).unwrap_or(0);
+            let mut perm = String::new();
+            if (initprot & 1) != 0 {
+                perm.push('R');
+            }
+            if (initprot & 2) != 0 {
+                perm.push('W');
+            }
+            if (initprot & 4) != 0 {
+                perm.push('X');
+            }
+            let rwx = if initprot & 7 == 7 { " [RWX!]" } else { "" };
+            seg_rows.push(format!(
+                "`{nm}` (va=0x{vmaddr:x} sz={}B {perm}{rwx})",
+                vmsize
+            ));
+            ctx.segs.push(MachoSegment {
+                name: nm,
+                vmaddr,
+                vmsize,
+                fileoff,
+                filesize,
+                initprot,
+            });
+        } else if matches!(cmd, 0x0C | 0x18 | 0x8000_0018 | 0x8000_001F) && lc.len() >= 24 {
+            let str_off = read_u32_le(lc, 8).unwrap_or(0) as usize;
+            if let Some(dl) = read_cstr(lc, str_off, 256) {
+                dylibs.push(dl);
+            }
+        } else if cmd == 0x8000_001C && lc.len() >= 12 {
+            // LC_RPATH
+            let str_off = read_u32_le(lc, 8).unwrap_or(0) as usize;
+            if let Some(rp) = read_cstr(lc, str_off, 256) {
+                rpaths.push(rp);
+            }
+        } else if cmd == 0x1D && lc.len() >= 16 {
+            // LC_CODE_SIGNATURE
+            let dataoff = read_u32_le(lc, 8).unwrap_or(0) as usize;
+            let datasize = read_u32_le(lc, 12).unwrap_or(0) as usize;
+            if dataoff > 0 && datasize > 0 && dataoff.saturating_add(datasize) <= slice.len() {
+                sig_len = datasize;
+                let sig_txt = String::from_utf8_lossy(&slice[dataoff..dataoff + datasize]);
+                for cand in sig_txt.match_indices("<key>") {
+                    let rest = &sig_txt[cand.0 + 5..];
+                    if let Some(end_k) = rest.find("</key>") {
+                        let k = rest[..end_k].trim();
+                        if (k.contains("com.apple.security.") || k == "get-task-allow")
+                            && entitlements.len() < 12
+                            && !entitlements.iter().any(|x| x == k)
+                        {
+                            entitlements.push(k.to_string());
+                        }
+                    }
+                }
+            }
+        } else if cmd == 0x02 && lc.len() >= 24 {
+            // LC_SYMTAB
+            let symoff = read_u32_le(lc, 8).unwrap_or(0) as usize;
+            let nsyms = read_u32_le(lc, 12).unwrap_or(0) as usize;
+            let stroff = read_u32_le(lc, 16).unwrap_or(0) as usize;
+            let strsize = read_u32_le(lc, 20).unwrap_or(0) as usize;
+            if stroff < slice.len() && strsize > 0 {
+                for sidx in 0..nsyms.min(256) {
+                    let nlist = symoff.saturating_add(sidx * 16);
+                    if nlist + 16 > slice.len() {
+                        break;
+                    }
+                    let strx = read_u32_le(slice, nlist).unwrap_or(0) as usize;
+                    if strx > 0 && strx < strsize {
+                        if let Some(nm) = read_cstr(slice, stroff + strx, 128) {
+                            if nm.len() >= 3 && sym_names.len() < 50 && !sym_names.contains(&nm) {
+                                sym_names.push(nm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos += cmdsize;
+    }
+
+    if !seg_rows.is_empty() {
+        out.push(format!(
+            "### Mach-O Segments ({}): {}",
+            seg_rows.len(),
+            seg_rows.join(" · ")
+        ));
+    }
+    if !rpaths.is_empty() {
+        out.push(format!("- LC_RPATH: `{}`", rpaths.join("`, `")));
+    }
+    if sig_len > 0 {
+        if entitlements.is_empty() {
+            out.push(format!("- CodeSignature: present ({sig_len} B)"));
+        } else {
+            out.push(format!(
+                "- CodeSignature: present ({sig_len} B) | Entitlements: `{}`",
+                entitlements.join("`, `")
+            ));
+        }
+    }
+    if !dylibs.is_empty() {
+        out.push(format!(
+            "### Mach-O Dylibs ({}): `{}`",
+            dylibs.len(),
+            dylibs.join("`, `")
+        ));
+    }
+    if !sym_names.is_empty() {
+        out.push(format!(
+            "### Mach-O Symbols ({} shown): {}",
+            sym_names.len(),
+            sym_names.join(", ")
+        ));
+    }
+    Some(ctx)
+}
+
 /// Inspect PE / ELF / Mach-O / WASM headers, imports/exports, SHA-256, entropy + ASCII & Windows UTF-16LE wide strings.
 pub fn inspect_binary_md(bytes: &[u8], query: Option<&str>, max_strings: usize) -> String {
     inspect_binary_with_xref_md(bytes, query, max_strings, false)
@@ -2469,6 +2969,7 @@ pub fn inspect_binary_with_xref_md(
     let mut out = Vec::new();
     let mut pe_ctx: Option<PeContext> = None;
     let mut elf_ctx: Option<ElfContext> = None;
+    let mut macho_ctx: Option<MachoContext> = None;
     if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
         let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
         if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
@@ -2490,14 +2991,8 @@ pub fn inspect_binary_with_xref_md(
             bytes.len(),
             sha256_hex(bytes)
         ));
-    } else if bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
-        || bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])
-    {
-        out.push(format!(
-            "## Binary Header: macOS Mach-O ({} B) | SHA-256: `{}`",
-            bytes.len(),
-            sha256_hex(bytes)
-        ));
+    } else if let Some(mctx) = parse_macho_details(bytes, &mut out) {
+        macho_ctx = Some(mctx);
     } else {
         out.push(format!(
             "## Binary File ({} B) | SHA-256: `{}` | Entropy: `{:.2}`",
@@ -2560,6 +3055,11 @@ pub fn inspect_binary_with_xref_md(
                     {
                         hits.push(format!("[ascii @0x{st:x} vaddr=0x{va:x} ({sec})] {s}"));
                         matched_elf_vaddrs.push((va, s.into_owned()));
+                    } else if let Some((va, sec)) = macho_ctx
+                        .as_ref()
+                        .and_then(|m| macho_file_offset_to_vmaddr(st, m))
+                    {
+                        hits.push(format!("[ascii @0x{st:x} vaddr=0x{va:x} ({sec})] {s}"));
                     } else {
                         hits.push(format!("[ascii @0x{st:x}] {s}"));
                     }
@@ -2880,6 +3380,36 @@ pub fn inspect_binary_address_md(
         return Ok(out);
     }
 
+    if resolve_macho_slice(bytes).is_some() {
+        let mut sink = Vec::new();
+        if let Some(macho) = parse_macho_details(bytes, &mut sink) {
+            let mut matched_file_off = None;
+            let mut matched_seg = "MachO";
+            for seg in &macho.segs {
+                if seg.filesize > 0
+                    && addr >= seg.vmaddr
+                    && addr < seg.vmaddr.saturating_add(seg.filesize as u64)
+                {
+                    matched_file_off = Some(
+                        macho
+                            .slice_off
+                            .saturating_add(seg.fileoff)
+                            .saturating_add((addr - seg.vmaddr) as usize),
+                    );
+                    matched_seg = seg.name.as_str();
+                    break;
+                }
+            }
+            let file_off = matched_file_off
+                .filter(|&fo| fo < bytes.len())
+                .ok_or_else(|| format!("Mach-O VA 0x{addr:x} not mapped to raw bytes"))?;
+            return Ok(format!(
+                "## Address Lookup: Mach-O va=0x{addr:x} -> offset=0x{file_off:x} | segment=`{matched_seg}`\n{}",
+                format_hex_dump(bytes, file_off, win)
+            ));
+        }
+    }
+
     let off = usize::try_from(addr).map_err(|_| "offset overflow".to_string())?;
     if off >= bytes.len() {
         return Err(format!(
@@ -2957,6 +3487,7 @@ pub fn find_binary_bytes_md(
 
     let mut pe_ctx: Option<PeContext> = None;
     let mut elf_ctx: Option<ElfContext> = None;
+    let mut macho_ctx: Option<MachoContext> = None;
     if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
         let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
         if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
@@ -2966,6 +3497,9 @@ pub fn find_binary_bytes_md(
     } else if bytes.starts_with(b"\x7FELF") {
         let mut sink = Vec::new();
         elf_ctx = Some(parse_elf_details(bytes, &mut sink));
+    } else if resolve_macho_slice(bytes).is_some() {
+        let mut sink = Vec::new();
+        macho_ctx = parse_macho_details(bytes, &mut sink);
     }
 
     let first_anchor = pat
@@ -3025,6 +3559,10 @@ pub fn find_binary_bytes_md(
             } else if let Some(ref elf) = elf_ctx {
                 if let Some((va, sec_nm)) = elf_file_offset_to_vaddr(cand_start, &elf.secs) {
                     loc.push_str(&format!(" va=0x{va:x} ({sec_nm})"));
+                }
+            } else if let Some(ref macho) = macho_ctx {
+                if let Some((va, seg_nm)) = macho_file_offset_to_vmaddr(cand_start, macho) {
+                    loc.push_str(&format!(" va=0x{va:x} ({seg_nm})"));
                 }
             }
             hits.push(format!("- {loc} | `{hex_prev}`"));
@@ -3471,5 +4009,152 @@ mod tests {
             hits_md.contains("0x220") && hits_md.contains("rva=0x1020"),
             "{hits_md}"
         );
+    }
+
+    #[test]
+    fn parses_elf_deep_macho64_and_tar_ustar_longlink() {
+        // 1. Minimal synthetic 64-bit ELF with PT_INTERP, PT_NOTE GNU Build-ID, DT_SONAME, DT_RPATH & imported symbol
+        let mut elf = vec![0u8; 0x500];
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2; // 64-bit
+        elf[5] = 1; // LE
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // x86_64
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff=64
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // phnum=2
+                                                          // PHDR 0: PT_INTERP @0x100 len 28
+        elf[64..68].copy_from_slice(&3u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&28u64.to_le_bytes());
+        elf[0x100..0x11C].copy_from_slice(b"/lib64/ld-linux-x86-64.so.2\0");
+        // PHDR 1: PT_NOTE @0x140 len 20 (namesz=4, descsz=4, type=3, "GNU\0", 0xDEADBEEF)
+        elf[120..124].copy_from_slice(&4u32.to_le_bytes());
+        elf[128..136].copy_from_slice(&0x140u64.to_le_bytes());
+        elf[152..160].copy_from_slice(&20u64.to_le_bytes());
+        elf[0x140..0x144].copy_from_slice(&4u32.to_le_bytes());
+        elf[0x144..0x148].copy_from_slice(&4u32.to_le_bytes());
+        elf[0x148..0x14C].copy_from_slice(&3u32.to_le_bytes());
+        elf[0x14C..0x150].copy_from_slice(b"GNU\0");
+        elf[0x150..0x154].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        // Section table @0x300 (4 sections: null, .shstrtab, .dynstr, .dynamic)
+        elf[40..48].copy_from_slice(&0x300u64.to_le_bytes());
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&5u16.to_le_bytes());
+        elf[62..64].copy_from_slice(&1u16.to_le_bytes());
+        let shstr = b"\0.shstrtab\0.dynstr\0.dynamic\0.dynsym\0";
+        elf[0x180..0x180 + shstr.len()].copy_from_slice(shstr);
+        let dynstr = b"\0libc.so.6\0libdemo.so.1\0$ORIGIN/../lib\0system\0";
+        elf[0x1B0..0x1B0 + dynstr.len()].copy_from_slice(dynstr);
+        // .dynamic @0x200: DT_NEEDED(libc), DT_SONAME(libdemo), DT_RUNPATH($ORIGIN), DT_NULL
+        let dyn_ents: [(u64, u64); 4] = [(1, 1), (14, 11), (29, 24), (0, 0)];
+        for (i, (t, v)) in dyn_ents.iter().enumerate() {
+            elf[0x200 + i * 16..0x208 + i * 16].copy_from_slice(&t.to_le_bytes());
+            elf[0x208 + i * 16..0x210 + i * 16].copy_from_slice(&v.to_le_bytes());
+        }
+        // .dynsym @0x260: entry 0 null, entry 1: st_name="system"@37, shndx=0 (imported)
+        elf[0x260 + 24..0x260 + 28].copy_from_slice(&37u32.to_le_bytes());
+        let write_sh =
+            |buf: &mut [u8], idx: usize, nm: u32, ty: u32, off: u64, sz: u64, esz: u64| {
+                let p = 0x300 + idx * 64;
+                buf[p..p + 4].copy_from_slice(&nm.to_le_bytes());
+                buf[p + 4..p + 8].copy_from_slice(&ty.to_le_bytes());
+                buf[p + 24..p + 32].copy_from_slice(&off.to_le_bytes());
+                buf[p + 32..p + 40].copy_from_slice(&sz.to_le_bytes());
+                buf[p + 56..p + 64].copy_from_slice(&esz.to_le_bytes());
+            };
+        write_sh(&mut elf, 1, 1, 3, 0x180, shstr.len() as u64, 0);
+        write_sh(&mut elf, 2, 11, 3, 0x1B0, dynstr.len() as u64, 0);
+        write_sh(&mut elf, 3, 19, 6, 0x200, 64, 16);
+        write_sh(&mut elf, 4, 28, 11, 0x260, 48, 24);
+        let emd = inspect_binary_md(&elf, None, 20);
+        assert!(
+            emd.contains("/lib64/ld-linux-x86-64.so.2") && emd.contains("deadbeef"),
+            "{emd}"
+        );
+        assert!(
+            emd.contains("libdemo.so.1") && emd.contains("RPATH-CHECK"),
+            "{emd}"
+        );
+        assert!(
+            emd.contains("ELF Imported Symbols") && emd.contains("system"),
+            "{emd}"
+        );
+
+        // 2. Synthetic Mach-O 64-bit binary (LC_SEGMENT_64 __TEXT + LC_LOAD_DYLIB + LC_CODE_SIGNATURE entitlements)
+        let mut mo = vec![0u8; 0x300];
+        mo[0..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // MH_MAGIC_64
+        mo[4..8].copy_from_slice(&0x0100_000Cu32.to_le_bytes()); // ARM64
+        mo[12..16].copy_from_slice(&2u32.to_le_bytes()); // MH_EXECUTE
+        mo[16..20].copy_from_slice(&3u32.to_le_bytes()); // ncmds=3
+        mo[20..24].copy_from_slice(&120u32.to_le_bytes()); // sizeofcmds
+        mo[24..28].copy_from_slice(&0x0020_0000u32.to_le_bytes()); // PIE
+                                                                   // cmd 0 @32: LC_SEGMENT_64 (72B) __TEXT vmaddr=0x100000000 fileoff=0x180 filesize=0x80
+        let c0 = 32usize;
+        mo[c0..c0 + 4].copy_from_slice(&0x19u32.to_le_bytes());
+        mo[c0 + 4..c0 + 8].copy_from_slice(&72u32.to_le_bytes());
+        mo[c0 + 8..c0 + 14].copy_from_slice(b"__TEXT");
+        mo[c0 + 24..c0 + 32].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+        mo[c0 + 32..c0 + 40].copy_from_slice(&0x100u64.to_le_bytes());
+        mo[c0 + 40..c0 + 48].copy_from_slice(&0x180u64.to_le_bytes());
+        mo[c0 + 48..c0 + 56].copy_from_slice(&0x80u64.to_le_bytes());
+        mo[c0 + 60..c0 + 64].copy_from_slice(&5u32.to_le_bytes()); // R+X
+                                                                   // cmd 1 @104: LC_LOAD_DYLIB (32B) "/usr/lib/libSystem.B.dylib" -> needs >=24+path -> 52B -> pad to 56B
+        let dylib = b"/usr/lib/libSystem.B.dylib\0";
+        mo[16..20].copy_from_slice(&3u32.to_le_bytes());
+        let c1 = 104usize;
+        let c1_sz = 52usize;
+        mo[c1..c1 + 4].copy_from_slice(&0x0Cu32.to_le_bytes());
+        mo[c1 + 4..c1 + 8].copy_from_slice(&(c1_sz as u32).to_le_bytes());
+        mo[c1 + 8..c1 + 12].copy_from_slice(&24u32.to_le_bytes());
+        mo[c1 + 24..c1 + 24 + dylib.len()].copy_from_slice(dylib);
+        // cmd 2 @156: LC_CODE_SIGNATURE (16B) -> dataoff=0x220 datasize=0x80
+        let c2 = c1 + c1_sz;
+        mo[20..24].copy_from_slice(&((72 + c1_sz + 16) as u32).to_le_bytes());
+        mo[c2..c2 + 4].copy_from_slice(&0x1Du32.to_le_bytes());
+        mo[c2 + 4..c2 + 8].copy_from_slice(&16u32.to_le_bytes());
+        mo[c2 + 8..c2 + 12].copy_from_slice(&0x220u32.to_le_bytes());
+        mo[c2 + 12..c2 + 16].copy_from_slice(&0x80u32.to_le_bytes());
+        mo[0x190..0x194].copy_from_slice(&[0xD5, 0x03, 0x20, 0x1F]); // NOP
+        let ent_xml = b"<key>com.apple.security.get-task-allow</key>";
+        mo[0x220..0x220 + ent_xml.len()].copy_from_slice(ent_xml);
+        let mmd = inspect_binary_md(&mo, None, 20);
+        assert!(
+            mmd.contains("ARM64")
+                && mmd.contains("libSystem.B.dylib")
+                && mmd.contains("com.apple.security.get-task-allow"),
+            "{mmd}"
+        );
+        let mva = inspect_binary_address_md(&mo, "0x100000010", true, 32).unwrap();
+        assert!(
+            mva.contains("Mach-O va=0x100000010") && mva.contains("offset=0x190"),
+            "{mva}"
+        );
+        let mfb = find_binary_bytes_md(&mo, "D5 03 ?? 1F", 5).unwrap();
+        assert!(
+            mfb.contains("va=0x100000010") && mfb.contains("__TEXT"),
+            "{mfb}"
+        );
+
+        // 3. USTAR + GNU @LongLink TAR archive parser
+        let mut tar = vec![0u8; 512 * 5];
+        let long_path = b"very/long/nested/directory/prefix/service_config_extra.json\0";
+        tar[0..13].copy_from_slice(b"././@LongLink");
+        tar[124..136].copy_from_slice(format!("{:011o}\0", long_path.len()).as_bytes());
+        tar[156] = b'L';
+        tar[512..512 + long_path.len()].copy_from_slice(long_path);
+        let hdr2 = 1024usize;
+        let payload = br#"{"ok":true}"#;
+        tar[hdr2..hdr2 + 9].copy_from_slice(b"short.tmp");
+        tar[hdr2 + 124..hdr2 + 136].copy_from_slice(format!("{:011o}\0", payload.len()).as_bytes());
+        tar[hdr2 + 156] = b'0';
+        tar[1536..1536 + payload.len()].copy_from_slice(payload);
+        let tmd = list_tar_md(&tar, Some("service_config"));
+        assert!(
+            tmd.contains("very/long/nested/directory/prefix/service_config_extra.json"),
+            "{tmd}"
+        );
+        let member = read_tar_member(&tar, "service_config_extra.json").unwrap();
+        assert_eq!(member, payload);
     }
 }

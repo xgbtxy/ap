@@ -661,29 +661,36 @@ fn extract_sqlite_md(p: &Path) -> Result<String, String> {
     Ok(sections.join("\n\n"))
 }
 
-fn extract_tar_entries(tar_bytes: &[u8]) -> String {
-    let mut pos = 0usize;
-    let mut entries = Vec::new();
-    while pos + 512 <= tar_bytes.len() {
-        let blk = &tar_bytes[pos..pos + 512];
-        if blk.iter().all(|&b| b == 0) {
-            break;
+fn read_tar_or_entry(
+    tar_bytes: &[u8],
+    entry: Option<&str>,
+    query: Option<&str>,
+    xref: bool,
+    list_tag: &'static str,
+    format_tag: &mut &str,
+    win_heals: &mut u32,
+) -> Result<String, (i32, String)> {
+    if let Some(ent) = entry {
+        let eb = crate::binary::read_tar_member(tar_bytes, ent)
+            .map_err(|e| (1, format!("[ap read] {e}")))?;
+        if crate::binary::is_java_class_magic(&eb) {
+            *format_tag = "java-class";
+            Ok(crate::binary::parse_java_class_md(&eb, query))
+        } else if crate::binary::is_binary_magic(&eb) {
+            *format_tag = "tar-entry-bin";
+            Ok(crate::binary::inspect_binary_with_xref_md(
+                &eb, query, 80, xref,
+            ))
+        } else {
+            *format_tag = "tar-entry";
+            let (dec_s, _, healed) = decode_any_bytes(&eb);
+            *win_heals += healed;
+            Ok(dec_s)
         }
-        let name_end = blk[..100].iter().position(|&b| b == 0).unwrap_or(100);
-        let name = String::from_utf8_lossy(&blk[..name_end]).trim().to_string();
-        let size_s = String::from_utf8_lossy(&blk[124..136]);
-        let oct = size_s.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-        let size = usize::from_str_radix(oct, 8).unwrap_or(0);
-        if !name.is_empty() && blk[156] != b'5' {
-            entries.push(format!("  - `{name}` ({size} B)"));
-        }
-        pos += 512 + size.div_ceil(512) * 512;
+    } else {
+        *format_tag = list_tag;
+        Ok(crate::binary::list_tar_md(tar_bytes, query))
     }
-    format!(
-        "## TAR Archive ({} file entries)\n{}",
-        entries.len(),
-        entries.into_iter().take(120).collect::<Vec<_>>().join("\n")
-    )
 }
 
 fn try_extract_image_meta(raw: &[u8], ext: &str) -> Option<String> {
@@ -808,39 +815,194 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 }
 
-fn scan_cpp_outline_lines(source: &str) -> Vec<String> {
+#[derive(Clone)]
+struct CppSymSpan {
+    kind: String,
+    qual: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn find_balanced_brace_end(lines: &[&str], decl_idx: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut opened = false;
+    let mut in_block_comment = false;
+    for (rel_idx, raw_ln) in lines[decl_idx..].iter().enumerate() {
+        let abs_idx = decl_idx + rel_idx;
+        if !opened && rel_idx > 4 {
+            return None;
+        }
+        let b = raw_ln.as_bytes();
+        let mut i = 0usize;
+        let mut in_dq = false;
+        let mut in_sq = false;
+        while i < b.len() {
+            if in_block_comment {
+                if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_dq {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    in_dq = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_sq {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'\'' {
+                    in_sq = false;
+                }
+                i += 1;
+                continue;
+            }
+            if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'/' {
+                break;
+            }
+            if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            match b[i] {
+                b'"' => in_dq = true,
+                b'\'' => in_sq = true,
+                b';' if !opened => return None,
+                b'{' => {
+                    opened = true;
+                    depth += 1;
+                }
+                b'}' if opened => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(abs_idx + 1);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn scan_cpp_symbols(source: &str) -> Vec<CppSymSpan> {
     static CPP_RE: OnceLock<(Regex, Regex)> = OnceLock::new();
     let (type_re, fn_re) = CPP_RE.get_or_init(|| {
         let t = Regex::new(
-            r"^\s*(?:template\s*<[^>]+>\s*)?(class|struct|enum|namespace)\s+([A-Za-z_]\w*)",
+            r"^\s*(?:template\s*<[^>]+>\s*)?(class|struct|enum(?:\s+class)?|namespace)\s+([A-Za-z_]\w*)",
         )
         .unwrap();
         let f = Regex::new(
-            r"^(?:[\w:\*&\s<>]+?)\b([A-Za-z_~]\w*(?:::[A-Za-z_~]\w*)?)\s*\([^;]*\)\s*(?:const\s*)?(?:override\s*)?(?:noexcept\s*)?(?:\{|$)",
+            r"^(?:[\w:\*&\s<>~]+?)\b([A-Za-z_~]\w*(?:::[A-Za-z_~]\w*)?)\s*\(",
         )
         .unwrap();
         (t, f)
     });
+    let lines: Vec<&str> = source.lines().collect();
     let mut out = Vec::new();
-    for (idx, raw_ln) in source.lines().enumerate() {
+    for idx in 0..lines.len() {
+        let raw_ln = lines[idx];
         let trimmed = raw_ln.trim();
         if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
             continue;
         }
         if let Some(cap) = type_re.captures(raw_ln) {
-            out.push(format!("L{}: {} {}", idx + 1, &cap[1], &cap[2]));
+            if let Some(end_ln) = find_balanced_brace_end(&lines, idx) {
+                out.push(CppSymSpan {
+                    kind: cap[1].to_string(),
+                    qual: cap[2].to_string(),
+                    start_line: idx + 1,
+                    end_line: end_ln,
+                });
+            } else if raw_ln.contains('{') {
+                out.push(CppSymSpan {
+                    kind: cap[1].to_string(),
+                    qual: cap[2].to_string(),
+                    start_line: idx + 1,
+                    end_line: idx + 1,
+                });
+            }
             continue;
         }
-        if !raw_ln.starts_with(' ') && !raw_ln.starts_with('\t') && raw_ln.contains('{') {
-            if let Some(cap) = fn_re.captures(trimmed) {
-                let sym = &cap[1];
-                if !matches!(sym, "if" | "for" | "while" | "switch" | "catch" | "return") {
-                    out.push(format!("L{}: fn {sym}", idx + 1));
+        if let Some(cap) = fn_re.captures(trimmed) {
+            let sym = &cap[1];
+            if matches!(
+                sym,
+                "if" | "for" | "while" | "switch" | "catch" | "return" | "sizeof"
+            ) {
+                continue;
+            }
+            // Match single-line or up-to-4-line C++ signature ending with `{` (excluding `;` calls/declarations)
+            let mut look = String::new();
+            let mut has_open_brace = false;
+            let mut terminated_semi = false;
+            for k in 0..=4 {
+                if idx + k >= lines.len() {
+                    break;
+                }
+                let l = lines[idx + k].trim();
+                look.push_str(l);
+                look.push(' ');
+                if l.ends_with(';') && !l.contains('{') {
+                    terminated_semi = true;
+                    break;
+                }
+                if l.contains('{') {
+                    has_open_brace = true;
+                    break;
+                }
+            }
+            if !terminated_semi && has_open_brace && look.contains(')') {
+                if let Some(end_ln) = find_balanced_brace_end(&lines, idx) {
+                    out.push(CppSymSpan {
+                        kind: "fn".to_string(),
+                        qual: sym.to_string(),
+                        start_line: idx + 1,
+                        end_line: end_ln,
+                    });
                 }
             }
         }
     }
     out
+}
+
+fn scan_cpp_outline_lines(source: &str) -> Vec<String> {
+    scan_cpp_symbols(source)
+        .into_iter()
+        .map(|s| format!("L{}-L{}: {} {}", s.start_line, s.end_line, s.kind, s.qual))
+        .collect()
+}
+
+fn find_cpp_symbol_span(source: &str, symbol: &str) -> Option<CppSymSpan> {
+    let want = symbol.trim();
+    let syms = scan_cpp_symbols(source);
+    syms.iter()
+        .find(|s| s.qual == want)
+        .or_else(|| {
+            syms.iter()
+                .find(|s| s.qual.rsplit("::").next() == Some(want))
+        })
+        .cloned()
+        .map(|s| CppSymSpan {
+            kind: s.kind,
+            qual: s.qual,
+            start_line: s.start_line,
+            end_line: s.end_line,
+        })
 }
 
 fn extract_md_section(
@@ -1221,20 +1383,27 @@ fn read_single_target(
 
     if cli.routes && cli.entry.is_none() {
         let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
-        let (rendered, jv_inner) =
-            crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());
+        let (rendered, jv_inner, fmt_tag) = if let Some((h_md, h_jv)) =
+            crate::inspect::extract_har_routes_md(&decoded_txt, &label, cli.query.as_deref())
+        {
+            (h_md, h_jv, "har-routes")
+        } else {
+            let (j_md, j_jv) =
+                crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());
+            (j_md, j_jv, "js-routes")
+        };
         record_event(
             "read",
             raw_bytes.len() as u64,
             rendered.len() as u64,
             0,
             1,
-            "js-routes",
+            fmt_tag,
         );
         let jv = json!({
             "ok": true,
             "target": label,
-            "format": "js-routes",
+            "format": fmt_tag,
             "size_bytes": raw_bytes.len(),
             "surface": jv_inner,
             "content": rendered,
@@ -1358,10 +1527,17 @@ fn read_single_target(
         "tgz" | "gz" => {
             let dec = GzDecoder::new(Cursor::new(&raw_bytes));
             let mut ubuf = Vec::new();
-            let _ = dec.take(4 * 1024 * 1024).read_to_end(&mut ubuf);
+            let _ = dec.take(16 * 1024 * 1024).read_to_end(&mut ubuf);
             if ext == "tgz" || label.to_ascii_lowercase().ends_with(".tar.gz") {
-                format_tag = "tar.gz";
-                extract_tar_entries(&ubuf)
+                read_tar_or_entry(
+                    &ubuf,
+                    cli.entry.as_deref(),
+                    cli.query.as_deref(),
+                    cli.xref,
+                    "tar.gz",
+                    &mut format_tag,
+                    &mut win_heals,
+                )?
             } else {
                 format_tag = "gzip";
                 let (decoded, _, _) = decode_any_bytes(&ubuf);
@@ -1377,7 +1553,15 @@ fn read_single_target(
                 }
             }
         }
-        "tar" => extract_tar_entries(&raw_bytes),
+        "tar" => read_tar_or_entry(
+            &raw_bytes,
+            cli.entry.as_deref(),
+            cli.query.as_deref(),
+            cli.xref,
+            "tar",
+            &mut format_tag,
+            &mut win_heals,
+        )?,
         _ => {
             if let Some(img_meta) = try_extract_image_meta(&raw_bytes, &ext) {
                 format_tag = "image-meta";
@@ -1461,23 +1645,33 @@ fn read_single_target(
             return Ok((rendered, jv));
         }
         if cli.routes {
-            let (rendered, jv_inner) = crate::inspect::extract_js_routes_md(
-                &converted,
-                &entry_label,
-                cli.query.as_deref(),
-            );
+            let (rendered, jv_inner, fmt_tag) = if let Some((h_md, h_jv)) =
+                crate::inspect::extract_har_routes_md(
+                    &converted,
+                    &entry_label,
+                    cli.query.as_deref(),
+                ) {
+                (h_md, h_jv, "har-routes")
+            } else {
+                let (j_md, j_jv) = crate::inspect::extract_js_routes_md(
+                    &converted,
+                    &entry_label,
+                    cli.query.as_deref(),
+                );
+                (j_md, j_jv, "js-routes")
+            };
             record_event(
                 "read",
                 raw_len,
                 rendered.len() as u64,
                 win_heals,
                 1,
-                "entry-routes",
+                fmt_tag,
             );
             let jv = json!({
                 "ok": true,
                 "target": entry_label,
-                "format": "js-routes",
+                "format": fmt_tag,
                 "surface": jv_inner,
                 "content": rendered,
             });
@@ -1597,10 +1791,11 @@ fn read_single_target(
             }
         }
     } else if let Some(ref sym_spec) = cli.symbol {
-        if ap_splice::ast::language_for_ext(&ext).is_none() {
+        let is_cpp = matches!(ext.as_str(), "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx");
+        if ap_splice::ast::language_for_ext(&ext).is_none() && !is_cpp {
             return Err((
                 2,
-                format!("[ap read] --symbol requires a Tree-sitter code file (Py/TS/JS/Go/Rust/C), got `.{ext}`"),
+                format!("[ap read] --symbol requires a Tree-sitter code file (Py/TS/JS/Go/Rust/C) or C/C++, got `.{ext}`"),
             ));
         }
         let wanted: Vec<&str> = sym_spec
@@ -1613,8 +1808,27 @@ fn read_single_target(
         }
         let mut blocks = Vec::new();
         for sym in wanted.into_iter().take(12) {
-            let Some(sp) = ap_splice::ast::find_symbol_span(&converted, &ext, sym) else {
-                let avail: Vec<String> = ap_splice::ast::scan_symbols(&converted, &ext)
+            let (kind, qual, s_ln, e_ln) = if !is_cpp {
+                if let Some(sp) = ap_splice::ast::find_symbol_span(&converted, &ext, sym) {
+                    (sp.kind, sp.qual, sp.start_line, sp.end_line)
+                } else {
+                    let avail: Vec<String> = ap_splice::ast::scan_symbols(&converted, &ext)
+                        .into_iter()
+                        .take(12)
+                        .map(|s| s.qual)
+                        .collect();
+                    return Err((
+                        1,
+                        format!(
+                            "[ap read] symbol `{sym}` not found in `{label}` (available: {})",
+                            avail.join(", ")
+                        ),
+                    ));
+                }
+            } else if let Some(sp) = find_cpp_symbol_span(&converted, sym) {
+                (sp.kind, sp.qual, sp.start_line, sp.end_line)
+            } else {
+                let avail: Vec<String> = scan_cpp_symbols(&converted)
                     .into_iter()
                     .take(12)
                     .map(|s| s.qual)
@@ -1627,13 +1841,13 @@ fn read_single_target(
                     ),
                 ));
             };
-            let s = sp.start_line.max(1);
-            let e = sp.end_line.min(total_lines);
+            let s = s_ln.max(1);
+            let e = e_ln.min(total_lines);
             let slice = (s..=e)
                 .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
                 .collect::<Vec<_>>()
                 .join("\n");
-            blocks.push(format!("## {} {} [L{s}-L{e}]\n{slice}", sp.kind, sp.qual,));
+            blocks.push(format!("## {kind} {qual} [L{s}-L{e}]\n{slice}"));
         }
         format!(
             "# READ `{label}` [{} AST symbol(s) of {total_lines} lines | {format_tag}]\n{}",
