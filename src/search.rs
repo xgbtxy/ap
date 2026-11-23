@@ -84,6 +84,15 @@ struct SearchCli {
     /// Emit per-file match counts (like `rg -c`)
     #[arg(short = 'c', long)]
     count: bool,
+    /// Code-only mode: skip non-code docs/configs AND matches inside Tree-sitter comments & string literals
+    #[arg(long)]
+    code_only: bool,
+    /// Production-only mode: skip test/fixture/mock files AND Rust #[cfg(test)]/Python test_* blocks
+    #[arg(long)]
+    no_tests: bool,
+    /// Exclude matching relative paths or glob suffixes (repeatable: `-x fixtures -x *.gen.ts`)
+    #[arg(short = 'x', long = "exclude")]
+    exclude: Vec<String>,
     /// Emit structured JSON output
     #[arg(long)]
     json: bool,
@@ -97,6 +106,76 @@ struct SearchOpts {
     block: bool,
     context: usize,
     max_hits: usize,
+    code_only: bool,
+    no_tests: bool,
+}
+
+fn is_non_code_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "md" | "txt"
+            | "rst"
+            | "json"
+            | "jsonc"
+            | "jsonl"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "xml"
+            | "csv"
+            | "tsv"
+            | "log"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+            | "pdf"
+            | "map"
+            | "html"
+            | "htm"
+            | "css"
+            | "svg"
+    )
+}
+
+fn is_test_rel_path(rel: &str) -> bool {
+    let low = rel.replace('\\', "/").to_ascii_lowercase();
+    for seg in low.split('/') {
+        if matches!(
+            seg,
+            "tests" | "test" | "__tests__" | "fixtures" | "fixture" | "mocks" | "mock"
+        ) {
+            return true;
+        }
+    }
+    let fname = low.rsplit('/').next().unwrap_or(low.as_str());
+    fname.contains(".test.")
+        || fname.contains(".spec.")
+        || fname.ends_with("_test.rs")
+        || fname.ends_with("_test.go")
+        || fname.ends_with("_test.ts")
+        || fname.ends_with("_test.js")
+        || (fname.starts_with("test_") && fname.ends_with(".py"))
+}
+
+fn matches_exclude(rel: &str, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let rel_low = rel.replace('\\', "/").to_ascii_lowercase();
+    for raw in excludes {
+        let p = raw.trim().trim_start_matches("./").to_ascii_lowercase();
+        if p.is_empty() {
+            continue;
+        }
+        if let Some(suf) = p.strip_prefix("*.") {
+            if rel_low.ends_with(&format!(".{suf}")) {
+                return true;
+            }
+        } else if rel_low.contains(&p) {
+            return true;
+        }
+    }
+    false
 }
 
 fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
@@ -124,23 +203,51 @@ fn push_text_matches(
     is_office: bool,
     re: &Regex,
     opts: SearchOpts,
+    filtered_non_code: &AtomicUsize,
+    filtered_tests: &AtomicUsize,
     matches: &mut Vec<SearchMatch>,
 ) {
     if !re.is_match(text) {
         return;
     }
-    let ast_spans = if !is_office
+    let can_ast = !is_office
         && text.len() <= 2 * 1024 * 1024
-        && ap_splice::ast::language_for_ext(ext).is_some()
-    {
+        && ap_splice::ast::language_for_ext(ext).is_some();
+    let ast_spans = if can_ast {
         ap_splice::ast::scan_symbols(text, ext)
     } else {
         Vec::new()
+    };
+    let non_code_ranges = if can_ast && opts.code_only {
+        ap_splice::ast::collect_non_code_ranges(text, ext)
+    } else {
+        Vec::new()
+    };
+    let test_ranges = if can_ast && opts.no_tests {
+        ap_splice::ast::collect_test_block_ranges(text, ext)
+    } else {
+        Vec::new()
+    };
+    let allow_span = |abs_s: usize, abs_e: usize| -> bool {
+        if !test_ranges.is_empty() && ap_splice::ast::range_is_covered(&test_ranges, abs_s, abs_e) {
+            filtered_tests.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if !non_code_ranges.is_empty()
+            && ap_splice::ast::range_is_covered(&non_code_ranges, abs_s, abs_e)
+        {
+            filtered_non_code.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     };
     let all_lines: Vec<&str> = text.lines().collect();
 
     if opts.multiline {
         for m in re.find_iter(text) {
+            if !allow_span(m.start(), m.end()) {
+                continue;
+            }
             let ln_no = text[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
             let enc = ast_spans
                 .iter()
@@ -187,6 +294,9 @@ fn push_text_matches(
             if ln_clean.len() > 300 {
                 // Minified / giant single-line bundle: emit every match as a byte-window slice!
                 for m in re.find_iter(ln_clean) {
+                    if !allow_span(line_byte_start + m.start(), line_byte_start + m.end()) {
+                        continue;
+                    }
                     let s = floor_char_boundary(ln_clean, m.start().saturating_sub(opts.around));
                     let e = ceil_char_boundary(ln_clean, m.end().saturating_add(opts.around));
                     let raw_snip = &ln_clean[s..e];
@@ -208,6 +318,18 @@ fn push_text_matches(
                     }
                 }
             } else {
+                if !non_code_ranges.is_empty() || !test_ranges.is_empty() {
+                    let mut kept_any = false;
+                    for m in re.find_iter(ln_clean) {
+                        if allow_span(line_byte_start + m.start(), line_byte_start + m.end()) {
+                            kept_any = true;
+                        }
+                    }
+                    if !kept_any {
+                        line_byte_start += ln.len() + 1;
+                        continue;
+                    }
+                }
                 let enc = ast_spans
                     .iter()
                     .filter(|sp| sp.start_line <= ln_no && ln_no <= sp.end_line)
@@ -339,6 +461,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         } else {
             cli.max_hits
         },
+        code_only: cli.code_only,
+        no_tests: cli.no_tests,
     };
 
     let root = Path::new(&cli.path);
@@ -359,11 +483,14 @@ pub fn run_cli(args: &[String]) -> i32 {
     let explicit_file = root_canon.is_file();
     let compiled_arc = Arc::new(compiled);
     let ext_allow_arc = Arc::new(ext_allow);
+    let exclude_arc = Arc::new(cli.exclude);
     let root_canon_arc = Arc::new(root_canon.clone());
     let all_matches: Arc<Mutex<Vec<SearchMatch>>> = Arc::new(Mutex::new(Vec::new()));
     let hit_counter = Arc::new(AtomicUsize::new(0));
     let scanned_files_cnt = Arc::new(AtomicUsize::new(0));
     let total_bytes_cnt = Arc::new(AtomicU64::new(0));
+    let filtered_non_code_cnt = Arc::new(AtomicUsize::new(0));
+    let filtered_tests_cnt = Arc::new(AtomicUsize::new(0));
     let hit_cap = s_opts.max_hits;
 
     #[allow(clippy::too_many_arguments)]
@@ -372,14 +499,31 @@ pub fn run_cli(args: &[String]) -> i32 {
         root_canon: &Path,
         explicit_file: bool,
         ext_allow: &HashSet<String>,
+        excludes: &[String],
         compiled: &[(String, Regex)],
         multi_mode: bool,
         s_opts: SearchOpts,
         scanned_files_cnt: &AtomicUsize,
         total_bytes_cnt: &AtomicU64,
+        filtered_non_code: &AtomicUsize,
+        filtered_tests: &AtomicUsize,
     ) -> Vec<SearchMatch> {
         let mut local_matches = Vec::new();
         if !p.is_file() {
+            return local_matches;
+        }
+        let rel = if explicit_file {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            p.strip_prefix(root_canon)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        if matches_exclude(&rel, excludes) {
             return local_matches;
         }
         let ext = p
@@ -388,6 +532,12 @@ pub fn run_cli(args: &[String]) -> i32 {
             .unwrap_or("")
             .to_ascii_lowercase();
         if !ext_allow.is_empty() && !ext_allow.contains(&ext) {
+            return local_matches;
+        }
+        if s_opts.code_only && is_non_code_ext(&ext) {
+            return local_matches;
+        }
+        if s_opts.no_tests && is_test_rel_path(&rel) {
             return local_matches;
         }
         if matches!(
@@ -449,18 +599,6 @@ pub fn run_cli(args: &[String]) -> i32 {
         scanned_files_cnt.fetch_add(1, Ordering::Relaxed);
         total_bytes_cnt.fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
-        let rel = if explicit_file {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string()
-        } else {
-            p.strip_prefix(root_canon)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-
         // SourceMap v3 embedded original sources search (`.js.map` / `.map`)
         if ext == "map" {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -492,6 +630,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                                     false,
                                     r,
                                     s_opts,
+                                    filtered_non_code,
+                                    filtered_tests,
                                     &mut local_matches,
                                 );
                                 if local_matches.len() >= s_opts.max_hits {
@@ -552,6 +692,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 false,
                                 r,
                                 s_opts,
+                                filtered_non_code,
+                                filtered_tests,
                                 &mut local_matches,
                             );
                             if local_matches.len() >= s_opts.max_hits {
@@ -616,6 +758,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                                     false,
                                     r,
                                     s_opts,
+                                    filtered_non_code,
+                                    filtered_tests,
                                     &mut local_matches,
                                 );
                                 if local_matches.len() >= s_opts.max_hits {
@@ -682,6 +826,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                 is_office,
                 r,
                 s_opts,
+                filtered_non_code,
+                filtered_tests,
                 &mut local_matches,
             );
             if local_matches.len() >= s_opts.max_hits {
@@ -697,11 +843,14 @@ pub fn run_cli(args: &[String]) -> i32 {
             &root_canon,
             true,
             &ext_allow_arc,
+            &exclude_arc,
             &compiled_arc,
             multi_mode,
             s_opts,
             &scanned_files_cnt,
             &total_bytes_cnt,
+            &filtered_non_code_cnt,
+            &filtered_tests_cnt,
         );
         if let Ok(mut guard) = all_matches.lock() {
             guard.extend(local);
@@ -722,11 +871,14 @@ pub fn run_cli(args: &[String]) -> i32 {
         walker.run(|| {
             let compiled_c = Arc::clone(&compiled_arc);
             let ext_allow_c = Arc::clone(&ext_allow_arc);
+            let exclude_c = Arc::clone(&exclude_arc);
             let root_c = Arc::clone(&root_canon_arc);
             let matches_c = Arc::clone(&all_matches);
             let hit_c = Arc::clone(&hit_counter);
             let scanned_c = Arc::clone(&scanned_files_cnt);
             let bytes_c = Arc::clone(&total_bytes_cnt);
+            let f_nc_c = Arc::clone(&filtered_non_code_cnt);
+            let f_test_c = Arc::clone(&filtered_tests_cnt);
 
             Box::new(move |res| {
                 if hit_c.load(Ordering::Relaxed) >= hit_cap {
@@ -740,11 +892,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                     &root_c,
                     false,
                     &ext_allow_c,
+                    &exclude_c,
                     &compiled_c,
                     multi_mode,
                     s_opts,
                     &scanned_c,
                     &bytes_c,
+                    &f_nc_c,
+                    &f_test_c,
                 );
                 if !local.is_empty() {
                     let added = local.len();
@@ -763,6 +918,20 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     let scanned_files = scanned_files_cnt.load(Ordering::Relaxed);
     let total_bytes = total_bytes_cnt.load(Ordering::Relaxed);
+    let filtered_non_code = filtered_non_code_cnt.load(Ordering::Relaxed);
+    let filtered_tests = filtered_tests_cnt.load(Ordering::Relaxed);
+    let mut filter_notes = Vec::new();
+    if filtered_non_code > 0 {
+        filter_notes.push(format!("{filtered_non_code} comment/string"));
+    }
+    if filtered_tests > 0 {
+        filter_notes.push(format!("{filtered_tests} test"));
+    }
+    let filter_tag = if filter_notes.is_empty() {
+        String::new()
+    } else {
+        format!(" [filtered {} hit(s)]", filter_notes.join(", "))
+    };
     let mut matches = match Arc::try_unwrap(all_matches) {
         Ok(m) => m.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
@@ -785,7 +954,7 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     let rendered = if cli.files_only {
         let mut out_lines = vec![format!(
-            "# SEARCH FILES `{combined_label}` ({} file(s) across {scanned_files} scanned in {elapsed_ms}ms)",
+            "# SEARCH FILES `{combined_label}` ({} file(s) across {scanned_files} scanned in {elapsed_ms}ms){filter_tag}",
             per_file_counts.len()
         )];
         for f in per_file_counts.keys() {
@@ -794,7 +963,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         out_lines.join("\n")
     } else if cli.count {
         let mut out_lines = vec![format!(
-            "# SEARCH COUNT `{combined_label}` ({} hit(s) in {} file(s) across {scanned_files} scanned in {elapsed_ms}ms)",
+            "# SEARCH COUNT `{combined_label}` ({} hit(s) in {} file(s) across {scanned_files} scanned in {elapsed_ms}ms){filter_tag}",
             matches.len(),
             per_file_counts.len()
         )];
@@ -804,7 +973,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         out_lines.join("\n")
     } else {
         let mut out_lines = vec![format!(
-            "# SEARCH `{combined_label}` ({} hit(s) across {scanned_files} files in {elapsed_ms}ms)",
+            "# SEARCH `{combined_label}` ({} hit(s) across {scanned_files} files in {elapsed_ms}ms){filter_tag}",
             matches.len()
         )];
         for m in &matches {
@@ -851,6 +1020,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                     "ok": true,
                     "elapsed_ms": elapsed_ms,
                     "scanned_files": scanned_files,
+                    "filtered_non_code": filtered_non_code,
+                    "filtered_tests": filtered_tests,
                     "files": files,
                 }))
                 .unwrap_or_default()
@@ -862,6 +1033,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                     "ok": true,
                     "elapsed_ms": elapsed_ms,
                     "scanned_files": scanned_files,
+                    "filtered_non_code": filtered_non_code,
+                    "filtered_tests": filtered_tests,
                     "total_matches": matches.len(),
                     "counts": per_file_counts,
                 }))
@@ -874,6 +1047,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                     "ok": true,
                     "elapsed_ms": elapsed_ms,
                     "scanned_files": scanned_files,
+                    "filtered_non_code": filtered_non_code,
+                    "filtered_tests": filtered_tests,
                     "matches": matches,
                 }))
                 .unwrap_or_default()

@@ -103,7 +103,11 @@ enum TopCmd {
         home: Option<String>,
     },
     /// Start native Model Context Protocol (MCP) stdio JSON-RPC server
-    Mcp,
+    Mcp {
+        /// Exposed tool profile: full (36 tools, default), core (8 everyday tools + ap_discover/ap_call), or deferred (only ap_discover + ap_call, ~94% fewer schema tokens)
+        #[arg(long, default_value = "")]
+        profile: String,
+    },
     /// Run deterministic micro-benchmark suite (with honest negative controls)
     Bench {
         #[arg(long, default_value = "bench/results.json")]
@@ -240,7 +244,7 @@ fn main() {
         TopCmd::Uninstall { here, dir, home } => {
             install::cmd_uninstall(here, dir.as_deref(), home.as_deref())
         }
-        TopCmd::Mcp => mcp::run_mcp_stdio(),
+        TopCmd::Mcp { profile } => mcp::run_mcp_stdio_with_profile(&profile),
         TopCmd::Bench { out } => bench::run_bench(std::path::Path::new(&out)),
     };
     std::process::exit(code);

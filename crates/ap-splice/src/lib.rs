@@ -8,7 +8,7 @@ use ast::{find_symbol_span, scan_symbols, verify_syntax};
 use base64::Engine;
 use check::{collect_check_payload, CheckPayload};
 use clap::{Parser, Subcommand};
-use patch::{dedent_and_reindent, parse_edit_spec, replace_crlf_tolerant};
+use patch::{dedent_and_reindent, parse_edit_spec, replace_crlf_tolerant_with_hint};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -528,8 +528,14 @@ fn apply_spec_inner(
                         .new
                         .trim_start_matches('\u{FEFF}')
                         .replace("\r\n", "\n");
-                    let (updated, cnt) = replace_crlf_tolerant(&cur_lf, &old_lf, &new_lf, item.all)
-                        .map_err(|e| format!("`{}`: {e}", item.path))?;
+                    let (updated, cnt) = replace_crlf_tolerant_with_hint(
+                        &cur_lf,
+                        &old_lf,
+                        &new_lf,
+                        item.all,
+                        item.line_hint.as_deref(),
+                    )
+                    .map_err(|e| format!("`{}`: {e}", item.path))?;
                     working_text.insert(p.clone(), (updated, nl_sep));
                     applied_summary.push(
                         json!({"index": idx, "path": item.path, "op": "replace", "matches": cnt}),

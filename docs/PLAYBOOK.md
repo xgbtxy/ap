@@ -1,4 +1,4 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.39)
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.40)
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -36,13 +36,13 @@ ap uninstall          # or: ap uninstall --here
 
 ---
 
-## 2. How the 36 MCP 2025-06-18 Tools & CLI Primitives Work Together
+## 2. How the 36 MCP 2025-06-18 Tools (`--profile full|core|deferred`) & CLI Primitives Work Together
 
 | Capability Group (`ap mcp` + CLI) | Cognitive / OS Bottleneck Eliminated | Typical Latency |
 | :--- | :--- | ---: |
-| **Universal Read / Search / SQL** (`ap read`, `ap search --pat`, `ap query`) | Tree-sitter `--symbol`/`--outline` + 12-file batch read; Office/PDF/SQLite/`.asar`/`.map` VLQ; PE32+/ELF64 (`--xref`, mitigations, MS-RPC UUID, Go `.gopclntab`); Java `.class`/`.jar`, `.NET CLR`, `--proto`, `--diff`, `--hex`; JS `--routes`/chunks/`--jwt`/redacted `--secrets`; zero-Python SQLite SQL over `.sqlite`/`.xlsx`/`GBK .csv`. | `1–20 ms` |
+| **Universal Read / Search / SQL** (`ap read`, `ap search --pat`, `ap query`) | Tree-sitter `--symbol`/`--outline` + 12-file batch read; `--code-only --no-tests --exclude` AST search filtering comments/strings/tests; Office/PDF/SQLite/`.asar`/`.map` VLQ; PE32+/ELF64 (`--xref`, mitigations, MS-RPC UUID, Go `.gopclntab`); Java `.class`/`.jar`, `.NET CLR`, `--proto`, `--diff`, `--hex`; JS `--routes`/chunks/`--jwt`/redacted `--secrets`; zero-Python SQLite SQL over `.sqlite`/`.xlsx`/`GBK .csv`. | `1–20 ms` |
 | **Orient / Surface / Locate / Trace** (`ap_orient`, `atlas map/surface/locate/trace/changes`) | Personalized PageRank repo map, `<60ms` guard-aware 9-axis surface frontier (source + binaries + web routes), `<25ms` zero-hint fault localization, and `<30ms` multi-hop call-chain & Git-diff blast radius. | `6–60 ms` |
-| **AST Edit & Refactor** (`ap_edit`, `ap splice view/apply/rename/check`, `ap undo`) | Aider 3-tier + Tier-4 blank-line-resilient & Hashline `L:HH\|` patching, Tree-sitter `rename` ignoring comments/strings, 6-lang + JSON/JSONC/TOML pre-write AST syntax gate, `<5ms` cross-file linker, and non-Git snapshots. | `0.7–5 ms` |
+| **AST Edit & Refactor** (`ap_edit`, `ap splice view/apply/rename/check`, `ap undo`) | Chain-of-resiliency patching (strips accidental read gutters, `@L<start>-L<end>` disambiguation, smart-quote rescue + candidate diagnostics, 4-tier indent/blank-line + Hashline `L:HH\|`), Tree-sitter `rename` ignoring comments/strings, 6-lang + JSON/JSONC/TOML AST gate, `<5ms` linker & non-Git snapshots. | `0.7–5 ms` |
 | **Runtime, Network & UI QA** (`ap_smoke`, `ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`) | Ephemeral `PORT` + process-tree cleanup; headless Edge/Chrome dual-viewport UI/network audit; non-destructive live `cdp --watch-ms`; single/batch/race/CORS/CDP-session `http` QA; RFC 6455 `ws --origin-matrix`; AST mutation testing & chaos fuzzing. | `0.2–4.5 s` |
 | **Deep Verify, Guard, Shell & Sieve** (`ap_verify`, `ap guard verify --deep/sec/diff/pack`, `ap exec`, `ap sieve`) | 1-call fused 6-gate verification (tests + vacuous/`.only` block + OWASP C/C++/Java/TS/Py/Go/Rust `sec` + semantic `diff` + cross-file contracts + active-file `mutate`), `3x` doom-loop breaker, Windows UTF-8/long-`PATH` healing & FTS5 log compression (`-98.8%`). | `<2 ms` (+ tests) |
 | **Pi Runtime, Baton & Recall** (`ap pi`, `ap baton frontier/claim/dedup`, `ap recall`) | 11 idempotent Pi v1.5+/v1.6 runtime patches (`codemode` `text()` return, keep-alive, serial shell barrier, CJK compaction, tool-order cache lock), orthogonal exploration frontier, atomic TTL leases, and `3.3ms` CJK+BM25 recall. | `<15 ms` |

@@ -6428,3 +6428,218 @@ fn test_manifest_versions_match_workspace_package() {
         ".claude-plugin/marketplace.json version drift (expected {expected})"
     );
 }
+
+#[test]
+fn test_v240_mcp_profiles_ast_code_search_and_resilient_splice() {
+    use serde_json::json;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Create sample files for AST-filtered search & chain-of-resiliency splice
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("src/auth.rs"),
+        [
+            "pub fn prod_handler() {",
+            "    // verify_token comment should be filtered in --code-only",
+            "    let msg = \"verify_token string literal should also be filtered\";",
+            "    let ok = verify_token(); // verify_token on real code line stays",
+            "}",
+            "pub fn verify_token() -> bool { true }",
+            "",
+            "#[cfg(test)]",
+            "mod tests {",
+            "    #[test]",
+            "    fn checks_token() {",
+            "        assert!(super::verify_token());",
+            "    }",
+            "}",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/auth_spec.rs"),
+        "fn integ() { verify_token(); }\n",
+    )
+    .unwrap();
+    fs::write(root.join("NOTES.md"), "Docs mention verify_token().\n").unwrap();
+
+    // 1. AST Structure-First search: --code-only --no-tests --exclude
+    let raw_search = run_ap(root, &["search", "verify_token", ".", "--json"], None, &[]);
+    assert!(raw_search.status.success());
+    let raw_j: Value = serde_json::from_slice(&raw_search.stdout).unwrap();
+    let raw_matches = raw_j["matches"].as_array().unwrap();
+    assert!(
+        raw_matches.len() >= 6,
+        "expected >=6 raw hits across docs/comments/tests, got {}",
+        raw_matches.len()
+    );
+
+    let clean_search = run_ap(
+        root,
+        &[
+            "search",
+            "verify_token",
+            ".",
+            "--code-only",
+            "--no-tests",
+            "--exclude",
+            "*.md",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(clean_search.status.success());
+    let clean_j: Value = serde_json::from_slice(&clean_search.stdout).unwrap();
+    let clean_matches = clean_j["matches"].as_array().unwrap();
+    // Only src/auth.rs L4 (real call) + L6 (fn def) should remain!
+    assert_eq!(clean_matches.len(), 2, "clean_j={clean_j}");
+    assert_eq!(clean_matches[0]["line"].as_u64(), Some(4));
+    assert_eq!(clean_matches[1]["line"].as_u64(), Some(6));
+    assert!(clean_j["filtered_non_code"].as_u64().unwrap_or(0) >= 2);
+    assert!(clean_j["filtered_tests"].as_u64().unwrap_or(0) >= 1);
+
+    // 2. Chain-of-Resiliency splice: gutter strip + @L disambiguation + candidate diagnostics + smart quotes
+    fs::write(
+        root.join("src/dup.rs"),
+        [
+            "fn alpha() {",
+            "    return 10;",
+            "}",
+            "fn banner() -> &'static str {",
+            "    \"hello-world\"",
+            "}",
+            "fn beta() {",
+            "    return 10;",
+            "}",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    // 2a. Copied read/view gutter lines + duplicate block disambiguated via @L7-L9
+    let spec_ok = [
+        "@@ FILE: src/dup.rs @L7-L9",
+        "<<<",
+        "   8:     return 10;",
+        "===",
+        "   8:     return 77;",
+        ">>>",
+    ]
+    .join("\n");
+    let sp_res = run_ap(
+        root,
+        &["splice", "apply", "--cwd", ".", "--stdin"],
+        Some(&spec_ok),
+        &[],
+    );
+    assert!(
+        sp_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sp_res.stderr)
+    );
+    let dup_after = fs::read_to_string(root.join("src/dup.rs")).unwrap();
+    assert!(dup_after.contains("fn alpha() {\n    return 10;\n}"));
+    assert!(dup_after.contains("fn beta() {\n    return 77;\n}"));
+
+    // 2b. Ambiguous edit without @L returns candidate line numbers
+    let spec_ambig = "@@ FILE: src/auth.rs\n<<<\nverify_token\n===\ncheck_token\n>>>\n";
+    let ambig_res = run_ap(
+        root,
+        &["splice", "apply", "--cwd", ".", "--stdin"],
+        Some(spec_ambig),
+        &[],
+    );
+    assert!(!ambig_res.status.success());
+    let ambig_err = String::from_utf8_lossy(&ambig_res.stderr);
+    assert!(
+        ambig_err.contains("L2:") && ambig_err.contains("L4:"),
+        "{ambig_err}"
+    );
+
+    // 3. Progressive MCP profiles: full vs core vs deferred + ap_discover + ap_call
+    fn mcp_rpc(cwd: &Path, profile_args: &[&str], reqs: &[Value]) -> (usize, Vec<Value>) {
+        let mut cmd = std::process::Command::new(ap_bin());
+        cmd.arg("mcp")
+            .args(profile_args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut payload = String::new();
+        for r in reqs {
+            payload.push_str(&r.to_string());
+            payload.push('\n');
+        }
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let stdout_s = String::from_utf8_lossy(&out.stdout).to_string();
+        let parsed: Vec<Value> = stdout_s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (stdout_s.len(), parsed)
+    }
+
+    let (full_bytes, full_resps) = mcp_rpc(
+        root,
+        &[],
+        &[json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})],
+    );
+    assert_eq!(
+        full_resps[0]["result"]["tools"].as_array().unwrap().len(),
+        36
+    );
+
+    let (core_bytes, core_resps) = mcp_rpc(
+        root,
+        &["--profile", "core"],
+        &[json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})],
+    );
+    let core_tools = core_resps[0]["result"]["tools"].as_array().unwrap();
+    assert_eq!(core_tools.len(), 10);
+    assert!(core_bytes < full_bytes / 2);
+
+    let (_def_total_bytes, def_resps) = mcp_rpc(
+        root,
+        &["--profile", "deferred"],
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_discover", "arguments": {"query": "http authz cors", "include_schema": true, "limit": 3}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ap_call", "arguments": {"tool": "ap_search", "arguments": {"pattern": "verify_token", "path": ".", "code_only": true, "no_tests": true, "json": true}}}}),
+        ],
+    );
+    let def_tools = def_resps[0]["result"]["tools"].as_array().unwrap();
+    let def_list_bytes = def_resps[0].to_string().len();
+    assert_eq!(def_tools.len(), 2);
+    assert!(
+        def_list_bytes < 4000 && def_list_bytes * 10 < full_bytes,
+        "deferred tools/list payload too large: {def_list_bytes} vs full={full_bytes}"
+    );
+    assert_eq!(def_tools[0]["name"], "ap_discover");
+    assert_eq!(def_tools[1]["name"], "ap_call");
+
+    let disc_sc = &def_resps[1]["result"]["structuredContent"];
+    assert_eq!(disc_sc["total_tools"].as_u64(), Some(36));
+    assert_eq!(disc_sc["tools"][0]["name"], "ap_http");
+    assert!(disc_sc["tools"][0]["inputSchema"]["properties"].is_object());
+
+    let call_sc = &def_resps[2]["result"]["structuredContent"];
+    assert_eq!(call_sc["ok"], true);
+    assert_eq!(call_sc["matches"].as_array().unwrap().len(), 2);
+}

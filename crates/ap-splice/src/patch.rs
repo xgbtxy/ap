@@ -17,24 +17,40 @@ pub struct EditOp {
     pub symbol: String,
     #[serde(default)]
     pub all: bool,
+    #[serde(default)]
+    pub line_hint: Option<String>,
 }
 
-fn patch_regexes() -> &'static (Regex, Regex, Regex, Regex) {
-    static RE: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
-    RE.get_or_init(|| {
-        let hdr = Regex::new(
+struct PatchRegexes {
+    hdr: Regex,
+    open: Regex,
+    mid: Regex,
+    close: Regex,
+    line_hint_tail: Regex,
+    gutter_prefix: Regex,
+}
+
+fn patch_regexes() -> &'static PatchRegexes {
+    static RE: OnceLock<PatchRegexes> = OnceLock::new();
+    RE.get_or_init(|| PatchRegexes {
+        hdr: Regex::new(
             r"(?i)^@@\s*(FILE_ALL|FILE|EDIT|REPLACE|SYMBOL|WRITE|APPEND|PREPEND)\s*:\s*(.+?)\s*$",
         )
-        .unwrap();
-        let open = Regex::new(r"(?i)^<<<(?:\s*(?:OLD|SEARCH|EOF))?\s*$").unwrap();
-        let mid = Regex::new(r"(?i)^===(?:\s*(?:NEW|REPLACE))?\s*$").unwrap();
-        let close = Regex::new(r"(?i)^>>>(?:\s*(?:END|REPLACE|EOF))?\s*$").unwrap();
-        (hdr, open, mid, close)
+        .unwrap(),
+        open: Regex::new(r"(?i)^<<<(?:\s*(?:OLD|SEARCH|EOF))?\s*$").unwrap(),
+        mid: Regex::new(r"(?i)^===(?:\s*(?:NEW|REPLACE))?\s*$").unwrap(),
+        close: Regex::new(r"(?i)^>>>(?:\s*(?:END|REPLACE|EOF))?\s*$").unwrap(),
+        line_hint_tail: Regex::new(r"(?i)^(.*?)\s+@L(\d+(?:\s*-\s*L?\d+)?)\s*$").unwrap(),
+        gutter_prefix: Regex::new(r"^\s*\d+(?::[0-9a-fA-F]{2}\||:\s|\|)").unwrap(),
     })
 }
 
 pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
-    let (hdr_re, open_re, mid_re, close_re) = patch_regexes();
+    let re_set = patch_regexes();
+    let hdr_re = &re_set.hdr;
+    let open_re = &re_set.open;
+    let mid_re = &re_set.mid;
+    let close_re = &re_set.close;
     let norm = raw_spec.replace("\r\n", "\n");
     let lines: Vec<&str> = norm.split('\n').collect();
     let mut ops = Vec::new();
@@ -55,7 +71,25 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
             ));
         };
         let kind = cap[1].to_ascii_uppercase();
-        let rest = cap[2].trim().to_string();
+        let raw_rest = cap[2].trim();
+        let (rest, line_hint) = if matches!(kind.as_str(), "FILE" | "FILE_ALL" | "EDIT" | "REPLACE")
+        {
+            if let Some(hcap) = re_set.line_hint_tail.captures(raw_rest) {
+                (
+                    hcap[1].trim().to_string(),
+                    Some(
+                        hcap[2]
+                            .chars()
+                            .filter(|c| !c.is_whitespace() && *c != 'L' && *c != 'l')
+                            .collect(),
+                    ),
+                )
+            } else {
+                (raw_rest.to_string(), None)
+            }
+        } else {
+            (raw_rest.to_string(), None)
+        };
         i += 1;
 
         match kind.as_str() {
@@ -108,6 +142,7 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
                         content: None,
                         symbol: String::new(),
                         all: replace_all,
+                        line_hint: line_hint.clone(),
                     });
                     hunks += 1;
                 }
@@ -155,6 +190,7 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
                     content: None,
                     symbol: sym,
                     all: false,
+                    line_hint: None,
                 });
             }
             "WRITE" | "APPEND" | "PREPEND" => {
@@ -198,6 +234,7 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
                     content: Some(content_s),
                     symbol: String::new(),
                     all: false,
+                    line_hint: None,
                 });
             }
             _ => unreachable!(),
@@ -272,6 +309,7 @@ fn parse_unified_diff(raw_diff: &str) -> Result<Vec<EditOp>, String> {
                     content: Some(format!("{}\n", new_buf.join("\n"))),
                     symbol: String::new(),
                     all: false,
+                    line_hint: None,
                 });
             } else if !old_buf.is_empty() {
                 ops.push(EditOp {
@@ -282,6 +320,7 @@ fn parse_unified_diff(raw_diff: &str) -> Result<Vec<EditOp>, String> {
                     content: None,
                     symbol: String::new(),
                     all: false,
+                    line_hint: None,
                 });
             }
             continue;
@@ -322,15 +361,126 @@ pub fn parse_edit_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
     }
 }
 
+pub fn parse_line_hint(hint: Option<&str>) -> Option<(usize, usize)> {
+    let raw = hint?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let clean = raw
+        .trim_start_matches('@')
+        .trim_start_matches(['L', 'l'])
+        .trim();
+    if let Some((a, b)) = clean.split_once('-') {
+        let s = a
+            .trim()
+            .trim_start_matches(['L', 'l'])
+            .parse::<usize>()
+            .ok()?;
+        let e = b
+            .trim()
+            .trim_start_matches(['L', 'l'])
+            .parse::<usize>()
+            .ok()?;
+        let lo = s.max(1);
+        let hi = e.max(lo);
+        Some((lo, hi))
+    } else {
+        let center = clean.parse::<usize>().ok()?.max(1);
+        Some((center.saturating_sub(10).max(1), center.saturating_add(10)))
+    }
+}
+
+fn strip_read_gutter_if_consistent(block: &str) -> Option<String> {
+    let g_re = &patch_regexes().gutter_prefix;
+    let lines: Vec<&str> = block.split('\n').collect();
+    let non_empty: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if non_empty.is_empty() || !non_empty.iter().all(|l| g_re.is_match(l)) {
+        return None;
+    }
+    let mut stripped_any = false;
+    let out: Vec<String> = lines
+        .into_iter()
+        .map(|ln| {
+            if ln.trim().is_empty() {
+                String::new()
+            } else if let Some(m) = g_re.find(ln) {
+                stripped_any = true;
+                ln[m.end()..].to_string()
+            } else {
+                ln.to_string()
+            }
+        })
+        .collect();
+    stripped_any.then(|| out.join("\n"))
+}
+
+fn normalize_unicode_punct(s: &str) -> String {
+    s.replace(['\u{201C}', '\u{201D}'], "\"")
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{2013}', '\u{2014}'], "-")
+}
+
+fn format_ambiguous_err(tier: &str, src_lines: &[&str], hits_0based: &[usize]) -> String {
+    let candidates: Vec<String> = hits_0based
+        .iter()
+        .take(5)
+        .map(|&idx| {
+            let preview: String = src_lines
+                .get(idx)
+                .copied()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(48)
+                .collect();
+            format!("L{}: `{preview}`", idx + 1)
+        })
+        .collect();
+    format!(
+        "`old` matched {} locations via {tier} ({}). Disambiguate with `@L<start>-L<end>` on the header (or `line_hint`), add 1-2 surrounding lines, or use `@@ FILE_ALL:` / `\"all\": true`.",
+        hits_0based.len(),
+        candidates.join(", ")
+    )
+}
+
 pub fn replace_crlf_tolerant(
     content_lf: &str,
     old_lf: &str,
     new_lf: &str,
     replace_all: bool,
 ) -> Result<(String, usize), String> {
+    replace_crlf_tolerant_with_hint(content_lf, old_lf, new_lf, replace_all, None)
+}
+
+pub fn replace_crlf_tolerant_with_hint(
+    content_lf: &str,
+    old_lf: &str,
+    new_lf: &str,
+    replace_all: bool,
+    line_hint: Option<&str>,
+) -> Result<(String, usize), String> {
+    replace_crlf_inner(content_lf, old_lf, new_lf, replace_all, line_hint, true)
+}
+
+fn replace_crlf_inner(
+    content_lf: &str,
+    old_lf: &str,
+    new_lf: &str,
+    replace_all: bool,
+    line_hint: Option<&str>,
+    allow_gutter_strip: bool,
+) -> Result<(String, usize), String> {
     if old_lf.is_empty() {
         return Err("`old` cannot be empty.".to_string());
     }
+    let hint_win = parse_line_hint(line_hint);
+    let src_lines: Vec<&str> = content_lf.split('\n').collect();
+
+    // Tier 1: exact match (+ line_hint disambiguation when multiple matches exist)
     let cnt = content_lf.matches(old_lf).count();
     if cnt == 1 || (cnt > 1 && replace_all) {
         let updated = if replace_all {
@@ -341,12 +491,55 @@ pub fn replace_crlf_tolerant(
         return Ok((updated, cnt));
     }
     if cnt > 1 && !replace_all {
-        return Err(format!(
-            "`old` matched {cnt} locations (ambiguous); include 1-2 surrounding lines or use `@@ FILE_ALL:` / `\"all\": true`."
-        ));
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        for (byte_pos, _) in content_lf.match_indices(old_lf) {
+            let ln0 = content_lf[..byte_pos]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count();
+            hits.push((byte_pos, ln0));
+        }
+        if let Some((hs, he)) = hint_win {
+            let scoped: Vec<(usize, usize)> = hits
+                .iter()
+                .copied()
+                .filter(|&(_, ln0)| (hs..=he).contains(&(ln0 + 1)))
+                .collect();
+            if scoped.len() == 1 {
+                let bpos = scoped[0].0;
+                let mut updated = String::with_capacity(
+                    content_lf.len() + new_lf.len().saturating_sub(old_lf.len()),
+                );
+                updated.push_str(&content_lf[..bpos]);
+                updated.push_str(new_lf);
+                updated.push_str(&content_lf[bpos + old_lf.len()..]);
+                return Ok((updated, 1));
+            }
+        }
+        let line_idxs: Vec<usize> = hits.into_iter().map(|(_, ln0)| ln0).collect();
+        return Err(format_ambiguous_err("exact match", &src_lines, &line_idxs));
     }
 
-    let src_lines: Vec<&str> = content_lf.split('\n').collect();
+    // Tier 0.5: accidental copied read/view/hashline line-number gutters in `old` (and optionally `new`)
+    if allow_gutter_strip {
+        if let Some(clean_old) = strip_read_gutter_if_consistent(old_lf) {
+            if !clean_old.trim().is_empty() && clean_old != old_lf {
+                let clean_new =
+                    strip_read_gutter_if_consistent(new_lf).unwrap_or_else(|| new_lf.to_string());
+                if let Ok(res) = replace_crlf_inner(
+                    content_lf,
+                    &clean_old,
+                    &clean_new,
+                    replace_all,
+                    line_hint,
+                    false,
+                ) {
+                    return Ok(res);
+                }
+            }
+        }
+    }
+
     let old_lines: Vec<&str> = old_lf.split('\n').collect();
     let src_stripped: Vec<&str> = src_lines.iter().map(|l| l.trim_end()).collect();
     let old_stripped: Vec<&str> = old_lines.iter().map(|l| l.trim_end()).collect();
@@ -354,22 +547,37 @@ pub fn replace_crlf_tolerant(
     if n_old > src_stripped.len() {
         return Err("`old` target block not found in file.".to_string());
     }
+
+    let pick_disambiguated = |cands: &[usize]| -> Option<usize> {
+        if cands.len() == 1 {
+            return Some(cands[0]);
+        }
+        if let Some((hs, he)) = hint_win {
+            let scoped: Vec<usize> = cands
+                .iter()
+                .copied()
+                .filter(|&ln0| (hs..=he).contains(&(ln0 + 1)))
+                .collect();
+            if scoped.len() == 1 {
+                return Some(scoped[0]);
+            }
+        }
+        None
+    };
+
+    // Tier 2: trailing-whitespace normalization
     let hits: Vec<usize> = (0..=(src_stripped.len() - n_old))
         .filter(|&i| src_stripped[i..i + n_old] == old_stripped[..])
         .collect();
-    if hits.len() == 1 {
-        let idx = hits[0];
-        let mut updated: Vec<&str> = Vec::new();
-        updated.extend_from_slice(&src_lines[..idx]);
-        updated.extend(new_lf.split('\n'));
-        updated.extend_from_slice(&src_lines[idx + n_old..]);
-        return Ok((updated.join("\n"), 1));
-    }
-    if hits.len() > 1 && !replace_all {
-        return Err(format!(
-            "`old` matched {} locations via rstrip alignment; add context lines.",
-            hits.len()
-        ));
+    if !hits.is_empty() && !replace_all {
+        if let Some(idx) = pick_disambiguated(&hits) {
+            let mut updated: Vec<&str> = Vec::new();
+            updated.extend_from_slice(&src_lines[..idx]);
+            updated.extend(new_lf.split('\n'));
+            updated.extend_from_slice(&src_lines[idx + n_old..]);
+            return Ok((updated.join("\n"), 1));
+        }
+        return Err(format_ambiguous_err("rstrip alignment", &src_lines, &hits));
     }
 
     // Tier 3 (Aider-style uniform indentation-delta fallback when unambiguous)
@@ -405,31 +613,42 @@ pub fn replace_crlf_tolerant(
                 indent_hits.push((i, win_ind));
             }
         }
-        if indent_hits.len() == 1 {
-            let (idx, win_ind) = indent_hits[0];
-            let delta = (win_ind as isize) - (old_ind as isize);
-            let shifted_new: Vec<String> = new_lf
-                .split('\n')
-                .map(|l| {
-                    if l.trim().is_empty() {
-                        String::new()
-                    } else {
-                        let cur = l.bytes().take_while(|b| *b == b' ').count();
-                        let next_ind = ((cur as isize) + delta).max(0) as usize;
-                        format!("{}{}", " ".repeat(next_ind), &l[cur..])
-                    }
-                })
-                .collect();
-            let mut updated: Vec<String> = Vec::with_capacity(src_lines.len() + shifted_new.len());
-            updated.extend(src_lines[..idx].iter().map(|s| (*s).to_string()));
-            updated.extend(shifted_new);
-            updated.extend(src_lines[idx + n_old..].iter().map(|s| (*s).to_string()));
-            return Ok((updated.join("\n"), 1));
-        }
-        if indent_hits.len() > 1 {
-            return Err(format!(
-                "`old` matched {} locations after indentation normalization; add surrounding lines.",
-                indent_hits.len()
+        if !indent_hits.is_empty() {
+            let line_idxs: Vec<usize> = indent_hits.iter().map(|&(idx, _)| idx).collect();
+            if let Some(chosen_idx) = pick_disambiguated(&line_idxs) {
+                let win_ind = indent_hits
+                    .iter()
+                    .find(|&&(idx, _)| idx == chosen_idx)
+                    .map(|&(_, wi)| wi)
+                    .unwrap_or(old_ind);
+                let delta = (win_ind as isize) - (old_ind as isize);
+                let shifted_new: Vec<String> = new_lf
+                    .split('\n')
+                    .map(|l| {
+                        if l.trim().is_empty() {
+                            String::new()
+                        } else {
+                            let cur = l.bytes().take_while(|b| *b == b' ').count();
+                            let next_ind = ((cur as isize) + delta).max(0) as usize;
+                            format!("{}{}", " ".repeat(next_ind), &l[cur..])
+                        }
+                    })
+                    .collect();
+                let mut updated: Vec<String> =
+                    Vec::with_capacity(src_lines.len() + shifted_new.len());
+                updated.extend(src_lines[..chosen_idx].iter().map(|s| (*s).to_string()));
+                updated.extend(shifted_new);
+                updated.extend(
+                    src_lines[chosen_idx + n_old..]
+                        .iter()
+                        .map(|s| (*s).to_string()),
+                );
+                return Ok((updated.join("\n"), 1));
+            }
+            return Err(format_ambiguous_err(
+                "indentation normalization",
+                &src_lines,
+                &line_idxs,
             ));
         }
 
@@ -465,27 +684,71 @@ pub fn replace_crlf_tolerant(
                         ne_hits.push((src_ne[k].0, src_ne[k + m - 1].0, w_ind));
                     }
                 }
-                if ne_hits.len() == 1 {
-                    let (s_idx, e_idx, w_ind) = ne_hits[0];
-                    let delta = (w_ind as isize) - (old_ne_ind as isize);
-                    let shifted_new: Vec<String> = new_lf
-                        .split('\n')
-                        .map(|l| {
-                            if l.trim().is_empty() {
-                                String::new()
-                            } else {
-                                let cur = l.bytes().take_while(|b| *b == b' ').count();
-                                let next_ind = ((cur as isize) + delta).max(0) as usize;
-                                format!("{}{}", " ".repeat(next_ind), &l[cur..])
-                            }
-                        })
-                        .collect();
-                    let mut updated: Vec<String> = Vec::new();
-                    updated.extend(src_lines[..s_idx].iter().map(|s| (*s).to_string()));
-                    updated.extend(shifted_new);
-                    updated.extend(src_lines[e_idx + 1..].iter().map(|s| (*s).to_string()));
-                    return Ok((updated.join("\n"), 1));
+                if !ne_hits.is_empty() {
+                    let line_idxs: Vec<usize> = ne_hits.iter().map(|&(s, _, _)| s).collect();
+                    if let Some(chosen_s) = pick_disambiguated(&line_idxs) {
+                        let (s_idx, e_idx, w_ind) = ne_hits
+                            .into_iter()
+                            .find(|&(s, _, _)| s == chosen_s)
+                            .unwrap();
+                        let delta = (w_ind as isize) - (old_ne_ind as isize);
+                        let shifted_new: Vec<String> = new_lf
+                            .split('\n')
+                            .map(|l| {
+                                if l.trim().is_empty() {
+                                    String::new()
+                                } else {
+                                    let cur = l.bytes().take_while(|b| *b == b' ').count();
+                                    let next_ind = ((cur as isize) + delta).max(0) as usize;
+                                    format!("{}{}", " ".repeat(next_ind), &l[cur..])
+                                }
+                            })
+                            .collect();
+                        let mut updated: Vec<String> = Vec::new();
+                        updated.extend(src_lines[..s_idx].iter().map(|s| (*s).to_string()));
+                        updated.extend(shifted_new);
+                        updated.extend(src_lines[e_idx + 1..].iter().map(|s| (*s).to_string()));
+                        return Ok((updated.join("\n"), 1));
+                    }
+                    return Err(format_ambiguous_err(
+                        "blank-line normalization",
+                        &src_lines,
+                        &line_idxs,
+                    ));
                 }
+            }
+        }
+    }
+
+    // Tier 4.5: Smart-quote / typographic-dash fallback when LLM emitted “curly” quotes or dashes
+    let norm_old_str = normalize_unicode_punct(old_lf);
+    if !replace_all && norm_old_str != old_lf {
+        let old_u_lines: Vec<String> = norm_old_str
+            .split('\n')
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        let src_u_lines: Vec<String> = src_stripped
+            .iter()
+            .map(|l| normalize_unicode_punct(l))
+            .collect();
+        if old_u_lines.len() <= src_u_lines.len() {
+            let mut u_hits = Vec::new();
+            for i in 0..=(src_u_lines.len() - old_u_lines.len()) {
+                if src_u_lines[i..i + old_u_lines.len()] == old_u_lines[..] {
+                    u_hits.push(i);
+                }
+            }
+            if let Some(idx) = pick_disambiguated(&u_hits) {
+                let clean_new = normalize_unicode_punct(new_lf);
+                let mut updated: Vec<String> = Vec::new();
+                updated.extend(src_lines[..idx].iter().map(|s| (*s).to_string()));
+                updated.extend(clean_new.split('\n').map(|s| s.to_string()));
+                updated.extend(
+                    src_lines[idx + old_u_lines.len()..]
+                        .iter()
+                        .map(|s| (*s).to_string()),
+                );
+                return Ok((updated.join("\n"), 1));
             }
         }
     }
@@ -575,4 +838,83 @@ pub fn dedent_and_reindent(new_block: &str, col_indent: usize) -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gutter_strip_rescues_copied_line_numbers_and_hashlines() {
+        let src = "fn compute() -> i32 {\n    let a = 10;\n    a + 2\n}";
+        let old = "   2:     let a = 10;\n   3:     a + 2";
+        let new = "   2:     let a = 20;\n   3:     a + 2";
+        let (out, cnt) =
+            replace_crlf_tolerant_with_hint(src, old, new, false, None).expect("gutter strip");
+        assert_eq!(cnt, 1);
+        assert!(out.contains("let a = 20;"));
+        assert!(!out.contains("   2:"));
+
+        let hashline_old = "2:ab|    let a = 10;\n3:cd|    a + 2";
+        let (out2, cnt2) = replace_crlf_tolerant_with_hint(
+            src,
+            hashline_old,
+            "    let a = 30;\n    a + 2",
+            false,
+            None,
+        )
+        .expect("hashline strip");
+        assert_eq!(cnt2, 1);
+        assert!(out2.contains("let a = 30;"));
+    }
+
+    #[test]
+    fn line_hint_disambiguates_duplicate_blocks_and_reports_candidate_lines() {
+        let src = [
+            "fn first() {",
+            "    return 1;",
+            "}",
+            "fn middle() {",
+            "    let x = 2;",
+            "}",
+            "fn second() {",
+            "    return 1;",
+            "}",
+        ]
+        .join("\n");
+
+        let spec = "@@ FILE: demo.rs @L7-L9\n<<<\n    return 1;\n===\n    return 99;\n>>>\n";
+        let ops = parse_text_spec(spec).unwrap();
+        assert_eq!(ops[0].path, "demo.rs");
+        assert_eq!(ops[0].line_hint.as_deref(), Some("7-9"));
+
+        let (out, cnt) = replace_crlf_tolerant_with_hint(
+            &src,
+            &ops[0].old,
+            &ops[0].new,
+            false,
+            ops[0].line_hint.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(cnt, 1);
+        assert!(out.starts_with("fn first() {\n    return 1;\n}"));
+        assert!(out.ends_with("fn second() {\n    return 99;\n}"));
+
+        let err =
+            replace_crlf_tolerant_with_hint(&src, "    return 1;", "    return 99;", false, None)
+                .unwrap_err();
+        assert!(err.contains("L2:"), "{err}");
+        assert!(err.contains("L8:"), "{err}");
+    }
+
+    #[test]
+    fn unicode_smart_quote_fallback_rescues_curly_quotes() {
+        let src = "let msg = \"hello-world\";";
+        let old = "let msg = \u{201C}hello\u{2013}world\u{201D};";
+        let new = "let msg = \u{201C}fixed-world\u{201D};";
+        let (out, cnt) =
+            replace_crlf_tolerant_with_hint(src, old, new, false, None).expect("unicode rescue");
+        assert_eq!(cnt, 1);
+        assert_eq!(out, "let msg = \"fixed-world\";");
+    }
 }

@@ -43,11 +43,11 @@ curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 
 | AI `<thinking>` 真实卡点 | 没装 `ap` 时为什么会越干越乱？ | `ap` 怎么自动铺平？（完整命令清单见 [实战手册](./docs/PLAYBOOK.zh-CN.md)） |
 | :--- | :--- | :--- |
-| **1. 复杂代码、办公文档与二进制读取**<br>*(AST、Office、归档、PE/ELF、前端)* | 缺 Python/`pefile` 读不了 Word/Excel/PDF/SQLite/`.asar`/DLL，读大文件盲猜行号，或被 GNU `grep -rn` 卡死。 | **`ap read` / `ap search` / `ap query`**：支持 AST `--symbol` 与 12 文件批读、Office/PDF/压缩包/PE·ELF·Java·.NET·Protobuf 与 JS `--routes`/`--jwt`/`--secrets` 解析、多模式并发检索与免 Python SQL 查询。 |
+| **1. 复杂代码、办公文档与二进制精准读写搜**<br>*(AST 过滤、Office、PE/ELF、前端)* | 缺 Python/`pefile` 读不了文档和二进制，传统 `grep` 搜出大量注释/字符串/单测噪音，或被 GNU `grep -rn` 卡死。 | **`ap read` / `ap search` / `ap query`**：AST `--symbol` 与 12 文件批读；`--code-only --no-tests` 语法树过滤注释/字符串/单测；PE·ELF·Java·.NET·Protobuf 与 JS `--routes`/`--jwt`/`--secrets`；免 Python SQL。 |
 | **2. 开局盲猜、表面图与真机接口/UI 质检**<br>*(定向、故障定位、HTTP/WS 鉴权)* | 面对多文件客诉靠 `ls`/`rg` 盲搜，手写脆弱 `curl`/Python 鉴权/CORS/并发脚本，或长会话遗漏测试维度。 | **`ap atlas` + `ap probe`**：`<15 ms` 全局骨架图、`<60 ms` 守卫感知 9 轴表面图、`<25 ms` 症状直达定位、零标签复用本地回环 CDP 会话（`--principal-cdp`）、HTTP `--race`/`--cors-origin` 与 WebSocket 跨源矩阵测试。 |
-| **3. 安全创造与跨文件精确重构**<br>*(跨模块契约、AST 改写与撤回)* | 全局替换误伤注释/字符串，重构漏改调用方，或写错 1 个缩进字符导致补丁失配被迫重读整文件。 | **`ap splice` + `ap undo`**：避开注释/字符串的 Tree-sitter `rename`、4 级缩进容错 + Hashline 补丁、6 语言+JSON/TOML 预检门禁、`<5 ms` 跨文件静态链接与无 Git 安全快照。 |
+| **3. 安全创造与弹性链式精确改码**<br>*(跨模块契约、防误拷行号与重名歧义)* | 全局替换误伤注释/字符串，重构漏改调用方，或因复制了行号前缀、同名代码块歧义、智能引号导致补丁失配重读。 | **`ap splice` + `ap undo`**：弹性链式补丁（自动剥离读取行号前缀、`@L` 行窗消歧、候选行定位与弯引号自愈）、避开注释的 `rename`、6 语言+JSON/TOML 预检门禁及无 Git 快照。 |
 | **4. 终端水土不服、慢搜索与死循环**<br>*(Windows/Mac Shell 与噪音日志)* | 撞上 **`528+` 次 OS/Shell 崩溃**（GBK/BOM、PS `&&`、长 `PATH` 截断）、60s+ `grep` 假死、40KB 日志刷屏与原地重试空转。 | **`ap exec` + `ap sieve` + `ap guard`**：透明 Hook 自动修复 UTF-8、`curl.exe`、超长 `PATH` 与慢 `grep`，Win32 Job Object 清理孤儿进程，日志无损脱水 **-98.8%**，并内置 `3x` 死循环熔断。 |
-| **5. 深度六门禁、MCP 与 Pi 缓存经济学**<br>*(36 MCP 工具、11 项 Pi 补丁、共维护)* | 产出假绿灯测试或安全隐患、中文压缩过留或中途打穿 KV-Cache，或让 `$0` 免费小模型硬刚脆弱命令行。 | **全栈 MCP 2025-06-18（36 强类型工具）** + **`ap guard verify --deep`**（单测/OWASP 安全/语义 Diff/契约/AST 变异）+ **`ap pi`**（11 项幂等 Pi 运行时补丁）+ **`ap audit --maintainer`**。 |
+| **5. 深度六门禁、按需 MCP 与 Pi 缓存经济学**<br>*(渐进发现 MCP、11 项 Pi 补丁、共维护)* | 全量 MCP 每次空烧 **11k+ Schema Token**，产出假绿灯测试或安全隐患，或长会话中途打穿 KV-Cache。 | **MCP 2025-06-18（`--profile full\|core\|deferred` + `ap_discover`/`ap_call`）** + **`ap guard verify --deep`** + **`ap pi`**（11 项幂等 Pi 补丁）+ **`ap audit --maintainer`**。 |
 
 ---
 

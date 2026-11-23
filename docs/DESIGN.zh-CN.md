@@ -1,4 +1,4 @@
-# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.39）
+# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.40）
 
 [English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -26,5 +26,5 @@
 ## 3. 为什么选择纯 Rust（`v2.39`）+ 原生内置 `ap mcp`？
 
 1. **编译期零开销安全与微秒启动（`Rust > C & Python`）**：所有权安全、`OnceLock` 全局单次编译自动机（热循环零正则重编译）、零 GC 停顿、零外部运行时依赖，内置 Windows 长 `PATH` 裁剪、UTF-8 锁定与 Win32 Job Object 进程树回收。
-2. **让 `$0` 免费模型与主流智能体直接满血提效（`ap mcp`）**：完整支持 **MCP 2025-06-18** stdio JSON-RPC，提供 **36 个带强类型 `outputSchema` 的工具**、Resources 与 5 套 Prompts（`ap init` 一键接入 15+ 智能体），彻底抹平跨平台 Shell 语法摩擦。
+2. **渐进式 MCP 按需发现（`ap mcp --profile full|core|deferred`）**：完整支持 **MCP 2025-06-18** stdio JSON-RPC：默认 `full` 暴露全量 **36 个带强类型 `outputSchema` 工具**；也可选 `core`（8 常用工具 + `ap_discover`/`ap_call`）或 `deferred`（仅 2 个元工具，削减约 **94%** 前置 Schema Token 税），全面淘汰脆弱命令行转义。
 3. **7 个物理隔离 Crate（`0` 兄弟依赖）**：每个 `crates/ap-*` 均可独立编译安装，与根模块共同编译为单个约 `15 MB` 原生二进制（全量 7 技能静默描述仅占 **`390 tokens`**）。

@@ -684,3 +684,181 @@ pub fn find_symbol_span(source: &str, ext: &str, symbol: &str) -> Option<SymbolS
     }
     None
 }
+
+fn merge_byte_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
+/// Returns sorted, non-overlapping UTF-8 byte ranges for comments and string literals
+/// across Python, TypeScript/TSX, JavaScript, Go, Rust, and C.
+pub fn collect_non_code_ranges(source: &str, ext: &str) -> Vec<(usize, usize)> {
+    let Some(lang) = language_for_ext(ext) else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "comment"
+            | "line_comment"
+            | "block_comment"
+            | "string"
+            | "string_literal"
+            | "raw_string_literal"
+            | "raw_byte_string_literal"
+            | "interpreted_string_literal"
+            | "char_literal"
+            | "byte_string_literal"
+            | "concatenated_string"
+            | "string_fragment" => {
+                let s = node.start_byte();
+                let e = node.end_byte();
+                if s < e {
+                    ranges.push((s, e));
+                }
+            }
+            _ => {
+                let mut cur = node.walk();
+                for ch in node.children(&mut cur) {
+                    stack.push(ch);
+                }
+            }
+        }
+    }
+    merge_byte_ranges(ranges)
+}
+
+/// Returns sorted, non-overlapping UTF-8 byte ranges for inline test modules/functions
+/// (e.g. Rust `#[cfg(test)] mod ...` / `#[test] fn ...`, Python `def test_*` / `class Test*`).
+pub fn collect_test_block_ranges(source: &str, ext: &str) -> Vec<(usize, usize)> {
+    let Some(lang) = language_for_ext(ext) else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let ext_low = ext.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+
+    if ext_low == "rs" {
+        while let Some(node) = stack.pop() {
+            let mut cur = node.walk();
+            let mut pending_test_attr_start: Option<usize> = None;
+            for ch in node.children(&mut cur) {
+                match ch.kind() {
+                    "attribute_item" => {
+                        let txt = node_text(ch, src);
+                        let compact: String = txt.chars().filter(|c| !c.is_whitespace()).collect();
+                        if compact.contains("cfg(test)")
+                            || compact.contains("#[test]")
+                            || compact.contains("::test]")
+                        {
+                            pending_test_attr_start.get_or_insert(ch.start_byte());
+                        } else if pending_test_attr_start.is_none() {
+                            // Keep unrelated attributes clear unless chained onto an active test attr
+                            pending_test_attr_start = None;
+                        }
+                    }
+                    "mod_item" | "function_item" => {
+                        if let Some(attr_start) = pending_test_attr_start.take() {
+                            ranges.push((attr_start, ch.end_byte()));
+                            continue;
+                        }
+                        if ch.kind() == "mod_item" {
+                            stack.push(ch);
+                        }
+                    }
+                    "line_comment" | "block_comment" => {}
+                    "declaration_list" => {
+                        pending_test_attr_start = None;
+                        stack.push(ch);
+                    }
+                    _ => {
+                        pending_test_attr_start = None;
+                    }
+                }
+            }
+        }
+    } else if ext_low == "py" {
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "function_definition" => {
+                    let is_test = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, src).starts_with("test_"))
+                        .unwrap_or(false);
+                    if is_test {
+                        let s = if node.parent().map(|p| p.kind()) == Some("decorated_definition") {
+                            node.parent().unwrap().start_byte()
+                        } else {
+                            node.start_byte()
+                        };
+                        ranges.push((s, node.end_byte()));
+                        continue;
+                    }
+                }
+                "class_definition" => {
+                    let is_test_cls = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, src).starts_with("Test"))
+                        .unwrap_or(false);
+                    if is_test_cls {
+                        let s = if node.parent().map(|p| p.kind()) == Some("decorated_definition") {
+                            node.parent().unwrap().start_byte()
+                        } else {
+                            node.start_byte()
+                        };
+                        ranges.push((s, node.end_byte()));
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            let mut cur = node.walk();
+            for ch in node.children(&mut cur) {
+                stack.push(ch);
+            }
+        }
+    }
+    merge_byte_ranges(ranges)
+}
+
+/// Returns true when `[start, end)` falls strictly inside any sorted merged range.
+pub fn range_is_covered(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    let idx = ranges.partition_point(|&(s, _)| s <= start);
+    if idx == 0 {
+        return false;
+    }
+    let (s, e) = ranges[idx - 1];
+    s <= start && end <= e
+}

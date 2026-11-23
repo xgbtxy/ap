@@ -1,4 +1,4 @@
-# Anti-Obsolescence Design Architecture: Cognitive & Physical Boundaries (`ap` v2.39)
+# Anti-Obsolescence Design Architecture: Cognitive & Physical Boundaries (`ap` v2.40)
 
 [English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Playbook](./PLAYBOOK.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -26,5 +26,5 @@
 ## 3. Why Pure Rust (`v2.39`) + Native `ap mcp`?
 
 1. **Compile-Time Safety & Sub-2ms Startup (`Rust > C & Python`)**: Strict ownership, zero `Regex::new` inside inner loops (`OnceLock` DFAs), zero GC pauses, zero external runtime dependencies, and Windows long-`PATH` / UTF-8 / Job-Object hardening built in.
-2. **Universal Zero-Brain Access for `$0` Free & Commercial Agents (`ap mcp`)**: Full **MCP 2025-06-18** stdio JSON-RPC server exposing **36 strongly-typed `outputSchema` tools**, live Resources, and 5 Prompts (`ap init` auto-wires 15+ agents), eliminating shell syntax fragility even for `$0` free models.
+2. **Progressive MCP Discovery & Zero-Brain Access (`ap mcp --profile full|core|deferred`)**: Full **MCP 2025-06-18** stdio JSON-RPC server exposing **36 strongly-typed `outputSchema` tools** by default, OR **`--profile core`** (`8` everyday tools + `ap_discover`/`ap_call`) / **`--profile deferred`** (`2` meta-tools only, eliminating **~94%** of upfront schema token bloat!).
 3. **7 Physically Isolated Crates (`0` Sibling Dependencies)**: Every primitive under `crates/ap-*` compiles standalone while linking with root modules into a single `~15 MB` stripped native binary (`390 tokens` total idle skill frontmatter).

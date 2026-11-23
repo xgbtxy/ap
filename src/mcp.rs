@@ -78,6 +78,13 @@ fn mcp_tools_schema() -> Value {
                     "context": { "type": "integer", "description": "Show N surrounding lines before & after each match (like `rg -C N`)" },
                     "files_only": { "type": "boolean", "description": "Return only unique matching file paths (like `rg -l`)" },
                     "count": { "type": "boolean", "description": "Return per-file match counts (like `rg -c`)" },
+                    "code_only": { "type": "boolean", "description": "Skip non-code doc/config files AND skip matches inside Tree-sitter comments & string literals" },
+                    "no_tests": { "type": "boolean", "description": "Skip test/fixture paths AND inline Rust #[cfg(test)]/Python test_* blocks" },
+                    "exclude": {
+                        "type": "array",
+                        "description": "Relative-path substring or suffix filters to skip (e.g. ['fixtures', '*.gen.ts'])",
+                        "items": { "type": "string" }
+                    },
                     "json": { "type": "boolean", "description": "Emit structured JSON populated into structuredContent (matches/files/counts) for zero-parse codemode pipelines" }
                 }
             }
@@ -135,13 +142,15 @@ fn mcp_tools_schema() -> Value {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "Exact substring replacements [{path, old, new}]",
+                        "description": "Substring/indent-resilient replacements [{path, old, new, line_hint?, all?}]",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "path": { "type": "string" },
                                 "old": { "type": "string" },
-                                "new": { "type": "string" }
+                                "new": { "type": "string" },
+                                "line_hint": { "type": "string", "description": "Optional line window (e.g. '40-70' or '52') to disambiguate duplicate blocks" },
+                                "all": { "type": "boolean", "description": "Replace all matching occurrences in the file" }
                             },
                             "required": ["path", "old", "new"]
                         }
@@ -634,9 +643,113 @@ fn mcp_tools_schema() -> Value {
     annotate_mcp_tools(tools)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpProfile {
+    Full,
+    Core,
+    Deferred,
+}
+
+impl McpProfile {
+    pub fn resolve(cli_profile: &str) -> Self {
+        let raw = if !cli_profile.trim().is_empty() {
+            cli_profile.trim().to_ascii_lowercase()
+        } else {
+            std::env::var("AP_MCP_PROFILE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        };
+        match raw.as_str() {
+            "core" => Self::Core,
+            "deferred" | "minimal" | "lazy" => Self::Deferred,
+            _ => Self::Full,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Core => "core",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+fn meta_tools_schema() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "ap_discover",
+            "description": "Search and load any of ap's 36 specialist tools by keyword/category (binaries, HTTP AuthZ/CORS, CDP, WebSocket, AST rename, OWASP sec, baton, etc.) without paying 11k schema tokens up front.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Task keyword(s), e.g. 'http authz', 'binary xref', 'rename', 'websocket'" },
+                    "category": { "type": "string", "description": "Optional filter: 'read', 'orient', 'edit', 'probe', 'guard', 'baton', or 'all'" },
+                    "include_schema": { "type": "boolean", "description": "Include full JSON inputSchema for matching tools (auto-enabled on exact tool name)" },
+                    "limit": { "type": "integer", "description": "Max tools to return (default: 8)" }
+                }
+            }
+        }),
+        json!({
+            "name": "ap_call",
+            "description": "Invoke any specialist `ap_*` tool discovered via `ap_discover` (e.g. tool='ap_http', arguments={...}). Preserves full structuredContent output.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string", "description": "Target tool name (e.g. 'ap_http', 'ap_rename', 'ap_locate', 'ap_ws')" },
+                    "arguments": { "type": "object", "description": "Arguments forwarded directly to that tool" }
+                },
+                "required": ["tool"]
+            }
+        }),
+    ]
+}
+
+fn mcp_tools_for_profile(profile: McpProfile) -> Value {
+    let all = mcp_tools_schema();
+    match profile {
+        McpProfile::Full => all,
+        McpProfile::Deferred => annotate_mcp_tools(Value::Array(meta_tools_schema())),
+        McpProfile::Core => {
+            const CORE_NAMES: &[&str] = &[
+                "ap_orient",
+                "ap_read",
+                "ap_search",
+                "ap_edit",
+                "ap_verify",
+                "ap_smoke",
+                "ap_exec",
+                "ap_sieve",
+            ];
+            let mut picked: Vec<Value> = all
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|t| {
+                            t.get("name")
+                                .and_then(Value::as_str)
+                                .map(|n| CORE_NAMES.contains(&n))
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let meta = annotate_mcp_tools(Value::Array(meta_tools_schema()));
+            if let Value::Array(m_arr) = meta {
+                picked.extend(m_arr);
+            }
+            Value::Array(picked)
+        }
+    }
+}
+
 fn tool_annotations_for(name: &str) -> (&'static str, bool, bool, bool, bool) {
     // (title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint)
     match name {
+        "ap_discover" => ("Discover ap Specialist Tools", true, false, true, false),
+        "ap_call" => ("Invoke Any ap Tool", false, false, false, true),
         "ap_read" => ("Universal File & URL Reader", true, false, true, true),
         "ap_query" => (
             "Exact SQLite/Office/CSV SQL Query",
@@ -775,12 +888,35 @@ fn tool_annotations_for(name: &str) -> (&'static str, bool, bool, bool, bool) {
 
 fn tool_output_schema_for(name: &str) -> Value {
     match name {
+        "ap_discover" => json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "profile": { "type": "string" },
+                "total_tools": { "type": "integer" },
+                "matched": { "type": "integer" },
+                "tools": { "type": "array" },
+                "text": { "type": "string" }
+            },
+            "additionalProperties": true
+        }),
+        "ap_call" => json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "tool": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "additionalProperties": true
+        }),
         "ap_search" => json!({
             "type": "object",
             "properties": {
                 "ok": { "type": "boolean" },
                 "elapsed_ms": { "type": "number" },
                 "scanned_files": { "type": "integer" },
+                "filtered_non_code": { "type": "integer" },
+                "filtered_tests": { "type": "integer" },
                 "total_matches": { "type": "integer" },
                 "matches": {
                     "type": "array",
@@ -1231,6 +1367,28 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("count").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--count".to_string());
             }
+            if args
+                .get("code_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--code-only".to_string());
+            }
+            if args
+                .get("no_tests")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--no-tests".to_string());
+            }
+            if let Some(ex_arr) = args.get("exclude").and_then(Value::as_array) {
+                for item in ex_arr {
+                    if let Some(ex) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        cli.push("--exclude".to_string());
+                        cli.push(ex.to_string());
+                    }
+                }
+            }
             if args.get("json").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--json".to_string());
             }
@@ -1289,7 +1447,16 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         e.get("old").and_then(Value::as_str),
                         e.get("new").and_then(Value::as_str),
                     ) {
-                        ops.push(json!({ "op": "replace", "path": p, "old": o, "new": n }));
+                        let mut op = json!({ "op": "replace", "path": p, "old": o, "new": n });
+                        if let Some(lh) = e.get("line_hint").and_then(Value::as_str) {
+                            if !lh.trim().is_empty() {
+                                op["line_hint"] = Value::String(lh.trim().to_string());
+                            }
+                        }
+                        if e.get("all").and_then(Value::as_bool).unwrap_or(false) {
+                            op["all"] = Value::Bool(true);
+                        }
+                        ops.push(op);
                     }
                 }
             }
@@ -2738,6 +2905,174 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 ),
             }
         }
+        "ap_discover" => {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let category = args
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("all")
+                .trim()
+                .to_ascii_lowercase();
+            let include_schema = args
+                .get("include_schema")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .clamp(1, 36) as usize;
+
+            let q_tokens: Vec<&str> = query
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .filter(|t| !t.is_empty())
+                .collect();
+
+            let matches_category = |tname: &str, desc: &str| -> bool {
+                match category.as_str() {
+                    "" | "all" => true,
+                    "read" => matches!(tname, "ap_read" | "ap_search" | "ap_query" | "ap_sieve"),
+                    "orient" => matches!(
+                        tname,
+                        "ap_orient"
+                            | "ap_surface"
+                            | "ap_locate"
+                            | "ap_trace"
+                            | "ap_changes"
+                            | "ap_impact"
+                    ),
+                    "edit" => matches!(tname, "ap_edit" | "ap_rename" | "ap_undo"),
+                    "probe" => matches!(
+                        tname,
+                        "ap_smoke"
+                            | "ap_ui"
+                            | "ap_cdp"
+                            | "ap_http"
+                            | "ap_ws"
+                            | "ap_tls"
+                            | "ap_tcp"
+                            | "ap_listen"
+                            | "ap_ports"
+                            | "ap_ps"
+                            | "ap_fs_diff"
+                            | "ap_mutate"
+                            | "ap_fuzz"
+                            | "ap_probe"
+                    ),
+                    "guard" => matches!(
+                        tname,
+                        "ap_verify" | "ap_diff_audit" | "ap_guard_pack" | "ap_exec"
+                    ),
+                    "baton" => matches!(
+                        tname,
+                        "ap_baton"
+                            | "ap_baton_claim"
+                            | "ap_baton_dedup"
+                            | "ap_frontier"
+                            | "ap_recall"
+                    ),
+                    other => tname.contains(other) || desc.to_ascii_lowercase().contains(other),
+                }
+            };
+
+            let catalog = mcp_tools_schema();
+            let all_tools = catalog.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let mut scored: Vec<(usize, Value)> = Vec::new();
+            for tool in all_tools {
+                let tname = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                let desc = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !matches_category(tname, desc) {
+                    continue;
+                }
+                let tname_low = tname.to_ascii_lowercase();
+                let desc_low = desc.to_ascii_lowercase();
+                let param_keys: Vec<String> = tool
+                    .pointer("/inputSchema/properties")
+                    .and_then(Value::as_object)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                let params_low = param_keys.join(" ").to_ascii_lowercase();
+
+                let score = if q_tokens.is_empty() {
+                    1usize
+                } else {
+                    let mut sc = 0usize;
+                    if tname_low == query {
+                        sc += 50;
+                    }
+                    for tok in &q_tokens {
+                        if tname_low.contains(tok) {
+                            sc += 6;
+                        }
+                        if params_low.contains(tok) {
+                            sc += 3;
+                        }
+                        if desc_low.contains(tok) {
+                            sc += 2;
+                        }
+                    }
+                    sc
+                };
+                if score == 0 {
+                    continue;
+                }
+                let exact_name_hit = !query.is_empty() && tname_low == query;
+                let mut entry = json!({
+                    "name": tname,
+                    "title": tool.get("title").and_then(Value::as_str).unwrap_or(""),
+                    "description": desc,
+                    "params": param_keys,
+                });
+                if include_schema || exact_name_hit {
+                    if let Some(schema) = tool.get("inputSchema") {
+                        entry["inputSchema"] = schema.clone();
+                    }
+                }
+                scored.push((score, entry));
+            }
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0).then_with(|| {
+                    a.1["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b.1["name"].as_str().unwrap_or(""))
+                })
+            });
+            let selected: Vec<Value> = scored.into_iter().take(limit).map(|(_, v)| v).collect();
+            (
+                true,
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "total_tools": all_tools.len(),
+                    "matched": selected.len(),
+                    "tools": selected,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        "ap_call" => {
+            let target = args
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if target.is_empty() {
+                return (false, "Pass non-empty `tool` to `ap_call`.".to_string());
+            }
+            if target == "ap_call" {
+                return (false, "Recursive `ap_call` is disallowed.".to_string());
+            }
+            let fwd_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            dispatch_tool_call(target, &fwd_args)
+        }
         other => (false, format!("Unknown tool: {other}")),
     }
 }
@@ -2947,7 +3282,7 @@ fn get_mcp_prompt(name: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
-fn handle_rpc_request(req: &Value) -> Option<Value> {
+fn handle_rpc_request(req: &Value, profile: McpProfile) -> Option<Value> {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let id_opt = req.get("id").cloned();
 
@@ -2973,7 +3308,8 @@ fn handle_rpc_request(req: &Value) -> Option<Value> {
                     },
                     "serverInfo": {
                         "name": "agent-primitives",
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "profile": profile.as_str()
                     }
                 }
             }))
@@ -2983,7 +3319,7 @@ fn handle_rpc_request(req: &Value) -> Option<Value> {
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "tools": mcp_tools_schema()
+                "tools": mcp_tools_for_profile(profile)
             }
         })),
         "resources/list" => Some(json!({
@@ -3083,6 +3419,11 @@ fn handle_rpc_request(req: &Value) -> Option<Value> {
 }
 
 pub fn run_mcp_stdio() -> i32 {
+    run_mcp_stdio_with_profile("")
+}
+
+pub fn run_mcp_stdio_with_profile(cli_profile: &str) -> i32 {
+    let profile = McpProfile::resolve(cli_profile);
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
@@ -3120,7 +3461,7 @@ pub fn run_mcp_stdio() -> i32 {
                 break;
             }
             if let Ok(req) = serde_json::from_slice::<Value>(&body) {
-                if let Some(resp) = handle_rpc_request(&req) {
+                if let Some(resp) = handle_rpc_request(&req, profile) {
                     let s = resp.to_string();
                     let _ = write!(writer, "Content-Length: {}\r\n\r\n{}", s.len(), s);
                     let _ = writer.flush();
@@ -3131,7 +3472,7 @@ pub fn run_mcp_stdio() -> i32 {
 
         // Mode B: Standard MCP 2024-11-05 / 2025-03-26 newline-delimited JSON-RPC
         if let Ok(req) = serde_json::from_str::<Value>(trimmed) {
-            if let Some(resp) = handle_rpc_request(&req) {
+            if let Some(resp) = handle_rpc_request(&req, profile) {
                 let _ = writeln!(writer, "{resp}");
                 let _ = writer.flush();
             }
