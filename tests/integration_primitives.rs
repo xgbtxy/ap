@@ -6393,7 +6393,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 13);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 14);
     }
 }
 
@@ -6603,7 +6603,7 @@ fn test_v240_mcp_profiles_ast_code_search_and_resilient_splice() {
     );
     assert_eq!(
         full_resps[0]["result"]["tools"].as_array().unwrap().len(),
-        36
+        37
     );
 
     let (core_bytes, core_resps) = mcp_rpc(
@@ -6620,8 +6620,8 @@ fn test_v240_mcp_profiles_ast_code_search_and_resilient_splice() {
         &["--profile", "deferred"],
         &[
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_discover", "arguments": {"query": "http authz cors", "include_schema": true, "limit": 3}}}),
-            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ap_call", "arguments": {"tool": "ap_search", "arguments": {"pattern": "verify_token", "path": ".", "code_only": true, "no_tests": true, "json": true}}}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params":{"name": "ap_discover", "arguments": {"query": "http authz cors", "include_schema": true, "limit": 3}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params":{"name": "ap_call", "arguments": {"tool": "ap_search", "arguments": {"pattern": "verify_token", "path": ".", "code_only": true, "no_tests": true, "json": true}}}}),
         ],
     );
     let def_tools = def_resps[0]["result"]["tools"].as_array().unwrap();
@@ -6635,7 +6635,7 @@ fn test_v240_mcp_profiles_ast_code_search_and_resilient_splice() {
     assert_eq!(def_tools[1]["name"], "ap_call");
 
     let disc_sc = &def_resps[1]["result"]["structuredContent"];
-    assert_eq!(disc_sc["total_tools"].as_u64(), Some(36));
+    assert_eq!(disc_sc["total_tools"].as_u64(), Some(37));
     assert_eq!(disc_sc["tools"][0]["name"], "ap_http");
     assert!(disc_sc["tools"][0]["inputSchema"]["properties"].is_object());
 
@@ -7157,6 +7157,153 @@ fn test_v244_pi_patch13_quote_safe_grep_ps_backtick_and_loop_sleep() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 13);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 14);
+    }
+}
+
+#[test]
+fn test_v245_windows_win_probe_msys_shield_tmp_path_and_pi_patch14() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let home = root.join("home_v245");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+
+    // 1. Initialize Pi accelerator & verify v2.45 MSYS2 / UTF-8 / `/tmp` helpers
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let acc_src =
+        fs::read_to_string(home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    for needle in [
+        "normalizeWindowsToolPath",
+        "healMsysPathConv",
+        "MSYS_NO_PATHCONV=1",
+        "ap msys-tip",
+        "ap utf8-tip",
+        "ap_win",
+    ] {
+        assert!(
+            acc_src.contains(needle),
+            "Missing v2.45 accelerator feature: {needle}"
+        );
+    }
+
+    // 2. Verify `ap doctor --json` sees updated v2.45 accelerator & 14 Pi patches
+    let doc = run_ap(
+        root,
+        &["doctor", "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(doc.status.success());
+    let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
+    assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
+    if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 14);
+    }
+
+    // 3. Verify `ap mcp` discovers `ap_win` across 37 specialist tools
+    let mcp_req = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ap_discover","arguments":{"query":"win","category":"probe","limit":10}}}"#,
+        "\n"
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let mcp_stdout = String::from_utf8_lossy(&mcp_out.stdout);
+    let disc: Value = mcp_stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("id") == Some(&serde_json::json!(1)))
+        .expect("missing ap_discover response");
+    assert_eq!(disc["result"]["structuredContent"]["total_tools"], 37);
+    let tools = disc["result"]["structuredContent"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert!(
+        tools.iter().any(|t| t["name"] == "ap_win"),
+        "ap_discover missing ap_win: {mcp_stdout}"
+    );
+
+    // 4. Platform-appropriate `ap probe win` & Windows `/tmp` path normalization
+    #[cfg(windows)]
+    {
+        for args in [
+            &["probe", "win", "--whoami", "--json"][..],
+            &["probe", "win", "--pipes", "--max", "5", "--json"][..],
+            &[
+                "probe",
+                "win",
+                "--reg",
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                "--filter",
+                "ProductName",
+                "--json",
+            ][..],
+            &[
+                "probe",
+                "win",
+                "--acl",
+                r"C:\Windows\System32\cmd.exe",
+                "--json",
+            ][..],
+            &[
+                "probe",
+                "win",
+                "--services",
+                "--filter",
+                "EventLog",
+                "--max",
+                "5",
+                "--json",
+            ][..],
+        ] {
+            let out = run_ap(root, args, None, &[]);
+            assert!(
+                out.status.success(),
+                "win probe failed {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["ok"], Value::Bool(true), "unexpected payload: {v}");
+        }
+
+        let probe_name = format!("ap_v245_tmp_probe_{}.txt", std::process::id());
+        let host_tmp = std::env::temp_dir().join(&probe_name);
+        fs::write(&host_tmp, "wave74-win-tmp-ok\n").unwrap();
+        let posix_tmp = format!("/tmp/{probe_name}");
+        let rd = run_ap(root, &["read", &posix_tmp], None, &[]);
+        let _ = fs::remove_file(&host_tmp);
+        assert!(
+            rd.status.success(),
+            "ap read /tmp failed: {}",
+            String::from_utf8_lossy(&rd.stderr)
+        );
+        assert!(String::from_utf8_lossy(&rd.stdout).contains("wave74-win-tmp-ok"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let out = run_ap(root, &["probe", "win", "--whoami", "--json"], None, &[]);
+        assert_eq!(out.status.code(), Some(2));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], Value::Bool(false));
     }
 }

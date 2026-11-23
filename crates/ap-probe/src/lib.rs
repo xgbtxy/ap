@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod slice;
 pub mod smoke;
 pub mod ui;
+pub mod win;
 
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
@@ -377,6 +378,33 @@ enum SubCmd {
         sni: Option<String>,
         #[arg(long, default_value_t = 6)]
         timeout: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pure-Rust Windows OS inspector (named pipes + ACL, registry, SDDL ACL, services, token privileges)
+    Win {
+        /// Enumerate \\.\pipe\* named pipes (with SDDL when <=30 or filtered)
+        #[arg(long)]
+        pipes: bool,
+        /// Query Windows registry key values and subkeys (e.g. HKLM\SYSTEM\...)
+        #[arg(long)]
+        reg: Option<String>,
+        /// Inspect Windows file/directory or named-pipe DACL + SDDL + non-admin write flags
+        #[arg(long)]
+        acl: Option<String>,
+        /// Enumerate Windows Win32 services (state, start type, binary path, SDDL when filtered)
+        #[arg(long)]
+        services: bool,
+        /// Inspect current process token user, SID, elevation, integrity level, and privileges
+        #[arg(long)]
+        whoami: bool,
+        /// Case-insensitive substring filter for pipes, registry values/subkeys, or services
+        #[arg(long)]
+        filter: Option<String>,
+        /// Maximum entries to return (1..=200)
+        #[arg(long, default_value_t = 50)]
+        max: usize,
+        /// Emit structured JSON output
         #[arg(long)]
         json: bool,
     },
@@ -786,5 +814,24 @@ pub fn run_cli(args: &[String]) -> i32 {
             timeout,
             json,
         } => net_probe::run_tls_cli(&addr, sni.as_deref(), timeout, json),
+        SubCmd::Win {
+            pipes,
+            reg,
+            acl,
+            services,
+            whoami,
+            filter,
+            max,
+            json,
+        } => win::run_win_cli(
+            pipes,
+            reg.as_deref(),
+            acl.as_deref(),
+            services,
+            whoami,
+            filter.as_deref(),
+            max,
+            json,
+        ),
     }
 }

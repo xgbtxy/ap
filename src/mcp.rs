@@ -368,6 +368,22 @@ fn mcp_tools_schema() -> Value {
         }
     },
     {
+        "name": "ap_win",
+        "description": "Zero-subprocess Windows diagnostics inspector (Named Pipes + SDDL DACLs, Registry keys/values, file/dir ACLs, Win32 services, and process token user/IL/privileges) — immune to Git Bash quoting and MSYS2 pathconv.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipes": { "type": "boolean", "description": "Enumerate \\\\.\\pipe\\* and inspect SDDL/non-admin write ACEs" },
+                "reg": { "type": "string", "description": "Registry key to inspect, e.g. HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion" },
+                "acl": { "type": "string", "description": "File or directory path whose owner, SDDL DACL & non-admin writability to inspect" },
+                "services": { "type": "boolean", "description": "Enumerate Windows services (state, PID, start_type, bin_path, account)" },
+                "whoami": { "type": "boolean", "description": "Inspect current process token user, SID, elevation, integrity level & privileges" },
+                "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services" },
+                "max": { "type": "integer", "description": "Max entries to return (default: 60)" }
+            }
+        }
+    },
+    {
         "name": "ap_fs_diff",
         "description": "Atomic before/after directory snapshot diff (`run`, `snapshot`, `diff`) and recent-files radar (`recent` seconds).",
         "inputSchema": {
@@ -692,7 +708,7 @@ fn meta_tools_schema() -> Vec<Value> {
     vec![
         json!({
             "name": "ap_discover",
-            "description": "Search and load any of ap's 36 specialist tools by keyword/category (binaries, HTTP AuthZ/CORS, CDP, WebSocket, AST rename, OWASP sec, baton, etc.) without paying 11k schema tokens up front.",
+            "description": "Search and load any of ap's 37 specialist tools by keyword/category (binaries, Win32 pipes/reg/acl/services, HTTP AuthZ/CORS, CDP, WebSocket, AST rename, OWASP sec, baton, etc.) without paying 11k schema tokens up front.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -816,6 +832,7 @@ fn tool_annotations_for(name: &str) -> (&'static str, bool, bool, bool, bool) {
         "ap_http" => ("HTTP/API Diagnostic Probe", false, false, false, true),
         "ap_ports" => ("Listening TCP Port & CDP Radar", true, false, true, false),
         "ap_ps" => ("Process Tree & Command Inspector", true, false, true, false),
+        "ap_win" => ("Windows Native OS Inspector", true, false, true, false),
         "ap_fs_diff" => ("Filesystem Snapshot & Diff", false, false, false, false),
         "ap_tcp" => ("Bounded Raw TCP Probe", false, false, false, true),
         "ap_listen" => (
@@ -2061,6 +2078,47 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             run_self_captured(&cli, None)
         }
+        "ap_win" => {
+            let mut cli = vec!["probe".into(), "win".into(), "--json".into()];
+            if args.get("pipes").and_then(Value::as_bool) == Some(true) {
+                cli.push("--pipes".into());
+            }
+            if let Some(rg) = args
+                .get("reg")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--reg".into());
+                cli.push(rg.to_string());
+            }
+            if let Some(ac) = args
+                .get("acl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--acl".into());
+                cli.push(ac.to_string());
+            }
+            if args.get("services").and_then(Value::as_bool) == Some(true) {
+                cli.push("--services".into());
+            }
+            if args.get("whoami").and_then(Value::as_bool) == Some(true) {
+                cli.push("--whoami".into());
+            }
+            if let Some(fl) = args
+                .get("filter")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--filter".into());
+                cli.push(fl.to_string());
+            }
+            if let Some(mx) = args.get("max").and_then(Value::as_u64) {
+                cli.push("--max".into());
+                cli.push(mx.to_string());
+            }
+            run_self_captured(&cli, None)
+        }
         "ap_fs_diff" => {
             let dir = args.get("dir").and_then(Value::as_str).unwrap_or(".");
             let mut cli = vec!["probe".into(), "fs".into(), dir.into()];
@@ -2990,7 +3048,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .get("limit")
                 .and_then(Value::as_u64)
                 .unwrap_or(8)
-                .clamp(1, 36) as usize;
+                .clamp(1, 37) as usize;
 
             let q_tokens: Vec<&str> = query
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
@@ -3023,6 +3081,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                             | "ap_listen"
                             | "ap_ports"
                             | "ap_ps"
+                            | "ap_win"
                             | "ap_fs_diff"
                             | "ap_mutate"
                             | "ap_fuzz"

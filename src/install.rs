@@ -809,7 +809,7 @@ pub fn render_pi_accelerator_ts(ap_bin_posix: &str) -> String {
 // - Opt-in `deepseek/flash-auto` virtual model (dynamic low/high/max effort, zero cache-bust switch)
 import {{ spawnSync }} from "node:child_process";
 import {{ existsSync, readFileSync, statSync }} from "node:fs";
-import {{ homedir }} from "node:os";
+import {{ homedir, tmpdir }} from "node:os";
 import {{ isAbsolute, join, resolve }} from "node:path";
 import type {{
 	ContextEditEntryDraft,
@@ -1286,6 +1286,12 @@ export function classifyShellFailureTip(
 	}}
 	if (/dir: cannot access '\/[bs]'/i.test(outText)) {{
 		return `[ap dir-tip] Windows \`dir /b\` fails under Git Bash; use \`ap ls <dir> --depth 2\` or POSIX \`ls\`.`;
+	}}
+	if (/Program Files[\/\\]Git[\/\\](?:PID|FO|FI|NH|F|c|C|k|K|TN|TR|grant|query|add|CN=|OU=|O=)|Invalid argument\/option - ['"]?[A-Za-z]:[\/\\]Program Files[\/\\]Git[\/\\]/i.test(outText)) {{
+		return `[ap msys-tip] Git Bash MSYS2 mangled a Windows CLI '/flag' into 'C:/Program Files/Git/...'. Prefix with \`MSYS_NO_PATHCONV=1\` or use \`ap probe win --pipes/--reg/--acl/--services/--whoami\` (MCP/codemode: \`ap_win\`) instead of spawning tasklist/sc/icacls/reg/whoami.`;
+	}}
+	if (/Unicode(?:Decode|Encode)Error:\s*'(?:gbk|cp936|cp1252|charmap)' codec can't/i.test(outText)) {{
+		return `[ap utf8-tip] Windows Python hit legacy GBK/cp936 encoding; set \`PYTHONUTF8=1 PYTHONIOENCODING=utf-8\` (or \`encoding="utf-8", errors="replace"\`) — or use \`ap read\`/\`ap search\`/\`ap sieve\` natively in Rust.`;
 	}}
 	if (TIMEOUT_ERR_RE.test(outText)) {{
 		if (SEARCH_CMD_RE.test(cmd)) {{
@@ -2434,6 +2440,39 @@ export function clampKvSafeSleep(cmd: string, toolName: string, maxSec = 45): st
 	return undefined;
 }}
 
+const MSYS_WIN_CLI_RE = /(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|taskkill(?:\.exe)?|tasklist(?:\.exe)?|sc(?:\.exe)?|icacls(?:\.exe)?|reg(?:\.exe)?|netstat(?:\.exe)?|whoami(?:\.exe)?|schtasks(?:\.exe)?|wevtutil(?:\.exe)?|netsh(?:\.exe)?|where(?:\.exe)?|wmic(?:\.exe)?|certutil(?:\.exe)?|bcdedit(?:\.exe)?|secedit(?:\.exe)?)\b[^\r\n;&|]*?\s\/[A-Za-z?]/i;
+const MSYS_OPENSSL_SUBJ_RE = /\bopenssl\b[^\r\n;&|]*?\s-subj\s+['"]?\//i;
+
+export function normalizeWindowsToolPath(rawPath: string, isWin = process.platform === "win32"): string | undefined {{
+	if (!rawPath || !isWin) return undefined;
+	const p = rawPath.trim();
+	if (/^\/tmp(?:\/|$)/.test(p)) {{
+		const winTmp = tmpdir().replace(/\\/g, "/").replace(/\/+$/, "");
+		return p === "/tmp" ? winTmp : `${{winTmp}}${{p.slice(4)}}`;
+	}}
+	const m = p.match(/^\/([a-zA-Z])(?:\/(.*))?$/);
+	if (m) {{
+		const drv = m[1].toUpperCase();
+		const rest = m[2] ?? "";
+		return `${{drv}}:/${{rest}}`;
+	}}
+	return undefined;
+}}
+
+export function healMsysPathConv(raw: string, toolName = "bash"): string | undefined {{
+	if (!raw || toolName !== "bash") return undefined;
+	if (/\b(?:MSYS_NO_PATHCONV|MSYS2_ARG_CONV_EXCL)=/.test(raw)) return undefined;
+	if (/(?:^|\s)\/\/[A-Za-z?]/.test(raw)) return undefined;
+	if (!MSYS_WIN_CLI_RE.test(raw) && !MSYS_OPENSSL_SUBJ_RE.test(raw)) return undefined;
+	const converted = raw.replace(/(^|[\s'"=])\/([a-zA-Z])\/([^\s'"`;&|<>()]*)/g, (_m, pfx: string, drv: string, tail: string) => {{
+		return `${{pfx}}${{drv.toUpperCase()}}:/${{tail}}`;
+	}});
+	const trimmed = converted.trimStart();
+	if (trimmed.includes("\n")) return `export MSYS_NO_PATHCONV=1\n${{converted}}`;
+	if (/(?:&&|\|\||[;|])/.test(trimmed)) return `export MSYS_NO_PATHCONV=1; ${{converted}}`;
+	return `MSYS_NO_PATHCONV=1 ${{converted}}`;
+}}
+
 export function healCommand(raw: string, toolName: string): string | undefined {{
 	if (!raw) return undefined;
 	let cmd = raw;
@@ -2634,6 +2673,13 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 	const clampedSleep = clampKvSafeSleep(cmd, toolName, 45);
 	if (clampedSleep) {{
 		cmd = clampedSleep;
+		changed = true;
+	}}
+
+	// 10. Shield Git Bash MSYS2 path conversion when invoking Windows CLIs with `/flag` or `openssl -subj '/...'`
+	const shieldedMsys = process.platform === "win32" ? healMsysPathConv(cmd, toolName) : undefined;
+	if (shieldedMsys) {{
+		cmd = shieldedMsys;
 		changed = true;
 	}}
 
@@ -4334,6 +4380,13 @@ export default function (pi: ExtensionAPI) {{
 	}});
 
 	pi.on("tool_call", (event, ctx) => {{
+		if (process.platform === "win32" && event.input && typeof event.input === "object") {{
+			const piInp = event.input as {{ path?: unknown; file_path?: unknown }};
+			const normP = typeof piInp.path === "string" ? normalizeWindowsToolPath(piInp.path) : undefined;
+			if (normP) piInp.path = normP;
+			const normFP = typeof piInp.file_path === "string" ? normalizeWindowsToolPath(piInp.file_path) : undefined;
+			if (normFP) piInp.file_path = normFP;
+		}}
 		const baseTool = event.toolName.replace(/^mcp__agent_primitives__/, "");
 		if (EDIT_TOOLS.has(baseTool)) {{
 			recentShellFps.length = 0;
@@ -5551,6 +5604,8 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("healBashPowerShellCommand")
                 && s.contains("clampKvSafeSleep")
                 && s.contains("shellQuoteBashPat")
+                && s.contains("normalizeWindowsToolPath")
+                && s.contains("healMsysPathConv")
         })
         .unwrap_or(false);
 

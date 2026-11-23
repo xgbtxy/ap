@@ -81,7 +81,19 @@ pub fn normalize_msys_drive_path(raw: &str) -> String {
     raw.to_string()
 }
 
-/// Normalizes CLI paths on Windows so Git-Bash `/c/...` or `/d/...` paths resolve seamlessly.
+/// Translates POSIX `/tmp` and `/tmp/...` paths into a Windows temp directory path when present.
+pub fn normalize_windows_tmp_path(raw: &str, temp_dir: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let base = temp_dir.trim_end_matches(['/', '\\']).replace('\\', "/");
+    if trimmed == "/tmp" || trimmed == "/tmp/" {
+        return Some(base);
+    }
+    trimmed
+        .strip_prefix("/tmp/")
+        .map(|rest| format!("{base}/{}", rest.replace('\\', "/")))
+}
+
+/// Normalizes CLI paths on Windows so Git-Bash `/c/...` or `/tmp/...` paths resolve seamlessly.
 pub fn normalize_cli_path(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -91,6 +103,11 @@ pub fn normalize_cli_path(raw: &str) -> String {
     {
         if Path::new(trimmed).exists() {
             return trimmed.to_string();
+        }
+        if let Some(tmp_norm) =
+            normalize_windows_tmp_path(trimmed, &std::env::temp_dir().to_string_lossy())
+        {
+            return tmp_norm;
         }
         let converted = normalize_msys_drive_path(trimmed);
         if converted != trimmed {
@@ -388,5 +405,29 @@ mod tests {
             "/usr/local/bin"
         );
         assert_eq!(normalize_msys_drive_path("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn windows_tmp_path_normalizes_to_env_temp_preserving_non_tmp() {
+        assert_eq!(
+            normalize_windows_tmp_path("/tmp/ap_wave74_probe.txt", r"C:\Users\demo\Temp\"),
+            Some("C:/Users/demo/Temp/ap_wave74_probe.txt".to_string())
+        );
+        assert_eq!(
+            normalize_windows_tmp_path("/tmp", r"C:\Users\demo\Temp"),
+            Some("C:/Users/demo/Temp".to_string())
+        );
+        assert_eq!(
+            normalize_windows_tmp_path("/tmp/", "C:/Temp/"),
+            Some("C:/Temp".to_string())
+        );
+        assert_eq!(
+            normalize_windows_tmp_path("/usr/local/bin", "C:/Temp"),
+            None
+        );
+        assert_eq!(
+            normalize_windows_tmp_path("C:/tmp/local.txt", "C:/Temp"),
+            None
+        );
     }
 }

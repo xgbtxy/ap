@@ -1,4 +1,4 @@
-# Agent Primitives Runtime Routing (`ap` v2.44+)
+# Agent Primitives Runtime Routing (`ap` v2.45+)
 
 1. **Orient & Read (`ls` / `atlas` / `read` / `search` / `query` / `ap_orient`)**: Bounded listing -> `ap ls <dir> --depth 2 --max 25` (also accepts Git Bash `/c/...` paths); repo overview -> `ap atlas map .` + `ap atlas surface . --include-binaries`; fault localization -> `ap atlas locate`; clean code & token mining -> `ap search <pat> [-o -u --no-filename -F -i --include] --code-only --no-tests`; Markdown `--section` / `--around` / AST / C++ outline / Office / binaries -> `ap read`.
 2. **Edit & Refactor (`splice` / `ap_edit`)**: Inspect symbols via `ap splice view <file> --symbol <Sym>`; AST rename via `ap splice rename`; atomic AST-gated edits via `ap splice apply --cwd . --stdin --test` (supports `@L<start>-L<end>` disambiguation & read-gutter auto-strip).

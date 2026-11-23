@@ -354,6 +354,26 @@ const PATCH_SPECS: &[PatchSpec] = &[
             },
         ],
     },
+    PatchSpec {
+        id: "windows_utf8_shell_env",
+        summary: "Lock PYTHONUTF8=1, PYTHONIOENCODING=utf-8, LANG=C.UTF-8 & LC_ALL=C.UTF-8 in Pi Windows getShellEnv() (prevents GBK crashes even on write/destructive shell commands)",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_windows_utf8_shell_env",
+                rel_hint: None,
+                old: "function getShellEnv(){let binDir=getBinDir(),pathKey=Object.keys(process.env).find(key=>key.toLowerCase()===\"path\")??\"PATH\",currentPath=process.env[pathKey]??\"\",updatedPath=currentPath.split(delimiter).filter(Boolean).includes(binDir)?currentPath:[binDir,currentPath].filter(Boolean).join(delimiter);return{...process.env,[pathKey]:updatedPath}}",
+                alt_olds: &[],
+                new: "function getShellEnv(){let binDir=getBinDir(),pathKey=Object.keys(process.env).find(key=>key.toLowerCase()===\"path\")??\"PATH\",currentPath=process.env[pathKey]??\"\",updatedPath=currentPath.split(delimiter).filter(Boolean).includes(binDir)?currentPath:[binDir,currentPath].filter(Boolean).join(delimiter);return{...process.env,...process.platform===\"win32\"?{PYTHONUTF8:process.env.PYTHONUTF8??\"1\",PYTHONIOENCODING:process.env.PYTHONIOENCODING??\"utf-8\",LANG:process.env.LANG??\"C.UTF-8\",LC_ALL:process.env.LC_ALL??\"C.UTF-8\"}:{},[pathKey]:updatedPath}}",
+            },
+            PatchHunk {
+                id: "shell_windows_utf8_shell_env",
+                rel_hint: Some("dist/utils/shell.js"),
+                old: "    return {\n        ...process.env,\n        [pathKey]: updatedPath,\n    };",
+                alt_olds: &[],
+                new: "    return {\n        ...process.env,\n        ...(process.platform === \"win32\" ? { PYTHONUTF8: process.env.PYTHONUTF8 ?? \"1\", PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? \"utf-8\", LANG: process.env.LANG ?? \"C.UTF-8\", LC_ALL: process.env.LC_ALL ?? \"C.UTF-8\" } : {}),\n        [pathKey]: updatedPath,\n    };",
+            },
+        ],
+    },
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,7 +902,7 @@ mod tests {
         fs::write(
             chunks.join("chunk-main.js"),
             format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 PATCH_SPECS[0].hunks[0].old,
                 PATCH_SPECS[0].hunks[1].old,
                 PATCH_SPECS[3].hunks[0].old,
@@ -896,6 +916,7 @@ mod tests {
                 PATCH_SPECS[8].hunks[0].old,
                 PATCH_SPECS[8].hunks[1].old,
                 PATCH_SPECS[12].hunks[0].old,
+                PATCH_SPECS[13].hunks[0].old,
             ),
         )
         .unwrap();
@@ -950,6 +971,9 @@ mod tests {
         )
         .unwrap();
         fs::write(core_ext.join("types.d.ts"), PATCH_SPECS[0].hunks[4].old).unwrap();
+        let dist_utils = pi_dir.join("dist").join("utils");
+        fs::create_dir_all(&dist_utils).unwrap();
+        fs::write(dist_utils.join("shell.js"), PATCH_SPECS[13].hunks[1].old).unwrap();
 
         std::env::set_var("AP_HOME", &ap_home);
         let pi_str = pi_dir.to_string_lossy().to_string();
@@ -960,7 +984,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 13);
+        assert_eq!(applied["report"]["applied_count"], 14);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));

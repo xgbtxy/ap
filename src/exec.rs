@@ -69,6 +69,9 @@ struct HealRegexes {
     body_sleep_re: Regex,
     bg_sleep_guard: Regex,
     sleep_skip_kw: Regex,
+    msys_win_cli_flag: Regex,
+    msys_openssl_subj: Regex,
+    msys_drive_prefix: Regex,
 }
 
 fn heal_re() -> &'static HealRegexes {
@@ -97,7 +100,58 @@ fn heal_re() -> &'static HealRegexes {
         body_sleep_re: Regex::new(r"(?i)(^|[;&|\s])sleep\s+(\d+(?:\.\d+)?)s?(\s*(?:$|[;&|]))").unwrap(),
         bg_sleep_guard: Regex::new(r"(?i)(?:&\s*$|\(\s*[^)]*\bsleep\b[^)]*\)\s*&)").unwrap(),
         sleep_skip_kw: Regex::new(r"(?i)(?:\bnohup\b|<<|\b(?:python3?|py|node)\b)").unwrap(),
+        msys_win_cli_flag: Regex::new(
+            r"(?i)(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|taskkill(?:\.exe)?|tasklist(?:\.exe)?|sc(?:\.exe)?|icacls(?:\.exe)?|reg(?:\.exe)?|netstat(?:\.exe)?|whoami(?:\.exe)?|schtasks(?:\.exe)?|wevtutil(?:\.exe)?|netsh(?:\.exe)?|where(?:\.exe)?|wmic(?:\.exe)?|certutil(?:\.exe)?|bcdedit(?:\.exe)?|secedit(?:\.exe)?)\b[^\r\n;&|]*?\s/[A-Za-z?]",
+        )
+        .unwrap(),
+        msys_openssl_subj: Regex::new(r#"(?i)\bopenssl\b[^\r\n;&|]*?\s-subj\s+['"]?/"#).unwrap(),
+        msys_drive_prefix: Regex::new(
+            r#"(^|[\s'"=])/([a-zA-Z])/([^\s'"`;&|<>()]*)"#,
+        )
+        .unwrap(),
     })
+}
+
+/// Shield Git Bash MSYS2 path conversion when invoking native Windows CLIs with `/flag` arguments
+/// (e.g. `cmd /c`, `taskkill /F /PID`, `icacls ... /grant`, `sc query`, `reg query`) or `openssl -subj '/CN=...'`.
+/// Skips commands that already set `MSYS_NO_PATHCONV` / `MSYS2_ARG_CONV_EXCL` or already use explicit `//flag` escapes,
+/// and converts explicit MSYS `/c/...` drive paths -> `C:/...` first so Windows native tools keep resolving paths.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn try_shield_msys_pathconv(raw: &str) -> Option<String> {
+    let re = heal_re();
+    if raw.contains("MSYS_NO_PATHCONV") || raw.contains("MSYS2_ARG_CONV_EXCL") {
+        return None;
+    }
+    let has_double_slash_flag = raw
+        .split_whitespace()
+        .any(|tok| tok.starts_with("//") && tok.len() >= 3);
+    if has_double_slash_flag {
+        return None;
+    }
+    if !re.msys_win_cli_flag.is_match(raw) && !re.msys_openssl_subj.is_match(raw) {
+        return None;
+    }
+    let converted = re
+        .msys_drive_prefix
+        .replace_all(raw, |caps: &regex::Captures| {
+            let pfx = &caps[1];
+            let drv = caps[2].to_ascii_uppercase();
+            let tail = &caps[3];
+            format!("{pfx}{drv}:/{tail}")
+        })
+        .into_owned();
+    let trimmed = converted.trim_start();
+    if trimmed.contains('\n') {
+        Some(format!("export MSYS_NO_PATHCONV=1\n{converted}"))
+    } else if trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains(';')
+        || trimmed.contains('|')
+    {
+        Some(format!("export MSYS_NO_PATHCONV=1; {converted}"))
+    } else {
+        Some(format!("MSYS_NO_PATHCONV=1 {converted}"))
+    }
 }
 
 /// Clamp long foreground synchronous sleeps (>= 60s) and polling sleep loops (`iters * secs >= 90`)
@@ -441,11 +495,16 @@ pub fn heal_windows_command(
     let has_ps_cmdlet = re.ps_cmdlet.is_match(raw);
     if has_git_bash && !has_ps_cmdlet && re.posix_only.is_match(raw) {
         heals.push("posix->git-bash");
-        if let Some(clamped) = try_cap_long_sleep(raw, 45) {
+        let mut bash_cmd = raw.to_string();
+        if let Some(clamped) = try_cap_long_sleep(&bash_cmd, 45) {
             heals.push("sleep-clamp->45s");
-            return (ShellKind::GitBash, clamped, heals);
+            bash_cmd = clamped;
         }
-        return (ShellKind::GitBash, raw.to_string(), heals);
+        if let Some(shielded) = try_shield_msys_pathconv(&bash_cmd) {
+            heals.push("msys-no-pathconv");
+            bash_cmd = shielded;
+        }
+        return (ShellKind::GitBash, bash_cmd, heals);
     }
 
     let mut out = raw.to_string();
@@ -1087,6 +1146,32 @@ mod tests {
         assert_eq!(
             try_cap_long_sleep("for i in $(seq 1 18); do sleep 30; done", 45).as_deref(),
             Some("for i in $(seq 1 18); do sleep 2; done")
+        );
+
+        // `try_shield_msys_pathconv` shields Windows CLI `/flag` & `openssl -subj '/...'` against Git Bash MSYS2 path mangling
+        assert_eq!(
+            try_shield_msys_pathconv("taskkill /F /PID 1234").as_deref(),
+            Some("MSYS_NO_PATHCONV=1 taskkill /F /PID 1234")
+        );
+        assert_eq!(
+            try_shield_msys_pathconv("openssl req -new -subj '/CN=127.0.0.1'").as_deref(),
+            Some("MSYS_NO_PATHCONV=1 openssl req -new -subj '/CN=127.0.0.1'")
+        );
+        assert_eq!(
+            try_shield_msys_pathconv("cd /d/work && icacls /d/work/secret.txt /grant Users:R")
+                .as_deref(),
+            Some(
+                "export MSYS_NO_PATHCONV=1; cd D:/work && icacls D:/work/secret.txt /grant Users:R"
+            )
+        );
+        assert!(try_shield_msys_pathconv("taskkill //F //PID 1234").is_none());
+        assert!(try_shield_msys_pathconv("MSYS_NO_PATHCONV=1 taskkill /F /PID 1234").is_none());
+        assert!(try_shield_msys_pathconv("rg foo src/").is_none());
+
+        let (_, h11, tags11) =
+            heal_windows_command("tasklist /FI \"STATUS eq RUNNING\" | head -n 5", true, true);
+        assert!(
+            h11.starts_with("export MSYS_NO_PATHCONV=1;") && tags11.contains(&"msys-no-pathconv")
         );
     }
 }

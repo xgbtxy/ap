@@ -131,8 +131,8 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
             sub_argv[0] = "read".to_string();
             return Some(read::run_cli(&sub_argv));
         }
-        "cdp" | "http" | "ws" | "tls" | "tcp" | "listen" | "ports" | "ps" | "ui" | "smoke"
-        | "fuzz" | "mutate" => {
+        "cdp" | "http" | "ws" | "tls" | "tcp" | "listen" | "ports" | "ps" | "win" | "ui"
+        | "smoke" | "fuzz" | "mutate" => {
             let mut probe_argv = Vec::with_capacity(tail_args.len() + 2);
             probe_argv.push("probe".to_string());
             probe_argv.push(name.to_string());
