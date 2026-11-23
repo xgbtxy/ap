@@ -467,7 +467,8 @@ fn decode_pb_fields(b: &[u8], depth: usize, out: &mut Vec<String>) -> bool {
                 let slice = &b[pos..pos + len];
                 pos += len;
                 let mut nested = Vec::new();
-                if slice.len() >= 2 && depth < 5 && decode_pb_fields(slice, depth + 1, &mut nested) {
+                if slice.len() >= 2 && depth < 5 && decode_pb_fields(slice, depth + 1, &mut nested)
+                {
                     // Prefer UTF-8 string if entire slice is clean printable text and nested only had 1 trivial field
                     let is_clean_text = std::str::from_utf8(slice)
                         .map(|s| {
@@ -499,20 +500,19 @@ fn decode_pb_fields(b: &[u8], depth: usize, out: &mut Vec<String>) -> bool {
                             s.chars().take(180).collect::<String>()
                         ));
                     } else {
-                        let hx: String = slice
-                            .iter()
-                            .take(32)
-                            .map(|x| format!("{x:02x}"))
-                            .collect();
-                        out.push(format!("{indent}{field_no} (bytes, {}B): 0x{hx}", slice.len()));
+                        let hx: String =
+                            slice.iter().take(32).map(|x| format!("{x:02x}")).collect();
+                        out.push(format!(
+                            "{indent}{field_no} (bytes, {}B): 0x{hx}",
+                            slice.len()
+                        ));
                     }
                 } else {
-                    let hx: String = slice
-                        .iter()
-                        .take(32)
-                        .map(|x| format!("{x:02x}"))
-                        .collect();
-                    out.push(format!("{indent}{field_no} (bytes, {}B): 0x{hx}", slice.len()));
+                    let hx: String = slice.iter().take(32).map(|x| format!("{x:02x}")).collect();
+                    out.push(format!(
+                        "{indent}{field_no} (bytes, {}B): 0x{hx}",
+                        slice.len()
+                    ));
                 }
             }
             5 => {
@@ -664,7 +664,17 @@ pub fn inspect_jwt_md(raw_text: &str) -> Result<(String, serde_json::Value), Str
                 let kl = k.to_ascii_lowercase();
                 if matches!(
                     kl.as_str(),
-                    "role" | "roles" | "admin" | "is_admin" | "isadmin" | "scope" | "scopes" | "permissions" | "perms" | "tenant" | "tenant_id"
+                    "role"
+                        | "roles"
+                        | "admin"
+                        | "is_admin"
+                        | "isadmin"
+                        | "scope"
+                        | "scopes"
+                        | "permissions"
+                        | "perms"
+                        | "tenant"
+                        | "tenant_id"
                 ) {
                     priv_keys.push(k.as_str());
                 }
@@ -791,7 +801,9 @@ pub fn extract_js_routes_md(
         e
     };
     let slice = &text[..scan_end];
-    let q_low = query.map(|q| q.trim().to_ascii_lowercase()).filter(|q| !q.is_empty());
+    let q_low = query
+        .map(|q| q.trim().to_ascii_lowercase())
+        .filter(|q| !q.is_empty());
     let matches_q = |s: &str| -> bool {
         match &q_low {
             Some(q) => s.to_ascii_lowercase().contains(q),
@@ -815,9 +827,12 @@ pub fn extract_js_routes_md(
             tags.push("PARAM");
         }
         let pl = p.to_ascii_lowercase();
-        if ["admin", "delete", "remove", "grant", "role", "perm", "token", "secret", "upload", "export", "import", "proxy", "internal", "transfer", "billing", "passwd", "password"]
-            .iter()
-            .any(|kw| pl.contains(kw))
+        if [
+            "admin", "delete", "remove", "grant", "role", "perm", "token", "secret", "upload",
+            "export", "import", "proxy", "internal", "transfer", "billing", "passwd", "password",
+        ]
+        .iter()
+        .any(|kw| pl.contains(kw))
         {
             tags.push("SENSITIVE");
         }
@@ -969,7 +984,11 @@ pub fn extract_js_routes_md(
             let host = hm.as_str().to_ascii_lowercase();
             if matches!(
                 host.as_str(),
-                "www.w3.org" | "schemas.openxmlformats.org" | "purl.org" | "ns.adobe.com" | "example.com"
+                "www.w3.org"
+                    | "schemas.openxmlformats.org"
+                    | "purl.org"
+                    | "ns.adobe.com"
+                    | "example.com"
             ) {
                 continue;
             }
@@ -1013,7 +1032,9 @@ pub fn extract_js_routes_md(
         };
         let win = &raw_win[..bounded_len];
         let kind_s = m.as_str().trim();
-        let is_server = kind_s.contains("createServer") || kind_s.contains("WebSocketServer") || kind_s.contains("oauth/callback");
+        let is_server = kind_s.contains("createServer")
+            || kind_s.contains("WebSocketServer")
+            || kind_s.contains("oauth/callback");
         let win_low = win.to_ascii_lowercase();
         let missing_auth = is_server
             && !win_low.contains("origin")
@@ -1117,7 +1138,10 @@ pub fn extract_js_routes_md(
                 )
             })
             .collect();
-        out.push(format!("\n## postMessage Listeners\n{}", pm_lines.join("\n")));
+        out.push(format!(
+            "\n## postMessage Listeners\n{}",
+            pm_lines.join("\n")
+        ));
     }
     if !dom_sinks.is_empty() {
         let sk_lines: Vec<String> = dom_sinks
@@ -1165,7 +1189,11 @@ pub fn extract_js_routes_md(
         ));
     }
     if !lazy_chunks.is_empty() {
-        let ch_list: Vec<String> = lazy_chunks.iter().take(30).map(|c| format!("`{c}`")).collect();
+        let ch_list: Vec<String> = lazy_chunks
+            .iter()
+            .take(30)
+            .map(|c| format!("`{c}`"))
+            .collect();
         out.push(format!(
             "\n## Lazy Webpack / Vite Chunks ({})\n{}",
             lazy_chunks.len(),
@@ -1173,8 +1201,15 @@ pub fn extract_js_routes_md(
         ));
     }
     if !custom_headers.is_empty() {
-        let h_list: Vec<String> = custom_headers.iter().take(25).map(|h| format!("`{h}`")).collect();
-        out.push(format!("\n## Custom Auth / Tenant Headers\n{}", h_list.join(", ")));
+        let h_list: Vec<String> = custom_headers
+            .iter()
+            .take(25)
+            .map(|h| format!("`{h}`"))
+            .collect();
+        out.push(format!(
+            "\n## Custom Auth / Tenant Headers\n{}",
+            h_list.join(", ")
+        ));
     }
     if !origins.is_empty() {
         let org_list: Vec<String> = origins.iter().take(40).map(|o| format!("`{o}`")).collect();
@@ -1229,7 +1264,9 @@ fn is_placeholder_secret(val: &str) -> bool {
         || low.contains("${")
         || low.contains("{{")
         || low.starts_with('<')
-        || low.chars().all(|c| c == '*' || c == 'x' || c == '0' || c == '-')
+        || low
+            .chars()
+            .all(|c| c == '*' || c == 'x' || c == '0' || c == '-')
 }
 
 /// Pure-Rust `<15ms` defensive hardcoded-secret & credential hygiene scanner (`--secrets`).
@@ -1300,7 +1337,9 @@ pub fn scan_secrets_md(
             };
             let ln = byte_line_col(slice, m0.start());
             if let Some(ref q) = q_low {
-                if !kind.to_ascii_lowercase().contains(q) && !redacted.to_ascii_lowercase().contains(q) {
+                if !kind.to_ascii_lowercase().contains(q)
+                    && !redacted.to_ascii_lowercase().contains(q)
+                {
                     continue;
                 }
             }
@@ -1361,31 +1400,63 @@ mod inspect_tests {
     #[test]
     fn inspects_jwt_posture_flags_and_timestamps() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let hdr = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT","jku":"https://auth.internal/jwks.json"}"#);
-        let pay = URL_SAFE_NO_PAD.encode(r#"{"sub":"u1","role":"admin","iat":1700000000,"exp":1700003600}"#);
+        let hdr = URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"none","typ":"JWT","jku":"https://auth.internal/jwks.json"}"#);
+        let pay = URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"u1","role":"admin","iat":1700000000,"exp":1700003600}"#);
         let tok = format!("Bearer {hdr}.{pay}.");
         let (md, jv) = inspect_jwt_md(&tok).unwrap();
         assert_eq!(jv["count"], 1);
         assert!(md.contains("WEAK-ALG:none"), "missing WEAK-ALG in:\n{md}");
-        assert!(md.contains("EMPTY-SIGNATURE"), "missing EMPTY-SIGNATURE in:\n{md}");
-        assert!(md.contains("HEADER-INJECTION-SURFACE:jku"), "missing jku flag in:\n{md}");
+        assert!(
+            md.contains("EMPTY-SIGNATURE"),
+            "missing EMPTY-SIGNATURE in:\n{md}"
+        );
+        assert!(
+            md.contains("HEADER-INJECTION-SURFACE:jku"),
+            "missing jku flag in:\n{md}"
+        );
         assert!(md.contains("EXPIRED"), "missing EXPIRED in:\n{md}");
-        assert!(md.contains("2023-11-14T22:13:20Z"), "wrong UTC timestamp in:\n{md}");
+        assert!(
+            md.contains("2023-11-14T22:13:20Z"),
+            "wrong UTC timestamp in:\n{md}"
+        );
     }
 
     #[test]
     fn extracts_routes_postmessage_and_sinks_from_minified_js() {
         let bundle = r#"!function(){axios.post("/api/v2/admin/users/:id",{headers:{"X-Domain-Id":d,"X-Target-Services":"svc"}});fetch("/rest/v1/export/report");const chunks={41:"fb19bfac5e8bf871"};http.createServer(function(req,res){res.end("ok")});window.addEventListener("message",function(e){el.innerHTML=e.data.html});window.addEventListener("message",function(ev){if(ev.origin!=="https://app.acme.test")return;console.log(ev.data)});const h="https://cdn.acme.test/app.js"}();"#;
         let (md, jv) = extract_js_routes_md(bundle, "app.min.js", None);
-        assert!(md.contains("/api/v2/admin/users/:id"), "missing route in:\n{md}");
+        assert!(
+            md.contains("/api/v2/admin/users/:id"),
+            "missing route in:\n{md}"
+        );
         assert!(md.contains("[PARAM,SENSITIVE]"), "missing tags in:\n{md}");
-        assert!(md.contains("[MISSING-ORIGIN-CHECK]"), "missing origin gap in:\n{md}");
-        assert!(md.contains("[origin-checked]"), "missing checked handler in:\n{md}");
-        assert!(md.contains("41.fb19bfac5e8bf871.js"), "missing lazy chunk in:\n{md}");
-        assert!(md.contains("[NO-ORIGIN-OR-AUTH-CHECK]"), "missing local server gap in:\n{md}");
-        assert!(md.contains("X-Domain-Id"), "missing custom header in:\n{md}");
+        assert!(
+            md.contains("[MISSING-ORIGIN-CHECK]"),
+            "missing origin gap in:\n{md}"
+        );
+        assert!(
+            md.contains("[origin-checked]"),
+            "missing checked handler in:\n{md}"
+        );
+        assert!(
+            md.contains("41.fb19bfac5e8bf871.js"),
+            "missing lazy chunk in:\n{md}"
+        );
+        assert!(
+            md.contains("[NO-ORIGIN-OR-AUTH-CHECK]"),
+            "missing local server gap in:\n{md}"
+        );
+        assert!(
+            md.contains("X-Domain-Id"),
+            "missing custom header in:\n{md}"
+        );
         assert!(md.contains("innerHTML"), "missing DOM sink in:\n{md}");
-        assert!(md.contains("cdn.acme.test"), "missing external origin in:\n{md}");
+        assert!(
+            md.contains("cdn.acme.test"),
+            "missing external origin in:\n{md}"
+        );
         assert_eq!(jv["counts"]["post_message"], 2);
         assert_eq!(jv["counts"]["lazy_chunks"], 1);
     }
@@ -1401,8 +1472,14 @@ mod inspect_tests {
         assert_eq!(jv["count"], 3, "unexpected count in:\n{md}");
         assert!(md.contains("PEM_PRIVATE_KEY"), "missing PEM in:\n{md}");
         assert!(md.contains("CLOUD_ACCESS_KEY"), "missing AK in:\n{md}");
-        assert!(md.contains("EMBEDDED_URI_CRED"), "missing URI cred in:\n{md}");
-        assert!(!md.contains("Sup3rS3cretPass!"), "secret must be redacted in:\n{md}");
+        assert!(
+            md.contains("EMBEDDED_URI_CRED"),
+            "missing URI cred in:\n{md}"
+        );
+        assert!(
+            !md.contains("Sup3rS3cretPass!"),
+            "secret must be redacted in:\n{md}"
+        );
         assert!(!md.contains(&ak_val), "AK must be redacted in:\n{md}");
     }
 }

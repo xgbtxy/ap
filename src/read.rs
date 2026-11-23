@@ -832,7 +832,14 @@ fn read_single_target(
             if cli.jwt && (target.contains("eyJ") && target.contains('.')) {
                 let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(target)
                     .map_err(|e| (1, format!("[ap read --jwt] {e}")))?;
-                record_event("read", target.len() as u64, rendered.len() as u64, 0, 1, "jwt");
+                record_event(
+                    "read",
+                    target.len() as u64,
+                    rendered.len() as u64,
+                    0,
+                    1,
+                    "jwt",
+                );
                 let jv = json!({
                     "ok": true,
                     "target": "<inline-jwt>",
@@ -938,8 +945,12 @@ fn read_single_target(
 
     if let Some(ref old_path_str) = cli.diff {
         let old_p = Path::new(old_path_str);
-        let old_bytes = fs::read(old_p)
-            .map_err(|e| (1, format!("[ap read --diff] failed to read `{old_path_str}`: {e}")))?;
+        let old_bytes = fs::read(old_p).map_err(|e| {
+            (
+                1,
+                format!("[ap read --diff] failed to read `{old_path_str}`: {e}"),
+            )
+        })?;
         let rendered = crate::binary::diff_binaries_or_archives_md(
             &raw_bytes,
             &old_bytes,
@@ -1174,7 +1185,19 @@ fn read_single_target(
                 img_meta
             } else if matches!(
                 ext.as_str(),
-                "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node" | "wasm" | "bin" | "class"
+                "exe"
+                    | "dll"
+                    | "sys"
+                    | "ocx"
+                    | "cpl"
+                    | "efi"
+                    | "so"
+                    | "ko"
+                    | "dylib"
+                    | "node"
+                    | "wasm"
+                    | "bin"
+                    | "class"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
                 format_tag = "binary";
@@ -1220,7 +1243,14 @@ fn read_single_target(
         if cli.jwt {
             let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(&converted)
                 .map_err(|e| (1, format!("[ap read --entry --jwt] {e}")))?;
-            record_event("read", raw_len, rendered.len() as u64, win_heals, 1, "entry-jwt");
+            record_event(
+                "read",
+                raw_len,
+                rendered.len() as u64,
+                win_heals,
+                1,
+                "entry-jwt",
+            );
             let jv = json!({
                 "ok": true,
                 "target": entry_label,
@@ -1231,9 +1261,19 @@ fn read_single_target(
             return Ok((rendered, jv));
         }
         if cli.routes {
-            let (rendered, jv_inner) =
-                crate::inspect::extract_js_routes_md(&converted, &entry_label, cli.query.as_deref());
-            record_event("read", raw_len, rendered.len() as u64, win_heals, 1, "entry-routes");
+            let (rendered, jv_inner) = crate::inspect::extract_js_routes_md(
+                &converted,
+                &entry_label,
+                cli.query.as_deref(),
+            );
+            record_event(
+                "read",
+                raw_len,
+                rendered.len() as u64,
+                win_heals,
+                1,
+                "entry-routes",
+            );
             let jv = json!({
                 "ok": true,
                 "target": entry_label,
@@ -1246,7 +1286,14 @@ fn read_single_target(
         if cli.secrets {
             let (rendered, jv_inner) =
                 crate::inspect::scan_secrets_md(&converted, &entry_label, cli.query.as_deref());
-            record_event("read", raw_len, rendered.len() as u64, win_heals, 1, "entry-secrets");
+            record_event(
+                "read",
+                raw_len,
+                rendered.len() as u64,
+                win_heals,
+                1,
+                "entry-secrets",
+            );
             let jv = json!({
                 "ok": true,
                 "target": entry_label,
@@ -1528,7 +1575,9 @@ fn read_single_target(
             converted.len()
         )
     } else if converted.len() > cli.max_chars
-        && !(format_tag == "binary" && (cli.query.is_some() || cli.xref) && converted.len() <= 24000)
+        && !(format_tag == "binary"
+            && (cli.query.is_some() || cli.xref)
+            && converted.len() <= 24000)
     {
         let is_ast_code = ap_splice::ast::language_for_ext(&ext).is_some();
         let outline = if is_ast_code {

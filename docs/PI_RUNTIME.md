@@ -8,7 +8,7 @@
 # Inspect detected @earendil-works/pi-coding-agent package and patch status
 ap pi status
 
-# Apply all 6 generic runtime patches idempotently (originals backed up to ~/.ap/pi-backups/<version>/)
+# Apply all 11 generic runtime patches idempotently (originals backed up to ~/.ap/pi-backups/<version>/)
 ap pi patch
 
 # Preview without modifying files
@@ -20,14 +20,19 @@ ap pi restore
 
 Pass `--pi-dir <path>` (or set `PI_PACKAGE_DIR`) if Pi is installed in a non-standard location.
 
-## Maintained Generic Pi v1.5+ Runtime Patches
+## Maintained Generic Pi v1.5+ Runtime Patches (11/11)
 
-1. **`before_agent_start_entries`**: Extends `emitBeforeAgentStart` & `AgentSession._prepareRun` (both bundled `dist/bundle/chunks/*.js` and unbundled `dist/core/*` + `types.d.ts`) so `before_agent_start` handlers can return `entries?: SessionBoundaryDraft[]` — enabling programmatic, zero-latency clean-slate compaction (`{ type: "compaction", firstKeptEntryId: null, summary }`) before a user turn without losing session logs or breaking KV-cache prefix reuse.
-2. **`windows_python_utf8`**: Auto-injects `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` into Pi's Windows subprocess environment to eliminate GBK codec crashes.
+1. **`before_agent_start_entries`**: Extends `emitBeforeAgentStart` & `AgentSession._prepareRun` so `before_agent_start` handlers can return `entries?: SessionBoundaryDraft[]` for zero-latency programmatic clean-slate compaction without breaking KV-cache prefix reuse.
+2. **`windows_python_utf8`**: Auto-injects `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`, `LANG=C.UTF-8`, and `LC_ALL=C.UTF-8` into Pi's Windows subprocess environment to eliminate GBK codec crashes.
 3. **`codemode_sleep_and_workers`**: Exposes abort-safe `await sleep(ms)` (capped at 30s) inside QuickJS `codemode` scripts and raises `DEFAULT_MAX_CODEMODE_WORKERS` from `2` to `4`.
-4. **`http_keepalive_and_transient_retry`**: Adds resilient TCP/HTTP keepAlive & connect timeouts (`20s` connect, `25s` keepAlive) plus transient socket/TLS/gateway retry tokens (`ECONNRESET`, `ETIMEDOUT`, `EPIPE`, `ECONNREFUSED`, `UND_ERR_SOCKET`, `socket disconnected`, `before secure tls`, `connect timeout`, `this operation was aborted`, `bad gateway`, `gateway timeout`) with jittered exponential backoff.
+4. **`http_keepalive_and_transient_retry`**: Adds resilient HTTP keepAlive (`15s` / `28s` / `10s` initial delay), `250ms` Happy-Eyeballs failover, and transient TLS/socket/gateway retry with jittered exponential backoff.
 5. **`virtual_model_cache_warmer`**: Allows virtual models (`api === "pi-virtual"`, such as `deepseek/flash-auto`) to match `CacheWarmer` physical sessions cleanly.
-6. **`codemode_web_builtins`**: Injects standard Web/JS builtins (`setTimeout`/`clearTimeout` backed by `sleep`, `atob`/`btoa`, `TextEncoder`/`TextDecoder`, and a compact `Buffer` polyfill supporting `utf8`/`base64`/`base64url`/`hex`/`latin1`/`concat`) directly into the QuickJS `codemode` guest sandbox, eliminating `ReferenceError: setTimeout/Buffer is not defined`.
+6. **`codemode_web_builtins`**: Injects standard Web/JS builtins (`setTimeout`/`clearTimeout`, `atob`/`btoa`, `TextEncoder`/`TextDecoder`, `Buffer`) into QuickJS `codemode` and stops the wrapper from shadowing prelude globals.
+7. **`sequential_shell_tool_barrier`**: Runs `bash`/`powershell` calls sequentially as barriers while keeping adjacent read/search calls parallel (eliminating `bash`+`read` race `ENOENT`s).
+8. **`boundary_compaction_event`**: Emits `session_compact` on extension boundary-draft compactions so cache trackers and extensions reset cleanly on auto-rotations.
+9. **`cjk_calibrated_compaction_budget`**: Weights CJK/fullwidth characters and calibrates `keepRecentTokens` against provider-reported `prompt_tokens` to prevent 2–3x compaction overshoot.
+10. **`deterministic_tool_order`**: Sorts resolved transcript tools deterministically by name so MCP reconnects or reloads never bust prompt KV-cache.
+11. **`codemode_text_returns_rendered`**: Returns the rendered string from `codemode`'s `text(value)` helper (both bundle and prelude) to eliminate `TypeError: cannot read property 'slice' of undefined`.
 
 ## Pairing with Guard-Aware `ap atlas surface` & `ap baton frontier`
 

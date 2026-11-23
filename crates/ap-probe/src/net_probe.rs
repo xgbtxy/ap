@@ -648,7 +648,11 @@ fn ws_handshake_one_origin(
     } else {
         format!("{host_port}:80")
     };
-    let Some(sa) = connect_target.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+    let Some(sa) = connect_target
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
         return json!({
             "origin": label,
             "accepted": false,
@@ -735,13 +739,23 @@ fn ws_handshake_one_origin(
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
                     match fr {
                         Ok((1 | 2, data)) => {
-                            messages.push(String::from_utf8_lossy(&data).chars().take(600).collect::<String>());
+                            messages.push(
+                                String::from_utf8_lossy(&data)
+                                    .chars()
+                                    .take(600)
+                                    .collect::<String>(),
+                            );
                         }
                         Ok((8, _)) | Err(_) => break,
                         _ => {}
                     }
                 }
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
                     continue;
                 }
                 Err(_) => break,
@@ -844,39 +858,6 @@ pub fn run_ws_origin_matrix(
         }
     }
     0
-}
-
-#[cfg(test)]
-mod ws_tests {
-    use super::*;
-
-    #[test]
-    fn detects_cswsh_cross_origin_ws_acceptance_vs_rejection() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let srv = std::thread::spawn(move || {
-            for _ in 0..2 {
-                if let Ok((mut s, _)) = listener.accept() {
-                    let mut buf = [0u8; 2048];
-                    let n = s.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-                    if req.contains("origin: https://evil.example") {
-                        let _ = s.write_all(
-                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
-                        );
-                    } else {
-                        let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
-                    }
-                }
-            }
-        });
-        let url = format!("ws://127.0.0.1:{port}/rpc");
-        let evil = ws_handshake_one_origin(&url, Some("https://evil.example"), &[], &[], 200);
-        let null_o = ws_handshake_one_origin(&url, Some("null"), &[], &[], 200);
-        let _ = srv.join();
-        assert_eq!(evil["accepted"], true);
-        assert_eq!(null_o["accepted"], false);
-    }
 }
 
 /// Cross-platform TLS protocol & X.509 certificate inspector (uses native .NET SslStream on Windows / openssl on Unix).
@@ -990,5 +971,38 @@ pub fn run_tls_cli(addr_str: &str, sni: Option<&str>, timeout_sec: u64, as_json:
             eprintln!("[probe tls] FAIL `{host}:{port}` ({elapsed_ms}ms): {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod ws_tests {
+    use super::*;
+
+    #[test]
+    fn detects_cswsh_cross_origin_ws_acceptance_vs_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    if req.contains("origin: https://evil.example") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        );
+                    } else {
+                        let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+                    }
+                }
+            }
+        });
+        let url = format!("ws://127.0.0.1:{port}/rpc");
+        let evil = ws_handshake_one_origin(&url, Some("https://evil.example"), &[], &[], 200);
+        let null_o = ws_handshake_one_origin(&url, Some("null"), &[], &[], 200);
+        let _ = srv.join();
+        assert_eq!(evil["accepted"], true);
+        assert_eq!(null_o["accepted"], false);
     }
 }

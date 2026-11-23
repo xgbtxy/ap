@@ -338,7 +338,10 @@ impl CdpSession {
         url: &str,
     ) -> Result<Vec<(String, String)>, String> {
         let host_low = host.trim().to_ascii_lowercase();
-        if !matches!(host_low.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        if !matches!(
+            host_low.as_str(),
+            "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        ) {
             return Err(format!(
                 "refusing CDP cookie reuse from non-loopback host `{host}`"
             ));
@@ -364,11 +367,7 @@ impl CdpSession {
         let mut out = Vec::new();
         if let Some(arr) = res.get("cookies").and_then(Value::as_array) {
             for c in arr {
-                let name = c
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
+                let name = c.get("name").and_then(Value::as_str).unwrap_or("").trim();
                 let val = c.get("value").and_then(Value::as_str).unwrap_or("");
                 if !name.is_empty()
                     && !name.contains(['\r', '\n', ';', '='])

@@ -160,7 +160,20 @@ fn walk_code_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if matches!(
                 ext,
-                "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "py" | "go" | "rs" | "java" | "c" | "cc" | "cpp" | "h" | "hpp"
+                "js" | "mjs"
+                    | "cjs"
+                    | "ts"
+                    | "tsx"
+                    | "jsx"
+                    | "py"
+                    | "go"
+                    | "rs"
+                    | "java"
+                    | "c"
+                    | "cc"
+                    | "cpp"
+                    | "h"
+                    | "hpp"
             ) {
                 out.push(p);
             }
@@ -519,11 +532,26 @@ def route(request):
 
         let findings = scan_security_issues(&dir);
         let cwes: Vec<&str> = findings.iter().map(|f| f.cwe.as_str()).collect();
-        assert!(cwes.iter().any(|c| c.contains("CWE-120")), "missing CWE-120: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-190")), "missing CWE-190: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-918")), "missing CWE-918: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-434")), "missing CWE-434: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-94/502")), "missing CWE-94/502: {cwes:?}");
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-120")),
+            "missing CWE-120: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-190")),
+            "missing CWE-190: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-918")),
+            "missing CWE-918: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-434")),
+            "missing CWE-434: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-94/502")),
+            "missing CWE-94/502: {cwes:?}"
+        );
 
         fs::write(
             dir.join("XmlCtrl.java"),
@@ -537,9 +565,18 @@ def route(request):
         .unwrap();
         let findings2 = scan_security_issues(&dir);
         let cwes2: Vec<&str> = findings2.iter().map(|f| f.cwe.as_str()).collect();
-        assert!(cwes2.iter().any(|c| c.contains("CWE-611")), "missing CWE-611: {cwes2:?}");
-        assert!(cwes2.iter().any(|c| c.contains("CWE-1321")), "missing CWE-1321: {cwes2:?}");
-        assert!(cwes2.iter().any(|c| c.contains("CWE-295/347")), "missing CWE-295/347: {cwes2:?}");
+        assert!(
+            cwes2.iter().any(|c| c.contains("CWE-611")),
+            "missing CWE-611: {cwes2:?}"
+        );
+        assert!(
+            cwes2.iter().any(|c| c.contains("CWE-1321")),
+            "missing CWE-1321: {cwes2:?}"
+        );
+        assert!(
+            cwes2.iter().any(|c| c.contains("CWE-295/347")),
+            "missing CWE-295/347: {cwes2:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -571,7 +608,10 @@ def route(request):
         .unwrap();
 
         let findings = scan_security_issues(&dir);
-        assert!(findings.is_empty(), "expected 0 findings on guarded code, got: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "expected 0 findings on guarded code, got: {findings:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -593,11 +633,26 @@ void Service::OnReq(uint32_t total, uint32_t hdr, std::string user) {
         .unwrap();
         let findings = scan_security_issues(&dir);
         let cwes: Vec<&str> = findings.iter().map(|f| f.cwe.as_str()).collect();
-        assert!(cwes.iter().any(|c| c.contains("CWE-400")), "missing CWE-400: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-191")), "missing CWE-191: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-416")), "missing CWE-416: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-89")), "missing CWE-89: {cwes:?}");
-        assert!(cwes.iter().any(|c| c.contains("CWE-327")), "missing CWE-327: {cwes:?}");
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-400")),
+            "missing CWE-400: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-191")),
+            "missing CWE-191: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-416")),
+            "missing CWE-416: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-89")),
+            "missing CWE-89: {cwes:?}"
+        );
+        assert!(
+            cwes.iter().any(|c| c.contains("CWE-327")),
+            "missing CWE-327: {cwes:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
 
         let safe_dir = make_tmp_dir("v3_safe");

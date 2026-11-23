@@ -12,7 +12,7 @@ pub mod smoke;
 pub mod ui;
 
 use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use fuzz::run_fuzz;
 use mutate::run_mutate;
 use runtime::{detect_lang, run_diff_dispatch, run_trace_dispatch};
@@ -33,6 +33,171 @@ struct Cli {
     cmd: SubCmd,
 }
 
+#[derive(Args, Debug)]
+struct RunArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long, default_value = "auto")]
+    lang: String,
+    #[arg(long, default_value = "")]
+    focus: String,
+    #[arg(long)]
+    code: Option<String>,
+    #[arg(long)]
+    b64: Option<String>,
+    #[arg(long)]
+    stdin: bool,
+    #[arg(long)]
+    script: Option<String>,
+    #[arg(long)]
+    unittest: Option<String>,
+    #[arg(long, default_value_t = 30)]
+    max_calls: usize,
+    #[arg(long)]
+    include_tests: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct SmokeArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    start: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+    #[arg(long, default_value = "/")]
+    ready_path: String,
+    #[arg(long, default_value_t = 12000)]
+    timeout_ms: u64,
+    #[arg(long = "env")]
+    envs: Vec<String>,
+    #[arg(long)]
+    spec: Option<PathBuf>,
+    #[arg(long)]
+    stdin: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct CdpArgs {
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(short = 'p', long, default_value_t = 9222)]
+    port: u16,
+    /// Optional pair of ports `portA,portB` to concurrently evaluate `--eval` and compute structured diff
+    #[arg(long)]
+    diff_ports: Option<String>,
+    /// Optional pair of target filters/IDs `targetA,targetB` paired with `--diff-ports`
+    #[arg(long)]
+    target_ids: Option<String>,
+    #[arg(long)]
+    list: bool,
+    #[arg(short = 't', long)]
+    target: Option<String>,
+    #[arg(short = 'e', long)]
+    eval: Option<String>,
+    #[arg(long)]
+    audit: bool,
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+    #[arg(long)]
+    stdin: bool,
+    /// Non-blocking bounded event watch window in ms (captures async console logs & network responses without hanging)
+    #[arg(long, default_value_t = 0)]
+    watch_ms: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct HttpArgs {
+    /// Optional single target URL (omit when using `--batch-stdin` or `--vary-request`)
+    url: Option<String>,
+    #[arg(short = 'X', long, default_value = "GET")]
+    method: String,
+    #[arg(short = 'H', long = "header")]
+    headers: Vec<String>,
+    #[arg(short = 'd', long)]
+    body: Option<String>,
+    #[arg(long, default_value_t = 15)]
+    timeout: u64,
+    #[arg(short = 'k', long)]
+    insecure: bool,
+    #[arg(short = 'L', long)]
+    follow: bool,
+    /// Read `METHOD URL [BODY]` lines from stdin to probe up to 25 endpoints in one call
+    #[arg(long)]
+    batch_stdin: bool,
+    /// Optional saved JSON or raw HTTP request file for `--vary-field` single-field testing
+    #[arg(long)]
+    vary_request: Option<PathBuf>,
+    /// Vary one single JSON/query/header field across boundary variants and cluster response outliers
+    #[arg(long)]
+    vary_field: Option<String>,
+    /// Optional alternate value used by `--vary-field`
+    #[arg(long)]
+    alt_value: Option<String>,
+    /// Delay in ms between serial `--vary-field` requests (default: 0, max: 5000)
+    #[arg(long, default_value_t = 0)]
+    rate_ms: u64,
+    /// Maximum number of `--vary-field` variants (default: 20, max: 100)
+    #[arg(long, default_value_t = 20)]
+    max_variants: usize,
+    /// Generate `--vary-field` variants without sending any network request
+    #[arg(long)]
+    dry_run: bool,
+    /// Multi-principal AuthZ/IDOR matrix (`--principal "owner=Authorization: Bearer A" --principal "anon="`)
+    #[arg(long = "principal")]
+    principals: Vec<String>,
+    /// Reuse live cookies in-memory from a local `127.0.0.1` CDP browser port (zero tabs opened, values never printed)
+    #[arg(long)]
+    cdp_cookies: Option<u16>,
+    /// Multi-principal AuthZ matrix reusing live local CDP browser sessions (`--principal-cdp owner=9451 --principal-cdp other=9470`)
+    #[arg(long = "principal-cdp")]
+    principal_cdps: Vec<String>,
+    /// Send a cross-origin `Origin: <url>` header and audit Access-Control-Allow-Origin / Allow-Credentials / Vary reflection
+    #[arg(long)]
+    cors_origin: Option<String>,
+    /// Extract a dot-separated JSON path (supports `[*]` array projection) from JSON responses
+    #[arg(long)]
+    select: Option<String>,
+    /// Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps
+    #[arg(long)]
+    audit_headers: bool,
+    /// Synchronized Barrier concurrency/TOCTOU race burst count (2..=32 parallel threads firing simultaneously)
+    #[arg(long, default_value_t = 0)]
+    race: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ListenArgs {
+    /// Port to bind on 127.0.0.1 (0 = ephemeral free port)
+    #[arg(short = 'p', long, default_value_t = 0)]
+    port: u16,
+    /// Max wait window in ms before clean exit (default: 5000, max: 30000)
+    #[arg(long, default_value_t = 5000)]
+    wait_ms: u64,
+    /// Stop cleanly after capturing N HTTP requests (default: 1)
+    #[arg(long, default_value_t = 1)]
+    max_reqs: usize,
+    #[arg(long, default_value_t = 200)]
+    reply_status: u16,
+    #[arg(long, default_value = "application/json")]
+    reply_type: String,
+    #[arg(long, default_value = "{\"ok\":true}")]
+    reply_body: String,
+    /// Optional command to trigger while listening (replaces `{{PORT}}` with the bound port)
+    #[arg(long)]
+    run: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum SubCmd {
     /// Static Tree-sitter/import reachability slice (Python, TS/JS, Go, Rust, C) & active bundle
@@ -49,30 +214,7 @@ enum SubCmd {
         json: bool,
     },
     /// Trace execution & auto-detect heap aliasing, in-place mutation, and state no-ops
-    Run {
-        #[arg(long, default_value = ".")]
-        cwd: PathBuf,
-        #[arg(long, default_value = "auto")]
-        lang: String,
-        #[arg(long, default_value = "")]
-        focus: String,
-        #[arg(long)]
-        code: Option<String>,
-        #[arg(long)]
-        b64: Option<String>,
-        #[arg(long)]
-        stdin: bool,
-        #[arg(long)]
-        script: Option<String>,
-        #[arg(long)]
-        unittest: Option<String>,
-        #[arg(long, default_value_t = 30)]
-        max_calls: usize,
-        #[arg(long)]
-        include_tests: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Run(Box<RunArgs>),
     /// Differential & boundary-matrix oracle across Python, TS/JS, or Rust
     Diff {
         #[arg(long, default_value = ".")]
@@ -95,26 +237,7 @@ enum SubCmd {
     /// Interactive headless CDP browser (OPEN/FILL/SELECT/CLICK/EVAL) + HTTP E2E server runner.
     /// Stdin DSL steps: OPEN / | FILL #id val | SELECT #id val | CLICK #id or text=Btn | EVAL <js>
     /// | GET/POST/PUT/PATCH/DELETE /api/... | BODY {...} | EXPECT STATUS 200 | EXPECT CONTAINS txt | EXPECT JSON a.b == 1
-    Smoke {
-        #[arg(long, default_value = ".")]
-        cwd: PathBuf,
-        #[arg(long)]
-        start: Option<String>,
-        #[arg(long)]
-        url: Option<String>,
-        #[arg(long, default_value = "/")]
-        ready_path: String,
-        #[arg(long, default_value_t = 12000)]
-        timeout_ms: u64,
-        #[arg(long = "env")]
-        envs: Vec<String>,
-        #[arg(long)]
-        spec: Option<PathBuf>,
-        #[arg(long)]
-        stdin: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Smoke(Box<SmokeArgs>),
     /// Adversarial HTTP/API & CLI chaos fuzzer (malformed JSON, negative/zero/NaN, CJK/SQLi & Barrier concurrency burst)
     Fuzz {
         #[arg(long, default_value = ".")]
@@ -160,35 +283,7 @@ enum SubCmd {
         json: bool,
     },
     /// Attach to an ALREADY-RUNNING Chrome/Edge/Electron/WebView CDP debugging port (--list, --target, --eval, --audit, --screenshot, --watch-ms, --diff-ports, --stdin) without killing the host app
-    Cdp {
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(short = 'p', long, default_value_t = 9222)]
-        port: u16,
-        /// Optional pair of ports `portA,portB` to concurrently evaluate `--eval` and compute structured diff
-        #[arg(long)]
-        diff_ports: Option<String>,
-        /// Optional pair of target filters/IDs `targetA,targetB` paired with `--diff-ports`
-        #[arg(long)]
-        target_ids: Option<String>,
-        #[arg(long)]
-        list: bool,
-        #[arg(short = 't', long)]
-        target: Option<String>,
-        #[arg(short = 'e', long)]
-        eval: Option<String>,
-        #[arg(long)]
-        audit: bool,
-        #[arg(long)]
-        screenshot: Option<PathBuf>,
-        #[arg(long)]
-        stdin: bool,
-        /// Non-blocking bounded event watch window in ms (captures async console logs & network responses without hanging)
-        #[arg(long, default_value_t = 0)]
-        watch_ms: u64,
-        #[arg(long)]
-        json: bool,
-    },
+    Cdp(Box<CdpArgs>),
     /// Cross-platform listening TCP port, process PID & live CDP DevTools radar (replaces netstat/lsof/ss + port guessing)
     Ports {
         #[arg(short = 'p', long)]
@@ -200,66 +295,7 @@ enum SubCmd {
         json: bool,
     },
     /// Zero-dependency HTTP/API diagnostic probe (single URL, `--batch-stdin`, or single-field `--vary-field` outlier analyzer)
-    Http {
-        /// Optional single target URL (omit when using `--batch-stdin` or `--vary-request`)
-        url: Option<String>,
-        #[arg(short = 'X', long, default_value = "GET")]
-        method: String,
-        #[arg(short = 'H', long = "header")]
-        headers: Vec<String>,
-        #[arg(short = 'd', long)]
-        body: Option<String>,
-        #[arg(long, default_value_t = 15)]
-        timeout: u64,
-        #[arg(short = 'k', long)]
-        insecure: bool,
-        #[arg(short = 'L', long)]
-        follow: bool,
-        /// Read `METHOD URL [BODY]` lines from stdin to probe up to 25 endpoints in one call
-        #[arg(long)]
-        batch_stdin: bool,
-        /// Optional saved JSON or raw HTTP request file for `--vary-field` single-field testing
-        #[arg(long)]
-        vary_request: Option<PathBuf>,
-        /// Vary one single JSON/query/header field across boundary variants and cluster response outliers
-        #[arg(long)]
-        vary_field: Option<String>,
-        /// Optional alternate value used by `--vary-field`
-        #[arg(long)]
-        alt_value: Option<String>,
-        /// Delay in ms between serial `--vary-field` requests (default: 0, max: 5000)
-        #[arg(long, default_value_t = 0)]
-        rate_ms: u64,
-        /// Maximum number of `--vary-field` variants (default: 20, max: 100)
-        #[arg(long, default_value_t = 20)]
-        max_variants: usize,
-        /// Generate `--vary-field` variants without sending any network request
-        #[arg(long)]
-        dry_run: bool,
-        /// Multi-principal AuthZ/IDOR matrix (`--principal "owner=Authorization: Bearer A" --principal "anon="`)
-        #[arg(long = "principal")]
-        principals: Vec<String>,
-        /// Reuse live cookies in-memory from a local `127.0.0.1` CDP browser port (zero tabs opened, values never printed)
-        #[arg(long)]
-        cdp_cookies: Option<u16>,
-        /// Multi-principal AuthZ matrix reusing live local CDP browser sessions (`--principal-cdp owner=9451 --principal-cdp other=9470`)
-        #[arg(long = "principal-cdp")]
-        principal_cdps: Vec<String>,
-        /// Send a cross-origin `Origin: <url>` header and audit Access-Control-Allow-Origin / Allow-Credentials / Vary reflection
-        #[arg(long)]
-        cors_origin: Option<String>,
-        /// Extract a dot-separated JSON path (supports `[*]` array projection) from JSON responses
-        #[arg(long)]
-        select: Option<String>,
-        /// Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps
-        #[arg(long)]
-        audit_headers: bool,
-        /// Synchronized Barrier concurrency/TOCTOU race burst count (2..=32 parallel threads firing simultaneously)
-        #[arg(long, default_value_t = 0)]
-        race: usize,
-        #[arg(long)]
-        json: bool,
-    },
+    Http(Box<HttpArgs>),
     /// Cross-platform running process tree, full command-line & listening TCP port inspector (replaces wmic/tasklist/ps)
     Ps {
         #[arg(short = 'f', long)]
@@ -315,28 +351,7 @@ enum SubCmd {
         json: bool,
     },
     /// Bounded ephemeral HTTP webhook/callback capture server (auto-exits after `--max-reqs` or `--wait-ms`, zero orphan server leaks)
-    Listen {
-        /// Port to bind on 127.0.0.1 (0 = ephemeral free port)
-        #[arg(short = 'p', long, default_value_t = 0)]
-        port: u16,
-        /// Max wait window in ms before clean exit (default: 5000, max: 30000)
-        #[arg(long, default_value_t = 5000)]
-        wait_ms: u64,
-        /// Stop cleanly after capturing N HTTP requests (default: 1)
-        #[arg(long, default_value_t = 1)]
-        max_reqs: usize,
-        #[arg(long, default_value_t = 200)]
-        reply_status: u16,
-        #[arg(long, default_value = "application/json")]
-        reply_type: String,
-        #[arg(long, default_value = "{\"ok\":true}")]
-        reply_body: String,
-        /// Optional command to trigger while listening (replaces `{{PORT}}` with the bound port)
-        #[arg(long)]
-        run: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Listen(Box<ListenArgs>),
     /// Deadline-bounded RFC 6455 generic WebSocket (`ws://`) send/recv & CSWSH cross-origin handshake auditor (zero hangs)
     Ws {
         url: String,
@@ -384,19 +399,20 @@ pub fn run_cli(args: &[String]) -> i32 {
             max_bundle_kb,
             json,
         } => run_slice(&root, &entries, json, bundle, max_bundle_kb).1,
-        SubCmd::Run {
-            cwd,
-            lang,
-            focus,
-            code,
-            b64,
-            stdin,
-            script,
-            unittest,
-            max_calls,
-            include_tests,
-            json,
-        } => {
+        SubCmd::Run(boxed) => {
+            let RunArgs {
+                cwd,
+                lang,
+                focus,
+                code,
+                b64,
+                stdin,
+                script,
+                unittest,
+                max_calls,
+                include_tests,
+                json,
+            } = *boxed;
             let snippet = if stdin {
                 let mut s = String::new();
                 let _ = std::io::stdin().read_to_string(&mut s);
@@ -445,17 +461,18 @@ pub fn run_cli(args: &[String]) -> i32 {
             let plang = detect_lang(&cwd, &lang, "", Some(&combined), None);
             run_diff_dispatch(&cwd, plang, &setup, &fn_a, &fn_b, &vars, &inputs, json)
         }
-        SubCmd::Smoke {
-            cwd,
-            start,
-            url,
-            ready_path,
-            timeout_ms,
-            envs,
-            spec,
-            stdin,
-            json,
-        } => {
+        SubCmd::Smoke(boxed) => {
+            let SmokeArgs {
+                cwd,
+                start,
+                url,
+                ready_path,
+                timeout_ms,
+                envs,
+                spec,
+                stdin,
+                json,
+            } = *boxed;
             let spec_text = if stdin {
                 let mut s = String::new();
                 let _ = std::io::stdin().read_to_string(&mut s);
@@ -533,20 +550,21 @@ pub fn run_cli(args: &[String]) -> i32 {
             screenshot.as_deref(),
             json,
         ),
-        SubCmd::Cdp {
-            host,
-            port,
-            diff_ports,
-            target_ids,
-            list,
-            target,
-            eval,
-            audit,
-            screenshot,
-            stdin,
-            watch_ms,
-            json,
-        } => {
+        SubCmd::Cdp(boxed) => {
+            let CdpArgs {
+                host,
+                port,
+                diff_ports,
+                target_ids,
+                list,
+                target,
+                eval,
+                audit,
+                screenshot,
+                stdin,
+                watch_ms,
+                json,
+            } = *boxed;
             if let Some(dp) = diff_ports.as_deref().filter(|s| !s.trim().is_empty()) {
                 let parts: Vec<u16> = dp
                     .split(',')
@@ -592,30 +610,31 @@ pub fn run_cli(args: &[String]) -> i32 {
             probe_cdp,
             json,
         } => ports::run_ports_radar(port, probe_cdp, json),
-        SubCmd::Http {
-            url,
-            method,
-            headers,
-            body,
-            timeout,
-            insecure,
-            follow,
-            batch_stdin,
-            vary_request,
-            vary_field,
-            alt_value,
-            rate_ms,
-            max_variants,
-            dry_run,
-            principals,
-            cdp_cookies,
-            principal_cdps,
-            cors_origin,
-            select,
-            audit_headers,
-            race,
-            json,
-        } => {
+        SubCmd::Http(boxed) => {
+            let HttpArgs {
+                url,
+                method,
+                headers,
+                body,
+                timeout,
+                insecure,
+                follow,
+                batch_stdin,
+                vary_request,
+                vary_field,
+                alt_value,
+                rate_ms,
+                max_variants,
+                dry_run,
+                principals,
+                cdp_cookies,
+                principal_cdps,
+                cors_origin,
+                select,
+                audit_headers,
+                race,
+                json,
+            } = *boxed;
             if race >= 2 {
                 return http_probe::run_http_race(
                     vary_request.as_deref(),
@@ -723,25 +742,28 @@ pub fn run_cli(args: &[String]) -> i32 {
             timeout_ms,
             json,
         ),
-        SubCmd::Listen {
-            port,
-            wait_ms,
-            max_reqs,
-            reply_status,
-            reply_type,
-            reply_body,
-            run,
-            json,
-        } => net_probe::run_listen_cli(
-            port,
-            wait_ms,
-            max_reqs,
-            reply_status,
-            &reply_type,
-            &reply_body,
-            run.as_deref(),
-            json,
-        ),
+        SubCmd::Listen(boxed) => {
+            let ListenArgs {
+                port,
+                wait_ms,
+                max_reqs,
+                reply_status,
+                reply_type,
+                reply_body,
+                run,
+                json,
+            } = *boxed;
+            net_probe::run_listen_cli(
+                port,
+                wait_ms,
+                max_reqs,
+                reply_status,
+                &reply_type,
+                &reply_body,
+                run.as_deref(),
+                json,
+            )
+        }
         SubCmd::Ws {
             url,
             send,

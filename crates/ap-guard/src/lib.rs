@@ -456,13 +456,41 @@ fn spawn_command_list(cmd: &[String], cwd: &Path) -> Result<std::process::Output
     }
 }
 
+#[cfg(windows)]
+fn compact_windows_path_if_long() -> Option<String> {
+    let raw = std::env::var("PATH").ok()?;
+    if raw.len() < 3072 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut kept = Vec::new();
+    for seg in raw.split(';') {
+        let s = seg.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let key = s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        if seen.insert(key) && Path::new(s).is_dir() {
+            kept.push(s);
+        }
+    }
+    let compacted = kept.join(";");
+    if !compacted.is_empty() && compacted.len() < raw.len() {
+        Some(compacted)
+    } else {
+        None
+    }
+}
+
 fn spawn_shell_string(shell_cmd: &str, cwd: &Path) -> Result<std::process::Output, std::io::Error> {
     #[cfg(windows)]
     {
-        Command::new("cmd")
-            .args(["/C", shell_cmd])
-            .current_dir(cwd)
-            .output()
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", shell_cmd]).current_dir(cwd);
+        if let Some(compacted) = compact_windows_path_if_long() {
+            cmd.env("PATH", compacted);
+        }
+        cmd.output()
     }
     #[cfg(not(windows))]
     {

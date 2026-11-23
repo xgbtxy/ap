@@ -12,7 +12,7 @@ use std::time::{Instant, UNIX_EPOCH};
 #[derive(Parser, Debug)]
 #[command(
     name = "audit",
-    about = "Local zero-cloud telemetry auditor across Codex, Pi, Antigravity, Claude & Grok"
+    about = "Local zero-cloud telemetry auditor across Codex, Pi, Antigravity, Claude, Grok & Gemini CLI (strictly anonymized process friction only)"
 )]
 struct AuditCli {
     #[arg(long, default_value = "")]
@@ -21,6 +21,9 @@ struct AuditCli {
     max_sessions: usize,
     #[arg(long)]
     compare: bool,
+    /// Emit a strictly anonymized, zero-PII Maintainer Brief mapping top observed process bottlenecks directly to `ap` source modules
+    #[arg(long)]
+    maintainer: bool,
     #[arg(long)]
     json: bool,
 }
@@ -626,6 +629,137 @@ pub fn default_home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn scan_gemini(f: &Path) -> Counters {
+    let mut st = Counters::default();
+    let Ok(raw) = fs::read_to_string(f) else {
+        return st;
+    };
+    if raw.len() > 25_000_000 {
+        return st;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return st;
+    };
+    let Some(msgs) = v.get("messages").and_then(Value::as_array) else {
+        return st;
+    };
+    let mut seen_reads: HashMap<String, usize> = HashMap::new();
+    for m in msgs {
+        if let Some(tcs) = m.get("toolCalls").and_then(Value::as_array) {
+            for tc in tcs {
+                st.tool_calls += 1;
+                let nm = tc.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = &tc["args"];
+                if nm == "read_file" || nm == "read_many_files" {
+                    st.file_reads += 1;
+                    if let Some(fp) = args["absolute_path"]
+                        .as_str()
+                        .or_else(|| args["path"].as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        let cnt = seen_reads.entry(fp.to_string()).or_insert(0);
+                        *cnt += 1;
+                        if *cnt >= 2 {
+                            st.redundant_same_file_rereads += 1;
+                        }
+                    }
+                } else if nm == "run_shell_command" {
+                    if let Some(c) = args["command"].as_str() {
+                        classify_cmd(c, &mut st);
+                    }
+                }
+                if let Some(res) = tc.get("result") {
+                    let rs = serde_json::to_string(res).unwrap_or_default();
+                    if rs.len() >= 8192 {
+                        st.outputs_over_8kb += 1;
+                    }
+                    classify_err(&rs, &mut st);
+                }
+            }
+        }
+    }
+    st
+}
+
+pub fn build_maintainer_targets(totals: &Counters) -> Vec<Value> {
+    let mut items: Vec<(usize, Value)> = Vec::new();
+    let mut push_if = |count: usize, id: &str, summary: &str, files: &[&str], focus: &str| {
+        if count > 0 {
+            items.push((
+                count,
+                json!({
+                    "bottleneck_id": id,
+                    "count": count,
+                    "summary": summary,
+                    "target_files": files,
+                    "optimization_focus": focus,
+                }),
+            ));
+        }
+    };
+    push_if(
+        totals.shell_quoting_collision + totals.encoding_utf8_crash + totals.path_translation_errors,
+        "shell_os_friction",
+        "Shell quoting collisions, UTF-8/GBK crashes, or cross-OS path translation failures",
+        &["src/exec.rs", "src/install.rs"],
+        "Expand pre-execution command auto-healing, quote/backslash normalization, and UTF-8 locking without breaking destructive-command boundaries",
+    );
+    push_if(
+        totals.adhoc_inline_python + totals.import_syspath_error,
+        "adhoc_inline_scripts",
+        "Ad-hoc inline python -c / node -e scripts or missing-package ImportErrors",
+        &["src/read.rs", "src/query.rs", "crates/ap-probe/src/"],
+        "Identify recurring one-off script patterns (file formats, HTTP/JSON/binary/log parsing) and promote them into zero-dependency native Rust subcommands",
+    );
+    push_if(
+        totals.redundant_same_file_rereads + totals.shell_line_slice_read,
+        "blind_reading_and_rereads",
+        "Redundant same-file re-reads or manual head/tail/sed line-slice paging",
+        &["src/read.rs", "crates/ap-atlas/src/lib.rs", "crates/ap-splice/src/lib.rs"],
+        "Improve AST symbol outlines, batch read ergonomics, and truncated-file structural TOC hints",
+    );
+    push_if(
+        totals.patch_target_mismatch,
+        "edit_patch_mismatch",
+        "Edit/patch target mismatches causing retry round-trips",
+        &["crates/ap-splice/src/lib.rs", "src/install.rs"],
+        "Tighten fuzzy anchor recovery (indentation/blank-line/hashline tolerance) and closest-window diagnostics",
+    );
+    push_if(
+        totals.outputs_over_8kb + totals.output_truncation_spill,
+        "context_log_bloat",
+        "Oversized (>8 KB) tool outputs or truncation spills flooding working memory",
+        &["crates/ap-sieve/src/lib.rs", "src/exec.rs"],
+        "Improve deterministic semantic digesting for noisy CLI/compiler/test/JSON logs while preserving lossless FTS5 peek",
+    );
+    push_if(
+        totals.shell_broad_search + totals.shell_timeouts,
+        "slow_search_and_timeouts",
+        "Broad shell searches or command timeouts stalling agent loops",
+        &["src/search.rs", "src/exec.rs", "crates/ap-atlas/src/lib.rs"],
+        "Accelerate multi-pattern/archive search, prune noisy vendor/cache dirs, and cap unbounded read-only probes",
+    );
+    push_if(
+        totals.identical_retry_loops,
+        "retry_doom_loops",
+        "Identical failing command retry loops without strategy change",
+        &["crates/ap-guard/src/lib.rs", "crates/ap-baton/src/lib.rs"],
+        "Strengthen deterministic loop-breakers and cross-turn dead-end recording",
+    );
+    push_if(
+        totals.heavy_thinking_turns
+            + totals.dsml_tool_leaks
+            + totals.serial_single_tool_turns
+            + totals.kv_cache_cold_drops,
+        "reasoning_and_cache_friction",
+        "Heavy-thinking churn, DSML tool leaks, serial 1-tool loops, or KV-cache cold drops",
+        &["src/pi_patch.rs", "src/install.rs"],
+        "Refine Pi runtime patches, KV-cache prefix stability, parallel tool batching hints, and tool-name self-healing",
+    );
+    items.sort_by_key(|a| std::cmp::Reverse(a.0));
+    items.into_iter().map(|(_, v)| v).collect()
+}
+
 pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
     let t0 = Instant::now();
     type AuditSpec<'a> = (
@@ -635,7 +769,7 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
         Option<&'a str>,
         fn(&Path) -> Counters,
     );
-    let specs: [AuditSpec; 5] = [
+    let specs: [AuditSpec; 6] = [
         (
             "codex_cli",
             home.join(".codex").join("sessions"),
@@ -670,6 +804,13 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
             "updates.jsonl",
             None,
             scan_grok,
+        ),
+        (
+            "gemini_cli",
+            home.join(".gemini").join("tmp"),
+            ".json",
+            Some("session-"),
+            scan_gemini,
         ),
     ];
 
@@ -756,11 +897,14 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
     }
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+    let maintainer_targets = build_maintainer_targets(&totals);
     let mut out = json!({
+        "privacy_guarantee": "100% local & strictly anonymized: zero prompts, zero code snippets, zero file paths, and zero credentials emitted.",
         "elapsed_ms": elapsed_ms,
         "harnesses_detected": harnesses,
         "aggregate_friction_counts": totals,
         "recommended_primitives": recs,
+        "maintainer_targets": maintainer_targets,
     });
     if compare {
         out["period_comparison"] = Value::Object(comparisons);
@@ -788,6 +932,58 @@ pub fn run_cli(args: &[String]) -> i32 {
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_default()
         );
+        return 0;
+    }
+
+    if cli.maintainer {
+        println!(
+            "# ap Maintainer Friction-to-Source Brief (scanned in {} ms — 100% local, zero-PII)",
+            report["elapsed_ms"]
+        );
+        println!("> Privacy Guarantee: numeric process-friction counters ONLY — zero prompts, zero user paths, zero code, zero secrets.\n");
+        let Some(hmap) = report["harnesses_detected"].as_object() else {
+            return 0;
+        };
+        if hmap.is_empty() {
+            println!("No local session logs found under ~/.codex, ~/.pi, ~/.claude, ~/.grok, ~/.gemini/tmp, or ~/.gemini/antigravity-cli.");
+            return 0;
+        }
+        println!("## Harnesses Sampled");
+        for (h, st) in hmap {
+            println!(
+                "- **{h}**: {} sessions, {} tool calls",
+                st["sessions"], st["tool_calls"]
+            );
+        }
+        println!("\n## Ranked Optimization Targets Mapped to `ap` Source Modules");
+        if let Some(targets) = report["maintainer_targets"].as_array() {
+            if targets.is_empty() {
+                println!("- No significant process friction detected in sampled sessions.");
+            } else {
+                for (idx, t) in targets.iter().enumerate() {
+                    let files = t["target_files"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "{}. **[{}] count={}** — {}\n   - `ap` source: `{}`\n   - Focus: {}",
+                        idx + 1,
+                        t["bottleneck_id"].as_str().unwrap_or(""),
+                        t["count"],
+                        t["summary"].as_str().unwrap_or(""),
+                        files,
+                        t["optimization_focus"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+        }
+        println!("\n## Required Verification Before Opening a PR");
+        println!("```bash\ncargo fmt --all -- --check\ncargo clippy --workspace --all-targets -- -D warnings\ncargo test --workspace\n```");
         return 0;
     }
 
@@ -883,4 +1079,62 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_home_emits_zero_private_paths_or_prompt_text() {
+        let tmp = std::env::temp_dir().join(format!("ap_audit_privacy_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let codex_dir = tmp.join(".codex").join("sessions");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let fake_log = codex_dir.join("rollout-sample.jsonl");
+        let lines = [
+            json!({
+                "payload": {
+                    "type": "function_call",
+                    "arguments": "python -c \"open('C:/PrivateCorp/payroll_2026.csv')\" # SECRET_TOKEN_XYZ_999"
+                }
+            })
+            .to_string(),
+            json!({
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "ParserError: Unexpected token && UnicodeDecodeError: 'gbk' codec in C:/PrivateCorp/payroll_2026.csv SECRET_TOKEN_XYZ_999"
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&fake_log, lines).unwrap();
+
+        let report = audit_home(&tmp, 10, false);
+        let _ = fs::remove_dir_all(&tmp);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(
+            report["aggregate_friction_counts"]["adhoc_inline_python"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(
+            report["aggregate_friction_counts"]["shell_quoting_collision"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(
+            report["aggregate_friction_counts"]["encoding_utf8_crash"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(!report["maintainer_targets"].as_array().unwrap().is_empty());
+        assert!(!serialized.contains("PrivateCorp"));
+        assert!(!serialized.contains("payroll_2026"));
+        assert!(!serialized.contains("SECRET_TOKEN_XYZ_999"));
+    }
 }

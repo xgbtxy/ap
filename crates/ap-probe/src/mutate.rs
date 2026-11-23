@@ -147,13 +147,45 @@ fn detect_mutate_test_cmd(cwd: &Path) -> Option<String> {
     None
 }
 
+#[cfg(windows)]
+fn compact_windows_path_if_long() -> Option<String> {
+    let raw = std::env::var("PATH").ok()?;
+    if raw.len() < 3072 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut kept = Vec::new();
+    for seg in raw.split(';') {
+        let s = seg.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let key = s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        if seen.insert(key) && Path::new(s).is_dir() {
+            kept.push(s);
+        }
+    }
+    let compacted = kept.join(";");
+    if !compacted.is_empty() && compacted.len() < raw.len() {
+        Some(compacted)
+    } else {
+        None
+    }
+}
+
 fn run_cmd_bounded(cwd: &Path, cmd_str: &str, timeout_ms: u64) -> (bool, u64) {
     let t0 = Instant::now();
-    let mut cmd = if cfg!(windows) {
+    #[cfg(windows)]
+    let mut cmd = {
         let mut c = Command::new("cmd");
         c.args(["/C", cmd_str]);
+        if let Some(compacted) = compact_windows_path_if_long() {
+            c.env("PATH", compacted);
+        }
         c
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
         let mut c = Command::new("sh");
         c.args(["-c", cmd_str]);
         c

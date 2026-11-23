@@ -1,6 +1,6 @@
-# `agent-primitives` Repository Operating Rules (`v1.2` Pure-Rust Edition)
+# `agent-primitives` Repository Operating Rules (`v2.38+` Pure-Rust Edition)
 
-Before proposing, adding, or modifying anything in this repository, read **[HANDBOOK.md](./HANDBOOK.md)** / **[HANDBOOK.zh-CN.md](./HANDBOOK.zh-CN.md)**.
+Before proposing, adding, or modifying anything in this repository, read **[docs/HANDBOOK.md](./docs/HANDBOOK.md)** / **[docs/HANDBOOK.zh-CN.md](./docs/HANDBOOK.zh-CN.md)** and **[CONTRIBUTING.md](./CONTRIBUTING.md)** / **[CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)**.
 
 ## Core Philosophy
 1. **Observe Real Coding-Agent Runs First**: Ground every upgrade in actual agent execution logs and `<thinking>` traces across free and commercial harnesses (`OpenCode`, `Codex`, `Pi`, `Claude Code`, `Antigravity`, `Qwen Code`, `Gemini CLI`, `Grok`).

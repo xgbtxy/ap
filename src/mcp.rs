@@ -1102,7 +1102,11 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("jwt").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--jwt".to_string());
             }
-            if args.get("secrets").and_then(Value::as_bool).unwrap_or(false) {
+            if args
+                .get("secrets")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 cli.push("--secrets".to_string());
             }
             if let Some(df) = args

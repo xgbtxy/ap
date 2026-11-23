@@ -409,7 +409,18 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         let is_bin_ext = matches!(
             ext.as_str(),
-            "exe" | "dll" | "sys" | "ocx" | "cpl" | "efi" | "so" | "ko" | "dylib" | "node" | "wasm" | "bin"
+            "exe"
+                | "dll"
+                | "sys"
+                | "ocx"
+                | "cpl"
+                | "efi"
+                | "so"
+                | "ko"
+                | "dylib"
+                | "node"
+                | "wasm"
+                | "bin"
         );
         if is_bin_ext && !explicit_file && ext_allow.is_empty() {
             return local_matches;

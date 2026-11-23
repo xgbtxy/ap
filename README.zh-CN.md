@@ -10,7 +10,7 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-64748b" alt="MIT License" /></a>
   </p>
   <p>
-    <a href="./README.md"><strong>English</strong></a> · <strong>简体中文</strong> · <a href="./docs/HANDBOOK.zh-CN.md">核心研发理念</a> · <a href="https://github.com/xgbtxy/ap/releases/latest">安装包下载</a>
+    <a href="./README.md"><strong>English</strong></a> · <strong>简体中文</strong> · <a href="./CONTRIBUTING.zh-CN.md"><strong>一起维护 / 贡献指南</strong></a> · <a href="./docs/HANDBOOK.zh-CN.md">核心研发理念</a> · <a href="https://github.com/xgbtxy/ap/releases/latest">安装包下载</a>
   </p>
   <img src="./assets/hero-comparison.zh-CN.svg" width="100%" alt="ap 如何顺着 AI 思考过程解决卡点并提效" />
 </div>
@@ -43,11 +43,11 @@ curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 
 | AI `<thinking>` 真实卡点 | 没装 `ap` 时为什么会越干越乱？ | `ap` 怎么在底层顺着思考链路提效？（用户零感知） |
 | :--- | :--- | :--- |
-| **1. AST 符号/批量直读、PE/ELF 导入导出与 Hex、多核并发搜索与 SQL**<br>*(通用办公、前端排障、原生二进制、桌面端审计与编程)* | 读 2000 行大代码文件只能盲猜行号或串行读 5 个文件，缺 `pefile`/`xxd` 解析不了 DLL/SO 导入导出表，或被 GNU `grep -rn` 卡死。 | **`ap read`** 原生支持 **Tree-sitter `--symbol` / `--outline`、大代码文件自动附带 AST 符号目录与单次批量读 12 个文件**，以及 PE32/PE32+/ELF64 导入导出/SHA-256/`--hex`、Office/SQLite/`.map` VLQ/`.asar`/`--json-path`/SPA；**`ap search --pat`** 多核单遍扫 20 条模式；**`ap query --json`** 直接返回按列名组织的 `records` 对象（免 Python）。 |
-| **2. 开局盲猜、守卫感知 9 轴表面图、变更爆炸半径与多跳调用链追踪**<br>*(全域 X 光、正交探索前沿、Git Diff 影响面与故障定位)* | 面对多文件客诉靠 `ls`/`rg` 盲搜，长会话漏探正交轴线误判覆盖度，或 PR 改动后漏看未触及的下游调用方与关联单测。 | **<15 ms 全域 X 光 (`atlas map`)** + **<60 ms 守卫感知 9 轴入口/汇聚面与 REST 路由扫描 (`atlas surface --include-binaries`，直扫 `.asar`/`.vsix`/`.zip`/`.jar`、压缩前端包与原生 PE/ELF/Mach-O 字符串并标出 `none_nearby`/`guard_after`)** 与 **跨会话正交探索前沿 (`baton frontier`)** + **<25 ms 症状直达 (`atlas locate`)** + **<30 ms Git 变更影响简报 (`atlas changes`)** 与多跳调用链 (`atlas trace`) + **多核并行 `ap search -l/-c/-C`**。 |
+| **1. AST 符号/批量直读、二进制/归档/前端审计、多核搜索与 SQL**<br>*(通用办公、前端排障、原生二进制、桌面端与编程)* | 读 2000 行大代码文件盲猜行号，缺 `pefile`/`javap`/`protoc`/`xxd` 解析不了 DLL/SO/JAR/Protobuf，或被 GNU `grep -rn` 卡死。 | **`ap read`** 原生支持 **Tree-sitter `--symbol` / `--outline` 与单次批量读 12 文件**、**PE32+/ELF64 (`x64` &amp; `AArch64`) `--xref`/缓解审计/MS-RPC UUID + Go `.gopclntab` + Java `.class`/`.jar` &amp; `.NET CLR` + `--proto` 原始 Protobuf + `--diff` 补丁差量 + `--hex`**、**JS/HTML `--routes`（路由、懒加载 chunk、本地 HTTP/IPC 服务校验与自定义头）、`--jwt` 姿势、脱敏 `--secrets`**、Office/SQLite/`.map` VLQ/`.asar`（最高 `256 MB`）/`--json-path`/SPA；**`ap search --pat`** 多核单遍扫 20 模式；**`ap query --json`** 直接输出按列名组织的 `records`（免 Python）。 |
+| **2. 开局盲猜、守卫感知 9 轴表面图、HTTP/WS 质检与多跳调用链**<br>*(全域 X 光、正交探索前沿、Git Diff 影响面与故障定位)* | 面对多文件客诉靠 `ls`/`rg` 盲搜，手写脆弱 `curl`/Python 鉴权/CORS/并发脚本，长会话漏探正交轴线，或重构漏改下游调用方。 | **<15 ms 全域 X 光 (`atlas map`)** + **<60 ms 守卫感知 9 轴表面图 (`atlas surface --include-binaries`)** 与 **跨会话正交探索前沿 (`baton frontier`)** + **`ap probe http`**（**`--principal`/`--principal-cdp` 0 标签复用本地回环会话、`--cors-origin` 跨源反射审计、`--select` JSON 路径、`--audit-headers`、`--vary-field`、`--race`**）与 **`ap probe ws --origin-matrix`** + **<25 ms 症状直达 (`atlas locate`)** + **<30 ms Git 变更影响简报 (`atlas changes`)** 与多跳调用链 (`atlas trace`)。 |
 | **3. 跨文件创造断链、AST 全局重命名与自愈补丁**<br>*(跨模块契约、JSONC/TOML 与安全重构)* | 跨文件重构靠全局替换误伤注释/字符串/子串，改错 1 个字符导致补丁失配被迫重读整文件，或写坏 `Cargo.toml`/`tsconfig.json`。 | **Tree-sitter 语法树 `ap splice rename`**（严格避开注释/字符串/子串，支持 `--dry-run` 与失败回滚）+ **失配补丁滑窗相似度直出真行** + **JSON/JSONC/TOML + 6 语言语法门禁** + **<5 ms 跨文件静态链接** + **`ap undo`**。 |
 | **4. 终端水土不服、慢 `grep`、编译/测试洪流与死循环**<br>*(Windows/Mac Shell 与语义压缩)* | 撞上 **528+ 次 OS/Shell 崩溃**、60s+ GNU `grep -rn` 假死、40KB 带 ANSI 色的编译/测试噪音日志，以及连续重复重试命令的“死循环空转”。 | **Base64 Hook + `ap exec`** 自动加速 `grep -rn` → `<50ms` 多核并行 `ap search`，安全修复非 raw 字符串 `python -c` 路径，锁死 UTF-8 + **Win32 Job Object**，自动剥离 ANSI 语义提纯 **`compiler`/`test`/`diff`** 日志 95%+，并内置 **3 次重复死循环熔断提示**。 |
-| **5. 全栈 MCP 2025-06-18 与 Pi v1.5+ / DeepSeek 深度思考加速器**<br>*(36 强类型 `outputSchema` MCP 工具 + `ap pi` 10 项运行时补丁器 + Hashline/多 hunk `edit` + 50:1 缓存经济学 + 清脑 `/ap fresh`)* | 重复行/全半角标点漂移致 `edit` 失配、`bash` 与 `read` 并行竞态报 `ENOENT`、CJK 压缩按 `chars/4` 过留 2–3 倍、中段 `context_edit` / 切思考档 / MCP 重连击穿 50:1 前缀缓存，或 QuickJS 遮蔽全局 `tools` 与 TLS 断流中断。 | **全栈 MCP 2025-06-18**（**36** 个强类型 **`outputSchema`** 工具，含 **`ap_surface`** 与 **`ap_frontier`** + Resources + `5` 套 Prompts），**`ap pi status\|patch\|restore`**（纯 Rust 幂等 **10 项** Pi v1.5+ 运行时补丁器：`before_agent_start` 清脑 `entries`、Windows UTF-8 注入、`codemode` `sleep(ms)` + 4 workers + Web/JS 内建与非遮蔽包装、抗 TLS/Socket/网关瞬断重试、虚拟模型 `CacheWarmer`、`bash`/`powershell` 串行屏障与只读并发、边界压缩派发 `session_compact`、CJK+真实用量校准压缩预算与工具字典序锁缓存），**`ap guard verify --deep`** + **`ap guard diff`**，**`ap doctor`** 与 **`ap audit`**，及 **Pi `codemode` + `zz-ap-accelerator.ts`**（**Hashline `L:HH\|` 与顺序/重叠多 hunk `edit` 自愈**、**50:1 深度缓存折扣防抖与热前缀锁思考档**、**幻觉工具名纠偏**、**Bash 内 PowerShell UTF-8 + `type`→`cat` + `cd &&` 90s 探针封顶**、**全类型截断自动目录**、**DeepSeek 49× ROI `CacheWarmer`**、**多 `--include`/压缩 JS `--around` 加速**、**`codemode` 多块自筛**、**`<12ms` 即时语法告警**、**`reasoning: "low"` 极速压缩**、**`agent_before_settle`**、**`deepseek/flash-auto`** 与 **`/ap fresh\|handoff\|review`**）。 |
+| **5. 全栈 MCP 2025-06-18、`ap audit --maintainer` 与 Pi v1.5+ 加速器**<br>*(36 强类型 `outputSchema` MCP 工具 + `ap pi` 11 项运行时补丁器 + 零隐私泄露自演进 + 50:1 缓存经济学)* | 重复行/标点漂移致 `edit` 失配、`bash` 与 `read` 竞态报 `ENOENT`、CJK 压缩过留 2–3 倍、中段缓存击穿，或 `codemode` `text(x).slice()` 报 `TypeError`。 | **全栈 MCP 2025-06-18**（**36** 个强类型 **`outputSchema`** 工具 + Resources + `5` 套 Prompts），**`ap pi status\|patch\|restore`**（纯 Rust 幂等 **11 项** Pi v1.5+ 运行时补丁器：含 `codemode` `text()` 返回值、15s/28s Keep-Alive + 250ms Happy-Eyeballs、`before_agent_start` 清脑 `entries`、Windows UTF-8、`sleep(ms)` + Web 内建、Shell 串行屏障、CJK 校准压缩与工具字典序锁缓存），**`ap guard verify --deep`** + **`ap guard sec`**（覆盖 C/C++/Java/TS/Py/Go/Rust）+ **`ap guard diff`**，**`ap doctor`**，**`ap audit --maintainer`**（100% 本地零隐私脱敏的“卡点→源码”维护简报，覆盖 6 款智能体），及 **Pi `zz-ap-accelerator.ts`**。 |
 
 ---
 
@@ -101,12 +101,18 @@ $ ap stats
 - **纯 Rust 零耦合单文件架构**：1 个原生二进制内聚 7 个物理隔离 crate（`crates/ap-{atlas,splice,probe,sieve,guard,recall,baton}`），子 crate 之间 `0` 相互依赖，内置 SQLite FTS5 与 6 语言编译态 Tree-sitter C 语法树，常驻提示词仅 `390` Tokens。
 - **一键复现底层微基准**：运行 `ap bench`（详见 [`bench/results.json`](./bench/results.json)）。
 - **深度工程文档**：
+  - [基于本地摩擦日志共同维护指南 (`CONTRIBUTING.zh-CN.md`)](./CONTRIBUTING.zh-CN.md) | [Contributing (`CONTRIBUTING.md`)](./CONTRIBUTING.md)
   - [核心研发理念与演进手册 (`docs/HANDBOOK.zh-CN.md`)](./docs/HANDBOOK.zh-CN.md) | [R&D Philosophy (`docs/HANDBOOK.md`)](./docs/HANDBOOK.md)
   - [系统架构设计 (`docs/DESIGN.zh-CN.md`)](./docs/DESIGN.zh-CN.md) | [Architecture (`docs/DESIGN.md`)](./docs/DESIGN.md)
   - [高阶实战手册 (`docs/PLAYBOOK.zh-CN.md`)](./docs/PLAYBOOK.zh-CN.md) | [Playbook (`docs/PLAYBOOK.md`)](./docs/PLAYBOOK.md)
   - [Pi 运行时维护 (`docs/PI_RUNTIME.zh-CN.md`)](./docs/PI_RUNTIME.zh-CN.md) | [Pi Runtime Maintenance (`docs/PI_RUNTIME.md`)](./docs/PI_RUNTIME.md)
 
 </details>
+
+## 隐私边界与合法使用声明
+
+- **100% 本地离线、零云端上传**：`ap stats` 与 `ap audit --maintainer` 完全在本机离线运行；`ap audit --maintainer` 仅输出脱敏后的纯数字过程卡点统计，绝不输出或上传任何提示词、业务源码、本机路径或凭据。
+- **合理使用边界（严禁误用）**：`ap` 仅用于通用软件工程、排障调试、QA 自动化测试以及对自有或已获明确授权系统的防御性安全配置核查，严禁用于未授权访问或恶意用途。如果你也想让自己的 AI 一起参与维护，请查看 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（内含一键可用的维护者提示词，介意扫描本地历史记录也可直接跳过）。
 
 ## 开源协议
 

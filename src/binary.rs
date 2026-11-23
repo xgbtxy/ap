@@ -262,7 +262,10 @@ pub fn read_asar_member(bytes: &[u8], entry_path: &str) -> Result<Vec<u8>, Strin
                 .map(|e| e.path.as_str())
                 .collect();
             if hints.is_empty() {
-                format!("entry `{entry_path}` not found in .asar ({} total entries)", entries.len())
+                format!(
+                    "entry `{entry_path}` not found in .asar ({} total entries)",
+                    entries.len()
+                )
             } else {
                 format!(
                     "entry `{entry_path}` not found in .asar; closest matches: {}",
@@ -377,7 +380,7 @@ pub fn is_java_class_magic(bytes: &[u8]) -> bool {
     }
     // Distinguish Java .class (major >= 45) from macOS Mach-O universal fat binary (nfat_arch is small, typically 1..16)
     let major = read_u16_be(bytes, 6).unwrap_or(0);
-    major >= 45 && major <= 100
+    (45..=100).contains(&major)
 }
 
 /// Pure-Rust JVM `.class` Constant Pool, Methods & Dangerous Sink Analyzer (zero `javap`/JDK required).
@@ -430,23 +433,26 @@ pub fn parse_java_class_md(bytes: &[u8], query: Option<&str>) -> String {
                 }
                 pos += 2;
             }
-            9 | 10 | 11 => {
+            9..=11 => {
                 // Fieldref / Methodref / InterfaceMethodref
-                if let (Some(ci), Some(nti)) = (read_u16_be(bytes, pos), read_u16_be(bytes, pos + 2)) {
+                if let (Some(ci), Some(nti)) =
+                    (read_u16_be(bytes, pos), read_u16_be(bytes, pos + 2))
+                {
                     member_refs.push((ci, nti));
                 }
                 pos += 4;
             }
             12 => {
                 // NameAndType
-                if let (Some(ni), Some(di)) = (read_u16_be(bytes, pos), read_u16_be(bytes, pos + 2)) {
+                if let (Some(ni), Some(di)) = (read_u16_be(bytes, pos), read_u16_be(bytes, pos + 2))
+                {
                     name_and_types[idx] = Some((ni, di));
                 }
                 pos += 4;
             }
-            15 => pos += 3, // MethodHandle
+            15 => pos += 3,           // MethodHandle
             16 | 19 | 20 => pos += 2, // MethodType / Module / Package
-            17 | 18 => pos += 4, // Dynamic / InvokeDynamic
+            17 | 18 => pos += 4,      // Dynamic / InvokeDynamic
             _ => break,
         }
         idx += 1;
@@ -467,8 +473,12 @@ pub fn parse_java_class_md(bytes: &[u8], query: Option<&str>) -> String {
             .unwrap_or_default()
     };
 
-    let this_cls = read_u16_be(bytes, pos + 2).map(resolve_class).unwrap_or_default();
-    let super_cls = read_u16_be(bytes, pos + 4).map(resolve_class).unwrap_or_default();
+    let this_cls = read_u16_be(bytes, pos + 2)
+        .map(resolve_class)
+        .unwrap_or_default();
+    let super_cls = read_u16_be(bytes, pos + 4)
+        .map(resolve_class)
+        .unwrap_or_default();
 
     let mut calls = Vec::new();
     let mut notable = Vec::new();
@@ -501,7 +511,10 @@ pub fn parse_java_class_md(bytes: &[u8], query: Option<&str>) -> String {
             .unwrap_or_default();
         if !cname.is_empty() && !mname.is_empty() {
             let full = format!("{cname}.{mname}");
-            if DANGER_JVM.iter().any(|k| full.contains(k)) && !notable.contains(&full) && notable.len() < 24 {
+            if DANGER_JVM.iter().any(|k| full.contains(k))
+                && !notable.contains(&full)
+                && notable.len() < 24
+            {
                 notable.push(full.clone());
             }
             if calls.len() < 50 && !calls.contains(&full) {
@@ -518,7 +531,10 @@ pub fn parse_java_class_md(bytes: &[u8], query: Option<&str>) -> String {
     let mut str_hits = Vec::new();
     for si in strings {
         let s = resolve_utf8(si);
-        if s.len() >= 3 && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) && !str_hits.contains(&s) {
+        if s.len() >= 3
+            && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true)
+            && !str_hits.contains(&s)
+        {
             str_hits.push(s);
             if str_hits.len() >= 60 {
                 break;
@@ -534,16 +550,25 @@ pub fn parse_java_class_md(bytes: &[u8], query: Option<&str>) -> String {
         format!("- SHA-256: `{}` | Constant Pool entries: {}", sha256_hex(bytes), cp_count),
     ];
     if !notable.is_empty() {
-        out.push(format!("- **Notable JVM Sinks**: `{}`", notable.join("`, `")));
+        out.push(format!(
+            "- **Notable JVM Sinks**: `{}`",
+            notable.join("`, `")
+        ));
     }
     if !calls.is_empty() {
-        out.push(format!("### JVM Referenced Methods/Fields ({} shown)", calls.len()));
+        out.push(format!(
+            "### JVM Referenced Methods/Fields ({} shown)",
+            calls.len()
+        ));
         for c in calls.iter().take(35) {
             out.push(format!("- `{c}`"));
         }
     }
     if !str_hits.is_empty() {
-        out.push(format!("### JVM String Constants ({} shown)", str_hits.len()));
+        out.push(format!(
+            "### JVM String Constants ({} shown)",
+            str_hits.len()
+        ));
         for s in str_hits {
             out.push(format!("- {s}"));
         }
@@ -666,7 +691,8 @@ fn scan_dotnet_clr_meta(bytes: &[u8]) -> Option<(String, Vec<String>)> {
                     continue;
                 }
                 if let Ok(s) = std::str::from_utf8(part) {
-                    if CLR_SINKS.iter().any(|k| s.contains(k)) && !notable.contains(&s.to_string()) {
+                    if CLR_SINKS.iter().any(|k| s.contains(k)) && !notable.contains(&s.to_string())
+                    {
                         notable.push(s.to_string());
                         if notable.len() >= 24 {
                             break;
@@ -704,44 +730,115 @@ pub fn diff_binaries_or_archives_md(
 
     // 1. Archive diff (.asar / .zip / .jar / .vsix / .war)
     if ext == "asar" {
-        if let (Ok((_, en_new)), Ok((_, en_old))) = (parse_asar_index(new_bytes), parse_asar_index(old_bytes)) {
-            let m_new: std::collections::HashMap<String, usize> = en_new.into_iter().map(|e| (e.path, e.size)).collect();
-            let m_old: std::collections::HashMap<String, usize> = en_old.into_iter().map(|e| (e.path, e.size)).collect();
-            let mut added: Vec<(String, usize)> = m_new.iter().filter(|(k, _)| !m_old.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
-            let mut removed: Vec<(String, usize)> = m_old.iter().filter(|(k, _)| !m_new.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
-            let mut changed: Vec<(String, i64, usize)> = m_new.iter().filter_map(|(k, &v)| {
-                let ov = *m_old.get(k)?;
-                if ov != v { Some((k.clone(), (v as i64) - (ov as i64), v)) } else { None }
-            }).collect();
-            added.sort_by(|a, b| b.1.cmp(&a.1));
-            removed.sort_by(|a, b| b.1.cmp(&a.1));
-            changed.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
-            out.push(format!("### ASAR Member Diff: +{} added, -{} removed, ~{} size-changed", added.len(), removed.len(), changed.len()));
-            for (p, sz) in added.iter().take(20) { out.push(format!("- [ADDED] `{p}` ({sz} B)")); }
-            for (p, sz) in removed.iter().take(15) { out.push(format!("- [REMOVED] `{p}` ({sz} B)")); }
-            for (p, d, sz) in changed.iter().take(25) { out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)")); }
+        if let (Ok((_, en_new)), Ok((_, en_old))) =
+            (parse_asar_index(new_bytes), parse_asar_index(old_bytes))
+        {
+            let m_new: std::collections::HashMap<String, usize> =
+                en_new.into_iter().map(|e| (e.path, e.size)).collect();
+            let m_old: std::collections::HashMap<String, usize> =
+                en_old.into_iter().map(|e| (e.path, e.size)).collect();
+            let mut added: Vec<(String, usize)> = m_new
+                .iter()
+                .filter(|(k, _)| !m_old.contains_key(*k))
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+            let mut removed: Vec<(String, usize)> = m_old
+                .iter()
+                .filter(|(k, _)| !m_new.contains_key(*k))
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+            let mut changed: Vec<(String, i64, usize)> = m_new
+                .iter()
+                .filter_map(|(k, &v)| {
+                    let ov = *m_old.get(k)?;
+                    if ov != v {
+                        Some((k.clone(), (v as i64) - (ov as i64), v))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            added.sort_by_key(|a| std::cmp::Reverse(a.1));
+            removed.sort_by_key(|a| std::cmp::Reverse(a.1));
+            changed.sort_by_key(|a| std::cmp::Reverse(a.1.abs()));
+            out.push(format!(
+                "### ASAR Member Diff: +{} added, -{} removed, ~{} size-changed",
+                added.len(),
+                removed.len(),
+                changed.len()
+            ));
+            for (p, sz) in added.iter().take(20) {
+                out.push(format!("- [ADDED] `{p}` ({sz} B)"));
+            }
+            for (p, sz) in removed.iter().take(15) {
+                out.push(format!("- [REMOVED] `{p}` ({sz} B)"));
+            }
+            for (p, d, sz) in changed.iter().take(25) {
+                out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)"));
+            }
             return out.join("\n");
         }
     }
     if matches!(ext, "zip" | "jar" | "vsix" | "war" | "apk" | "whl") {
-        if let (Ok(mut zn), Ok(mut zo)) = (ZipArchive::new(Cursor::new(new_bytes)), ZipArchive::new(Cursor::new(old_bytes))) {
+        if let (Ok(mut zn), Ok(mut zo)) = (
+            ZipArchive::new(Cursor::new(new_bytes)),
+            ZipArchive::new(Cursor::new(old_bytes)),
+        ) {
             let mut m_new = std::collections::HashMap::<String, u64>::new();
             let mut m_old = std::collections::HashMap::<String, u64>::new();
-            for i in 0..zn.len() { if let Ok(f) = zn.by_index(i) { if !f.is_dir() { m_new.insert(f.name().to_string(), f.size()); } } }
-            for i in 0..zo.len() { if let Ok(f) = zo.by_index(i) { if !f.is_dir() { m_old.insert(f.name().to_string(), f.size()); } } }
-            let mut added: Vec<(String, u64)> = m_new.iter().filter(|(k, _)| !m_old.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
-            let mut removed: Vec<(String, u64)> = m_old.iter().filter(|(k, _)| !m_new.contains_key(*k)).map(|(k, &v)| (k.clone(), v)).collect();
-            let mut changed: Vec<(String, i64, u64)> = m_new.iter().filter_map(|(k, &v)| {
-                let ov = *m_old.get(k)?;
-                if ov != v { Some((k.clone(), (v as i64) - (ov as i64), v)) } else { None }
-            }).collect();
-            added.sort_by(|a, b| b.1.cmp(&a.1));
-            removed.sort_by(|a, b| b.1.cmp(&a.1));
-            changed.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
-            out.push(format!("### Archive Member Diff: +{} added, -{} removed, ~{} size-changed", added.len(), removed.len(), changed.len()));
-            for (p, sz) in added.iter().take(20) { out.push(format!("- [ADDED] `{p}` ({sz} B)")); }
-            for (p, sz) in removed.iter().take(15) { out.push(format!("- [REMOVED] `{p}` ({sz} B)")); }
-            for (p, d, sz) in changed.iter().take(25) { out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)")); }
+            for i in 0..zn.len() {
+                if let Ok(f) = zn.by_index(i) {
+                    if !f.is_dir() {
+                        m_new.insert(f.name().to_string(), f.size());
+                    }
+                }
+            }
+            for i in 0..zo.len() {
+                if let Ok(f) = zo.by_index(i) {
+                    if !f.is_dir() {
+                        m_old.insert(f.name().to_string(), f.size());
+                    }
+                }
+            }
+            let mut added: Vec<(String, u64)> = m_new
+                .iter()
+                .filter(|(k, _)| !m_old.contains_key(*k))
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+            let mut removed: Vec<(String, u64)> = m_old
+                .iter()
+                .filter(|(k, _)| !m_new.contains_key(*k))
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+            let mut changed: Vec<(String, i64, u64)> = m_new
+                .iter()
+                .filter_map(|(k, &v)| {
+                    let ov = *m_old.get(k)?;
+                    if ov != v {
+                        Some((k.clone(), (v as i64) - (ov as i64), v))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            added.sort_by_key(|a| std::cmp::Reverse(a.1));
+            removed.sort_by_key(|a| std::cmp::Reverse(a.1));
+            changed.sort_by_key(|a| std::cmp::Reverse(a.1.abs()));
+            out.push(format!(
+                "### Archive Member Diff: +{} added, -{} removed, ~{} size-changed",
+                added.len(),
+                removed.len(),
+                changed.len()
+            ));
+            for (p, sz) in added.iter().take(20) {
+                out.push(format!("- [ADDED] `{p}` ({sz} B)"));
+            }
+            for (p, sz) in removed.iter().take(15) {
+                out.push(format!("- [REMOVED] `{p}` ({sz} B)"));
+            }
+            for (p, d, sz) in changed.iter().take(25) {
+                out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)"));
+            }
             return out.join("\n");
         }
     }
@@ -755,10 +852,22 @@ pub fn diff_binaries_or_archives_md(
         while i < data.len() && set.len() < 12000 {
             if (0x20..=0x7E).contains(&data[i]) {
                 let st = i;
-                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 180 { i += 1; }
+                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 180 {
+                    i += 1;
+                }
                 if i - st >= 8 {
                     let s = String::from_utf8_lossy(&data[st..i]).to_string();
-                    if s.contains('/') || s.contains('\\') || s.contains("http") || s.contains("err") || s.contains("fail") || s.contains("invalid") || s.contains("deny") || s.contains("check") || s.contains("pipe") || s.contains('%') {
+                    if s.contains('/')
+                        || s.contains('\\')
+                        || s.contains("http")
+                        || s.contains("err")
+                        || s.contains("fail")
+                        || s.contains("invalid")
+                        || s.contains("deny")
+                        || s.contains("check")
+                        || s.contains("pipe")
+                        || s.contains('%')
+                    {
                         set.insert(s);
                     }
                 }
@@ -770,11 +879,24 @@ pub fn diff_binaries_or_archives_md(
         while j + 1 < data.len() && set.len() < 16000 {
             if (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 {
                 let mut s = String::new();
-                while j + 1 < data.len() && (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 && s.len() < 160 {
+                while j + 1 < data.len()
+                    && (0x20..=0x7E).contains(&data[j])
+                    && data[j + 1] == 0
+                    && s.len() < 160
+                {
                     s.push(data[j] as char);
                     j += 2;
                 }
-                if s.len() >= 7 && (s.contains('/') || s.contains('\\') || s.contains("http") || s.contains("err") || s.contains("fail") || s.contains("invalid") || s.contains("pipe") || s.contains('%')) {
+                if s.len() >= 7
+                    && (s.contains('/')
+                        || s.contains('\\')
+                        || s.contains("http")
+                        || s.contains("err")
+                        || s.contains("fail")
+                        || s.contains("invalid")
+                        || s.contains("pipe")
+                        || s.contains('%'))
+                {
                     set.insert(s);
                 }
             } else {
@@ -789,22 +911,46 @@ pub fn diff_binaries_or_archives_md(
     let added_s: Vec<&String> = s_new.difference(&s_old).take(35).collect();
     let removed_s: Vec<&String> = s_old.difference(&s_new).take(25).collect();
 
-    let g_new: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(new_bytes, None, 2000).into_iter().map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string()).collect();
-    let g_old: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(old_bytes, None, 2000).into_iter().map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string()).collect();
+    let g_new: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(new_bytes, None, 2000)
+        .into_iter()
+        .map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string())
+        .collect();
+    let g_old: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(old_bytes, None, 2000)
+        .into_iter()
+        .map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string())
+        .collect();
     if !g_new.is_empty() || !g_old.is_empty() {
         let ga: Vec<&String> = g_new.difference(&g_old).take(20).collect();
         let gr: Vec<&String> = g_old.difference(&g_new).take(15).collect();
-        out.push(format!("### Go Function Diff: +{} added, -{} removed", ga.len(), gr.len()));
-        for f in ga { out.push(format!("- [GO+] {f}")); }
-        for f in gr { out.push(format!("- [GO-] {f}")); }
+        out.push(format!(
+            "### Go Function Diff: +{} added, -{} removed",
+            ga.len(),
+            gr.len()
+        ));
+        for f in ga {
+            out.push(format!("- [GO+] {f}"));
+        }
+        for f in gr {
+            out.push(format!("- [GO-] {f}"));
+        }
     }
 
-    let r_new: std::collections::BTreeSet<String> = scan_pe_rpc_interfaces(new_bytes, true).into_iter().map(|s| s.split(" (").next().unwrap_or(&s).to_string()).collect();
-    let r_old: std::collections::BTreeSet<String> = scan_pe_rpc_interfaces(old_bytes, true).into_iter().map(|s| s.split(" (").next().unwrap_or(&s).to_string()).collect();
+    let r_new: std::collections::BTreeSet<String> = scan_pe_rpc_interfaces(new_bytes, true)
+        .into_iter()
+        .map(|s| s.split(" (").next().unwrap_or(&s).to_string())
+        .collect();
+    let r_old: std::collections::BTreeSet<String> = scan_pe_rpc_interfaces(old_bytes, true)
+        .into_iter()
+        .map(|s| s.split(" (").next().unwrap_or(&s).to_string())
+        .collect();
     if r_new != r_old {
         out.push("### MS-RPC Interface Diff".to_string());
-        for r in r_new.difference(&r_old) { out.push(format!("- [RPC+] {r}")); }
-        for r in r_old.difference(&r_new) { out.push(format!("- [RPC-] {r}")); }
+        for r in r_new.difference(&r_old) {
+            out.push(format!("- [RPC+] {r}"));
+        }
+        for r in r_old.difference(&r_new) {
+            out.push(format!("- [RPC-] {r}"));
+        }
     }
 
     out.push(format!(
@@ -812,8 +958,12 @@ pub fn diff_binaries_or_archives_md(
         added_s.len(),
         removed_s.len()
     ));
-    for s in added_s { out.push(format!("+ {s}")); }
-    for s in removed_s { out.push(format!("- {s}")); }
+    for s in added_s {
+        out.push(format!("+ {s}"));
+    }
+    for s in removed_s {
+        out.push(format!("- {s}"));
+    }
     out.join("\n")
 }
 
@@ -852,7 +1002,7 @@ fn rva_to_file_offset(rva: u32, secs: &[PeSection]) -> Option<usize> {
     None
 }
 
-fn file_offset_to_rva<'a>(off: usize, secs: &'a [PeSection]) -> Option<(u32, &'a str)> {
+fn file_offset_to_rva(off: usize, secs: &[PeSection]) -> Option<(u32, &str)> {
     for s in secs {
         let start = s.raw_ptr as usize;
         let end = start.saturating_add(s.raw_size as usize);
@@ -932,7 +1082,7 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeCon
     };
     let is_pe64 = opt_magic == 0x020B;
     let image_base = if is_pe64 && opt_sz >= 32 {
-        read_u64_le(bytes, opt_off + 24).unwrap_or(0x14000_0000)
+        read_u64_le(bytes, opt_off + 24).unwrap_or(0x0001_4000_0000)
     } else if !is_pe64 && opt_sz >= 32 {
         read_u32_le(bytes, opt_off + 28).unwrap_or(0x0040_0000) as u64
     } else {
@@ -1141,7 +1291,8 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeCon
                         {
                             if let Some(fn_name) = read_cstr(bytes, hn_off + 2, 128) {
                                 if ft != 0 && iat_map.len() < 4096 {
-                                    let slot_rva = ft.saturating_add(slot_idx.saturating_mul(step as u32));
+                                    let slot_rva =
+                                        ft.saturating_add(slot_idx.saturating_mul(step as u32));
                                     iat_map.push((slot_rva, format!("{dll_name}!{fn_name}")));
                                 }
                                 if is_notable_import(&fn_name) && notable.len() < 32 {
@@ -1261,7 +1412,8 @@ fn scan_pe64_xrefs(
             if !str_lookup.is_empty() && (b0 == 0x48 || b0 == 0x4C) && b1 == 0x8D {
                 let modrm = code[i + 2];
                 if (modrm & 0xC7) == 0x05 {
-                    let disp = i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
+                    let disp =
+                        i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
                     let insn_rva = s.vaddr.saturating_add(i as u32);
                     let target = (insn_rva as i64) + 7 + (disp as i64);
                     if target > 0 && target <= u32::MAX as i64 {
@@ -1282,7 +1434,11 @@ fn scan_pe64_xrefs(
                 }
             }
             // 2. x64 RIP-relative `CALL/JMP [RIP + disp32]` -> FF 15/25 disp32
-            if !iat_lookup.is_empty() && b0 == 0xFF && (b1 == 0x15 || b1 == 0x25) && i + 6 <= code.len() {
+            if !iat_lookup.is_empty()
+                && b0 == 0xFF
+                && (b1 == 0x15 || b1 == 0x25)
+                && i + 6 <= code.len()
+            {
                 let disp = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
                 let insn_rva = s.vaddr.saturating_add(i as u32);
                 let target = (insn_rva as i64) + 6 + (disp as i64);
@@ -1387,14 +1543,17 @@ struct ElfContext {
     func_syms: Vec<(u64, String)>,
 }
 
-fn elf_file_offset_to_vaddr<'a>(off: usize, secs: &'a [ElfSection]) -> Option<(u64, &'a str)> {
+fn elf_file_offset_to_vaddr(off: usize, secs: &[ElfSection]) -> Option<(u64, &str)> {
     for s in secs {
         if s.vaddr == 0 || s.raw_size == 0 {
             continue;
         }
         let end = s.raw_ptr.saturating_add(s.raw_size);
         if off >= s.raw_ptr && off < end {
-            return Some((s.vaddr.saturating_add((off - s.raw_ptr) as u64), s.name.as_str()));
+            return Some((
+                s.vaddr.saturating_add((off - s.raw_ptr) as u64),
+                s.name.as_str(),
+            ));
         }
     }
     None
@@ -1562,10 +1721,8 @@ fn find_enclosing_elf_func(elf: &ElfContext, vaddr: u64) -> String {
     // Find nearest symbol <= vaddr within 64 KB
     let mut best: Option<(u64, &str)> = None;
     for (sa, nm) in &elf.func_syms {
-        if *sa <= vaddr && vaddr - *sa < 0x10000 {
-            if best.map(|(ba, _)| *sa > ba).unwrap_or(true) {
-                best = Some((*sa, nm.as_str()));
-            }
+        if *sa <= vaddr && vaddr - *sa < 0x10000 && best.map(|(ba, _)| *sa > ba).unwrap_or(true) {
+            best = Some((*sa, nm.as_str()));
         }
     }
     if let Some((sa, nm)) = best {
@@ -1848,13 +2005,20 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
             if tag == 0 {
                 break;
             }
-            if tag == 24 || (tag == 30 && (val & 0x8) != 0) || (tag == 0x6fff_fffb && (val & 0x1) != 0) {
+            if tag == 24
+                || (tag == 30 && (val & 0x8) != 0)
+                || (tag == 0x6fff_fffb && (val & 0x1) != 0)
+            {
                 has_bind_now = true;
             }
         }
     }
     if has_relro {
-        elf_mit.push(if has_bind_now { "Full-RELRO" } else { "Partial-RELRO" });
+        elf_mit.push(if has_bind_now {
+            "Full-RELRO"
+        } else {
+            "Partial-RELRO"
+        });
     } else {
         elf_mit.push("NO-RELRO");
     }
@@ -1908,7 +2072,10 @@ fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
                 let st_value = read_u64_le(bytes, p + 8).unwrap_or(0);
                 if st_name > 0 {
                     if let Some(nm) = read_cstr(bytes, dstr_off.saturating_add(st_name), 128) {
-                        if is_notable_elf_symbol(&nm) && notable_syms.len() < 30 && !notable_syms.contains(&nm) {
+                        if is_notable_elf_symbol(&nm)
+                            && notable_syms.len() < 30
+                            && !notable_syms.contains(&nm)
+                        {
                             notable_syms.push(nm.clone());
                         }
                         if st_shndx != 0 {
@@ -2051,10 +2218,16 @@ pub fn inspect_binary_with_xref_md(
             if i - st >= 6 {
                 let s = String::from_utf8_lossy(&data[st..i]);
                 if q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
-                    if let Some((rva, sec)) = pe_ctx.as_ref().and_then(|p| file_offset_to_rva(st, &p.secs)) {
+                    if let Some((rva, sec)) = pe_ctx
+                        .as_ref()
+                        .and_then(|p| file_offset_to_rva(st, &p.secs))
+                    {
                         hits.push(format!("[ascii @0x{st:x} rva=0x{rva:x} ({sec})] {s}"));
                         matched_str_rvas.push((rva, s.into_owned()));
-                    } else if let Some((va, sec)) = elf_ctx.as_ref().and_then(|e| elf_file_offset_to_vaddr(st, &e.secs)) {
+                    } else if let Some((va, sec)) = elf_ctx
+                        .as_ref()
+                        .and_then(|e| elf_file_offset_to_vaddr(st, &e.secs))
+                    {
                         hits.push(format!("[ascii @0x{st:x} vaddr=0x{va:x} ({sec})] {s}"));
                         matched_elf_vaddrs.push((va, s.into_owned()));
                     } else {
@@ -2082,7 +2255,10 @@ pub fn inspect_binary_with_xref_md(
                 j += 2;
             }
             if s.len() >= 5 && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
-                if let Some((rva, sec)) = pe_ctx.as_ref().and_then(|p| file_offset_to_rva(st, &p.secs)) {
+                if let Some((rva, sec)) = pe_ctx
+                    .as_ref()
+                    .and_then(|p| file_offset_to_rva(st, &p.secs))
+                {
                     hits.push(format!("[utf16le @0x{st:x} rva=0x{rva:x} ({sec})] {s}"));
                     matched_str_rvas.push((rva, s));
                 } else {
@@ -2102,7 +2278,10 @@ pub fn inspect_binary_with_xref_md(
                 xrefs.len()
             )];
             if xrefs.is_empty() {
-                xref_block.push("*(no matching x64 RIP-relative LEA/CALL XREFs found in executable sections)*".to_string());
+                xref_block.push(
+                    "*(no matching x64 RIP-relative LEA/CALL XREFs found in executable sections)*"
+                        .to_string(),
+                );
             } else {
                 xref_block.extend(xrefs);
             }
@@ -2113,10 +2292,7 @@ pub fn inspect_binary_with_xref_md(
             out.splice(insert_at..insert_at, xref_block);
         } else if let Some(ref elf) = elf_ctx {
             let xrefs = scan_elf64_xrefs(bytes, elf, &matched_elf_vaddrs, 60);
-            let mut xref_block = vec![format!(
-                "### ELF64 Code XREFs ({} found)",
-                xrefs.len()
-            )];
+            let mut xref_block = vec![format!("### ELF64 Code XREFs ({} found)", xrefs.len())];
             if xrefs.is_empty() {
                 xref_block.push("*(no matching x86_64 LEA or AArch64 ADRP+ADD XREFs found in executable sections)*".to_string());
             } else {
@@ -2190,7 +2366,7 @@ mod tests {
         elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
         elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
         elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
-        // PHDR 0: PT_GNU_STACK (RW only -> NX)
+                                                          // PHDR 0: PT_GNU_STACK (RW only -> NX)
         elf[64..68].copy_from_slice(&0x6474_e551u32.to_le_bytes());
         elf[68..72].copy_from_slice(&6u32.to_le_bytes());
         // PHDR 1: PT_GNU_RELRO
@@ -2218,13 +2394,13 @@ mod tests {
         pe[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
         let opt = 0x98usize;
         pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
-        pe[opt + 24..opt + 32].copy_from_slice(&0x14000_0000u64.to_le_bytes());
+        pe[opt + 24..opt + 32].copy_from_slice(&0x0001_4000_0000_u64.to_le_bytes());
         // Import Directory DataDirectory[1] at opt + 112 + 8 = opt + 120 -> RVA 0x2000
         pe[opt + 120..opt + 124].copy_from_slice(&0x2000u32.to_le_bytes());
         pe[opt + 124..opt + 128].copy_from_slice(&0x28u32.to_le_bytes());
 
         let sh = opt + 0xF0; // 0x188
-        // Section 0: .text (vaddr 0x1000, raw 0x200, size 0x200, RX)
+                             // Section 0: .text (vaddr 0x1000, raw 0x200, size 0x200, RX)
         pe[sh..sh + 5].copy_from_slice(b".text");
         pe[sh + 8..sh + 12].copy_from_slice(&0x200u32.to_le_bytes());
         pe[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
@@ -2272,10 +2448,22 @@ mod tests {
         pe[0x21D..0x221].copy_from_slice(&(0x101Fi32).to_le_bytes());
 
         let md = inspect_binary_with_xref_md(&pe, Some("DemoSvc|CreateProcess"), 40, true);
-        assert!(md.contains("rva=0x2080 (.rdata)"), "Expected RVA on string in:\n{md}");
-        assert!(md.contains("[str-xref] insn=0x1014 in func_rva=0x1010"), "Expected str-xref in:\n{md}");
-        assert!(md.contains("[iat-xref] call insn=0x101b in func_rva=0x1010"), "Expected iat-xref in:\n{md}");
-        assert!(md.contains("KERNEL32.dll!CreateProcessW"), "Expected IAT symbol in:\n{md}");
+        assert!(
+            md.contains("rva=0x2080 (.rdata)"),
+            "Expected RVA on string in:\n{md}"
+        );
+        assert!(
+            md.contains("[str-xref] insn=0x1014 in func_rva=0x1010"),
+            "Expected str-xref in:\n{md}"
+        );
+        assert!(
+            md.contains("[iat-xref] call insn=0x101b in func_rva=0x1010"),
+            "Expected iat-xref in:\n{md}"
+        );
+        assert!(
+            md.contains("KERNEL32.dll!CreateProcessW"),
+            "Expected IAT symbol in:\n{md}"
+        );
     }
 
     #[test]
@@ -2313,7 +2501,15 @@ mod tests {
         elf[0x430..0x434].copy_from_slice(&17u32.to_le_bytes()); // st_name = 17 ("system")
         elf[0x436..0x438].copy_from_slice(&0u16.to_le_bytes()); // st_shndx = 0 (imported)
 
-        let write_shdr = |buf: &mut [u8], idx: usize, name: u32, ty: u32, flags: u64, addr: u64, off: u64, sz: u64, entsz: u64| {
+        let write_shdr = |buf: &mut [u8],
+                          idx: usize,
+                          name: u32,
+                          ty: u32,
+                          flags: u64,
+                          addr: u64,
+                          off: u64,
+                          sz: u64,
+                          entsz: u64| {
             let h = 0x480 + idx * 64;
             buf[h..h + 4].copy_from_slice(&name.to_le_bytes());
             buf[h + 4..h + 8].copy_from_slice(&ty.to_le_bytes());
@@ -2330,9 +2526,18 @@ mod tests {
         write_shdr(&mut elf, 5, 33, 11, 0, 0, 0x400, 0x60, 24); // .dynsym
 
         let md = inspect_binary_with_xref_md(&elf, Some("ipc_ctl"), 40, true);
-        assert!(md.contains("vaddr=0x2020 (.rodata)"), "Expected ELF vaddr on string:\n{md}");
-        assert!(md.contains("[elf-str-xref] arm64 adrp+add=0x1000 in `OnRemoteRequest`+0x0"), "Expected ARM64 ADRP+ADD XREF:\n{md}");
-        assert!(md.contains("Notable ELF Symbols") && md.contains("system"), "Expected notable ELF symbols:\n{md}");
+        assert!(
+            md.contains("vaddr=0x2020 (.rodata)"),
+            "Expected ELF vaddr on string:\n{md}"
+        );
+        assert!(
+            md.contains("[elf-str-xref] arm64 adrp+add=0x1000 in `OnRemoteRequest`+0x0"),
+            "Expected ARM64 ADRP+ADD XREF:\n{md}"
+        );
+        assert!(
+            md.contains("Notable ELF Symbols") && md.contains("system"),
+            "Expected notable ELF symbols:\n{md}"
+        );
 
         // 2. Synthetic Go 1.20 .gopclntab (magic 0xFFFFFFF1, 64-bit)
         let mut go_blob = vec![0u8; 0x200];
@@ -2342,7 +2547,7 @@ mod tests {
         go_blob[base + 24..base + 32].copy_from_slice(&0x401000u64.to_le_bytes()); // textStart
         go_blob[base + 32..base + 40].copy_from_slice(&0x60u64.to_le_bytes()); // funcnameOffset = 0x60
         go_blob[base + 64..base + 72].copy_from_slice(&0xC0u64.to_le_bytes()); // pclnOffset = 0xC0
-        // funcnames at base + 0x60 = 0x80
+                                                                               // funcnames at base + 0x60 = 0x80
         go_blob[0x80..0x98].copy_from_slice(b"runtime.gcBgMarkWorker\0\0");
         go_blob[0x98..0xB0].copy_from_slice(b"main.handleRpcRequest\0\0\0");
         // functab at base + 0xC0 = 0xE0: 2 entries * 8B + _func structs at +0x20 and +0x28
@@ -2356,7 +2561,11 @@ mod tests {
         go_blob[0x10C..0x110].copy_from_slice(&0x18u32.to_le_bytes());
 
         let funcs = scan_go_pclntab_funcs(&go_blob, None, 10);
-        assert_eq!(funcs.len(), 1, "Expected 1 non-stdlib Go func, got {funcs:?}");
+        assert_eq!(
+            funcs.len(),
+            1,
+            "Expected 1 non-stdlib Go func, got {funcs:?}"
+        );
         assert!(funcs[0].contains("main.handleRpcRequest") && funcs[0].contains("0x401080"));
     }
 
@@ -2377,26 +2586,43 @@ mod tests {
             v.extend_from_slice(s.as_bytes());
         };
         push_utf8(&mut cls, "com/demo/Runner"); // 1
-        cls.push(7); cls.extend_from_slice(&1u16.to_be_bytes()); // 2
+        cls.push(7);
+        cls.extend_from_slice(&1u16.to_be_bytes()); // 2
         push_utf8(&mut cls, "java/lang/Object"); // 3
-        cls.push(7); cls.extend_from_slice(&3u16.to_be_bytes()); // 4
+        cls.push(7);
+        cls.extend_from_slice(&3u16.to_be_bytes()); // 4
         push_utf8(&mut cls, "java/lang/Runtime"); // 5
-        cls.push(7); cls.extend_from_slice(&5u16.to_be_bytes()); // 6
+        cls.push(7);
+        cls.extend_from_slice(&5u16.to_be_bytes()); // 6
         push_utf8(&mut cls, "exec"); // 7
         push_utf8(&mut cls, "(Ljava/lang/String;)Ljava/lang/Process;"); // 8
-        cls.push(12); cls.extend_from_slice(&7u16.to_be_bytes()); cls.extend_from_slice(&8u16.to_be_bytes()); // 9
-        cls.push(10); cls.extend_from_slice(&6u16.to_be_bytes()); cls.extend_from_slice(&9u16.to_be_bytes()); // 10
+        cls.push(12);
+        cls.extend_from_slice(&7u16.to_be_bytes());
+        cls.extend_from_slice(&8u16.to_be_bytes()); // 9
+        cls.push(10);
+        cls.extend_from_slice(&6u16.to_be_bytes());
+        cls.extend_from_slice(&9u16.to_be_bytes()); // 10
         push_utf8(&mut cls, "/bin/sh -c id"); // 11
-        cls.push(8); cls.extend_from_slice(&11u16.to_be_bytes()); // 12
-        // access_flags, this_class=2, super_class=4
+        cls.push(8);
+        cls.extend_from_slice(&11u16.to_be_bytes()); // 12
+                                                     // access_flags, this_class=2, super_class=4
         cls.extend_from_slice(&0x0021u16.to_be_bytes());
         cls.extend_from_slice(&2u16.to_be_bytes());
         cls.extend_from_slice(&4u16.to_be_bytes());
 
         let jmd = parse_java_class_md(&cls, None);
-        assert!(jmd.contains("com/demo/Runner"), "missing class name:\n{jmd}");
-        assert!(jmd.contains("java/lang/Runtime.exec"), "missing Runtime.exec sink:\n{jmd}");
-        assert!(jmd.contains("/bin/sh -c id"), "missing string constant:\n{jmd}");
+        assert!(
+            jmd.contains("com/demo/Runner"),
+            "missing class name:\n{jmd}"
+        );
+        assert!(
+            jmd.contains("java/lang/Runtime.exec"),
+            "missing Runtime.exec sink:\n{jmd}"
+        );
+        assert!(
+            jmd.contains("/bin/sh -c id"),
+            "missing string constant:\n{jmd}"
+        );
 
         // 2. Synthetic .NET CLR BSJB metadata + #Strings stream
         let mut clr = vec![0u8; 0x120];
@@ -2415,12 +2641,18 @@ mod tests {
         clr[0x70..0x70 + s_payload.len()].copy_from_slice(s_payload);
         let (ver, sinks) = scan_dotnet_clr_meta(&clr).unwrap();
         assert_eq!(ver, "v4.0.30319");
-        assert!(sinks.iter().any(|s| s == "BinaryFormatter") && sinks.iter().any(|s| s == "ProcessStartInfo"));
+        assert!(
+            sinks.iter().any(|s| s == "BinaryFormatter")
+                && sinks.iter().any(|s| s == "ProcessStartInfo")
+        );
 
         // 3. Binary patch diff
         let old_b = b"MZ\0\0____/api/v1/old_route\0invalid_old_check\0";
         let new_b = b"MZ\0\0____/api/v1/old_route\0/api/v2/admin_exec\0invalid_path_guard\0";
         let dmd = diff_binaries_or_archives_md(new_b, old_b, "new.dll", "old.dll", "dll");
-        assert!(dmd.contains("+ /api/v2/admin_exec") && dmd.contains("- invalid_old_check"), "unexpected diff:\n{dmd}");
+        assert!(
+            dmd.contains("+ /api/v2/admin_exec") && dmd.contains("- invalid_old_check"),
+            "unexpected diff:\n{dmd}"
+        );
     }
 }
