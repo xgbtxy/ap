@@ -726,6 +726,9 @@ struct JsRouteRegexes {
     post_msg: Regex,
     dom_sink: Regex,
     ext_origin: Regex,
+    local_server_ipc: Regex,
+    lazy_chunk: Regex,
+    custom_header: Regex,
 }
 
 fn js_route_re() -> &'static JsRouteRegexes {
@@ -749,6 +752,18 @@ fn js_route_re() -> &'static JsRouteRegexes {
         .unwrap(),
         ext_origin: Regex::new(r#"(?:https?|wss?)://([A-Za-z0-9][A-Za-z0-9.-]{2,100}(?::\d{2,5})?)"#)
             .unwrap(),
+        local_server_ipc: Regex::new(
+            r#"(?:\b(?:http|https|net)\.createServer\s*\(|\bnew\s+WebSocketServer\s*\(|['"`]/oauth/callback['"`]|\bipcMain\.(?:handle|on)\s*\(|\bcontextBridge\.exposeInMainWorld\s*\(|\bshell\.openExternal\s*\(|\b(?:execFile|execSync|spawn|spawnSync)\s*\()"#,
+        )
+        .unwrap(),
+        lazy_chunk: Regex::new(
+            r#"(?:['"`]([A-Za-z0-9_./-]{1,64}\.(?:chunk|bundle|async)\.[a-f0-9]{6,20}\.js|[0-9]{1,5}\.[a-f0-9]{8,20}\.js|assets/[A-Za-z0-9_.-]{3,64}-[A-Za-z0-9_-]{6,16}\.js)['"`]|\b([0-9]{1,5})\s*:\s*['"]([a-f0-9]{12,20})['"])"#,
+        )
+        .unwrap(),
+        custom_header: Regex::new(
+            r#"(?i)['"`](X-(?:Auth-Token|Domain-Id|Project-Id|Tenant-Id|User-Id|Csrf-Token|Xsrf-Token|Api-Key|Security-Token|Target-Services|Forwarded-[A-Za-z0-9-]+|Signature[A-Za-z0-9-]*|Request-[A-Za-z0-9-]+))['"`]"#,
+        )
+        .unwrap(),
     })
 }
 
@@ -964,6 +979,90 @@ pub fn extract_js_routes_md(
         }
     }
 
+    let mut local_ipc_sinks: Vec<serde_json::Value> = Vec::new();
+    let mut seen_ipc_off = std::collections::HashSet::new();
+    for m in re.local_server_ipc.find_iter(slice) {
+        if local_ipc_sinks.len() >= 30 {
+            break;
+        }
+        let hard_end = {
+            let mut e = (m.end() + 420).min(slice.len());
+            while e > m.end() && !slice.is_char_boundary(e) {
+                e -= 1;
+            }
+            e
+        };
+        let raw_win = &slice[m.start()..hard_end];
+        let bounded_len = if let Some(fb) = raw_win.find('{') {
+            let mut depth = 0i32;
+            let mut end_rel = raw_win.len();
+            for (bi, ch) in raw_win[fb..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_rel = (fb + bi + 1).min(raw_win.len());
+                        break;
+                    }
+                }
+            }
+            end_rel
+        } else {
+            raw_win.len().min(180)
+        };
+        let win = &raw_win[..bounded_len];
+        let kind_s = m.as_str().trim();
+        let is_server = kind_s.contains("createServer") || kind_s.contains("WebSocketServer") || kind_s.contains("oauth/callback");
+        let win_low = win.to_ascii_lowercase();
+        let missing_auth = is_server
+            && !win_low.contains("origin")
+            && !win_low.contains("authorization")
+            && !win_low.contains("csrf")
+            && !win_low.contains("state")
+            && !win_low.contains("token");
+        let snip: String = win.replace(['\r', '\n'], " ").chars().take(120).collect();
+        if !matches_q(&snip) && !matches_q(kind_s) {
+            continue;
+        }
+        if seen_ipc_off.insert(m.start() / 24) {
+            local_ipc_sinks.push(serde_json::json!({
+                "kind": kind_s,
+                "line": byte_line_col(slice, m.start()),
+                "offset": m.start(),
+                "missing_origin_or_auth": missing_auth,
+                "snippet": snip,
+            }));
+        }
+    }
+
+    let mut lazy_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for cap in re.lazy_chunk.captures_iter(slice) {
+        if lazy_chunks.len() >= 50 {
+            break;
+        }
+        let item = if let Some(m1) = cap.get(1) {
+            m1.as_str().to_string()
+        } else if let (Some(id), Some(h)) = (cap.get(2), cap.get(3)) {
+            format!("{}.{}.js", id.as_str(), h.as_str())
+        } else {
+            continue;
+        };
+        if matches_q(&item) {
+            lazy_chunks.insert(item);
+        }
+    }
+
+    let mut custom_headers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for cap in re.custom_header.captures_iter(slice) {
+        if let Some(hm) = cap.get(1) {
+            let h = hm.as_str().to_string();
+            if matches_q(&h) {
+                custom_headers.insert(h);
+            }
+        }
+    }
+
     let mut routes_json: Vec<serde_json::Value> = Vec::new();
     let mut route_lines: Vec<String> = Vec::new();
     for (p, (method, off, tags)) in route_map.iter().take(120) {
@@ -984,10 +1083,13 @@ pub fn extract_js_routes_md(
     }
 
     let mut out = vec![format!(
-        "# JS/API Surface `{label}` ({} route(s) | {} postMessage | {} DOM sink(s) | {} origin(s))",
+        "# JS/API Surface `{label}` ({} route(s) | {} postMessage | {} local-server/IPC | {} DOM sink(s) | {} lazy chunk(s) | {} header(s) | {} origin(s))",
         route_map.len(),
         post_messages.len(),
+        local_ipc_sinks.len(),
         dom_sinks.len(),
+        lazy_chunks.len(),
+        custom_headers.len(),
         origins.len()
     )];
     if !route_lines.is_empty() {
@@ -1038,23 +1140,67 @@ pub fn extract_js_routes_md(
             sk_lines.join("\n")
         ));
     }
+    if !local_ipc_sinks.is_empty() {
+        let ipc_lines: Vec<String> = local_ipc_sinks
+            .iter()
+            .take(20)
+            .map(|s| {
+                let flag = if s["missing_origin_or_auth"].as_bool().unwrap_or(false) {
+                    " **[NO-ORIGIN-OR-AUTH-CHECK]**"
+                } else {
+                    ""
+                };
+                format!(
+                    "- `{}` (L{}, @{}){flag}: `{}`",
+                    s["kind"].as_str().unwrap_or(""),
+                    s["line"],
+                    s["offset"],
+                    s["snippet"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        out.push(format!(
+            "\n## Local Server / IPC / Process Exec Sinks\n{}",
+            ipc_lines.join("\n")
+        ));
+    }
+    if !lazy_chunks.is_empty() {
+        let ch_list: Vec<String> = lazy_chunks.iter().take(30).map(|c| format!("`{c}`")).collect();
+        out.push(format!(
+            "\n## Lazy Webpack / Vite Chunks ({})\n{}",
+            lazy_chunks.len(),
+            ch_list.join(", ")
+        ));
+    }
+    if !custom_headers.is_empty() {
+        let h_list: Vec<String> = custom_headers.iter().take(25).map(|h| format!("`{h}`")).collect();
+        out.push(format!("\n## Custom Auth / Tenant Headers\n{}", h_list.join(", ")));
+    }
     if !origins.is_empty() {
         let org_list: Vec<String> = origins.iter().take(40).map(|o| format!("`{o}`")).collect();
         out.push(format!("\n## External Origins\n{}", org_list.join(", ")));
     }
 
     let origins_vec: Vec<String> = origins.into_iter().take(80).collect();
+    let chunks_vec: Vec<String> = lazy_chunks.into_iter().take(50).collect();
+    let headers_vec: Vec<String> = custom_headers.into_iter().take(30).collect();
     let jv = serde_json::json!({
         "target": label,
         "counts": {
             "routes": route_map.len(),
             "post_message": post_messages.len(),
+            "local_server_ipc": local_ipc_sinks.len(),
             "dom_sinks": dom_sinks.len(),
+            "lazy_chunks": chunks_vec.len(),
+            "custom_headers": headers_vec.len(),
             "origins": origins_vec.len(),
         },
         "routes": routes_json,
         "post_message_handlers": post_messages,
+        "local_server_and_ipc": local_ipc_sinks,
         "client_sinks": dom_sinks,
+        "lazy_chunks": chunks_vec,
+        "custom_headers": headers_vec,
         "external_origins": origins_vec,
     });
     (out.join("\n"), jv)
@@ -1229,15 +1375,19 @@ mod inspect_tests {
 
     #[test]
     fn extracts_routes_postmessage_and_sinks_from_minified_js() {
-        let bundle = r#"!function(){axios.post("/api/v2/admin/users/:id",{ok:1});fetch("/rest/v1/export/report");window.addEventListener("message",function(e){el.innerHTML=e.data.html});window.addEventListener("message",function(ev){if(ev.origin!=="https://app.acme.test")return;console.log(ev.data)});const h="https://cdn.acme.test/app.js"}();"#;
+        let bundle = r#"!function(){axios.post("/api/v2/admin/users/:id",{headers:{"X-Domain-Id":d,"X-Target-Services":"svc"}});fetch("/rest/v1/export/report");const chunks={41:"fb19bfac5e8bf871"};http.createServer(function(req,res){res.end("ok")});window.addEventListener("message",function(e){el.innerHTML=e.data.html});window.addEventListener("message",function(ev){if(ev.origin!=="https://app.acme.test")return;console.log(ev.data)});const h="https://cdn.acme.test/app.js"}();"#;
         let (md, jv) = extract_js_routes_md(bundle, "app.min.js", None);
         assert!(md.contains("/api/v2/admin/users/:id"), "missing route in:\n{md}");
         assert!(md.contains("[PARAM,SENSITIVE]"), "missing tags in:\n{md}");
         assert!(md.contains("[MISSING-ORIGIN-CHECK]"), "missing origin gap in:\n{md}");
         assert!(md.contains("[origin-checked]"), "missing checked handler in:\n{md}");
+        assert!(md.contains("41.fb19bfac5e8bf871.js"), "missing lazy chunk in:\n{md}");
+        assert!(md.contains("[NO-ORIGIN-OR-AUTH-CHECK]"), "missing local server gap in:\n{md}");
+        assert!(md.contains("X-Domain-Id"), "missing custom header in:\n{md}");
         assert!(md.contains("innerHTML"), "missing DOM sink in:\n{md}");
         assert!(md.contains("cdn.acme.test"), "missing external origin in:\n{md}");
         assert_eq!(jv["counts"]["post_message"], 2);
+        assert_eq!(jv["counts"]["lazy_chunks"], 1);
     }
 
     #[test]
