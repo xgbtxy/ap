@@ -7051,3 +7051,56 @@ fn test_v242_search_only_matching_unique_exec_dir_heal_and_pi_accelerator() {
         );
     }
 }
+
+#[test]
+fn test_v243_ps_var_shield_kv_sleep_clamp_and_double_bar_dsml() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let home = root.join("home_v243");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let acc_src =
+        fs::read_to_string(home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    for needle in [
+        "export function healBashPowerShellCommand",
+        "export function clampKvSafeSleep",
+        "[|｜]{1,2}DSML[|｜]{1,2}",
+        "JSONDecodeError",
+        "dir: cannot access",
+    ] {
+        assert!(
+            acc_src.contains(needle),
+            "Missing v2.43 accelerator feature: {needle}"
+        );
+    }
+
+    let doc = run_ap(
+        root,
+        &["doctor", "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(doc.status.success());
+    let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
+    assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
+}

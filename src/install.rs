@@ -1281,6 +1281,12 @@ export function classifyShellFailureTip(
 	if (QUOTE_OR_BS_ERR.test(outText)) {{
 		return `[ap quote-tip] Avoid nested quotes/backslashes inside inline python -c; use a single-quoted heredoc (python - <<'PY' ... PY) or write a script file via write/ap_edit.`;
 	}}
+	if (/\b(?:json\.decoder\.)?JSONDecodeError\b|Unexpected token .* in JSON/i.test(outText)) {{
+		return `[ap json-tip] JSON parse failed (empty/HTML/non-JSON response); inspect HTTP status & raw prefix first or use \`ap probe http --select\` / \`ap read --json-path\` instead of blind json.loads.`;
+	}}
+	if (/dir: cannot access '\/[bs]'/i.test(outText)) {{
+		return `[ap dir-tip] Windows \`dir /b\` fails under Git Bash; use \`ap ls <dir> --depth 2\` or POSIX \`ls\`.`;
+	}}
 	if (TIMEOUT_ERR_RE.test(outText)) {{
 		if (SEARCH_CMD_RE.test(cmd)) {{
 			return `[ap timeout-tip] Slow recursive shell search timed out; use ap search (or ap_search / ap_atlas) with -e <ext> or a narrower directory instead.`;
@@ -2299,6 +2305,76 @@ export function trackReadOnlyBashStreak(
 	return {{ nextStreak, shouldTip: false }};
 }}
 
+export function healBashPowerShellCommand(cmd: string): string | undefined {{
+	if (!/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd) || /-EncodedCommand\b|-enc\b/i.test(cmd)) {{
+		return undefined;
+	}}
+	const hm = cmd.match(/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&"']*?\s-(?:Command|c)\s+)"/i);
+	if (hm && hm.index !== undefined) {{
+		const prefix = cmd.slice(0, hm.index) + hm[1];
+		const bodyStart = hm.index + hm[0].length;
+		let bodyEnd = -1;
+		for (let i = bodyStart; i < cmd.length; i++) {{
+			const ch = cmd[i];
+			if (ch === "\\" && i + 1 < cmd.length && (cmd[i + 1] === '"' || cmd[i + 1] === "\\")) {{
+				i += 1;
+				continue;
+			}}
+			if (ch === '"') {{
+				bodyEnd = i;
+				break;
+			}}
+		}}
+		if (bodyEnd > bodyStart) {{
+			const inner = cmd.slice(bodyStart, bodyEnd);
+			const suffix = cmd.slice(bodyEnd + 1);
+			const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(inner);
+			const utf8Prefix = hasUtf8 ? "" : "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
+			const hasPsVar = /\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*|\?|\()/i.test(inner);
+			if (!inner.includes("'") && !/\$\(/.test(inner) && hasPsVar) {{
+				const sqInner = inner.replace(/\\"/g, '"').replace(/\\\$/g, "$");
+				const out = `${{prefix}}'${{utf8Prefix}}${{sqInner}}'${{suffix}}`;
+				return out !== cmd ? out : undefined;
+			}}
+			if (hasPsVar || !hasUtf8) {{
+				const innerEsc = inner.replace(/(?<!\\)\$(?=[A-Za-z_?(])/g, "\\$");
+				const out = `${{prefix}}"${{utf8Prefix}}${{innerEsc}}"${{suffix}}`;
+				return out !== cmd ? out : undefined;
+			}}
+			return undefined;
+		}}
+	}}
+	if (!/OutputEncoding|UTF8Encoding/i.test(cmd)) {{
+		const psFixed = cmd.replace(
+			/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
+			"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
+		);
+		return psFixed !== cmd ? psFixed : undefined;
+	}}
+	return undefined;
+}}
+
+export function clampKvSafeSleep(cmd: string, toolName: string, maxSec = 45): string | undefined {{
+	if (!cmd || /\bnohup\b|<<|\b(?:python3?|py|node)\b/i.test(cmd) || /&\s*$/.test(cmd.trim()) || /\(\s*[^)]*\bsleep\b[^)]*\)\s*&/i.test(cmd)) {{
+		return undefined;
+	}}
+	if (toolName === "bash") {{
+		const next = cmd.replace(
+			/(^|[;&|]\s*)sleep\s+(\d+(?:\.\d+)?)s?(?=\s*(?:$|[;&|]))/gi,
+			(m, pfx: string, secsStr: string) => (Number(secsStr) >= 60 ? `${{pfx}}sleep ${{maxSec}}` : m),
+		);
+		return next !== cmd ? next : undefined;
+	}}
+	if (toolName === "powershell") {{
+		const next = cmd.replace(
+			/(^|[;&|]\s*)Start-Sleep(?:\s+-s(?:ec(?:ond)?s?)?)?\s+(\d+(?:\.\d+)?)(?=\s*(?:$|[;&|]))/gi,
+			(m, pfx: string, secsStr: string) => (Number(secsStr) >= 60 ? `${{pfx}}Start-Sleep -Seconds ${{maxSec}}` : m),
+		);
+		return next !== cmd ? next : undefined;
+	}}
+	return undefined;
+}}
+
 export function healCommand(raw: string, toolName: string): string | undefined {{
 	if (!raw) return undefined;
 	let cmd = raw;
@@ -2456,37 +2532,9 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 	}}
 
 	// 7. Lock UTF-8 output encoding & shield PowerShell `$var` when Git Bash spawns `powershell -Command "..."`
-	if (
-		toolName === "bash" &&
-		/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd) &&
-		!/OutputEncoding|UTF8Encoding|-EncodedCommand\b|-enc\b/i.test(cmd)
-	) {{
-		let psFixed = cmd;
-		const psDq = cmd.match(
-			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:powershell|pwsh)(?:\.exe)?(?:\s+-[A-Za-z-]+)*\s+-(?:Command|c)\s+)"([\s\S]+)"(\s*)$/i,
-		);
-		if (
-			psDq &&
-			!psDq[3].includes("'") &&
-			!/\$\(/.test(psDq[3]) &&
-			/\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*)/i.test(psDq[3])
-		) {{
-			const inner = psDq[3].replace(/\\"/g, '"').replace(/\\\$/g, "$");
-			psFixed = `${{psDq[1]}}${{psDq[2]}}'[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${{inner}}'${{psDq[4]}}`;
-		}} else if (psDq) {{
-			// Inner single quotes prevent outer single-quoting: escape `$var` -> `\$var` so Bash preserves PS vars
-			const innerEsc = psDq[3].replace(/(?<!\\)\$(?=[A-Za-z_])/g, "\\$");
-			psFixed = `${{psDq[1]}}${{psDq[2]}}"${{innerEsc}}"${{psDq[4]}}`.replace(
-				/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
-				"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
-			);
-		}} else {{
-			psFixed = cmd.replace(
-				/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
-				"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
-			);
-		}}
-		if (psFixed !== cmd) {{
+	if (toolName === "bash") {{
+		const psFixed = healBashPowerShellCommand(cmd);
+		if (psFixed) {{
 			cmd = psFixed;
 			changed = true;
 		}}
@@ -2520,6 +2568,13 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 				changed = true;
 			}}
 		}}
+	}}
+
+	// 9. Clamp long foreground sleeps (>=60s) to 45s to avoid evicting LLM KV-caches
+	const clampedSleep = clampKvSafeSleep(cmd, toolName, 45);
+	if (clampedSleep) {{
+		cmd = clampedSleep;
+		changed = true;
 	}}
 
 	return changed ? cmd : undefined;
@@ -2629,9 +2684,9 @@ export function extractDsmlToolCalls(
 ): {{ cleanedText: string; calls: DsmlRecoveredCall[] }} | undefined {{
 	if (!text || !text.includes("DSML") || !text.includes("invoke")) return undefined;
 	const invokeRe =
-		/<[|｜]DSML[|｜]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[|｜]DSML[|｜]invoke>/g;
+		/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke>/g;
 	const paramRe =
-		/<[|｜]DSML[|｜]parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?[^>]*>([\s\S]*?)<\/[|｜]DSML[|｜]parameter>/g;
+		/<[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?[^>]*>([\s\S]*?)<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*parameter>/g;
 
 	const calls: DsmlRecoveredCall[] = [];
 	let match: RegExpExecArray | null;
@@ -2671,7 +2726,7 @@ export function extractDsmlToolCalls(
 	}}
 	if (calls.length === 0) return undefined;
 	const cleanedText = text
-		.replace(/<[|｜]DSML[|｜]function_calls>[\s\S]*?<\/[|｜]DSML[|｜]function_calls>/g, "")
+		.replace(/<[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>/g, "")
 		.replace(invokeRe, "")
 		.trim();
 	return {{ cleanedText, calls }};
@@ -5433,6 +5488,8 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("repairHallucinatedToolName")
                 && s.contains("healMultiEditsSequential")
                 && s.contains("isDeepCacheDiscountModel")
+                && s.contains("healBashPowerShellCommand")
+                && s.contains("clampKvSafeSleep")
         })
         .unwrap_or(false);
 

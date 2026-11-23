@@ -1,4 +1,4 @@
-# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.42）
+# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.43）
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 

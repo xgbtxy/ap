@@ -63,6 +63,10 @@ struct HealRegexes {
     dev_null: Regex,
     bare_amp_url: Regex,
     port_in_use: Regex,
+    bash_long_sleep: Regex,
+    ps_long_sleep: Regex,
+    bg_sleep_guard: Regex,
+    sleep_skip_kw: Regex,
 }
 
 fn heal_re() -> &'static HealRegexes {
@@ -85,7 +89,58 @@ fn heal_re() -> &'static HealRegexes {
         dev_null: Regex::new(r"([12]?>+\s*)/dev/null\b").unwrap(),
         bare_amp_url: Regex::new(r#"(^|[\s=])(https?://[^\s'"`;&|]+&[^\s'"`;&|]+)"#).unwrap(),
         port_in_use: Regex::new(r"(?i)(?:EADDRINUSE|address already in use|10048).*?(?::(\d{2,5})\b|\bport\s+(\d{2,5})\b)").unwrap(),
+        bash_long_sleep: Regex::new(r"(?i)(^|[;&|]\s*)sleep\s+(\d+(?:\.\d+)?)s?(\s*(?:$|[;&|]))").unwrap(),
+        ps_long_sleep: Regex::new(r"(?i)(^|[;&|]\s*)Start-Sleep(?:\s+-s(?:ec(?:ond)?s?)?)?\s+(\d+(?:\.\d+)?)(\s*(?:$|[;&|]))").unwrap(),
+        bg_sleep_guard: Regex::new(r"(?i)(?:&\s*$|\(\s*[^)]*\bsleep\b[^)]*\)\s*&)").unwrap(),
+        sleep_skip_kw: Regex::new(r"(?i)(?:\bnohup\b|<<|\b(?:python3?|py|node)\b)").unwrap(),
     })
+}
+
+/// Clamp long foreground synchronous sleeps (>= 60s) to `max_sec` so they do not evict LLM KV-caches,
+/// while preserving short sleeps, background `&` jobs, heredocs, and `python`/`node` invocations.
+pub fn try_cap_long_sleep(raw: &str, max_sec: u64) -> Option<String> {
+    let re = heal_re();
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || re.sleep_skip_kw.is_match(trimmed)
+        || re.bg_sleep_guard.is_match(trimmed)
+    {
+        return None;
+    }
+    let mut changed = false;
+    let after_bash = re
+        .bash_long_sleep
+        .replace_all(raw, |caps: &regex::Captures| {
+            let secs = caps
+                .get(2)
+                .and_then(|m| m.as_str().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            if secs >= 60.0 {
+                changed = true;
+                format!("{}sleep {}{}", &caps[1], max_sec, &caps[3])
+            } else {
+                caps[0].to_string()
+            }
+        });
+    let after_ps = re
+        .ps_long_sleep
+        .replace_all(&after_bash, |caps: &regex::Captures| {
+            let secs = caps
+                .get(2)
+                .and_then(|m| m.as_str().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            if secs >= 60.0 {
+                changed = true;
+                format!("{}Start-Sleep -Seconds {}{}", &caps[1], max_sec, &caps[3])
+            } else {
+                caps[0].to_string()
+            }
+        });
+    if changed {
+        Some(after_ps.into_owned())
+    } else {
+        None
+    }
 }
 
 /// Detect bare recursive GNU `grep -rn` / `grep -rl` `<pat> [path]` (which hangs 60-180s on large Windows trees)
@@ -332,12 +387,20 @@ pub fn heal_windows_command(
     let has_ps_cmdlet = re.ps_cmdlet.is_match(raw);
     if has_git_bash && !has_ps_cmdlet && re.posix_only.is_match(raw) {
         heals.push("posix->git-bash");
+        if let Some(clamped) = try_cap_long_sleep(raw, 45) {
+            heals.push("sleep-clamp->45s");
+            return (ShellKind::GitBash, clamped, heals);
+        }
         return (ShellKind::GitBash, raw.to_string(), heals);
     }
 
     let mut out = raw.to_string();
     if has_ps_cmdlet {
         heals.push("ps-cmdlet->pwsh");
+    }
+    if let Some(clamped) = try_cap_long_sleep(&out, 45) {
+        out = clamped;
+        heals.push("sleep-clamp->45s");
     }
     if re.py_win_backslash.is_match(&out) {
         let (fixed, did_fix) = heal_py_win_backslashes(&out);
@@ -949,5 +1012,22 @@ mod tests {
         );
         assert!(try_build_rg_fixed_retry("rg -F \"foo(bar\" src").is_none());
         assert!(try_build_rg_fixed_retry("rg \"foo\" src | head -n 5").is_none());
+
+        // `try_cap_long_sleep` clamps foreground >=60s waits while keeping short/bg/python sleeps untouched
+        assert_eq!(
+            try_cap_long_sleep("sleep 120 && echo ok", 45).as_deref(),
+            Some("sleep 45 && echo ok")
+        );
+        assert_eq!(
+            try_cap_long_sleep("Start-Sleep -Seconds 90", 45).as_deref(),
+            Some("Start-Sleep -Seconds 45")
+        );
+        assert!(try_cap_long_sleep("sleep 30 && echo ok", 45).is_none());
+        assert!(try_cap_long_sleep("nohup sleep 120 &", 45).is_none());
+        assert!(try_cap_long_sleep("python -c \"import time; time.sleep(120)\"", 45).is_none());
+
+        let (_, h10, tags10) =
+            heal_windows_command("export FOO=1; sleep 90 && echo ok", true, true);
+        assert!(h10.contains("sleep 45") && tags10.contains(&"sleep-clamp->45s"));
     }
 }
