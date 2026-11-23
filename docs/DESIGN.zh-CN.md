@@ -1,4 +1,4 @@
-# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.43）
+# 反淘汰架构深潜：瞄准思考链与物理边界的纯 Rust 原语设计（`ap` v2.44）
 
 [English](./DESIGN.md) | [简体中文](./DESIGN.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [实战手册](./PLAYBOOK.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 

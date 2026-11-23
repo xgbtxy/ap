@@ -6393,7 +6393,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 12);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 13);
     }
 }
 
@@ -7103,4 +7103,60 @@ fn test_v243_ps_var_shield_kv_sleep_clamp_and_double_bar_dsml() {
     assert!(doc.status.success());
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
+}
+
+#[test]
+fn test_v244_pi_patch13_quote_safe_grep_ps_backtick_and_loop_sleep() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let home = root.join("home_v244");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let acc_src =
+        fs::read_to_string(home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    for needle in [
+        "shellQuoteBashPat",
+        "hasPsBacktick",
+        "(?<!\\\\)\"([A-Za-z]:\\\\[^\"]*?)\"",
+        "JSON.stringify(val)",
+        "Fast-path A2b",
+    ] {
+        assert!(
+            acc_src.contains(needle),
+            "Missing v2.44 accelerator feature: {needle}"
+        );
+    }
+
+    let doc = run_ap(
+        root,
+        &["doctor", "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(doc.status.success());
+    let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
+    assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
+    if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 13);
+    }
 }

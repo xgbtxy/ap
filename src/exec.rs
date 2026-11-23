@@ -65,6 +65,8 @@ struct HealRegexes {
     port_in_use: Regex,
     bash_long_sleep: Regex,
     ps_long_sleep: Regex,
+    loop_sleep_re: Regex,
+    body_sleep_re: Regex,
     bg_sleep_guard: Regex,
     sleep_skip_kw: Regex,
 }
@@ -91,13 +93,15 @@ fn heal_re() -> &'static HealRegexes {
         port_in_use: Regex::new(r"(?i)(?:EADDRINUSE|address already in use|10048).*?(?::(\d{2,5})\b|\bport\s+(\d{2,5})\b)").unwrap(),
         bash_long_sleep: Regex::new(r"(?i)(^|[;&|]\s*)sleep\s+(\d+(?:\.\d+)?)s?(\s*(?:$|[;&|]))").unwrap(),
         ps_long_sleep: Regex::new(r"(?i)(^|[;&|]\s*)Start-Sleep(?:\s+-s(?:ec(?:ond)?s?)?)?\s+(\d+(?:\.\d+)?)(\s*(?:$|[;&|]))").unwrap(),
+        loop_sleep_re: Regex::new(r"(?is)\b(for\s+\w+\s+in\s+(?:\$\(\s*seq\s+(?:(\d+)\s+)?(\d+)\s*\)|([^\r\n;]+));\s*do\b)([\s\S]*?)(\bdone\b)").unwrap(),
+        body_sleep_re: Regex::new(r"(?i)(^|[;&|\s])sleep\s+(\d+(?:\.\d+)?)s?(\s*(?:$|[;&|]))").unwrap(),
         bg_sleep_guard: Regex::new(r"(?i)(?:&\s*$|\(\s*[^)]*\bsleep\b[^)]*\)\s*&)").unwrap(),
         sleep_skip_kw: Regex::new(r"(?i)(?:\bnohup\b|<<|\b(?:python3?|py|node)\b)").unwrap(),
     })
 }
 
-/// Clamp long foreground synchronous sleeps (>= 60s) to `max_sec` so they do not evict LLM KV-caches,
-/// while preserving short sleeps, background `&` jobs, heredocs, and `python`/`node` invocations.
+/// Clamp long foreground synchronous sleeps (>= 60s) and polling sleep loops (`iters * secs >= 90`)
+/// so total synchronous wait stays <= `max_sec` without touching short, background, heredoc, or Python/Node sleeps.
 pub fn try_cap_long_sleep(raw: &str, max_sec: u64) -> Option<String> {
     let re = heal_re();
     let trimmed = raw.trim();
@@ -122,9 +126,59 @@ pub fn try_cap_long_sleep(raw: &str, max_sec: u64) -> Option<String> {
                 caps[0].to_string()
             }
         });
+    let after_loop = re
+        .loop_sleep_re
+        .replace_all(&after_bash, |caps: &regex::Captures| {
+            let iters: u64 = if let Some(end_m) = caps.get(3) {
+                let start_n = caps
+                    .get(2)
+                    .and_then(|m| m.as_str().parse::<u64>().ok())
+                    .unwrap_or(1);
+                let end_n = end_m.as_str().parse::<u64>().unwrap_or(0);
+                if end_n >= start_n {
+                    end_n - start_n + 1
+                } else {
+                    0
+                }
+            } else if let Some(wl) = caps.get(4) {
+                let wc = wl.as_str().split_whitespace().count() as u64;
+                if wc >= 3 {
+                    wc
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if iters < 3 {
+                return caps[0].to_string();
+            }
+            let body = &caps[5];
+            let mut loop_changed = false;
+            let new_body = re.body_sleep_re.replace_all(body, |bc: &regex::Captures| {
+                let s_num = bc
+                    .get(2)
+                    .and_then(|m| m.as_str().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                if s_num > 0.0 && (iters as f64) * s_num >= 90.0 {
+                    let per_iter = (max_sec / iters).max(2);
+                    if (per_iter as f64) < s_num {
+                        loop_changed = true;
+                        return format!("{}sleep {}{}", &bc[1], per_iter, &bc[3]);
+                    }
+                }
+                bc[0].to_string()
+            });
+            if loop_changed {
+                changed = true;
+                format!("{}{}{}", &caps[1], new_body, &caps[6])
+            } else {
+                caps[0].to_string()
+            }
+        });
     let after_ps = re
         .ps_long_sleep
-        .replace_all(&after_bash, |caps: &regex::Captures| {
+        .replace_all(&after_loop, |caps: &regex::Captures| {
             let secs = caps
                 .get(2)
                 .and_then(|m| m.as_str().parse::<f64>().ok())
@@ -1029,5 +1083,10 @@ mod tests {
         let (_, h10, tags10) =
             heal_windows_command("export FOO=1; sleep 90 && echo ok", true, true);
         assert!(h10.contains("sleep 45") && tags10.contains(&"sleep-clamp->45s"));
+
+        assert_eq!(
+            try_cap_long_sleep("for i in $(seq 1 18); do sleep 30; done", 45).as_deref(),
+            Some("for i in $(seq 1 18); do sleep 2; done")
+        );
     }
 }

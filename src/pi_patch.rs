@@ -312,21 +312,45 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "codemode_result_output_shim",
-        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects lacking .output (eliminates TypeError on r.output.slice())",
+        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects lacking string .output (eliminates TypeError on r.output.slice())",
         hunks: &[
             PatchHunk {
                 id: "bundle_codemode_result_output_shim",
                 rel_hint: None,
                 old: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tentry.resolve(value);",
-                alt_olds: &[],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                alt_olds: &[
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                ],
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
             PatchHunk {
                 id: "prelude_codemode_result_output_shim",
                 rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
                 old: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                alt_olds: &[
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                ],
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+            },
+        ],
+    },
+    PatchSpec {
+        id: "tool_result_preserve_codemode_structured_content",
+        summary: "Preserve structuredContent on codemode child tool_result hooks when extensions modify content without structuredContent (prevents tools.bash(...).output TypeError)",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_tool_result_preserve_codemode_structured_content",
+                rel_hint: None,
+                old: "handlerResult.content!==void 0&&(currentEvent.content=handlerResult.content,handlerResult.structuredContent===void 0&&delete currentEvent.structuredContent,modified=!0)",
                 alt_olds: &[],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "handlerResult.content!==void 0&&(currentEvent.content=handlerResult.content,handlerResult.structuredContent===void 0&&!currentEvent.parentToolCallId&&delete currentEvent.structuredContent,modified=!0)",
+            },
+            PatchHunk {
+                id: "runner_tool_result_preserve_codemode_structured_content",
+                rel_hint: Some("dist/core/extensions/runner.js"),
+                old: "                        // Structured content that is not replaced along with the content may no longer match it.\n                        if (handlerResult.structuredContent === undefined)\n                            delete currentEvent.structuredContent;",
+                alt_olds: &[],
+                new: "                        // Structured content that is not replaced along with the content may no longer match it.\n                        if (handlerResult.structuredContent === undefined && !currentEvent.parentToolCallId)\n                            delete currentEvent.structuredContent;",
             },
         ],
     },
@@ -858,7 +882,7 @@ mod tests {
         fs::write(
             chunks.join("chunk-main.js"),
             format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 PATCH_SPECS[0].hunks[0].old,
                 PATCH_SPECS[0].hunks[1].old,
                 PATCH_SPECS[3].hunks[0].old,
@@ -871,6 +895,7 @@ mod tests {
                 PATCH_SPECS[7].hunks[2].old,
                 PATCH_SPECS[8].hunks[0].old,
                 PATCH_SPECS[8].hunks[1].old,
+                PATCH_SPECS[12].hunks[0].old,
             ),
         )
         .unwrap();
@@ -911,7 +936,14 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::write(core_ext.join("runner.js"), PATCH_SPECS[0].hunks[2].old).unwrap();
+        fs::write(
+            core_ext.join("runner.js"),
+            format!(
+                "{}\n{}\n",
+                PATCH_SPECS[0].hunks[2].old, PATCH_SPECS[12].hunks[1].old
+            ),
+        )
+        .unwrap();
         fs::write(
             pi_dir.join("dist").join("core").join("agent-session.js"),
             PATCH_SPECS[0].hunks[3].old,
@@ -928,7 +960,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 12);
+        assert_eq!(applied["report"]["applied_count"], 13);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));

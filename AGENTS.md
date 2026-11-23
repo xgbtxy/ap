@@ -1,4 +1,4 @@
-# `agent-primitives` Repository Operating Rules (`v2.43+` Pure-Rust Edition)
+# `agent-primitives` Repository Operating Rules (`v2.44+` Pure-Rust Edition)
 
 Before proposing, adding, or modifying anything in this repository, read **[docs/HANDBOOK.md](./docs/HANDBOOK.md)** / **[docs/HANDBOOK.zh-CN.md](./docs/HANDBOOK.zh-CN.md)**, **[CONTRIBUTING.md](./CONTRIBUTING.md)** / **[CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)**, and **[.github/PULL_REQUEST_TEMPLATE.md](./.github/PULL_REQUEST_TEMPLATE.md)**.
 

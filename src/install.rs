@@ -1122,7 +1122,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 			outText,
 		)
 	) {{
-		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (read (res.output ?? "")), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined). Run await describeTool("<name>") to verify exact fields.`;
+		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (read (res.output ?? "")), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined, or use (JSON.stringify(val) ?? "").slice(...)). Run await describeTool("<name>") to verify exact fields.`;
 	}}
 	if (/Unexpected end of JSON input/i.test(outText)) {{
 		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on non-JSON wrappers.`;
@@ -2114,6 +2114,10 @@ export function formatPostEditLineShiftTip(
 	return `[ap edit-lines] Net line shift: ${{sign}} line(s)${{anchor}} (subsequent line numbers shifted by ${{sign}}).`;
 }}
 
+function shellQuoteBashPat(pat: string): string {{
+	return `'${{pat.replace(/'/g, "'\\''")}}'`;
+}}
+
 function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undefined {{
 	// Match optional leading `cd <dir> && ` or `cd <dir>; `, strip `2>/dev/null` & trailing pagers (`| more`/`| less`).
 	const cleaned = cmd
@@ -2132,11 +2136,12 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const bm = rawPat.match(/^(?:\.\\?\{{0,(\d+)\\?\}})?([\s\S]+?)(?:\.\\?\{{0,(\d+)\\?\}})?$/);
 		const leftN = Number(bm?.[1] || 0);
 		const rightN = Number(bm?.[3] || 0);
-		const midPat = (bm?.[2] || rawPat).replace(/"/g, '\\"');
-		if (fileTarget && (leftN > 0 || rightN > 0) && midPat) {{
+		const rawMid = bm?.[2] || rawPat;
+		if (fileTarget && (leftN > 0 || rightN > 0) && rawMid) {{
 			const around = Math.min(800, Math.max(40, leftN, rightN));
 			const prefix = toolName === "powershell" ? "& " : "";
-			return `${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty "${{midPat}}" "${{fileTarget}}"${{varGrep[8] || ""}}`;
+			const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawMid) : `"${{rawMid.replace(/"/g, '\\"')}}"`;
+			return `${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty ${{quotedPat}} "${{fileTarget}}"${{varGrep[8] || ""}}`;
 		}}
 	}}
 
@@ -2149,12 +2154,13 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const leftN = Math.min(800, Math.max(40, Number(aroundMatch[2]) || 160));
 		const rightN = Math.min(800, Math.max(40, Number(aroundMatch[5]) || leftN));
 		const around = Math.max(leftN, rightN);
-		const pat = (aroundMatch[3] || "").replace(/"/g, '\\"');
+		const rawPat = aroundMatch[3] || "";
 		const target = aroundMatch[6] || aroundMatch[7] || aroundMatch[8] || ".";
 		const pipeSuffix = aroundMatch[9] || "";
-		if (pat && !pat.includes("{{")) {{
+		if (rawPat && !rawPat.includes("{{")) {{
 			const prefix = toolName === "powershell" ? "& " : "";
-			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty "${{pat}}" "${{target}}"${{pipeSuffix}}`;
+			const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${{rawPat.replace(/"/g, '\\"')}}"`;
+			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
 		}}
 	}}
 
@@ -2168,6 +2174,24 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const q = forGrep[4];
 		const erePat = forGrep[5].replace(/\\([{{}}])/g, "$1");
 		return `${{cdPrefix}}rg -a --no-ignore -o ${{q}}${{erePat}}${{q}} ${{files}}`;
+	}}
+
+	// Fast-path A2b: `for f in <files>; do [echo "== $f";] grep -a -o -E <pat> "$f" [| pipe...]; done` -> `rg -a --no-ignore -o`
+	if (
+		/^\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?for\s+\w+\s+in\b[\s\S]*\bgrep\s+-[aAoEPhHi]+[\s\S]*;\s*done\s*$/.test(
+			cleaned,
+		)
+	) {{
+		const rewrittenFor = cleaned.replace(
+			/\bgrep\s+((?:-[aAoEPhHi]+\s+)+)(['"])([\s\S]+?)\2/g,
+			(gm, flg: string, q: string, gp: string) => {{
+				if (!flg.includes("o")) return gm;
+				const erePat = flg.includes("E") ? gp : gp.replace(/\\([{{}}])/g, "$1");
+				const noFile = flg.includes("h") ? " --no-filename" : "";
+				return `rg -a --no-ignore -o${{noFile}} ${{q}}${{erePat}}${{q}}`;
+			}},
+		);
+		if (rewrittenFor !== cleaned) return rewrittenFor;
 	}}
 
 	// Fast-path A3: `cat <files> | grep -o[E] <pat> [| sort/head...]` -> `rg -a --no-ignore -o --no-filename`
@@ -2208,7 +2232,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 
 	// Trailing `-l` / `-c` or AppData / backtick-safe recursive grep -> fast bounded `rg`
 	const complexRec = withoutIncludes.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[rRnwiEHlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))([\s\S]*?)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[rRnwiEHhlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))([\s\S]*?)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
 	);
 	if (complexRec && /[rR]/.test(complexRec[2])) {{
 		const cdPrefix = complexRec[1] || "";
@@ -2238,24 +2262,25 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	}}
 
 	const m = withoutIncludes.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHlcIsFo]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHhlcIsFo]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
 	);
 	if (!m || !/[rR]/.test(m[2])) return undefined;
 	const cdPrefix = m[1] || "";
 	const flags = m[2];
-	const pat = (m[3] || m[4] || m[5] || "").replace(/"/g, '\\"');
-	if (!pat) return undefined;
+	const rawPat = m[3] || m[4] || m[5] || "";
+	if (!rawPat) return undefined;
 	const target = m[6] || m[7] || m[8] || ".";
 	const pipeSuffix = m[9] || "";
 	const extFlag = exts.length > 0 ? ` -e ${{[...new Set(exts)].join(",")}}` : "";
 	const prefix = toolName === "powershell" ? "& " : "";
+	const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${{rawPat.replace(/"/g, '\\"')}}"`;
 	const extra = [
 		flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
 		flags.includes("o") ? " -o" : "",
 		flags.includes("i") ? " -i" : "",
 		flags.includes("h") ? " --no-filename" : "",
 	].join("");
-	return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}} "${{pat}}" "${{target}}"${{pipeSuffix}}`;
+	return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}} ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
 }}
 
 /**
@@ -2331,13 +2356,16 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {{
 			const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(inner);
 			const utf8Prefix = hasUtf8 ? "" : "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
 			const hasPsVar = /\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*|\?|\()/i.test(inner);
-			if (!inner.includes("'") && !/\$\(/.test(inner) && hasPsVar) {{
-				const sqInner = inner.replace(/\\"/g, '"').replace(/\\\$/g, "$");
+			const hasPsBacktick = /(?<!\\)`/.test(inner);
+			if (!inner.includes("'") && !/\$\(/.test(inner) && (hasPsVar || hasPsBacktick)) {{
+				const sqInner = inner.replace(/\\"/g, '"').replace(/\\\$/g, "$").replace(/\\`/g, "`");
 				const out = `${{prefix}}'${{utf8Prefix}}${{sqInner}}'${{suffix}}`;
 				return out !== cmd ? out : undefined;
 			}}
-			if (hasPsVar || !hasUtf8) {{
-				const innerEsc = inner.replace(/(?<!\\)\$(?=[A-Za-z_?(])/g, "\\$");
+			if (hasPsVar || hasPsBacktick || !hasUtf8) {{
+				const innerEsc = inner
+					.replace(/(?<!\\)\$(?=[A-Za-z_?(])/g, "\\$")
+					.replace(/(?<!\\)`/g, "\\`");
 				const out = `${{prefix}}"${{utf8Prefix}}${{innerEsc}}"${{suffix}}`;
 				return out !== cmd ? out : undefined;
 			}}
@@ -2359,9 +2387,40 @@ export function clampKvSafeSleep(cmd: string, toolName: string, maxSec = 45): st
 		return undefined;
 	}}
 	if (toolName === "bash") {{
-		const next = cmd.replace(
+		let next = cmd.replace(
 			/(^|[;&|]\s*)sleep\s+(\d+(?:\.\d+)?)s?(?=\s*(?:$|[;&|]))/gi,
 			(m, pfx: string, secsStr: string) => (Number(secsStr) >= 60 ? `${{pfx}}sleep ${{maxSec}}` : m),
+		);
+		next = next.replace(
+			/\b(for\s+\w+\s+in\s+(?:\$\(\s*seq\s+(?:(\d+)\s+)?(\d+)\s*\)|([^\r\n;]+));\s*do\b)([\s\S]*?)(\bdone\b)/gi,
+			(loopMatch, head: string, seqStart: string | undefined, seqEnd: string | undefined, wordList: string | undefined, body: string, tail: string) => {{
+				let iters = 0;
+				if (seqEnd) {{
+					const startN = seqStart ? Number(seqStart) : 1;
+					const endN = Number(seqEnd);
+					iters = endN >= startN ? endN - startN + 1 : 0;
+				}} else if (wordList) {{
+					const words = wordList.trim().split(/\s+/).filter(Boolean);
+					if (words.length >= 3) iters = words.length;
+				}}
+				if (iters < 3) return loopMatch;
+				let loopChanged = false;
+				const clampedBody = body.replace(
+					/(^|[;&|\s])sleep\s+(\d+(?:\.\d+)?)s?(?=\s*(?:$|[;&|]))/gi,
+					(sm, spfx: string, sStr: string) => {{
+						const sNum = Number(sStr);
+						if (sNum > 0 && iters * sNum >= 90) {{
+							const perIter = Math.max(2, Math.floor(maxSec / iters));
+							if (perIter < sNum) {{
+								loopChanged = true;
+								return `${{spfx}}sleep ${{perIter}}`;
+							}}
+						}}
+						return sm;
+					}},
+				);
+				return loopChanged ? `${{head}}${{clampedBody}}${{tail}}` : loopMatch;
+			}},
 		);
 		return next !== cmd ? next : undefined;
 	}}
@@ -2397,15 +2456,16 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		const gm = cmd.match(BARE_SLOW_GREP);
 		if (gm && /[rR]/.test(gm[1])) {{
 			const flags = gm[1];
-			const pat = (gm[2] || gm[3] || gm[4] || "").replace(/"/g, '\\"');
+			const rawPat = gm[2] || gm[3] || gm[4] || "";
 			const target = gm[5] || gm[6] || gm[7] || ".";
 			const prefix = toolName === "powershell" ? "& " : "";
+			const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${{rawPat.replace(/"/g, '\\"')}}"`;
 			const extra = [
 				flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
 				flags.includes("o") ? " -o" : "",
 				flags.includes("i") ? " -i" : "",
 			].join("");
-			return `${{prefix}}"${{AP_BIN}}" search${{extra}} "${{pat}}" "${{target}}"`;
+			return `${{prefix}}"${{AP_BIN}}" search${{extra}} ${{quotedPat}} "${{target}}"`;
 		}}
 	}}
 
@@ -2462,9 +2522,9 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		}}
 	}}
 
-	// 2d. Fix Windows trailing backslash inside quotes (`"C:\"` -> `"C:/"` or `"C:\App\"*.dll` -> `"C:/App/"*.dll`)
+	// 2d. Fix Windows trailing backslash inside quotes (`"C:\"` -> `"C:/"` or `"C:\App\"*.dll` -> `"C:/App/"*.dll`) while preserving nested `\"C:\\...\"`
 	if (toolName === "bash") {{
-		const fixedBs = cmd.replace(/"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
+		const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
 		if (fixedBs !== cmd) {{
 			cmd = fixedBs;
 			changed = true;
@@ -5490,6 +5550,7 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("isDeepCacheDiscountModel")
                 && s.contains("healBashPowerShellCommand")
                 && s.contains("clampKvSafeSleep")
+                && s.contains("shellQuoteBashPat")
         })
         .unwrap_or(false);
 
