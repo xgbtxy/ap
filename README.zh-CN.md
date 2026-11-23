@@ -47,7 +47,32 @@ curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 | **2. 开局盲猜、表面图与真机接口/UI 质检**<br>*(定向、故障定位、HTTP/WS 鉴权)* | 面对多文件客诉靠 `ls`/`rg` 盲搜，手写脆弱 `curl`/Python 鉴权/CORS/并发脚本，或长会话遗漏测试维度。 | **`ap atlas` + `ap probe`**：`<15 ms` 全局骨架图、`<60 ms` 守卫感知 9 轴表面图、`<25 ms` 症状直达定位、零标签复用本地回环 CDP 会话（`--principal-cdp`）、HTTP `--race`/`--cors-origin` 与 WebSocket 跨源矩阵测试。 |
 | **3. 安全创造与弹性链式精确改码**<br>*(跨模块契约、防误拷行号与重名歧义)* | 全局替换误伤注释/字符串，重构漏改调用方，或因复制了行号前缀、同名代码块歧义、智能引号导致补丁失配重读。 | **`ap splice` + `ap undo`**：弹性链式补丁（自动剥离读取行号前缀、`@L` 行窗消歧、候选行定位与弯引号自愈）、避开注释的 `rename`、6 语言+JSON/TOML 预检门禁及无 Git 快照。 |
 | **4. 终端水土不服、慢搜索与死循环**<br>*(Windows/Mac Shell 与噪音日志)* | 撞上 **`528+` 次 OS/Shell 崩溃**（GBK/BOM、PS `&&`/`$_` 剥离、`rg` 正则报错、`dir /b`、长 `PATH` 截断）、慢 `grep -rhoE`、40KB 日志刷屏与死循环。 | **`ap exec` + `ap sieve` + `ap guard`**：透明 Hook 自动修复 UTF-8、`curl.exe`、PS `$var` 引号、`dir /b -> ap ls`、`rg -F` 与 `grep -rhoE` 自愈、临时服务 TTL 护栏，日志无损脱水 **-98.8%**，并内置 `3x` 死循环与批处理熔断。 |
-| **5. 深度六门禁、按需 MCP 与 Pi 缓存经济学**<br>*(渐进发现 MCP、12 项 Pi 补丁、共维护)* | 全量 MCP 每次空烧 **11k+ Schema Token**，产出假绿灯测试或安全隐患，或长会话中途打穿 KV-Cache。 | **MCP 2025-06-18（`--profile full\|core\|deferred` + `ap_discover`/`ap_call`）** + **`ap guard verify --deep`** + **`ap pi`**（12 项幂等 Pi 补丁）+ **`ap audit --maintainer`**。 |
+| **5. 深度六门禁、按需 MCP 与 Pi 缓存经济学**<br>*(渐进发现 MCP、14 项 Pi 补丁、共维护)* | 全量 MCP 每次空烧 **11k+ Schema Token**，产出假绿灯测试或安全隐患，或长会话中途打穿 KV-Cache。 | **MCP 2025-06-18（`--profile full\|core\|deferred` + `ap_discover`/`ap_call`）** + **`ap guard verify --deep`** + **`ap pi`**（14 项幂等 Pi 补丁）+ **`ap audit --maintainer`**。 |
+
+---
+
+## 架构分层与演进方向：通用底座 + 真实运行日志 + 按需「模型 × 框架」适配
+
+```text
++-------------------------------------------------------------------+
+|  3. 按需适配层（按当前使用的 Agent 框架 x 模型家族按需装配）         |
+|     - 宿主接线与 MCP 档位：`ap init -a <harness>` / `--profile`    |
+|     - 可选运行时补丁包：`ap pi patch`（14 项 Pi 运行时增强）        |
+|     - 模型特性经济学：KV-Cache 续热、快模型脱水阈值与 Schema 裁剪   |
++-------------------------------------------------------------------+
+|  2. 实证驱动层：各家 Harness 与模型的真实运行过程日志                |
+|     - 100% 离线零隐私轨迹审计（`ap audit --maintainer`）            |
+|     - 从真实报错、重试、截断与缓存跌落中定位高杠杆改进点            |
++-------------------------------------------------------------------+
+|  1. 通用能力底座（`ap` / `ap.exe` 单文件纯 Rust 核心）              |
+|     - 与模型/框架解耦的物理原子能力：读写搜、语法树、二进制/归档、    |
+|       SQLite、HTTP/WS/CDP 验证与 `37` 工具强类型 `ap mcp`          |
++-------------------------------------------------------------------+
+```
+
+- **通用能力底座放最底层**：把文件/Office/二进制/归档直读、Tree-sitter 语义搜索与安全改码、Shell/编码护盾、SQLite 查询及无头浏览器/接口门禁沉淀在零依赖纯 Rust 内核里，所有宿主通过统一 CLI 与 `ap mcp` 无差别复用。
+- **由各家 Harness 与模型真实过程日志驱动演进**：通过离线零隐私 `ap audit --maintainer` 持续观察不同框架（`Claude Code`、`Codex`、`Pi`、`OpenCode`、`Cursor`、`Gemini CLI`、`Antigravity`、`Grok` 等）与不同模型档位的真实过程摩擦，共性痛点反哺通用底座，个性痛点精准归类。
+- **「通用 `ap` + 特定模型/框架按需适配」组合使用**：用户只启用自己当前宿主与模型所需的薄适配（如 `ap init -a <harness>`、`ap pi patch` 或 `--profile deferred`），未使用的框架和模型零 Token 税、零运行时负担，也可随上游模型/框架升级随时安全退场。
 
 ---
 

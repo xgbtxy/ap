@@ -47,7 +47,33 @@ When we audited **101,108 real tool calls** and raw `<thinking>` traces across c
 | **2. Orientation, Surface &amp; Live Browser/API QA**<br>*(Mapping, Locating, HTTP/WS AuthZ)* | Blind `ls`/`rg` across modules, hand-rolled `curl`/Python RBAC/CORS/concurrency scripts, or losing track of untested axes in long runs. | **`ap atlas` + `ap probe`**: `<15 ms` PageRank map, `<60 ms` 9-axis guard-aware surface frontier, `<25 ms` fault localization, zero-tab CDP cookie reuse (`--principal-cdp`), HTTP `--race`/`--cors-origin` &amp; `ws --origin-matrix`. |
 | **3. Safe Creation &amp; Multi-File Refactors**<br>*(Cross-File Contracts &amp; AST Editing)* | Naive find-replace corrupts comments/strings, hallucinates cross-file imports, or retries after copied line numbers, ambiguity, or smart quotes. | **`ap splice` + `ap undo`**: Chain-of-resiliency patching (auto-strips read gutters, `@L` line hints, smart-quote rescue + candidate diagnostics), Tree-sitter `rename`, 6-lang + JSON/TOML AST gate, `<5 ms` linker &amp; snapshots. |
 | **4. OS Quoting Crashes, Slow Grep &amp; Doom Loops**<br>*(Windows/Mac Shell &amp; Log Noise)* | Hits **`528+` Windows OS/shell crashes** (GBK/BOM, PS `&&`, `rg` regex errors, `dir /b`, slow `grep`), ANSI log floods &amp; repetitive retry loops. | **`ap exec` + `ap sieve` + `ap guard`**: Transparent hook fixes UTF-8, `curl.exe`, PS `$var` quoting, `dir /b -> ap ls`, `rg -F` &amp; `grep -rhoE` auto-heal, ephemeral server TTLs, CI log compression **-98.8%**, and `3x` doom-loops + batch nudges. |
-| **5. Deep Verification, Progressive MCP &amp; Pi Cache**<br>*(6-Gate QA, Progressive MCP, 12 Pi Patches)* | Burns **11k+ schema tokens/turn** dumping all 36 MCP schemas, ships vacuous tests/OWASP bugs, or busts KV-caches mid-run. | **MCP 2025-06-18 (`--profile full\|core\|deferred` w/ `ap_discover`+`ap_call`)** + **`ap guard verify --deep`** + **`ap pi`** (12 idempotent Pi v1.5+/v1.6 runtime patches) + **`ap audit --maintainer`**. |
+| **5. Deep Verification, Progressive MCP &amp; Pi Cache**<br>*(6-Gate QA, Progressive MCP, 14 Pi Patches)* | Burns **11k+ schema tokens/turn** dumping all 37 MCP schemas, ships vacuous tests/OWASP bugs, or busts KV-caches mid-run. | **MCP 2025-06-18 (`--profile full\|core\|deferred` w/ `ap_discover`+`ap_call`)** + **`ap guard verify --deep`** + **`ap pi`** (14 idempotent Pi v1.5+/v1.6 runtime patches) + **`ap audit --maintainer`**. |
+
+---
+
+## Architecture &amp; Direction: Universal Core + On-Demand Harness &amp; Model Adapters
+
+```text
++-------------------------------------------------------------------+
+|  3. On-Demand Adapters (Selected per Harness x Model Family)      |
+|     - Harness hooks/MCP wiring: `ap init -a <harness>` / profiles |
+|     - Optional runtime patches: `ap pi patch` (Pi v1.5+/v1.6)    |
+|     - Model-tier economics: KV-cache TTL keep, sieve limits,      |
+|       `--profile core|deferred` schema slimming                   |
++-------------------------------------------------------------------+
+|  2. Empirical Driver: Real Harness &amp; Model Execution Telemetry    |
+|     - Offline zero-PII process logs (`ap audit --maintainer`)     |
+|     - Pinpoints where real agents stall across harnesses &amp; models |
++-------------------------------------------------------------------+
+|  1. Universal Core (`ap` / `ap.exe` Single Pure-Rust Binary)      |
+|     - Model- &amp; harness-agnostic physical primitives: files, AST,  |
+|       binaries/archives, SQLite, HTTP/WS/CDP, OS shield, `ap mcp` |
++-------------------------------------------------------------------+
+```
+
+- **Universal Core First**: Keep durable physical primitives—reading/searching code, docs, binaries &amp; archives, Tree-sitter AST navigation &amp; safe patching, OS/shell quoting recovery, SQLite SQL, and browser/API verification—inside one dependency-free Rust core usable everywhere via CLI and `37` typed `ap mcp` tools.
+- **Driven by Multi-Harness &amp; Multi-Model Reality**: Prioritize work from empirical execution friction logs across real harnesses (`Claude Code`, `Codex`, `Pi`, `OpenCode`, `Cursor`, `Gemini CLI`, `Antigravity`, `Grok`, etc.) and model tiers via offline, zero-PII `ap audit --maintainer` rather than speculative prompting.
+- **Composed On Demand**: End users run **Universal `ap` + only the adapters for their chosen harness and model** (e.g., `ap init -a <harness>`, `ap pi patch`, or `--profile deferred`), incurring zero token or runtime tax for unused frameworks and allowing adapters to retire cleanly as upstream hosts or models evolve.
 
 ---
 
