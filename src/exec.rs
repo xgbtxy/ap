@@ -682,6 +682,50 @@ pub fn try_accelerate_head_slice(raw: &str) -> Option<String> {
     ))
 }
 
+/// Rewrite bare `tail -n <N> <file>` or `tail -<N> <file>` (with optional leading `cd <dir> &&`) cleanly
+/// to bounded `ap read "<file>" --tail <N>`. Passes through `-f`, `--follow`, `+N`, pipes, and globs safely.
+pub fn try_accelerate_tail_slice(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if has_unsafe_shell_meta(body) {
+        return None;
+    }
+    static TAIL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TAIL_RE.get_or_init(|| {
+        Regex::new(
+            r#"^\s*tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$"#,
+        )
+        .unwrap()
+    });
+    let cap = re.captures(body.trim())?;
+    let n: usize = cap.get(1).or_else(|| cap.get(2))?.as_str().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let file = cap
+        .get(3)
+        .or_else(|| cap.get(4))
+        .or_else(|| cap.get(5))?
+        .as_str();
+    if file.contains('*') || file.contains('?') || file.contains(',') {
+        return None;
+    }
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+    let file_esc = file.replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" read \"{file_esc}\" --tail {n}",
+        cd_pfx.unwrap_or("")
+    ))
+}
+
 /// Rewrite bare PowerShell `Get-ChildItem` / `gci` calls cleanly to bounded `ap ls`
 /// (with `--depth`), while safely passing through pipes, `-Filter`/`-Include`, or globs.
 pub fn try_accelerate_get_child_item(raw: &str) -> Option<String> {
@@ -1059,6 +1103,11 @@ pub fn heal_windows_command(
     if let Some(fast_head) = try_accelerate_head_slice(raw) {
         heals.push("head-slice->ap-read");
         let (kind, cmd_out) = route_accelerated_cmd(fast_head, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_tail) = try_accelerate_tail_slice(raw) {
+        heals.push("tail-slice->ap-read");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_tail, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -1880,5 +1929,22 @@ mod tests {
         );
         assert!(tags23.contains(&"head-slice->ap-read"));
         assert!(try_accelerate_head_slice("rg foo | head -n 5").is_none());
+
+        // `try_accelerate_tail_slice` accelerates bare `tail -n <N>` / `tail -<N>` while passing through `-f` / `+N` / pipes
+        let (_, h24, tags24) = heal_windows_command("tail -n 20 app.log", true, true);
+        assert!(h24.contains("read \"app.log\" --tail 20"), "{h24}");
+        assert!(tags24.contains(&"tail-slice->ap-read"));
+
+        let (k25, h25, tags25) =
+            heal_windows_command("cd sub && tail -50 \"src/a b.rs\"", true, true);
+        assert_eq!(k25, ShellKind::GitBash);
+        assert!(
+            h25.starts_with("cd sub && ") && h25.contains("read \"src/a b.rs\" --tail 50"),
+            "{h25}"
+        );
+        assert!(tags25.contains(&"tail-slice->ap-read"));
+        assert!(try_accelerate_tail_slice("tail -f app.log").is_none());
+        assert!(try_accelerate_tail_slice("tail -n +5 app.log").is_none());
+        assert!(try_accelerate_tail_slice("cat app.log | tail -n 10").is_none());
     }
 }

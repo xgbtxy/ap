@@ -600,7 +600,7 @@ fn mcp_tools_schema() -> Value {
         }),
         json!({
             "name": "ap_baton",
-            "description": "Compaction-proof task state & cross-agent handoff capsule (<500 tokens): `resume`, `set` (goal/constraints/next), `fact` (verified ground truth), `deadend` (falsified approach), `checkpoint`, or `clear`.",
+            "description": "Compaction-proof task state & cross-agent handoff capsule (<500 tokens) with automatic fact/HEAD drift detection on `resume`: `resume`, `set` (goal/constraints/next), `fact` (verified ground truth), `deadend` (falsified approach), `checkpoint`, or `clear`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -619,18 +619,20 @@ fn mcp_tools_schema() -> Value {
         }),
         json!({
             "name": "ap_recall",
-            "description": "Sub-millisecond SQLite FTS5/BM25 triggered micro-memory vault: `match` (retrieve top-K rules for query/files), `add` (save triggers + rule), or `stats`.",
+            "description": "Sub-millisecond SQLite FTS5/BM25 triggered micro-memory vault with file-hash/git provenance & staleness invalidation: `match` (retrieve top-K rules for query/files), `add` (save triggers + rule, optionally bound to `--file`), `stats`, or `verify` (detect/prune stale rules).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "description": "'match', 'add', or 'stats'" },
+                    "action": { "type": "string", "description": "'match', 'add', 'stats', or 'verify'" },
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
                     "query": { "type": "string", "description": "Task/command query for `match`" },
                     "files": { "type": "string", "description": "Comma-separated active file paths for `match`" },
                     "top": { "type": "integer", "description": "Max rules to retrieve (default: 3)" },
                     "triggers": { "type": "string", "description": "Trigger keywords/globs for `add`" },
                     "rule": { "type": "string", "description": "Concise actionable rule text for `add`" },
-                    "kind": { "type": "string", "description": "Rule category (default: 'gotcha')" }
+                    "kind": { "type": "string", "description": "Rule category (default: 'gotcha')" },
+                    "file": { "type": "string", "description": "Optional bound source file path for provenance hash tracking on `add`" },
+                    "prune_stale": { "type": "boolean", "description": "When true on `verify`, delete rules whose bound source_file was modified or deleted" }
                 },
                 "required": ["action"]
             }
@@ -2965,7 +2967,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         .map(String::from)
                         .collect();
                     let top = args.get("top").and_then(Value::as_u64).unwrap_or(3) as usize;
-                    match ap_recall::match_rules(&conn, q, &file_list, top) {
+                    match ap_recall::match_rules_in(&conn, cwd_p, q, &file_list, top) {
                         Ok((hits, elapsed_ms)) => (
                             true,
                             serde_json::to_string_pretty(&json!({
@@ -3000,7 +3002,15 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .unwrap_or("gotcha");
-                    match ap_recall::add_rule(&conn, triggers, rule, kind) {
+                    let source_file = args.get("file").and_then(Value::as_str).unwrap_or("");
+                    match ap_recall::add_rule_with_provenance(
+                        &conn,
+                        cwd_p,
+                        triggers,
+                        rule,
+                        kind,
+                        source_file,
+                    ) {
                         Ok(id) => (
                             true,
                             serde_json::to_string_pretty(&json!({
@@ -3008,10 +3018,21 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 "id": id,
                                 "kind": kind,
                                 "triggers": triggers,
+                                "file": source_file,
                             }))
                             .unwrap_or_default(),
                         ),
                         Err(e) => (false, format!("recall add failed: {e}")),
+                    }
+                }
+                "verify" => {
+                    let prune_stale = args
+                        .get("prune_stale")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    match ap_recall::verify_vault(&conn, cwd_p, prune_stale) {
+                        Ok(rep) => (true, serde_json::to_string_pretty(&rep).unwrap_or_default()),
+                        Err(e) => (false, format!("recall verify failed: {e}")),
                     }
                 }
                 "stats" => match ap_recall::compute_stats(&conn) {
@@ -3020,7 +3041,8 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 },
                 _ => (
                     false,
-                    "Pass `action`: 'match', 'add', or 'stats' to `ap_recall`.".to_string(),
+                    "Pass `action`: 'match', 'add', 'stats', or 'verify' to `ap_recall`."
+                        .to_string(),
                 ),
             }
         }

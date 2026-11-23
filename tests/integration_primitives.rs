@@ -8932,3 +8932,146 @@ fn test_v254_supply_chain_sec_breaking_api_diff_and_mcp_codex_edit() {
         .unwrap_or("")
         .contains("invalid `diff` patch"));
 }
+
+#[test]
+fn test_v255_recall_provenance_baton_drift_and_read_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    let root_s = root.to_string_lossy().to_string();
+
+    // 1. Recall provenance (`--file`) + automatic staleness detection + `verify --prune-stale`
+    let auth_p = root.join("src/auth.ts");
+    fs::write(
+        &auth_p,
+        "export const verifyToken = (t: string) => t.length > 0;\n",
+    )
+    .unwrap();
+    let r_add = run_ap(
+        root,
+        &[
+            "recall",
+            "add",
+            "--triggers",
+            "auth,verifyToken",
+            "--rule",
+            "verifyToken returns boolean",
+            "--file",
+            "src/auth.ts",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        r_add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&r_add.stderr)
+    );
+
+    let m_fresh = run_ap(
+        root,
+        &["recall", "match", "--query", "verifyToken", "--json"],
+        None,
+        &[],
+    );
+    assert!(m_fresh.status.success());
+    let mf_j: Value = serde_json::from_slice(&m_fresh.stdout).unwrap();
+    assert_eq!(mf_j["matches"][0]["stale"].as_bool(), None);
+
+    fs::write(
+        &auth_p,
+        "export const verifyToken = (t: string) => ({ ok: t.length > 0 });\n",
+    )
+    .unwrap();
+    let m_stale = run_ap(
+        root,
+        &["recall", "match", "--query", "verifyToken", "--json"],
+        None,
+        &[],
+    );
+    assert!(m_stale.status.success());
+    let ms_j: Value = serde_json::from_slice(&m_stale.stdout).unwrap();
+    assert_eq!(ms_j["matches"][0]["stale"], true, "{ms_j}");
+    assert_eq!(ms_j["matches"][0]["stale_reason"], "source_file_modified");
+
+    let r_ver = run_ap(
+        root,
+        &["recall", "verify", "--prune-stale", "--json"],
+        None,
+        &[],
+    );
+    assert!(r_ver.status.success());
+    let rv_j: Value = serde_json::from_slice(&r_ver.stdout).unwrap();
+    assert_eq!(rv_j["stale_rules"], 1);
+    assert_eq!(rv_j["pruned_rules"], 1);
+
+    // 2. Baton fact provenance (`--ref`) + drift detection on `resume`
+    let cfg_p = root.join("src/config.ts");
+    fs::write(&cfg_p, "line1\nline2\nline3\nline4\n").unwrap();
+    let bf = run_ap(
+        root,
+        &[
+            "baton",
+            "fact",
+            "timeout is 5000ms",
+            "--ref",
+            "src/config.ts:1",
+        ],
+        None,
+        &[],
+    );
+    assert!(bf.status.success());
+    fs::write(&cfg_p, "line1\nline2\nline3\nline4-changed\n").unwrap();
+
+    let br_md = run_ap(root, &["baton", "resume"], None, &[]);
+    assert!(br_md.status.success());
+    let br_s = String::from_utf8_lossy(&br_md.stdout);
+    assert!(
+        br_s.contains("[DRIFT WARNING]") && br_s.contains("[DRIFTED: modified]"),
+        "{br_s}"
+    );
+
+    let br_js = run_ap(root, &["baton", "resume", "--json"], None, &[]);
+    assert!(br_js.status.success());
+    let bj: Value = serde_json::from_slice(&br_js.stdout).unwrap();
+    assert_eq!(bj["drift"]["drifted_facts"].as_array().unwrap().len(), 1);
+    assert_eq!(bj["drift"]["drifted_facts"][0]["reason"], "modified");
+
+    // 3. `ap read --tail 2` emits only the last 2 numbered lines
+    let rt = run_ap(root, &["read", "src/config.ts", "--tail", "2"], None, &[]);
+    assert!(rt.status.success());
+    let rt_s = String::from_utf8_lossy(&rt.stdout);
+    assert!(
+        rt_s.contains("L3-L4") && rt_s.contains("line4-changed") && !rt_s.contains("line1"),
+        "{rt_s}"
+    );
+
+    // 4. MCP exact 37 tools + `ap_recall(action="verify")` + `ap_baton(action="resume")`
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_recall",
+            "arguments": { "cwd": root_s, "action": "verify" }
+        }}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "ap_baton",
+            "arguments": { "cwd": root_s, "action": "resume" }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    assert_eq!(resps[2]["result"]["isError"], false, "{}", resps[2]);
+    assert!(resps[3]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .contains("drifted_facts"));
+}

@@ -1,8 +1,8 @@
-# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.54）
+# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.55）
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives`（`v2.54`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP `2025-11-25` / `2025-06-18`（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
+`agent-primitives`（`v2.55`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP `2025-11-25` / `2025-06-18`（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
 
 ---
 
@@ -48,8 +48,8 @@ ap uninstall          # 或卸载当前项目：ap uninstall --here
 | **定向 / 依赖图 / 死代码审计 / 单测**（`ap_orient`、`ap_impact(file=..., dead=true)`、`atlas deps/changes/history`） | Personalized PageRank 核心地图、`<40ms` 跨文件 `atlas deps --dead`（出站导入/多跳被引用/循环依赖 + 孤立模块与未用符号）、`<60ms` 9 轴表面图、`<25ms` 故障定位、`atlas changes` 精选单测及 `atlas history`。 | `6–60 ms` |
 | **AST 改写、Codex Diff 与检查点**（`ap_edit`、`ap splice view/apply/rename/rewrite/check --hook`、`ap undo`） | Codex `*** Begin Patch` 与 Unified Diff 行窗消歧补丁（`@L`/弯引号/Hashline）、Tree-sitter `rename` 与 `rewrite`（`, $$$ARGS` 自动消去）、6 语言预检、`<5ms` `PostToolUse` 钩子，以及 `ap undo --save/--diff/--keep` 命名快照。 | `0.7–15 ms` |
 | **运行时、网络与双端 UI 质检**（`ap_smoke`、`ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`） | 空闲端口托管 + 进程树清零；无头 Edge/Chrome 桌面+移动 UI/4xx-5xx 巡检；非侵入式实时 `cdp --watch-ms`；单发/批量/并发竞态/CORS/CDP 会话复用 `http` 质检；RFC 6455 `ws --origin-matrix`；AST 变异测试与接口混沌 Fuzz。 | `0.2–4.5 s` |
-| **深度六门禁、供应链与压缩**（`ap_verify`、`ap guard verify --deep/sec/diff/pack`、`ap exec`、`ap sieve`） | 单次跑通 6 重门禁（测试 + `.only` 拦截 + OWASP 及 `package.json`/锁文件/`requirements.txt`/`.mcp.json` 供应链 `sec` + 含破坏性 API 变更预警的语义 `diff` + 契约 + `mutate`）、`3x` 熔断、Windows/PS/`sed`/`head` 自愈与 `-98.8%` 脱水。 | `<2 ms` (+测试) |
-| **Pi 运行时、接力棒与微记忆**（`ap pi`、`ap baton frontier/claim/dedup`、`ap recall`） | 12 项幂等 Pi v1.5+/v1.6 运行时补丁（`codemode` `text()`/`.output` 兼容、Keep-Alive、串行 Shell 屏障、CJK 校准压缩、工具序锁缓存）、正交探索前沿调度、原子租约与 `3.3ms` CJK+BM25 微记忆。 | `<15 ms` |
+| **深度六门禁、供应链与压缩**（`ap_verify`、`ap guard verify --deep/sec/diff/pack`、`ap exec`、`ap sieve`） | 单次跑通 6 重门禁（测试 + `.only` 拦截 + OWASP 及 `package.json`/锁文件/`requirements.txt`/`.mcp.json` 供应链 `sec` + 含破坏性 API 变更预警的语义 `diff` + 契约 + `mutate`）、`3x` 熔断、Windows/PS/`sed`/`head`/`tail` 自愈与 `-98.8%` 脱水。 | `<2 ms` (+测试) |
+| **Pi 运行时、接力棒与微记忆**（`ap pi`、`ap baton fact/resume/frontier/claim/dedup`、`ap recall add --file/verify`） | 14 项幂等 Pi v1.5+/v1.6 运行时补丁（`codemode` `text()`/`.output` 兼容、Keep-Alive、串行 Shell 屏障、CJK 校准压缩、工具序锁缓存）、`resume` 自动校验源码哈希/HEAD 漂移、文件溯源微记忆与 `verify --prune-stale`、正交探索前沿及 `3.3ms` CJK+BM25 微记忆。 | `<15 ms` |
 
 ---
 

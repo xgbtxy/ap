@@ -12,7 +12,28 @@ pub struct FactEntry {
     pub text: String,
     #[serde(default)]
     pub r#ref: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ref_hash: String,
     pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DriftedFact {
+    pub text: String,
+    #[serde(default)]
+    pub r#ref: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DriftReport {
+    pub head_drifted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drifted_facts: Vec<DriftedFact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -28,6 +49,8 @@ pub struct WorkspaceSnapshot {
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,6 +323,59 @@ pub fn load_state(base: &Path) -> BatonState {
         .unwrap_or_default()
 }
 
+fn fnv1a64_file(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in &bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("{hash:016x}"))
+}
+
+fn is_line_spec_segment(seg: &str) -> bool {
+    let mut saw_part = false;
+    for part in seg.split('-') {
+        let digits = part.strip_prefix('L').unwrap_or(part);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        saw_part = true;
+    }
+    saw_part
+}
+
+pub fn extract_ref_path(reference: &str) -> Option<&str> {
+    let mut s = reference.trim();
+    if s.is_empty() || s.starts_with("http://") || s.starts_with("https://") {
+        return None;
+    }
+    for _ in 0..2 {
+        let Some((prefix, tail)) = s.rsplit_once(':') else {
+            break;
+        };
+        if prefix.len() <= 1 || !is_line_spec_segment(tail) {
+            break;
+        }
+        s = prefix;
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn resolve_ref_path(cwd: &Path, path_str: &str) -> PathBuf {
+    let p = Path::new(path_str);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
 pub fn probe_workspace(cwd: &Path) -> WorkspaceSnapshot {
     let mut snap = WorkspaceSnapshot {
         cwd: cwd.to_string_lossy().to_string(),
@@ -313,6 +389,18 @@ pub fn probe_workspace(cwd: &Path) -> WorkspaceSnapshot {
         if out.status.success() {
             let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
             snap.git_branch = Some(branch);
+            if let Ok(head_out) = Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .current_dir(cwd)
+                .output()
+            {
+                if head_out.status.success() {
+                    let h = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+                    if !h.is_empty() {
+                        snap.git_head = Some(h);
+                    }
+                }
+            }
             if let Ok(st_out) = Command::new("git")
                 .args(["status", "--short"])
                 .current_dir(cwd)
@@ -353,8 +441,68 @@ pub fn probe_workspace(cwd: &Path) -> WorkspaceSnapshot {
     snap
 }
 
+pub fn verify_state_drift(
+    state: &BatonState,
+    cwd: &Path,
+    live_ws: &WorkspaceSnapshot,
+) -> DriftReport {
+    let head_drifted = match (&state.workspace.git_head, &live_ws.git_head) {
+        (Some(saved), Some(curr)) => !saved.is_empty() && !curr.is_empty() && saved != curr,
+        _ => false,
+    };
+    let mut drifted_facts = Vec::new();
+    for f in &state.facts {
+        if f.ref_hash.is_empty() || f.r#ref.is_empty() {
+            continue;
+        }
+        let Some(path_str) = extract_ref_path(&f.r#ref) else {
+            continue;
+        };
+        let resolved = resolve_ref_path(cwd, path_str);
+        if !resolved.exists() {
+            drifted_facts.push(DriftedFact {
+                text: f.text.clone(),
+                r#ref: f.r#ref.clone(),
+                reason: "deleted".to_string(),
+            });
+        } else if fnv1a64_file(&resolved).as_deref() != Some(f.ref_hash.as_str()) {
+            drifted_facts.push(DriftedFact {
+                text: f.text.clone(),
+                r#ref: f.r#ref.clone(),
+                reason: "modified".to_string(),
+            });
+        }
+    }
+    DriftReport {
+        head_drifted,
+        saved_head: state.workspace.git_head.clone(),
+        current_head: live_ws.git_head.clone(),
+        drifted_facts,
+    }
+}
+
 pub fn render_markdown(state: &BatonState) -> String {
+    render_markdown_with_drift(state, None)
+}
+
+pub fn render_markdown_with_drift(state: &BatonState, drift: Option<&DriftReport>) -> String {
     let mut lines = vec![format!("# BATON HANDOFF ({})", state.updated_at)];
+    if let Some(dr) = drift {
+        if dr.head_drifted || !dr.drifted_facts.is_empty() {
+            let mut parts = Vec::new();
+            if dr.head_drifted {
+                parts.push(format!(
+                    "HEAD moved {} -> {}",
+                    dr.saved_head.as_deref().unwrap_or("?"),
+                    dr.current_head.as_deref().unwrap_or("?")
+                ));
+            }
+            if !dr.drifted_facts.is_empty() {
+                parts.push(format!("{} fact(s) drifted", dr.drifted_facts.len()));
+            }
+            lines.push(format!("> [DRIFT WARNING] {}", parts.join("; ")));
+        }
+    }
     if !state.goal.is_empty() {
         lines.push(format!("**Goal**: {}", state.goal));
     }
@@ -399,7 +547,15 @@ pub fn render_markdown(state: &BatonState) -> String {
             } else {
                 format!(" (`{}`)", f.r#ref)
             };
-            lines.push(format!("- {}{r}", f.text));
+            let drift_tag = drift
+                .and_then(|dr| {
+                    dr.drifted_facts
+                        .iter()
+                        .find(|df| df.text == f.text && df.r#ref == f.r#ref)
+                })
+                .map(|df| format!(" [DRIFTED: {}]", df.reason))
+                .unwrap_or_default();
+            lines.push(format!("- {}{r}{drift_tag}", f.text));
         }
     }
 
@@ -511,10 +667,21 @@ pub fn run_cli(args: &[String]) -> i32 {
         SubCmd::Fact { text, reference } => {
             let mut state = load_state(&base);
             let clean_text = truncate_chars(&text, 220);
-            if !state.facts.iter().any(|f| f.text == clean_text) {
+            let clean_ref = truncate_chars(&reference, 120);
+            let ref_hash = extract_ref_path(&clean_ref)
+                .and_then(|p| fnv1a64_file(&resolve_ref_path(&cwd, p)))
+                .unwrap_or_default();
+            if let Some(existing) = state.facts.iter_mut().find(|f| f.text == clean_text) {
+                if !clean_ref.is_empty() {
+                    existing.r#ref = clean_ref;
+                    existing.ref_hash = ref_hash;
+                    existing.at = now_iso_utc();
+                }
+            } else {
                 state.facts.push(FactEntry {
                     text: clean_text,
-                    r#ref: truncate_chars(&reference, 120),
+                    r#ref: clean_ref,
+                    ref_hash,
                     at: now_iso_utc(),
                 });
                 if state.facts.len() > 12 {
@@ -564,14 +731,23 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         SubCmd::Resume { json } => {
             let mut state = load_state(&base);
-            state.workspace = probe_workspace(&cwd);
+            let live_ws = probe_workspace(&cwd);
+            let drift = verify_state_drift(&state, &cwd, &live_ws);
+            state.workspace = live_ws;
             if json {
+                let mut val = serde_json::to_value(&state)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(obj) = val.as_object_mut() {
+                    if let Ok(dv) = serde_json::to_value(&drift) {
+                        obj.insert("drift".to_string(), dv);
+                    }
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                print!("{}", render_markdown(&state));
+                print!("{}", render_markdown_with_drift(&state, Some(&drift)));
             }
             0
         }
@@ -651,5 +827,75 @@ pub fn run_cli(args: &[String]) -> i32 {
                 json,
             } => frontier::run_frontier_sync_stopped(&cwd, store.as_deref(), &text_files, json),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_ref_path_strips_line_ranges_without_breaking_windows_drive() {
+        assert_eq!(extract_ref_path("src/app.rs:42"), Some("src/app.rs"));
+        assert_eq!(extract_ref_path("src/app.rs:42:7"), Some("src/app.rs"));
+        assert_eq!(extract_ref_path("src/app.rs:L10-L25"), Some("src/app.rs"));
+        assert_eq!(
+            extract_ref_path(r"C:\repo\src\app.rs:12"),
+            Some(r"C:\repo\src\app.rs")
+        );
+        assert_eq!(extract_ref_path("https://example.com:8443/x"), None);
+    }
+
+    #[test]
+    fn verify_state_drift_detects_modified_deleted_and_head_drift() {
+        let dir = std::env::temp_dir().join(format!("ap_baton_drift_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join("config.rs");
+        fs::write(&fp, "pub const TIMEOUT_MS: u64 = 3000;\n").unwrap();
+        let h = fnv1a64_file(&fp).unwrap();
+
+        let state = BatonState {
+            goal: "verify drift".to_string(),
+            facts: vec![FactEntry {
+                text: "timeout is 3000ms".to_string(),
+                r#ref: "config.rs:1".to_string(),
+                ref_hash: h,
+                at: now_iso_utc(),
+            }],
+            workspace: WorkspaceSnapshot {
+                cwd: dir.to_string_lossy().to_string(),
+                git_branch: Some("main".to_string()),
+                git_head: Some("aaaa111".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let same_ws = WorkspaceSnapshot {
+            git_head: Some("aaaa111".to_string()),
+            ..Default::default()
+        };
+        let clean = verify_state_drift(&state, &dir, &same_ws);
+        assert!(!clean.head_drifted);
+        assert!(clean.drifted_facts.is_empty());
+
+        fs::write(&fp, "pub const TIMEOUT_MS: u64 = 9000;\n").unwrap();
+        let moved_ws = WorkspaceSnapshot {
+            git_head: Some("bbbb222".to_string()),
+            ..Default::default()
+        };
+        let drifted = verify_state_drift(&state, &dir, &moved_ws);
+        assert!(drifted.head_drifted);
+        assert_eq!(drifted.drifted_facts.len(), 1);
+        assert_eq!(drifted.drifted_facts[0].reason, "modified");
+        let md = render_markdown_with_drift(&state, Some(&drifted));
+        assert!(md.contains("[DRIFT WARNING]"));
+        assert!(md.contains("[DRIFTED: modified]"));
+
+        fs::remove_file(&fp).unwrap();
+        let deleted = verify_state_drift(&state, &dir, &moved_ws);
+        assert_eq!(deleted.drifted_facts[0].reason, "deleted");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -32,6 +32,9 @@ struct ReadCli {
     /// Read only the first N lines (convenience alias for `--lines 1-N`)
     #[arg(long)]
     limit: Option<usize>,
+    /// Read only the last N lines of a file (e.g. `ap read app.log --tail 50`)
+    #[arg(long)]
+    tail: Option<usize>,
     /// Filter or search rows/paragraphs matching keyword or regex
     #[arg(short = 'q', long)]
     query: Option<String>,
@@ -756,7 +759,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
-    if cli.lines.is_none() {
+    if cli.lines.is_none() && cli.tail.is_none() {
         if let Some(n) = cli.limit.filter(|&n| n > 0) {
             cli.lines = Some(format!("1-{n}"));
         }
@@ -1957,6 +1960,21 @@ fn read_single_target(
                 blocks.len(),
                 blocks.join("\n\n")
             )
+        }
+    } else if let Some(tail_n) = cli.tail {
+        if tail_n == 0 {
+            return Err((2, "[ap read] invalid --tail 0 (expected >= 1)".to_string()));
+        }
+        if total_lines == 0 {
+            format!("# READ `{label}` [tail {tail_n} of 0 lines | {format_tag}]\n")
+        } else {
+            let s = total_lines.saturating_sub(tail_n) + 1;
+            let e = total_lines;
+            let slice = (s..=e)
+                .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("# READ `{label}` [L{s}-L{e} of {total_lines} | {format_tag}]\n{slice}")
         }
     } else if let Some(ref q) = cli
         .query
