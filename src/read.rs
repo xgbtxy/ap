@@ -62,9 +62,21 @@ struct ReadCli {
     /// Canonical hex + ASCII dump (`xxd`/`hexdump -C`) with SHA-256 & entropy (supports decimal or `0x` `--offset`)
     #[arg(long)]
     hex: bool,
+    /// Map a PE RVA (or ELF offset) to file offset, section, enclosing x64 function & hex/disasm preview
+    #[arg(long)]
+    rva: Option<String>,
+    /// Map a PE/ELF virtual address (`VA`, e.g. `0x140001080`) to file offset, section & nearby XREFs
+    #[arg(long)]
+    va: Option<String>,
+    /// Search binary for a hex/wildcard byte pattern (e.g. `"48 8D ?? ?? ?? ?? ?? E8"`), mapping hits to RVA/VA/func
+    #[arg(long = "find-bytes")]
+    find_bytes: Option<String>,
     /// Resolve PE64/ELF64 (x64 & AArch64) string & IAT import cross-references with enclosing function RVAs
     #[arg(long)]
     xref: bool,
+    /// Pure-Rust zero-OpenSSL X.509 PEM/DER certificate inspector (Subject, Issuer, Validity, SANs, SHA-256)
+    #[arg(long)]
+    cert: bool,
     /// Schema-less raw Protocol Buffers wire-format decoder (no `protoc` required)
     #[arg(long)]
     proto: bool,
@@ -1068,6 +1080,101 @@ fn read_single_target(
         return Ok((rendered, jv));
     }
 
+    if let Some(ref addr_spec) = cli.rva {
+        let win = if cli.chars == 2400 { 256 } else { cli.chars };
+        let rendered = crate::binary::inspect_binary_address_md(&raw_bytes, addr_spec, false, win)
+            .map_err(|e| (1, format!("[ap read --rva] {e}")))?;
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "bin-rva",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "bin-rva",
+            "address": addr_spec,
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if let Some(ref addr_spec) = cli.va {
+        let win = if cli.chars == 2400 { 256 } else { cli.chars };
+        let rendered = crate::binary::inspect_binary_address_md(&raw_bytes, addr_spec, true, win)
+            .map_err(|e| (1, format!("[ap read --va] {e}")))?;
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "bin-va",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "bin-va",
+            "address": addr_spec,
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if let Some(ref byte_pat) = cli.find_bytes {
+        let rendered = crate::binary::find_binary_bytes_md(&raw_bytes, byte_pat, cli.max_hits)
+            .map_err(|e| (1, format!("[ap read --find-bytes] {e}")))?;
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "bin-bytes",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "bin-bytes",
+            "pattern": byte_pat,
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    let auto_cert = matches!(ext.as_str(), "pem" | "crt" | "cer" | "der")
+        && cli.lines.is_none()
+        && cli.query.is_none()
+        && cli.offset.is_none()
+        && !cli.hex
+        && !cli.secrets
+        && !cli.jwt
+        && String::from_utf8_lossy(&raw_bytes[..raw_bytes.len().min(512)])
+            .contains("-----BEGIN CERTIFICATE-----");
+    if cli.cert || auto_cert {
+        let rendered = crate::inspect::inspect_x509_pem_or_der(&raw_bytes)
+            .map_err(|e| (1, format!("[ap read --cert] {e}")))?;
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "x509-cert",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "x509-cert",
+            "size_bytes": raw_bytes.len(),
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
     if cli.proto {
         let rendered = crate::inspect::decode_raw_protobuf_md(&raw_bytes)
             .map_err(|e| (1, format!("[ap read --proto] {e}")))?;
@@ -1313,6 +1420,7 @@ fn read_single_target(
                     && cli.query.is_none()
                     && cli.offset.is_none()
                     && cli.json_path.is_none()
+                    && !cli.outline
                     && !cli.decode
                 {
                     let sieve_store = std::env::var("SIEVE_HOME")
@@ -1448,6 +1556,10 @@ fn read_single_target(
                 } else {
                     cpp_syms.iter().take(100).cloned().collect::<Vec<_>>().join("\n")
                 }
+            )
+        } else if let Some(json_outline) = crate::inspect::outline_json_or_jsonl(&converted) {
+            format!(
+                "# OUTLINE `{label}` [JSON/HAR/JSONL schema across {total_lines} lines | {format_tag}]\n{json_outline}"
             )
         } else {
             let headings: Vec<String> = all_lines

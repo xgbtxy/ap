@@ -1323,11 +1323,341 @@ fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeCon
             }
         }
     }
+
+    append_pe_delay_imports(bytes, opt_sz, dd_off, is_pe64, image_base, &secs, out);
+    append_pe_debug_and_sig_metadata(bytes, opt_sz, dd_off, is_pe64, &secs, out);
+    append_pe_manifest_and_version_info(bytes, &secs, out);
+
     PeContext {
         is_pe64,
         image_base,
         secs,
         iat_map,
+    }
+}
+
+fn delay_addr_to_rva(val: u32, gr_attrs: u32, image_base: u64) -> u32 {
+    if (gr_attrs & 1) != 0 {
+        val
+    } else {
+        let base_lo = (image_base & 0xFFFF_FFFF) as u32;
+        if val >= base_lo {
+            val - base_lo
+        } else {
+            val
+        }
+    }
+}
+
+fn append_pe_delay_imports(
+    bytes: &[u8],
+    opt_sz: usize,
+    dd_off: usize,
+    is_pe64: bool,
+    image_base: u64,
+    secs: &[PeSection],
+    out: &mut Vec<String>,
+) {
+    let min_opt = if is_pe64 { 224 } else { 208 };
+    if opt_sz < min_opt {
+        return;
+    }
+    let delay_rva = read_u32_le(bytes, dd_off + 13 * 8).unwrap_or(0);
+    let Some(delay_off) = rva_to_file_offset(delay_rva, secs) else {
+        return;
+    };
+    let mut dll_lines = Vec::new();
+    let mut notable = Vec::new();
+    for idx in 0..48usize {
+        let desc = delay_off.saturating_add(idx * 32);
+        if desc + 32 > bytes.len() {
+            break;
+        }
+        let gr_attrs = read_u32_le(bytes, desc).unwrap_or(0);
+        let name_val = read_u32_le(bytes, desc + 4).unwrap_or(0);
+        let iat_val = read_u32_le(bytes, desc + 12).unwrap_or(0);
+        let int_val = read_u32_le(bytes, desc + 16).unwrap_or(0);
+        if name_val == 0 && iat_val == 0 && int_val == 0 {
+            break;
+        }
+        let name_rva = delay_addr_to_rva(name_val, gr_attrs, image_base);
+        let dll_name = rva_to_file_offset(name_rva, secs)
+            .and_then(|o| read_cstr(bytes, o, 128))
+            .unwrap_or_else(|| format!("delay_dll@{name_rva:#x}"));
+        let thunk_rva = delay_addr_to_rva(
+            if int_val != 0 { int_val } else { iat_val },
+            gr_attrs,
+            image_base,
+        );
+        let mut funcs = Vec::new();
+        if let Some(mut t_off) = rva_to_file_offset(thunk_rva, secs) {
+            let step = if is_pe64 { 8 } else { 4 };
+            for _ in 0..128usize {
+                let val: u64 = if is_pe64 {
+                    read_u64_le(bytes, t_off).unwrap_or(0)
+                } else {
+                    read_u32_le(bytes, t_off).unwrap_or(0) as u64
+                };
+                if val == 0 {
+                    break;
+                }
+                t_off += step;
+                let is_ord = if is_pe64 {
+                    (val & (1u64 << 63)) != 0
+                } else {
+                    (val & (1u64 << 31)) != 0
+                };
+                if is_ord {
+                    if funcs.len() < 16 {
+                        funcs.push(format!("#{}", val & 0xFFFF));
+                    }
+                } else {
+                    let hn_rva =
+                        delay_addr_to_rva((val & 0x7FFF_FFFF) as u32, gr_attrs, image_base);
+                    if let Some(hn_off) = rva_to_file_offset(hn_rva, secs) {
+                        if let Some(fn_name) = read_cstr(bytes, hn_off + 2, 128) {
+                            if is_notable_import(&fn_name) && notable.len() < 24 {
+                                notable.push(format!("{dll_name}!{fn_name}"));
+                            }
+                            if funcs.len() < 16 {
+                                funcs.push(fn_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        dll_lines.push(format!(
+            "- `{dll_name}`: {}",
+            if funcs.is_empty() {
+                "(ordinals/stripped)".to_string()
+            } else {
+                funcs.join(", ")
+            }
+        ));
+    }
+    if !dll_lines.is_empty() {
+        out.push(format!(
+            "### PE Delay-Load Imports ({} DLLs)",
+            dll_lines.len()
+        ));
+        if !notable.is_empty() {
+            out.push(format!(
+                "- **Notable Delayed APIs**: `{}`",
+                notable.join("`, `")
+            ));
+        }
+        out.extend(dll_lines);
+    }
+}
+
+fn append_pe_debug_and_sig_metadata(
+    bytes: &[u8],
+    opt_sz: usize,
+    dd_off: usize,
+    is_pe64: bool,
+    secs: &[PeSection],
+    out: &mut Vec<String>,
+) {
+    // Debug Directory DataDirectory[6] (CodeView RSDS PDB path + GUID + Age)
+    let min_dbg = if is_pe64 { 168 } else { 152 };
+    if opt_sz >= min_dbg {
+        let dbg_rva = read_u32_le(bytes, dd_off + 6 * 8).unwrap_or(0);
+        let dbg_sz = read_u32_le(bytes, dd_off + 6 * 8 + 4).unwrap_or(0) as usize;
+        if let Some(dbg_off) = rva_to_file_offset(dbg_rva, secs) {
+            for idx in 0..(dbg_sz / 28).min(16) {
+                let ent = dbg_off.saturating_add(idx * 28);
+                if ent + 28 > bytes.len() {
+                    break;
+                }
+                let kind = read_u32_le(bytes, ent + 12).unwrap_or(0);
+                let sz = read_u32_le(bytes, ent + 16).unwrap_or(0) as usize;
+                let raw_ptr = read_u32_le(bytes, ent + 24).unwrap_or(0) as usize;
+                if kind == 2
+                    && sz >= 25
+                    && raw_ptr.saturating_add(sz) <= bytes.len()
+                    && bytes.get(raw_ptr..raw_ptr + 4) == Some(b"RSDS")
+                {
+                    {
+                        let d1 = read_u32_le(bytes, raw_ptr + 4).unwrap_or(0);
+                        let d2 = read_u16_le(bytes, raw_ptr + 8).unwrap_or(0);
+                        let d3 = read_u16_le(bytes, raw_ptr + 10).unwrap_or(0);
+                        let d4 = &bytes[raw_ptr + 12..raw_ptr + 20];
+                        let age = read_u32_le(bytes, raw_ptr + 20).unwrap_or(0);
+                        let guid = format!(
+                            "{d1:08X}{d2:04X}{d3:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                            d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+                        );
+                        if let Some(pdb) = read_cstr(bytes, raw_ptr + 24, 260) {
+                            if !pdb.is_empty() {
+                                out.push(format!("- Debug PDB: `{pdb}` (guid=`{guid}` age={age})"));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Security Directory DataDirectory[4] (FILE OFFSET, NOT RVA) + PE Overlay size
+    let min_sec = if is_pe64 { 152 } else { 136 };
+    let mut cert_file_off = None;
+    if opt_sz >= min_sec {
+        let cert_off = read_u32_le(bytes, dd_off + 4 * 8).unwrap_or(0) as usize;
+        let cert_sz = read_u32_le(bytes, dd_off + 4 * 8 + 4).unwrap_or(0) as usize;
+        if cert_off > 0 && cert_sz >= 8 && cert_off.saturating_add(cert_sz) <= bytes.len() {
+            cert_file_off = Some(cert_off);
+            let blob = &bytes[cert_off..cert_off + cert_sz];
+            let mut cns: Vec<String> = Vec::new();
+            let mut i = 0usize;
+            while i + 5 < blob.len() && cns.len() < 8 {
+                if blob[i] == 0x55
+                    && blob[i + 1] == 0x04
+                    && (blob[i + 2] == 0x03 || blob[i + 2] == 0x0A)
+                {
+                    let tag = blob[i + 3];
+                    let slen = blob[i + 4] as usize;
+                    if matches!(tag, 0x0C | 0x13 | 0x16 | 0x14)
+                        && (1..=96).contains(&slen)
+                        && i + 5 + slen <= blob.len()
+                    {
+                        if let Ok(s) = std::str::from_utf8(&blob[i + 5..i + 5 + slen]) {
+                            let clean = s.trim();
+                            if !clean.is_empty()
+                                && clean.is_ascii()
+                                && !cns.iter().any(|x| x == clean)
+                            {
+                                cns.push(clean.to_string());
+                            }
+                        }
+                        i += 5 + slen;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            if cns.is_empty() {
+                out.push(format!(
+                    "- Authenticode: signed ({cert_sz} B @0x{cert_off:x})"
+                ));
+            } else {
+                out.push(format!(
+                    "- Authenticode: signed ({cert_sz} B @0x{cert_off:x}) | Certs: `{}`",
+                    cns.join("` · `")
+                ));
+            }
+        }
+    }
+    let max_sec_end = secs
+        .iter()
+        .map(|s| (s.raw_ptr as usize).saturating_add(s.raw_size as usize))
+        .max()
+        .unwrap_or(0);
+    if max_sec_end > 0 {
+        let data_end = cert_file_off
+            .filter(|&c| c >= max_sec_end && c <= bytes.len())
+            .unwrap_or(bytes.len());
+        if data_end >= max_sec_end + 64 {
+            out.push(format!(
+                "- Overlay: {} B @0x{max_sec_end:x}",
+                data_end - max_sec_end
+            ));
+        }
+    }
+}
+
+fn append_pe_manifest_and_version_info(bytes: &[u8], secs: &[PeSection], out: &mut Vec<String>) {
+    let rsrc_slice: &[u8] = secs
+        .iter()
+        .find(|s| s.name.starts_with(".rsrc"))
+        .and_then(|s| {
+            let st = s.raw_ptr as usize;
+            let len = (s.raw_size as usize).min(6 * 1024 * 1024);
+            bytes.get(st..st.saturating_add(len).min(bytes.len()))
+        })
+        .unwrap_or_else(|| &bytes[bytes.len().saturating_sub(2 * 1024 * 1024)..]);
+
+    // UAC RT_MANIFEST summary
+    if let Some(mpos) = rsrc_slice
+        .windows(24)
+        .position(|w| w == b"<requestedExecutionLevel")
+    {
+        let win_end = (mpos + 512).min(rsrc_slice.len());
+        let snippet = String::from_utf8_lossy(&rsrc_slice[mpos..win_end]);
+        let extract_attr = |k: &str| -> Option<String> {
+            let pat = format!("{k}=\"");
+            let idx = snippet.find(&pat)?;
+            let rest = &snippet[idx + pat.len()..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        };
+        let mut parts = Vec::new();
+        if let Some(lvl) = extract_attr("level") {
+            parts.push(format!("level={lvl}"));
+        }
+        if let Some(uia) = extract_attr("uiAccess") {
+            parts.push(format!("uiAccess={uia}"));
+        }
+        let full_lo = String::from_utf8_lossy(&rsrc_slice[mpos.saturating_sub(300)..win_end]);
+        if full_lo.contains("<autoElevate") && full_lo.contains("true") {
+            parts.push("autoElevate=true".to_string());
+        }
+        if !parts.is_empty() {
+            out.push(format!("- UAC Manifest: `{}`", parts.join("` · `")));
+        }
+    }
+
+    // UTF-16LE VS_VERSION_INFO string properties
+    let mut ver_pairs = Vec::new();
+    for key in [
+        "CompanyName",
+        "ProductName",
+        "FileDescription",
+        "FileVersion",
+        "OriginalFilename",
+    ] {
+        let mut needle: Vec<u8> = Vec::with_capacity((key.len() + 1) * 2);
+        for u in key.encode_utf16() {
+            needle.extend_from_slice(&u.to_le_bytes());
+        }
+        needle.extend_from_slice(&[0, 0]);
+        let Some(pos) = rsrc_slice
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+        else {
+            continue;
+        };
+        let mut v_off = pos + needle.len();
+        // Skip up to 6 padding zero bytes for DWORD alignment before value UTF-16LE string
+        let max_skip = (v_off + 6).min(rsrc_slice.len().saturating_sub(1));
+        while v_off + 1 < max_skip && rsrc_slice[v_off] == 0 && rsrc_slice[v_off + 1] == 0 {
+            v_off += 2;
+        }
+        let mut code_units = Vec::new();
+        let mut cur = v_off;
+        while cur + 1 < rsrc_slice.len() && code_units.len() < 96 {
+            let u = u16::from_le_bytes([rsrc_slice[cur], rsrc_slice[cur + 1]]);
+            if u == 0 {
+                break;
+            }
+            if u < 0x20 || u == 0x7F {
+                code_units.clear();
+                break;
+            }
+            code_units.push(u);
+            cur += 2;
+        }
+        if !code_units.is_empty() {
+            let val = String::from_utf16_lossy(&code_units);
+            let clean = val.trim();
+            if !clean.is_empty() {
+                ver_pairs.push(format!("{key}=\"{clean}\""));
+            }
+        }
+    }
+    if !ver_pairs.is_empty() {
+        out.push(format!("- VersionInfo: {}", ver_pairs.join(" · ")));
     }
 }
 
@@ -2327,6 +2657,393 @@ pub fn inspect_binary_with_xref_md(
     out.join("\n")
 }
 
+fn parse_addr_hex_or_dec(spec: &str) -> Result<u64, String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Err("empty address".to_string());
+    }
+    if let Some(hx) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return u64::from_str_radix(hx, 16).map_err(|_| format!("invalid hex address `{spec}`"));
+    }
+    if s.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F')) {
+        u64::from_str_radix(s, 16).map_err(|_| format!("invalid hex address `{spec}`"))
+    } else {
+        s.parse::<u64>()
+            .map_err(|_| format!("invalid address `{spec}`"))
+    }
+}
+
+fn parse_elf_pt_load(bytes: &[u8]) -> Vec<(usize, u64, usize)> {
+    let mut segs = Vec::new();
+    if bytes.starts_with(b"\x7FELF") && bytes.get(4) == Some(&2) && bytes.len() >= 64 {
+        let phoff = read_u64_le(bytes, 32).unwrap_or(0) as usize;
+        let phentsize = read_u16_le(bytes, 54).unwrap_or(0) as usize;
+        let phnum = read_u16_le(bytes, 56).unwrap_or(0) as usize;
+        if phoff > 0 && phentsize >= 56 {
+            for i in 0..phnum.min(64) {
+                let p = phoff.saturating_add(i.saturating_mul(phentsize));
+                if p + 56 > bytes.len() {
+                    break;
+                }
+                let p_type = read_u32_le(bytes, p).unwrap_or(0);
+                if p_type == 1 {
+                    let p_offset = read_u64_le(bytes, p + 8).unwrap_or(0) as usize;
+                    let p_vaddr = read_u64_le(bytes, p + 16).unwrap_or(0);
+                    let p_filesz = read_u64_le(bytes, p + 32).unwrap_or(0) as usize;
+                    if p_filesz > 0 {
+                        segs.push((p_offset, p_vaddr, p_filesz));
+                    }
+                }
+            }
+        }
+    }
+    segs
+}
+
+/// Map a PE RVA/VA (or ELF VA/offset) to exact file offset, section, enclosing function, nearby calls & hex dump.
+pub fn inspect_binary_address_md(
+    bytes: &[u8],
+    addr_spec: &str,
+    is_va: bool,
+    window: usize,
+) -> Result<String, String> {
+    let addr = parse_addr_hex_or_dec(addr_spec)?;
+    let win = window.clamp(16, 4096);
+    if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
+        let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
+        if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
+            let mut sink = Vec::new();
+            let pe = parse_pe_details(bytes, pe_off, &mut sink);
+            let rva64 = if is_va {
+                addr.checked_sub(pe.image_base).ok_or_else(|| {
+                    format!("VA 0x{addr:x} is below ImageBase 0x{:x}", pe.image_base)
+                })?
+            } else {
+                addr
+            };
+            let rva = u32::try_from(rva64).map_err(|_| format!("RVA 0x{rva64:x} exceeds u32"))?;
+            let va = pe.image_base.saturating_add(rva as u64);
+            let matched_sec = pe
+                .secs
+                .iter()
+                .find(|s| rva >= s.vaddr && rva < s.vaddr.saturating_add(s.vsize.max(s.raw_size)));
+            let file_off = rva_to_file_offset(rva, &pe.secs)
+                .or_else(|| {
+                    if (rva as usize) < bytes.len() && matched_sec.is_none() {
+                        Some(rva as usize)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| format!("RVA 0x{rva:x} not mapped to raw file bytes"))?;
+
+            let sec_info = matched_sec
+                .map(|s| format!("`{}` (sec_rva=0x{:x})", s.name, s.vaddr))
+                .unwrap_or_else(|| "`PE_HEADER`".to_string());
+            let mut lines = vec![format!(
+                "## Address Lookup: PE rva=0x{rva:x} (va=0x{va:x}) -> offset=0x{file_off:x} | section={sec_info}"
+            )];
+
+            if let Some(sec) = matched_sec {
+                if pe.is_pe64 && (sec.chars & 0x2000_0000) != 0 {
+                    let s_start = sec.raw_ptr as usize;
+                    let s_len = (sec.raw_size as usize).min(16 * 1024 * 1024);
+                    if let Some(code) =
+                        bytes.get(s_start..s_start.saturating_add(s_len).min(bytes.len()))
+                    {
+                        let rel = file_off.saturating_sub(s_start);
+                        if rel < code.len() {
+                            let fn_rva = find_enclosing_x64_func_rva(code, sec.vaddr, rel);
+                            let fn_va = pe.image_base.saturating_add(fn_rva as u64);
+                            lines.push(format!("- Enclosing x64 Function: `func_rva=0x{fn_rva:x}` (`va=0x{fn_va:x}`)"));
+                        }
+                        let mut targets = Vec::new();
+                        let scan_end = rel.saturating_add(win).min(code.len());
+                        let mut p = rel;
+                        while p + 5 <= scan_end && targets.len() < 16 {
+                            let b0 = code[p];
+                            let cur_rva = sec.vaddr.saturating_add(p as u32);
+                            if (b0 == 0xE8 || b0 == 0xE9) && p + 5 <= scan_end {
+                                let disp = i32::from_le_bytes([
+                                    code[p + 1],
+                                    code[p + 2],
+                                    code[p + 3],
+                                    code[p + 4],
+                                ]);
+                                let tgt = (cur_rva as i64) + 5 + (disp as i64);
+                                if tgt > 0 {
+                                    let kind = if b0 == 0xE8 { "CALL" } else { "JMP" };
+                                    targets.push(format!(
+                                        "`0x{cur_rva:x}: {kind} 0x{:x}`",
+                                        tgt as u64
+                                    ));
+                                    p += 5;
+                                    continue;
+                                }
+                            } else if b0 == 0xFF
+                                && p + 6 <= scan_end
+                                && (code[p + 1] == 0x15 || code[p + 1] == 0x25)
+                            {
+                                let disp = i32::from_le_bytes([
+                                    code[p + 2],
+                                    code[p + 3],
+                                    code[p + 4],
+                                    code[p + 5],
+                                ]);
+                                let tgt = (cur_rva as i64) + 6 + (disp as i64);
+                                if tgt > 0 {
+                                    let trva = tgt as u32;
+                                    let sym = pe
+                                        .iat_map
+                                        .iter()
+                                        .find(|(r, _)| *r == trva)
+                                        .map(|(_, s)| s.as_str())
+                                        .unwrap_or("iat_slot");
+                                    targets.push(format!("`0x{cur_rva:x}: [0x{trva:x}] -> {sym}`"));
+                                    p += 6;
+                                    continue;
+                                }
+                            } else if (b0 == 0x48 || b0 == 0x4C)
+                                && p + 7 <= scan_end
+                                && code[p + 1] == 0x8D
+                                && (code[p + 2] & 0xC7) == 0x05
+                            {
+                                let disp = i32::from_le_bytes([
+                                    code[p + 3],
+                                    code[p + 4],
+                                    code[p + 5],
+                                    code[p + 6],
+                                ]);
+                                let tgt = (cur_rva as i64) + 7 + (disp as i64);
+                                if tgt > 0 {
+                                    let trva = tgt as u32;
+                                    let s_preview = rva_to_file_offset(trva, &pe.secs)
+                                        .and_then(|fo| read_cstr(bytes, fo, 48))
+                                        .unwrap_or_default();
+                                    if s_preview.is_empty() {
+                                        targets
+                                            .push(format!("`0x{cur_rva:x}: LEA rva=0x{trva:x}`"));
+                                    } else {
+                                        targets.push(format!(
+                                            "`0x{cur_rva:x}: LEA 0x{trva:x} \"{}\"`",
+                                            s_preview
+                                        ));
+                                    }
+                                    p += 7;
+                                    continue;
+                                }
+                            }
+                            p += 1;
+                        }
+                        if !targets.is_empty() {
+                            lines.push(format!("- Disasm Hints: {}", targets.join(" · ")));
+                        }
+                    }
+                }
+            }
+            lines.push(format_hex_dump(bytes, file_off, win));
+            return Ok(lines.join("\n"));
+        }
+    }
+
+    if bytes.starts_with(b"\x7FELF") {
+        let mut sink = Vec::new();
+        let elf = parse_elf_details(bytes, &mut sink);
+        let loads = parse_elf_pt_load(bytes);
+        let mapped_sec = elf.secs.iter().find(|s| {
+            s.vaddr > 0 && addr >= s.vaddr && addr < s.vaddr.saturating_add(s.raw_size as u64)
+        });
+        let file_off = mapped_sec
+            .map(|s| s.raw_ptr.saturating_add((addr - s.vaddr) as usize))
+            .or_else(|| {
+                loads.iter().find_map(|&(poff, pva, psz)| {
+                    if addr >= pva && addr < pva.saturating_add(psz as u64) {
+                        Some(poff.saturating_add((addr - pva) as usize))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| format!("ELF VA 0x{addr:x} not mapped to file bytes"))?;
+        let sec_nm = mapped_sec.map(|s| s.name.as_str()).unwrap_or("PT_LOAD");
+        let nearest = elf
+            .func_syms
+            .iter()
+            .filter(|(sv, _)| *sv <= addr)
+            .max_by_key(|(sv, _)| *sv)
+            .map(|(sv, nm)| format!(" | nearest_sym=`{nm}+0x{:x}`", addr - sv))
+            .unwrap_or_default();
+        let out = format!(
+            "## Address Lookup: ELF va=0x{addr:x} -> offset=0x{file_off:x} | section=`{sec_nm}`{nearest}\n{}",
+            format_hex_dump(bytes, file_off, win)
+        );
+        return Ok(out);
+    }
+
+    let off = usize::try_from(addr).map_err(|_| "offset overflow".to_string())?;
+    if off >= bytes.len() {
+        return Err(format!(
+            "offset 0x{off:x} exceeds file size ({} B)",
+            bytes.len()
+        ));
+    }
+    Ok(format!(
+        "## Offset Lookup: 0x{off:x} ({off} B)\n{}",
+        format_hex_dump(bytes, off, win)
+    ))
+}
+
+fn parse_byte_pattern(pattern: &str) -> Result<Vec<Option<u8>>, String> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err("empty --find-bytes pattern".to_string());
+    }
+    let mut pat = Vec::new();
+    if trimmed.contains(' ') || trimmed.contains('\t') {
+        for tok in trimmed.split_whitespace() {
+            let t = tok.trim_start_matches("0x").trim_start_matches("0X");
+            if t == "??" || t == "?" || t == "*" || t == "**" {
+                pat.push(None);
+            } else if t.len() == 2 {
+                let b = u8::from_str_radix(t, 16)
+                    .map_err(|_| format!("invalid hex byte token `{tok}`"))?;
+                pat.push(Some(b));
+            } else {
+                return Err(format!(
+                    "invalid hex token `{tok}` (expected 2-hex byte or `??`)"
+                ));
+            }
+        }
+    } else {
+        let s = trimmed.trim_start_matches("0x").trim_start_matches("0X");
+        let b = s.as_bytes();
+        if b.len() % 2 != 0 {
+            return Err(format!("hex pattern `{trimmed}` must have even length"));
+        }
+        for pair in b.chunks_exact(2) {
+            let p_str = std::str::from_utf8(pair).unwrap_or("");
+            if p_str == "??" || p_str == "**" {
+                pat.push(None);
+            } else {
+                let byte = u8::from_str_radix(p_str, 16)
+                    .map_err(|_| format!("invalid hex byte `{p_str}`"))?;
+                pat.push(Some(byte));
+            }
+        }
+    }
+    if !pat.iter().any(|x| x.is_some()) {
+        return Err("pattern cannot consist solely of wildcards".to_string());
+    }
+    Ok(pat)
+}
+
+/// Wildcard binary byte-signature finder (`--find-bytes`) mapping hits to PE RVA/VA/enclosing function or ELF VA.
+pub fn find_binary_bytes_md(
+    bytes: &[u8],
+    pattern: &str,
+    max_hits: usize,
+) -> Result<String, String> {
+    let pat = parse_byte_pattern(pattern)?;
+    let cap = if max_hits == 0 {
+        30
+    } else {
+        max_hits.clamp(1, 200)
+    };
+    let scan_end = bytes.len().min(64 * 1024 * 1024);
+    let data = &bytes[..scan_end];
+    if pat.len() > data.len() {
+        return Ok(format!("## Byte Search `{pattern}` (0 hits)"));
+    }
+
+    let mut pe_ctx: Option<PeContext> = None;
+    let mut elf_ctx: Option<ElfContext> = None;
+    if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
+        let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
+        if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
+            let mut sink = Vec::new();
+            pe_ctx = Some(parse_pe_details(bytes, pe_off, &mut sink));
+        }
+    } else if bytes.starts_with(b"\x7FELF") {
+        let mut sink = Vec::new();
+        elf_ctx = Some(parse_elf_details(bytes, &mut sink));
+    }
+
+    let first_anchor = pat
+        .iter()
+        .enumerate()
+        .find_map(|(idx, &b)| b.map(|v| (idx, v)))
+        .unwrap();
+    let mut hits = Vec::new();
+    let mut pos = first_anchor.0;
+    let limit_i = data.len() - pat.len();
+    while pos <= limit_i + first_anchor.0 && hits.len() < cap {
+        let Some(rel) = data[pos..=limit_i + first_anchor.0]
+            .iter()
+            .position(|&x| x == first_anchor.1)
+        else {
+            break;
+        };
+        let cand_start = pos + rel - first_anchor.0;
+        let window = &data[cand_start..cand_start + pat.len()];
+        if pat
+            .iter()
+            .enumerate()
+            .all(|(k, &m)| m.map(|v| v == window[k]).unwrap_or(true))
+        {
+            let preview_end = (cand_start + 16).min(data.len());
+            let hex_prev = data[cand_start..preview_end]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut loc = format!("offset=0x{cand_start:x}");
+            if let Some(ref pe) = pe_ctx {
+                if let Some((rva, sec_nm)) = file_offset_to_rva(cand_start, &pe.secs) {
+                    let va = pe.image_base.saturating_add(rva as u64);
+                    loc.push_str(&format!(" rva=0x{rva:x} va=0x{va:x} ({sec_nm})"));
+                    if pe.is_pe64 {
+                        if let Some(sec) = pe
+                            .secs
+                            .iter()
+                            .find(|s| s.name == sec_nm && (s.chars & 0x2000_0000) != 0)
+                        {
+                            let s_st = sec.raw_ptr as usize;
+                            let s_len = (sec.raw_size as usize).min(16 * 1024 * 1024);
+                            if let Some(code) =
+                                bytes.get(s_st..s_st.saturating_add(s_len).min(bytes.len()))
+                            {
+                                let fn_rva = find_enclosing_x64_func_rva(
+                                    code,
+                                    sec.vaddr,
+                                    cand_start.saturating_sub(s_st),
+                                );
+                                loc.push_str(&format!(" func_rva=0x{fn_rva:x}"));
+                            }
+                        }
+                    }
+                }
+            } else if let Some(ref elf) = elf_ctx {
+                if let Some((va, sec_nm)) = elf_file_offset_to_vaddr(cand_start, &elf.secs) {
+                    loc.push_str(&format!(" va=0x{va:x} ({sec_nm})"));
+                }
+            }
+            hits.push(format!("- {loc} | `{hex_prev}`"));
+        }
+        pos = cand_start + first_anchor.0 + 1;
+    }
+
+    if hits.is_empty() {
+        return Ok(format!(
+            "## Byte Search `{pattern}` (0 hits across {scan_end} B)"
+        ));
+    }
+    Ok(format!(
+        "## Byte Search `{pattern}` ({} hit(s), cap={cap})\n{}",
+        hits.len(),
+        hits.join("\n")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2653,6 +3370,106 @@ mod tests {
         assert!(
             dmd.contains("+ /api/v2/admin_exec") && dmd.contains("- invalid_old_check"),
             "unexpected diff:\n{dmd}"
+        );
+    }
+
+    #[test]
+    fn parses_pe_delay_pdb_cert_overlay_manifest_ver_rva_and_find_bytes() {
+        let mut pe = vec![0u8; 0x900];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes()); // x86_64
+        pe[0x86..0x88].copy_from_slice(&2u16.to_le_bytes()); // 2 sections
+        pe[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes()); // opt_sz=240
+        let opt = 0x98usize;
+        pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+        pe[opt + 24..opt + 32].copy_from_slice(&0x0001_4000_0000u64.to_le_bytes());
+        let dd = opt + 112;
+        // DataDirectory[4] Authenticode (FILE OFFSET @0x600, size=0x40)
+        pe[dd + 4 * 8..dd + 4 * 8 + 4].copy_from_slice(&0x600u32.to_le_bytes());
+        pe[dd + 4 * 8 + 4..dd + 4 * 8 + 8].copy_from_slice(&0x40u32.to_le_bytes());
+        // DataDirectory[6] Debug (RVA 0x2000, size=28)
+        pe[dd + 6 * 8..dd + 6 * 8 + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        pe[dd + 6 * 8 + 4..dd + 6 * 8 + 8].copy_from_slice(&28u32.to_le_bytes());
+        // DataDirectory[13] Delay-Load (RVA 0x2100, size=64)
+        pe[dd + 13 * 8..dd + 13 * 8 + 4].copy_from_slice(&0x2100u32.to_le_bytes());
+        pe[dd + 13 * 8 + 4..dd + 13 * 8 + 8].copy_from_slice(&64u32.to_le_bytes());
+
+        // Section 0: .text (vaddr 0x1000, raw 0x200..0x400)
+        let s0 = opt + 0xF0;
+        pe[s0..s0 + 5].copy_from_slice(b".text");
+        pe[s0 + 8..s0 + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[s0 + 12..s0 + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[s0 + 16..s0 + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[s0 + 20..s0 + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[s0 + 36..s0 + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        // Prologue + x64 instruction pattern @0x220 (RVA 0x1020)
+        pe[0x220..0x228].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8D, 0x05, 0x11]);
+
+        // Section 1: .rdata (vaddr 0x2000, raw 0x400..0x600)
+        let s1 = s0 + 40;
+        pe[s1..s1 + 6].copy_from_slice(b".rdata");
+        pe[s1 + 8..s1 + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[s1 + 12..s1 + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        pe[s1 + 16..s1 + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[s1 + 20..s1 + 24].copy_from_slice(&0x400u32.to_le_bytes());
+        pe[s1 + 36..s1 + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+
+        // Debug directory @0x400 (RVA 0x2000) -> RSDS @0x440
+        pe[0x400 + 12..0x400 + 16].copy_from_slice(&2u32.to_le_bytes());
+        pe[0x400 + 16..0x400 + 20].copy_from_slice(&40u32.to_le_bytes());
+        pe[0x400 + 24..0x400 + 28].copy_from_slice(&0x440u32.to_le_bytes());
+        pe[0x440..0x444].copy_from_slice(b"RSDS");
+        pe[0x454..0x458].copy_from_slice(&7u32.to_le_bytes());
+        pe[0x458..0x467].copy_from_slice(b"C:\\b\\demo.pdb\0\0");
+
+        // Delay-Load descriptor @0x500 (RVA 0x2100)
+        pe[0x500..0x504].copy_from_slice(&1u32.to_le_bytes()); // grAttrs=1 (RVA)
+        pe[0x504..0x508].copy_from_slice(&0x2140u32.to_le_bytes()); // szName
+        pe[0x510..0x514].copy_from_slice(&0x2160u32.to_le_bytes()); // pINT
+        pe[0x540..0x54D].copy_from_slice(b"WINHTTP.dll\0\0");
+        pe[0x560..0x568].copy_from_slice(&0x2180u64.to_le_bytes()); // thunk[0]
+        pe[0x580..0x58D].copy_from_slice(b"\0\0WinHttpOpen");
+
+        // Authenticode blob @0x600 with CN OID 55 04 03 "Acme Signer" + Manifest + VersionInfo in tail
+        let cert_snippet = b"\x30\x20\x55\x04\x03\x0C\x0BAcme Signer";
+        pe[0x600..0x600 + cert_snippet.len()].copy_from_slice(cert_snippet);
+        let man = b"<requestedExecutionLevel level=\"requireAdministrator\" uiAccess=\"false\"/>";
+        pe[0x680..0x680 + man.len()].copy_from_slice(man);
+        let mut vi = Vec::new();
+        for u in "CompanyName\0\0AcmeCorp\0".encode_utf16() {
+            vi.extend_from_slice(&u.to_le_bytes());
+        }
+        pe[0x720..0x720 + vi.len()].copy_from_slice(&vi);
+
+        let md = inspect_binary_md(&pe, None, 20);
+        assert!(
+            md.contains("WINHTTP.dll") && md.contains("WinHttpOpen"),
+            "{md}"
+        );
+        assert!(md.contains("demo.pdb") && md.contains("age=7"), "{md}");
+        assert!(md.contains("Acme Signer"), "{md}");
+        assert!(md.contains("requireAdministrator"), "{md}");
+        assert!(md.contains("CompanyName=\"AcmeCorp\""), "{md}");
+
+        let rva_md = inspect_binary_address_md(&pe, "0x1024", false, 32).unwrap();
+        assert!(
+            rva_md.contains("offset=0x224")
+                && rva_md.contains(".text")
+                && rva_md.contains("0x1020"),
+            "{rva_md}"
+        );
+        let va_md = inspect_binary_address_md(&pe, "0x140001024", true, 32).unwrap();
+        assert!(
+            va_md.contains("rva=0x1024") && va_md.contains("offset=0x224"),
+            "{va_md}"
+        );
+
+        let hits_md = find_binary_bytes_md(&pe, "48 83 EC ?? 48 8D", 10).unwrap();
+        assert!(
+            hits_md.contains("0x220") && hits_md.contains("rva=0x1020"),
+            "{hits_md}"
         );
     }
 }

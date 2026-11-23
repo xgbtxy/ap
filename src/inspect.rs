@@ -270,20 +270,233 @@ pub fn eval_json_path<'a>(root: &'a Value, expr: &str) -> Vec<&'a Value> {
     cur
 }
 
+fn split_json_path_segments(expr: &str) -> Vec<&str> {
+    let s = expr.trim();
+    let b = s.as_bytes();
+    let mut segs = Vec::new();
+    let mut start = 0usize;
+    let mut sq_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut in_q: Option<u8> = None;
+    let mut i = 0usize;
+    while i < b.len() {
+        let ch = b[i];
+        if let Some(q) = in_q {
+            if ch == q && (i == 0 || b[i - 1] != b'\\') {
+                in_q = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            b'\'' | b'"' => in_q = Some(ch),
+            b'[' => sq_depth += 1,
+            b']' => sq_depth = (sq_depth - 1).max(0),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = (brace_depth - 1).max(0),
+            b'.' if sq_depth == 0 && brace_depth == 0 => {
+                if i > start {
+                    segs.push(&s[start..i]);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < s.len() {
+        segs.push(&s[start..]);
+    }
+    segs
+}
+
+fn value_as_f64_or_str(v: &Value) -> (Option<f64>, String) {
+    match v {
+        Value::Number(n) => (n.as_f64(), n.to_string()),
+        Value::Bool(b) => (None, b.to_string()),
+        Value::Null => (None, "null".to_string()),
+        Value::String(s) => (s.trim().parse::<f64>().ok(), s.clone()),
+        other => (None, other.to_string()),
+    }
+}
+
+fn matches_json_predicate(item: &Value, pred: &str) -> bool {
+    let p = pred.trim().trim_start_matches('?').trim();
+    const OPS: [&str; 8] = ["!=", ">=", "<=", "~=", "==", "=", ">", "<"];
+    let Some((op_pos, op)) = OPS
+        .iter()
+        .filter_map(|op| p.find(op).map(|pos| (pos, *op)))
+        .min_by_key(|x| x.0)
+    else {
+        return false;
+    };
+    let lhs_path = p[..op_pos].trim();
+    let rhs_raw = p[op_pos + op.len()..].trim();
+    let rhs = rhs_raw
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .or_else(|| {
+            rhs_raw
+                .strip_prefix('\'')
+                .and_then(|x| x.strip_suffix('\''))
+        })
+        .unwrap_or(rhs_raw);
+    let vals = eval_json_path(item, lhs_path);
+    if vals.is_empty() {
+        return op == "!=" && rhs != "null";
+    }
+    let rhs_num = rhs.parse::<f64>().ok();
+    vals.into_iter().any(|v| {
+        let (v_num, v_str) = value_as_f64_or_str(v);
+        match op {
+            "=" | "==" => {
+                if let (Some(a), Some(b)) = (v_num, rhs_num) {
+                    (a - b).abs() < 1e-9
+                } else {
+                    v_str.eq_ignore_ascii_case(rhs)
+                }
+            }
+            "!=" => {
+                if let (Some(a), Some(b)) = (v_num, rhs_num) {
+                    (a - b).abs() >= 1e-9
+                } else {
+                    !v_str.eq_ignore_ascii_case(rhs)
+                }
+            }
+            "~=" => v_str
+                .to_ascii_lowercase()
+                .contains(&rhs.to_ascii_lowercase()),
+            ">" => v_num.zip(rhs_num).map(|(a, b)| a > b).unwrap_or(false),
+            "<" => v_num.zip(rhs_num).map(|(a, b)| a < b).unwrap_or(false),
+            ">=" => v_num.zip(rhs_num).map(|(a, b)| a >= b).unwrap_or(false),
+            "<=" => v_num.zip(rhs_num).map(|(a, b)| a <= b).unwrap_or(false),
+            _ => false,
+        }
+    })
+}
+
+fn eval_json_path_owned(root: &Value, expr: &str) -> Vec<Value> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return vec![root.clone()];
+    }
+    if let Some(rec_key) = trimmed.strip_prefix("..") {
+        if !rec_key.contains('[') && !rec_key.contains('{') {
+            return eval_json_path(root, trimmed).into_iter().cloned().collect();
+        }
+    }
+    let clean = trimmed.trim_start_matches('$').trim_start_matches('.');
+    if clean.is_empty() {
+        return vec![root.clone()];
+    }
+    let mut cur: Vec<Value> = vec![root.clone()];
+    for part in split_json_path_segments(clean) {
+        if part.is_empty() {
+            continue;
+        }
+        if part == "keys()" {
+            cur = cur
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Object(map) => Some(Value::Array(
+                        map.keys().cloned().map(Value::String).collect(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            continue;
+        }
+        if part == "len()" || part == "length" {
+            cur = cur
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Array(a) => Some(serde_json::json!(a.len())),
+                    Value::Object(m) => Some(serde_json::json!(m.len())),
+                    Value::String(s) => Some(serde_json::json!(s.chars().count())),
+                    _ => None,
+                })
+                .collect();
+            continue;
+        }
+        if part.starts_with('{') && part.ends_with('}') && part.len() >= 2 {
+            let inner = &part[1..part.len() - 1];
+            let fields: Vec<(&str, &str)> = inner
+                .split(',')
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(|f| match f.split_once(':') {
+                    Some((alias, path)) => (alias.trim(), path.trim()),
+                    None => (f, f),
+                })
+                .collect();
+            cur = cur
+                .into_iter()
+                .map(|v| {
+                    let mut obj = serde_json::Map::new();
+                    for (alias, fpath) in &fields {
+                        let hits = eval_json_path(&v, fpath);
+                        let val = match hits.len() {
+                            0 => Value::Null,
+                            1 => hits[0].clone(),
+                            _ => Value::Array(hits.into_iter().cloned().collect()),
+                        };
+                        obj.insert((*alias).to_string(), val);
+                    }
+                    Value::Object(obj)
+                })
+                .collect();
+            continue;
+        }
+
+        let mut next = Vec::new();
+        if let Some((key, bracket_rest)) = part.split_once('[') {
+            let inner = bracket_rest.trim_end_matches(']').trim();
+            for v in &cur {
+                let target = if key.is_empty() { Some(v) } else { v.get(key) };
+                if let Some(Value::Array(arr)) = target {
+                    if inner == "*" {
+                        next.extend(arr.iter().cloned());
+                    } else if let Ok(idx) = inner.parse::<usize>() {
+                        if let Some(el) = arr.get(idx) {
+                            next.push(el.clone());
+                        }
+                    } else {
+                        for el in arr {
+                            if matches_json_predicate(el, inner) {
+                                next.push(el.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for v in &cur {
+                if let Some(sub) = v.get(part) {
+                    next.push(sub.clone());
+                } else if let Value::Array(arr) = v {
+                    for el in arr {
+                        if let Some(sub) = el.get(part) {
+                            next.push(sub.clone());
+                        }
+                    }
+                }
+            }
+        }
+        cur = next;
+    }
+    cur
+}
+
 pub fn query_json_or_jsonl(text: &str, expr: &str) -> Result<String, String> {
     let mut results: Vec<Value> = Vec::new();
     if let Ok(v) = serde_json::from_str::<Value>(text) {
-        for hit in eval_json_path(&v, expr) {
-            results.push(hit.clone());
-        }
+        results.extend(eval_json_path_owned(&v, expr));
     } else {
         for ln in text.lines() {
             let t = ln.trim();
             if t.starts_with('{') || t.starts_with('[') {
                 if let Ok(v) = serde_json::from_str::<Value>(t) {
-                    for hit in eval_json_path(&v, expr) {
-                        results.push(hit.clone());
-                    }
+                    results.extend(eval_json_path_owned(&v, expr));
                 }
             }
         }
@@ -300,6 +513,456 @@ pub fn query_json_or_jsonl(text: &str, expr: &str) -> Result<String, String> {
         "## JSON Path `{expr}` ({} match(es))\n{body}",
         results.len()
     ))
+}
+
+fn summarize_json_node(v: &Value, name: &str, depth: usize, out: &mut Vec<String>) {
+    if out.len() >= 75 {
+        return;
+    }
+    let pad = "  ".repeat(depth);
+    match v {
+        Value::Object(map) => {
+            if !name.is_empty() {
+                out.push(format!("{pad}{name}: object ({} keys)", map.len()));
+            }
+            if depth >= 4 {
+                return;
+            }
+            for (k, child) in map.iter().take(24) {
+                summarize_json_node(child, k, depth + if name.is_empty() { 0 } else { 1 }, out);
+                if out.len() >= 75 {
+                    break;
+                }
+            }
+            if map.len() > 24 {
+                out.push(format!("{pad}  ... (+{} more keys)", map.len() - 24));
+            }
+        }
+        Value::Array(arr) => {
+            out.push(format!("{pad}{name}: array[{}]", arr.len()));
+            if depth < 4 && !arr.is_empty() {
+                let mut merged = serde_json::Map::new();
+                for item in arr.iter().take(5) {
+                    if let Value::Object(obj) = item {
+                        for (k, val) in obj {
+                            merged.entry(k.clone()).or_insert_with(|| val.clone());
+                        }
+                    }
+                }
+                if !merged.is_empty() {
+                    for (k, val) in merged.iter().take(20) {
+                        summarize_json_node(val, &format!("[].{k}"), depth + 1, out);
+                        if out.len() >= 75 {
+                            break;
+                        }
+                    }
+                } else {
+                    summarize_json_node(&arr[0], "[0]", depth + 1, out);
+                }
+            }
+        }
+        Value::String(s) => {
+            let preview: String = s.chars().take(36).collect();
+            let ell = if s.chars().count() > 36 { "..." } else { "" };
+            out.push(format!(
+                "{pad}{name}: string ({}ch \"{preview}{ell}\")",
+                s.len()
+            ));
+        }
+        Value::Number(n) => out.push(format!("{pad}{name}: number ({n})")),
+        Value::Bool(b) => out.push(format!("{pad}{name}: bool ({b})")),
+        Value::Null => out.push(format!("{pad}{name}: null")),
+    }
+}
+
+/// Compact schema outline for JSON documents, HAR captures (`log.entries`), and JSONL streams.
+pub fn outline_json_or_jsonl(text: &str) -> Option<String> {
+    let trimmed = text.trim_start_matches('\u{FEFF}').trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    let mut lines_out = Vec::new();
+    if let Ok(root) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(entries) = root
+            .get("log")
+            .and_then(|l| l.get("entries"))
+            .and_then(Value::as_array)
+        {
+            let mut methods: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut statuses: std::collections::BTreeMap<u64, usize> =
+                std::collections::BTreeMap::new();
+            let mut hosts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for e in entries {
+                if let Some(m) = e.pointer("/request/method").and_then(Value::as_str) {
+                    *methods.entry(m.to_string()).or_default() += 1;
+                }
+                if let Some(st) = e.pointer("/response/status").and_then(Value::as_u64) {
+                    *statuses.entry(st).or_default() += 1;
+                }
+                if let Some(u) = e.pointer("/request/url").and_then(Value::as_str) {
+                    if let Some(rest) = u.split("://").nth(1) {
+                        let host = rest.split('/').next().unwrap_or("");
+                        if !host.is_empty() {
+                            *hosts.entry(host.to_string()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            lines_out.push(format!(
+                "HAR Capture: {} entries | methods={methods:?} | statuses={statuses:?} | hosts={hosts:?}",
+                entries.len()
+            ));
+        }
+        summarize_json_node(
+            &root,
+            if root.is_array() { "root" } else { "" },
+            0,
+            &mut lines_out,
+        );
+        if lines_out.is_empty() {
+            lines_out.push("(empty JSON container)".to_string());
+        }
+        return Some(lines_out.join("\n"));
+    }
+
+    let mut records = Vec::new();
+    for ln in trimmed.lines().take(200) {
+        let t = ln.trim();
+        if t.starts_with('{') || t.starts_with('[') {
+            if let Ok(v) = serde_json::from_str::<Value>(t) {
+                records.push(v);
+            }
+        }
+    }
+    if records.is_empty() {
+        return None;
+    }
+    lines_out.push(format!(
+        "JSONL Stream: {} parsed record(s) sampled",
+        records.len()
+    ));
+    summarize_json_node(&Value::Array(records), "records", 0, &mut lines_out);
+    Some(lines_out.join("\n"))
+}
+
+fn der_tlv(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let tag = buf[0];
+    let l0 = buf[1];
+    let (hdr_len, val_len) = if l0 < 0x80 {
+        (2usize, l0 as usize)
+    } else {
+        let nb = (l0 & 0x7F) as usize;
+        if nb == 0 || nb > 4 || buf.len() < 2 + nb {
+            return None;
+        }
+        let mut n = 0usize;
+        for &b in &buf[2..2 + nb] {
+            n = (n << 8) | (b as usize);
+        }
+        (2 + nb, n)
+    };
+    let end = hdr_len.checked_add(val_len)?;
+    if end > buf.len() {
+        return None;
+    }
+    Some((tag, &buf[hdr_len..end], &buf[end..]))
+}
+
+fn der_oid_dotted(raw: &[u8]) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut parts = vec![(raw[0] / 40) as u64, (raw[0] % 40) as u64];
+    let mut acc = 0u64;
+    for &b in &raw[1..] {
+        acc = (acc << 7) | ((b & 0x7F) as u64);
+        if (b & 0x80) == 0 {
+            parts.push(acc);
+            acc = 0;
+        }
+    }
+    parts
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn der_oid_label(oid: &str) -> &str {
+    match oid {
+        "2.5.4.3" => "CN",
+        "2.5.4.10" => "O",
+        "2.5.4.11" => "OU",
+        "2.5.4.6" => "C",
+        "2.5.4.7" => "L",
+        "2.5.4.8" => "ST",
+        "1.2.840.113549.1.9.1" => "email",
+        "1.2.840.113549.1.1.1" => "RSA",
+        "1.2.840.113549.1.1.5" => "sha1WithRSA",
+        "1.2.840.113549.1.1.11" => "sha256WithRSA",
+        "1.2.840.113549.1.1.12" => "sha384WithRSA",
+        "1.2.840.113549.1.1.13" => "sha512WithRSA",
+        "1.2.840.10045.2.1" => "EC",
+        "1.2.840.10045.3.1.7" => "P-256",
+        "1.3.132.0.34" => "P-384",
+        "1.3.101.112" => "Ed25519",
+        "1.2.840.10045.4.3.2" => "ecdsa-SHA256",
+        "1.2.840.10045.4.3.3" => "ecdsa-SHA384",
+        other => other,
+    }
+}
+
+fn parse_der_name(seq: &[u8]) -> String {
+    let mut parts = Vec::new();
+    let mut cur = seq;
+    while let Some((t, set_body, rest)) = der_tlv(cur) {
+        cur = rest;
+        if t != 0x31 {
+            continue;
+        }
+        let mut sc = set_body;
+        while let Some((st, atv, srest)) = der_tlv(sc) {
+            sc = srest;
+            if st != 0x30 {
+                continue;
+            }
+            if let Some((0x06, oid_b, rem)) = der_tlv(atv) {
+                if let Some((_vt, val_b, _)) = der_tlv(rem) {
+                    let oid_s = der_oid_dotted(oid_b);
+                    let k = der_oid_label(&oid_s);
+                    let v = String::from_utf8_lossy(val_b).trim().to_string();
+                    parts.push(format!("{k}={v}"));
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        "(empty)".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn format_der_time(tag: u8, val: &[u8]) -> String {
+    let s = String::from_utf8_lossy(val);
+    let b = s.as_bytes();
+    if tag == 0x17 && b.len() >= 12 {
+        let yy = std::str::from_utf8(&b[0..2]).unwrap_or("00");
+        let cen = if yy.parse::<u16>().unwrap_or(0) >= 50 {
+            "19"
+        } else {
+            "20"
+        };
+        format!(
+            "{cen}{}-{}-{}T{}:{}:{}Z",
+            yy,
+            std::str::from_utf8(&b[2..4]).unwrap_or("00"),
+            std::str::from_utf8(&b[4..6]).unwrap_or("00"),
+            std::str::from_utf8(&b[6..8]).unwrap_or("00"),
+            std::str::from_utf8(&b[8..10]).unwrap_or("00"),
+            std::str::from_utf8(&b[10..12]).unwrap_or("00")
+        )
+    } else if tag == 0x18 && b.len() >= 14 {
+        format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            std::str::from_utf8(&b[0..4]).unwrap_or("0000"),
+            std::str::from_utf8(&b[4..6]).unwrap_or("00"),
+            std::str::from_utf8(&b[6..8]).unwrap_or("00"),
+            std::str::from_utf8(&b[8..10]).unwrap_or("00"),
+            std::str::from_utf8(&b[10..12]).unwrap_or("00"),
+            std::str::from_utf8(&b[12..14]).unwrap_or("00")
+        )
+    } else {
+        s.to_string()
+    }
+}
+
+fn inspect_single_x509_der(der: &[u8], idx: usize) -> Result<String, String> {
+    let (0x30, cert_body, _) = der_tlv(der).ok_or("invalid DER SEQUENCE header")? else {
+        return Err("certificate must start with ASN.1 SEQUENCE (0x30)".to_string());
+    };
+    let (0x30, mut tbs, _) = der_tlv(cert_body).ok_or("missing tbsCertificate")? else {
+        return Err("tbsCertificate must be ASN.1 SEQUENCE".to_string());
+    };
+    let mut version = 1u8;
+    if let Some((0xA0, ver_inner, rest)) = der_tlv(tbs) {
+        if let Some((0x02, vb, _)) = der_tlv(ver_inner) {
+            version = vb.last().copied().unwrap_or(0).saturating_add(1);
+        }
+        tbs = rest;
+    }
+    let (0x02, serial_b, rest) = der_tlv(tbs).ok_or("missing serialNumber")? else {
+        return Err("missing serialNumber INTEGER".to_string());
+    };
+    let serial = serial_b
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let (_, sig_body, rest) = der_tlv(rest).ok_or("missing signature AlgorithmIdentifier")?;
+    let sig_alg = der_tlv(sig_body)
+        .filter(|(t, _, _)| *t == 0x06)
+        .map(|(_, ob, _)| der_oid_label(&der_oid_dotted(ob)).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let (_, issuer_b, rest) = der_tlv(rest).ok_or("missing issuer")?;
+    let issuer = parse_der_name(issuer_b);
+    let (_, val_b, rest) = der_tlv(rest).ok_or("missing validity")?;
+    let (not_before, not_after) = if let Some((t1, b1, r1)) = der_tlv(val_b) {
+        if let Some((t2, b2, _)) = der_tlv(r1) {
+            (format_der_time(t1, b1), format_der_time(t2, b2))
+        } else {
+            (format_der_time(t1, b1), "?".to_string())
+        }
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+    let (_, subj_b, rest) = der_tlv(rest).ok_or("missing subject")?;
+    let subject = parse_der_name(subj_b);
+    let (_, spki_b, mut rem) = der_tlv(rest).ok_or("missing SubjectPublicKeyInfo")?;
+    let key_info = if let Some((0x30, alg_b, spki_rest)) = der_tlv(spki_b) {
+        let alg_oid = der_tlv(alg_b)
+            .filter(|(t, _, _)| *t == 0x06)
+            .map(|(_, ob, r)| {
+                let main = der_oid_label(&der_oid_dotted(ob)).to_string();
+                if let Some((0x06, pb, _)) = der_tlv(r) {
+                    format!("{main} ({})", der_oid_label(&der_oid_dotted(pb)))
+                } else {
+                    main
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let bits = der_tlv(spki_rest)
+            .filter(|(t, _, _)| *t == 0x03)
+            .map(|(_, kb, _)| kb.len().saturating_sub(1) * 8)
+            .unwrap_or(0);
+        format!("{alg_oid} (~{bits}b SPKI)")
+    } else {
+        "unknown".to_string()
+    };
+
+    let mut sans = Vec::new();
+    let mut is_ca: Option<bool> = None;
+    while let Some((t, inner, rnext)) = der_tlv(rem) {
+        rem = rnext;
+        if t != 0xA3 {
+            continue;
+        }
+        if let Some((0x30, mut ext_seq, _)) = der_tlv(inner) {
+            while let Some((0x30, ext, erest)) = der_tlv(ext_seq) {
+                ext_seq = erest;
+                let Some((0x06, eoid_b, ext_r)) = der_tlv(ext) else {
+                    continue;
+                };
+                let eoid = der_oid_dotted(eoid_b);
+                let mut cur_r = ext_r;
+                if let Some((0x01, _, after_crit)) = der_tlv(cur_r) {
+                    cur_r = after_crit;
+                }
+                let Some((0x04, oct, _)) = der_tlv(cur_r) else {
+                    continue;
+                };
+                if eoid == "2.5.29.17" {
+                    if let Some((0x30, mut gn_seq, _)) = der_tlv(oct) {
+                        while let Some((gt, gb, grest)) = der_tlv(gn_seq) {
+                            gn_seq = grest;
+                            match gt {
+                                0x82 => sans.push(format!("DNS:{}", String::from_utf8_lossy(gb))),
+                                0x86 => sans.push(format!("URI:{}", String::from_utf8_lossy(gb))),
+                                0x87 if gb.len() == 4 => {
+                                    sans.push(format!(
+                                        "IP:{}.{}.{}.{}",
+                                        gb[0], gb[1], gb[2], gb[3]
+                                    ));
+                                }
+                                0x87 if gb.len() == 16 => {
+                                    let hexs = gb
+                                        .chunks_exact(2)
+                                        .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+                                        .collect::<Vec<_>>()
+                                        .join(":");
+                                    sans.push(format!("IP:{hexs}"));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if eoid == "2.5.29.19" {
+                    if let Some((0x30, bc_body, _)) = der_tlv(oct) {
+                        is_ca = Some(
+                            der_tlv(bc_body)
+                                .filter(|(bt, _, _)| *bt == 0x01)
+                                .and_then(|(_, bb, _)| bb.first().map(|&v| v != 0))
+                                .unwrap_or(false),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let fp = crate::binary::sha256_hex(der);
+    let mut lines = vec![
+        format!("### X.509 Certificate #{idx} (v{version}) | SHA-256: `{fp}`"),
+        format!("- **Subject**: `{subject}`"),
+        format!("- **Issuer**: `{issuer}`"),
+        format!("- **Validity**: `{not_before}` .. `{not_after}`"),
+        format!("- **Key & Signature**: `{key_info}` | sig=`{sig_alg}` | serial=`{serial}`"),
+    ];
+    if let Some(ca) = is_ca {
+        lines.push(format!("- **BasicConstraints**: CA={ca}"));
+    }
+    if !sans.is_empty() {
+        lines.push(format!(
+            "- **SANs ({})**: `{}`",
+            sans.len(),
+            sans.join("`, `")
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Pure-Rust zero-OpenSSL X.509 PEM/DER certificate inspector (`--cert`).
+pub fn inspect_x509_pem_or_der(bytes: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(bytes);
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if text.contains(BEGIN) {
+        let mut out = Vec::new();
+        let mut search = text.as_ref();
+        let mut idx = 1usize;
+        while let Some(s_pos) = search.find(BEGIN) {
+            let after = &search[s_pos + BEGIN.len()..];
+            let Some(e_pos) = after.find(END) else {
+                break;
+            };
+            let b64: String = after[..e_pos]
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| format!("PEM base64 decode failed: {e}"))?;
+            out.push(inspect_single_x509_der(&der, idx)?);
+            idx += 1;
+            search = &after[e_pos + END.len()..];
+            if idx > 8 {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err("no complete PEM certificate block found".to_string());
+        }
+        return Ok(out.join("\n\n"));
+    }
+    if bytes.first() == Some(&0x30) {
+        return inspect_single_x509_der(bytes, 1);
+    }
+    Err("input is neither PEM (-----BEGIN CERTIFICATE-----) nor DER SEQUENCE (0x30)".to_string())
 }
 
 fn decode_b64_any(s: &str) -> Option<Vec<u8>> {
@@ -1481,5 +2144,134 @@ mod inspect_tests {
             "secret must be redacted in:\n{md}"
         );
         assert!(!md.contains(&ak_val), "AK must be redacted in:\n{md}");
+    }
+
+    fn der_tlv_build(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 0x80 {
+            out.push(body.len() as u8);
+        } else {
+            let len_bytes = (body.len() as u32).to_be_bytes();
+            let first = len_bytes.iter().position(|&b| b != 0).unwrap_or(3);
+            let n = 4 - first;
+            out.push(0x80 | (n as u8));
+            out.extend_from_slice(&len_bytes[first..]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn json_outline_filtered_json_path_and_x509_cert_inspection() {
+        // 1. HAR outline & filtered/projected JSON path
+        let har = r#"{
+          "log": {
+            "entries": [
+              {"request": {"method": "GET", "url": "https://api.acme.test/v1/users"}, "response": {"status": 200}},
+              {"request": {"method": "POST", "url": "https://api.acme.test/v1/admin/role"}, "response": {"status": 403}}
+            ]
+          }
+        }"#;
+        let out = outline_json_or_jsonl(har).unwrap();
+        assert!(
+            out.contains("HAR Capture: 2 entries") && out.contains("api.acme.test"),
+            "{out}"
+        );
+
+        let proj = query_json_or_jsonl(
+            har,
+            "log.entries[?response.status!=200].{method:request.method,url:request.url,status:response.status}",
+        )
+        .unwrap();
+        assert!(
+            proj.contains("POST") && proj.contains("/v1/admin/role") && !proj.contains("/v1/users"),
+            "{proj}"
+        );
+
+        let keys_md = query_json_or_jsonl(har, "log.entries[0].keys()").unwrap();
+        assert!(
+            keys_md.contains("\"request\"") && keys_md.contains("\"response\""),
+            "{keys_md}"
+        );
+
+        // 2. Minimal synthetic DER -> PEM X.509 v3 certificate with SAN & BasicConstraints
+        let oid_cn = der_tlv_build(0x06, &[0x55, 0x04, 0x03]);
+        let rdn = |name: &str| {
+            let atv = der_tlv_build(
+                0x30,
+                &[oid_cn.clone(), der_tlv_build(0x0C, name.as_bytes())].concat(),
+            );
+            der_tlv_build(0x31, &atv)
+        };
+        let issuer = der_tlv_build(0x30, &rdn("Acme Root CA"));
+        let subject = der_tlv_build(0x30, &rdn("api.acme.test"));
+        let validity = der_tlv_build(
+            0x30,
+            &[
+                der_tlv_build(0x17, b"260101000000Z"),
+                der_tlv_build(0x17, b"270101000000Z"),
+            ]
+            .concat(),
+        );
+        let spki = der_tlv_build(
+            0x30,
+            &[
+                der_tlv_build(
+                    0x30,
+                    &der_tlv_build(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]),
+                ),
+                der_tlv_build(0x03, &[0x00, 0x04, 0xAA, 0xBB]),
+            ]
+            .concat(),
+        );
+        let san_ext = der_tlv_build(
+            0x30,
+            &[
+                der_tlv_build(0x06, &[0x55, 0x1D, 0x11]),
+                der_tlv_build(
+                    0x04,
+                    &der_tlv_build(0x30, &der_tlv_build(0x82, b"api.acme.test")),
+                ),
+            ]
+            .concat(),
+        );
+        let exts = der_tlv_build(0xA3, &der_tlv_build(0x30, &san_ext));
+        let sig_alg = der_tlv_build(
+            0x30,
+            &der_tlv_build(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]),
+        );
+        let tbs = der_tlv_build(
+            0x30,
+            &[
+                der_tlv_build(0xA0, &der_tlv_build(0x02, &[0x02])),
+                der_tlv_build(0x02, &[0x01, 0x2A]),
+                sig_alg.clone(),
+                issuer,
+                validity,
+                subject,
+                spki,
+                exts,
+            ]
+            .concat(),
+        );
+        let cert_der = der_tlv_build(
+            0x30,
+            &[tbs, sig_alg, der_tlv_build(0x03, &[0x00, 0x01])].concat(),
+        );
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64::engine::general_purpose::STANDARD.encode(&cert_der)
+        );
+        let xmd = inspect_x509_pem_or_der(pem.as_bytes()).unwrap();
+        assert!(
+            xmd.contains("(v3)")
+                && xmd.contains("CN=Acme Root CA")
+                && xmd.contains("DNS:api.acme.test"),
+            "{xmd}"
+        );
+        assert!(
+            xmd.contains("2026-01-01T00:00:00Z") && xmd.contains("ecdsa-SHA256"),
+            "{xmd}"
+        );
     }
 }

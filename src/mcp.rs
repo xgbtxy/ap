@@ -33,7 +33,11 @@ fn mcp_tools_schema() -> Value {
                     "decode": { "type": "boolean", "description": "Auto-decode embedded JWT tokens, Base64 blobs, and URL-encoded strings" },
                     "render": { "type": "boolean", "description": "Render JS-driven URLs in real Headless Edge/Chrome" },
                     "hex": { "type": "boolean", "description": "Emit canonical hex+ASCII dump with SHA-256 & entropy (supports hex/decimal offset)" },
+                    "rva": { "type": "string", "description": "Map a PE RVA (or ELF offset) to file offset, section, enclosing x64 function & nearby call/hex preview" },
+                    "va": { "type": "string", "description": "Map a PE/ELF virtual address (`VA`) to file offset, section & nearby XREFs" },
+                    "find_bytes": { "type": "string", "description": "Wildcard hex byte pattern search across binary (e.g. '48 8D ?? ?? ?? ?? ?? E8'), mapping hits to RVA/VA/func" },
                     "xref": { "type": "boolean", "description": "Resolve PE64 (x64 LEA/CALL) & ELF64 (x64 LEA / AArch64 ADRP+ADD) string & IAT XREFs + enclosing function RVAs" },
+                    "cert": { "type": "boolean", "description": "Pure-Rust X.509 PEM/DER certificate inspector (Subject, Issuer, Validity, SANs, SHA-256)" },
                     "proto": { "type": "boolean", "description": "Schema-less raw Protocol Buffers wire decoder (no protoc required)" },
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins" },
                     "jwt": { "type": "boolean", "description": "Decode JWT header/claims/UTC timestamps & defensive security posture flags (accepts file or inline eyJ... token)" },
@@ -1275,8 +1279,35 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("hex").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--hex".to_string());
             }
+            if let Some(rv) = args
+                .get("rva")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--rva".to_string());
+                cli.push(rv.trim().to_string());
+            }
+            if let Some(va) = args
+                .get("va")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--va".to_string());
+                cli.push(va.trim().to_string());
+            }
+            if let Some(fb) = args
+                .get("find_bytes")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--find-bytes".to_string());
+                cli.push(fb.trim().to_string());
+            }
             if args.get("xref").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--xref".to_string());
+            }
+            if args.get("cert").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--cert".to_string());
             }
             if args.get("proto").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--proto".to_string());

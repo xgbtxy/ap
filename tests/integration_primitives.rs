@@ -7307,3 +7307,221 @@ fn test_v245_windows_win_probe_msys_shield_tmp_path_and_pi_patch14() {
         assert_eq!(v["ok"], Value::Bool(false));
     }
 }
+
+#[test]
+fn test_v246_pe_deep_meta_rva_bytes_json_x509_and_shell_heals() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. JSON outline & filtered/projected JSON path CLI
+    let har_path = root.join("sample.har");
+    fs::write(
+        &har_path,
+        r#"{
+          "log": {
+            "entries": [
+              {"request": {"method": "GET", "url": "https://api.example.com/health"}, "response": {"status": 200}},
+              {"request": {"method": "POST", "url": "https://api.example.com/v2/admin"}, "response": {"status": 403}}
+            ]
+          }
+        }"#,
+    )
+    .unwrap();
+    let out_cmd = run_ap(
+        root,
+        &["read", &har_path.to_string_lossy(), "--outline"],
+        None,
+        &[],
+    );
+    assert!(out_cmd.status.success());
+    let out_s = String::from_utf8_lossy(&out_cmd.stdout);
+    assert!(
+        out_s.contains("HAR Capture: 2 entries") && out_s.contains("api.example.com"),
+        "unexpected HAR outline:\n{out_s}"
+    );
+    let jp_cmd = run_ap(
+        root,
+        &[
+            "read",
+            &har_path.to_string_lossy(),
+            "--json-path",
+            "log.entries[?response.status!=200].{method:request.method,url:request.url,status:response.status}",
+        ],
+        None,
+        &[],
+    );
+    assert!(jp_cmd.status.success());
+    let jp_s = String::from_utf8_lossy(&jp_cmd.stdout);
+    assert!(
+        jp_s.contains("POST") && jp_s.contains("/v2/admin") && !jp_s.contains("/health"),
+        "unexpected json-path projection:\n{jp_s}"
+    );
+
+    // 2. X.509 --cert pure-Rust parser (DER inside PEM)
+    use base64::Engine;
+    fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag];
+        if body.len() < 0x80 {
+            v.push(body.len() as u8);
+        } else {
+            let lb = (body.len() as u32).to_be_bytes();
+            let first = lb.iter().position(|&b| b != 0).unwrap_or(3);
+            v.push(0x80 | ((4 - first) as u8));
+            v.extend_from_slice(&lb[first..]);
+        }
+        v.extend_from_slice(body);
+        v
+    }
+    let cn_atv = der(
+        0x30,
+        &[
+            der(0x06, &[0x55, 0x04, 0x03]),
+            der(0x0C, b"demo.example.com"),
+        ]
+        .concat(),
+    );
+    let name = der(0x30, &der(0x31, &cn_atv));
+    let val = der(
+        0x30,
+        &[der(0x17, b"260101000000Z"), der(0x17, b"280101000000Z")].concat(),
+    );
+    let spki = der(
+        0x30,
+        &[
+            der(
+                0x30,
+                &der(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]),
+            ),
+            der(0x03, &[0x00, 0x04, 0x11]),
+        ]
+        .concat(),
+    );
+    let alg = der(
+        0x30,
+        &der(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]),
+    );
+    let tbs = der(
+        0x30,
+        &[
+            der(0xA0, &der(0x02, &[0x02])),
+            der(0x02, &[0x01]),
+            alg.clone(),
+            name.clone(),
+            val,
+            name,
+            spki,
+        ]
+        .concat(),
+    );
+    let cert_der = der(0x30, &[tbs, alg, der(0x03, &[0x00, 0x01])].concat());
+    let cert_path = root.join("server.pem");
+    fs::write(
+        &cert_path,
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64::engine::general_purpose::STANDARD.encode(&cert_der)
+        ),
+    )
+    .unwrap();
+    let cert_out = run_ap(root, &["read", &cert_path.to_string_lossy()], None, &[]);
+    assert!(cert_out.status.success());
+    let cert_s = String::from_utf8_lossy(&cert_out.stdout);
+    assert!(
+        cert_s.contains("CN=demo.example.com") && cert_s.contains("2028-01-01T00:00:00Z"),
+        "unexpected x509 output:\n{cert_s}"
+    );
+
+    // 3. Synthetic PE --rva & --find-bytes CLI
+    let mut pe = vec![0u8; 0x300];
+    pe[0..2].copy_from_slice(b"MZ");
+    pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+    pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+    pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    pe[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+    let opt = 0x98usize;
+    pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes());
+    pe[opt + 24..opt + 32].copy_from_slice(&0x0001_4000_0000u64.to_le_bytes());
+    let s0 = opt + 0xF0;
+    pe[s0..s0 + 5].copy_from_slice(b".text");
+    pe[s0 + 8..s0 + 12].copy_from_slice(&0x100u32.to_le_bytes());
+    pe[s0 + 12..s0 + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    pe[s0 + 16..s0 + 20].copy_from_slice(&0x100u32.to_le_bytes());
+    pe[s0 + 20..s0 + 24].copy_from_slice(&0x200u32.to_le_bytes());
+    pe[s0 + 36..s0 + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+    pe[0x210..0x216].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28, 0xEB, 0xFE]);
+    let pe_path = root.join("probe_demo.dll");
+    fs::write(&pe_path, &pe).unwrap();
+
+    let rva_out = run_ap(
+        root,
+        &["read", &pe_path.to_string_lossy(), "--rva", "0x1010"],
+        None,
+        &[],
+    );
+    assert!(rva_out.status.success());
+    let rva_s = String::from_utf8_lossy(&rva_out.stdout);
+    assert!(
+        rva_s.contains("offset=0x210") && rva_s.contains(".text"),
+        "{rva_s}"
+    );
+
+    let fb_out = run_ap(
+        root,
+        &[
+            "read",
+            &pe_path.to_string_lossy(),
+            "--find-bytes",
+            "48 83 ?? 28",
+        ],
+        None,
+        &[],
+    );
+    assert!(fb_out.status.success());
+    let fb_s = String::from_utf8_lossy(&fb_out.stdout);
+    assert!(
+        fb_s.contains("offset=0x210") && fb_s.contains("rva=0x1010"),
+        "{fb_s}"
+    );
+
+    // 4. Accelerator v2.46 checks
+    let home = root.join("home_v246");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(init_res.status.success());
+    let acc = fs::read_to_string(home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    for needle in [
+        "healCmdForLoop",
+        "ap cmd-for-tip",
+        "ap py-unicodeescape-tip",
+        "ap py-rawstr-tip",
+    ] {
+        assert!(
+            acc.contains(needle),
+            "missing v2.46 accelerator feature: {needle}"
+        );
+    }
+    let doc = run_ap(
+        root,
+        &["doctor", "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(doc.status.success());
+    let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
+    assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
+}

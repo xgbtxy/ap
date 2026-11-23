@@ -424,6 +424,36 @@ pub fn split_top_level_and_and(s: &str) -> Vec<String> {
 /// inside `python -c` non-raw string literals, while leaving Python raw strings (`r'C:\foo'`)
 /// and already-escaped strings (`'C:\\foo'`) completely untouched.
 #[cfg_attr(not(windows), allow(dead_code))]
+fn contains_lethal_py_backslash(seg: &str) -> bool {
+    if seg.contains("\\\\") {
+        return false;
+    }
+    let bytes = seg.as_bytes();
+    if bytes.len() >= 4 && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'\\' {
+        return true;
+    }
+    const SEG_KEYS: [&str; 12] = [
+        "\\Users",
+        "\\Network",
+        "\\Windows",
+        "\\AppData",
+        "\\Local",
+        "\\Roaming",
+        "\\System32",
+        "\\Program Files",
+        "\\Temp",
+        "\\Desktop",
+        "\\Documents",
+        "\\Default",
+    ];
+    SEG_KEYS.iter().any(|k| {
+        seg.find(k).is_some_and(|idx| {
+            let after = idx + k.len();
+            matches!(seg.as_bytes().get(after), Some(b'\\') | None)
+        })
+    })
+}
+
 fn heal_py_win_backslashes(cmd: &str) -> (String, bool) {
     let b = cmd.as_bytes();
     let mut out = String::with_capacity(cmd.len());
@@ -431,26 +461,31 @@ fn heal_py_win_backslashes(cmd: &str) -> (String, bool) {
     let mut changed = false;
     while i < b.len() {
         let ch = b[i];
-        if (ch == b'\'' || ch == b'"') && i + 4 <= b.len() {
+        if ch == b'\'' || ch == b'"' {
+            let quote = ch;
+            let other = if quote == b'"' { b'\'' } else { b'"' };
             let prev_is_raw = i > 0
                 && matches!(b[i - 1], b'r' | b'R')
                 && (i == 1 || !(b[i - 2].is_ascii_alphanumeric() || b[i - 2] == b'_'));
-            if !prev_is_raw
-                && b[i + 1].is_ascii_alphabetic()
-                && b[i + 2] == b':'
-                && b[i + 3] == b'\\'
-                && b.get(i + 4) != Some(&b'\\')
-            {
-                let quote = ch;
-                let mut end = i + 4;
-                while end < b.len() && b[end] != quote && !b[end].is_ascii_whitespace() {
-                    end += 1;
+            let mut end = i + 1;
+            while end < b.len() && b[end] != quote && b[end] != b'\n' && b[end] != b'\r' {
+                end += 1;
+            }
+            if end < b.len() && b[end] == quote {
+                if prev_is_raw {
+                    out.push_str(&cmd[i..=end]);
+                    i = end + 1;
+                    continue;
                 }
-                let seg = &cmd[i..end];
-                out.push_str(&seg.replace('\\', "/"));
-                changed = true;
-                i = end;
-                continue;
+                if !b[i + 1..end].contains(&other) {
+                    let inner = &cmd[i..=end];
+                    if contains_lethal_py_backslash(inner) {
+                        out.push_str(&inner.replace('\\', "/"));
+                        changed = true;
+                        i = end + 1;
+                        continue;
+                    }
+                }
             }
         }
         let next_ch = cmd[i..].chars().next().unwrap();
@@ -458,6 +493,87 @@ fn heal_py_win_backslashes(cmd: &str) -> (String, bool) {
         i += next_ch.len_utf8();
     }
     (out, changed)
+}
+
+/// Convert simple Windows CMD `for %x in (a b c) do ...` (without `/f`, `/r`, `/l`, `/d`) into Bash `for x in a b c; do ...; done`,
+/// optionally preserving a leading `cd [/d] <dir> &/&&` prefix.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn try_heal_cmd_for_loop(raw: &str) -> Option<String> {
+    static RE: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (for_re, var_re) = RE.get_or_init(|| {
+        (
+            Regex::new(
+                r#"(?is)^\s*(?:(cd(?:\s+/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(([^)\r\n]+)\)\s+do\s+(.+?)\s*$"#,
+            )
+            .unwrap(),
+            Regex::new(r"%%?([A-Za-z_]\w*)").unwrap(),
+        )
+    });
+    let trimmed = raw.trim();
+    if Regex::new(r"(?i)\bfor\s+/[frld]\b")
+        .unwrap()
+        .is_match(trimmed)
+    {
+        return None;
+    }
+    let caps = for_re.captures(trimmed)?;
+    let var = caps.get(2)?.as_str();
+    let items = caps.get(3)?.as_str().trim();
+    if items.is_empty() {
+        return None;
+    }
+    let mut body = caps.get(4)?.as_str().trim().to_string();
+    if let Some(stripped) = body.strip_prefix('@') {
+        body = stripped.trim().to_string();
+    }
+    if body.starts_with('(') && body.ends_with(')') && body.len() >= 2 {
+        body = body[1..body.len() - 1].trim().to_string();
+    }
+    body = var_re
+        .replace_all(&body, |c: &regex::Captures| {
+            if &c[1] == var {
+                format!("${{{var}}}")
+            } else {
+                c[0].to_string()
+            }
+        })
+        .into_owned();
+    // Convert standalone CMD `&` separator between subcommands (avoiding `&&` or `>&`) to `; `
+    let mut bash_body = String::with_capacity(body.len());
+    let b = body.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'&'
+            && b.get(i.wrapping_sub(1)) != Some(&b'&')
+            && b.get(i + 1) != Some(&b'&')
+            && b.get(i.wrapping_sub(1)) != Some(&b'>')
+            && b.get(i + 1) != Some(&b'>')
+        {
+            bash_body.push_str("; ");
+            i += 1;
+            while i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+        } else {
+            let ch = body[i..].chars().next().unwrap();
+            bash_body.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let cd_part = caps
+        .get(1)
+        .map(|m| {
+            let cleaned = Regex::new(r"(?i)^cd\s+/d\s+")
+                .unwrap()
+                .replace(m.as_str().trim(), "cd ");
+            format!("{cleaned} && ")
+        })
+        .unwrap_or_default()
+        .replace('\\', "/");
+    Some(format!(
+        "{cd_part}for {var} in {items}; do {}; done",
+        bash_body.trim()
+    ))
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -492,6 +608,12 @@ pub fn heal_windows_command(
             heals,
         );
     }
+    if has_git_bash {
+        if let Some(healed_for) = try_heal_cmd_for_loop(raw) {
+            heals.push("cmd-for->bash-for");
+            return (ShellKind::GitBash, healed_for, heals);
+        }
+    }
     let has_ps_cmdlet = re.ps_cmdlet.is_match(raw);
     if has_git_bash && !has_ps_cmdlet && re.posix_only.is_match(raw) {
         heals.push("posix->git-bash");
@@ -515,7 +637,7 @@ pub fn heal_windows_command(
         out = clamped;
         heals.push("sleep-clamp->45s");
     }
-    if re.py_win_backslash.is_match(&out) {
+    if re.py_win_backslash.is_match(&out) || out.contains("python") || out.contains("py ") {
         let (fixed, did_fix) = heal_py_win_backslashes(&out);
         if did_fix {
             out = fixed;
@@ -1172,6 +1294,31 @@ mod tests {
             heal_windows_command("tasklist /FI \"STATUS eq RUNNING\" | head -n 5", true, true);
         assert!(
             h11.starts_with("export MSYS_NO_PATHCONV=1;") && tags11.contains(&"msys-no-pathconv")
+        );
+
+        // `try_heal_cmd_for_loop` translates Windows CMD `for %p in (...) do ...` into POSIX Bash loops
+        assert_eq!(
+            try_heal_cmd_for_loop(
+                r#"cd /d D:\work\demo & for %p in (9451 9223) do @(echo === %p ===& curl -s -m 3 http://127.0.0.1:%p/json)"#
+            )
+            .as_deref(),
+            Some("cd D:/work/demo && for p in 9451 9223; do echo === ${p} ===; curl -s -m 3 http://127.0.0.1:${p}/json; done")
+        );
+        assert!(
+            try_heal_cmd_for_loop(r#"for /f "tokens=*" %a in (list.txt) do echo %a"#).is_none()
+        );
+
+        // `heal_py_win_backslashes` heals both drive-letter & relative Windows backslash literals (`\Network\`, `\Users\`)
+        let (_, h12, tags12) = heal_windows_command(
+            r#"python -c "p = 'Default\Network\Cookies'; q = r'Default\Raw\Stay'""#,
+            true,
+            false,
+        );
+        assert!(
+            h12.contains("Default/Network/Cookies")
+                && h12.contains(r#"r'Default\Raw\Stay'"#)
+                && tags12.contains(&"py-win-backslash->slash"),
+            "unexpected py heal: {h12}"
         );
     }
 }

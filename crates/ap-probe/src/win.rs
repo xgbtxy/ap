@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(windows)]
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AceEntry {

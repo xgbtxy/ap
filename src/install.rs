@@ -992,7 +992,13 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (next.includes("tools.mcp__agent-primitives__")) {{
 		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
 	}}
-	// Strip accidental TypeScript `as any|unknown|string|number|boolean|object|const` assertions in QuickJS scripts
+	// Strip accidental TypeScript variable type annotations (`const x: string = ...`) and `as <Type>` casts in QuickJS scripts
+	if (/\b(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:/.test(next)) {{
+		next = next.replace(
+			/(^|[;\n]\s*)(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:string|number|boolean|any|unknown|object|Record<[^>\n]+>|Array<[^>\n]+>|(?:string|number|boolean|any|unknown)\[\])\s*=/gm,
+			"$1$2 $3 =",
+		);
+	}}
 	if (/\bas\s+(?:any|unknown|string|number|boolean|object|const)\b/.test(next)) {{
 		next = next.replace(
 			/(\)|\]|\b[A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+(?:any|unknown|string|number|boolean|object|const)\b(?=\s*[;,)\]\r\n.?:&|])/g,
@@ -1278,6 +1284,15 @@ export function classifyShellFailureTip(
 	outText: string,
 ): string | undefined {{
 	if (isBenignGrepNoMatch(cmd, outText)) return undefined;
+	if (/syntax error near unexpected token [`'"]?\(/i.test(outText) && /\bfor\s+%%?[A-Za-z_]|cd\s+\/d\b/i.test(cmd)) {{
+		return `[ap cmd-for-tip] Windows CMD \`for %x in (...)\` & \`cd /d\` syntax fails in Git Bash; use POSIX \`for x in ...; do ...; done\` (single-quoted/braced) or run via \`powershell\`.`;
+	}}
+	if (/unicodeescape.*codec can't decode/i.test(outText)) {{
+		return `[ap py-unicodeescape-tip] Python non-raw string hit Windows backslash escape (\`\\U\`, \`\\N\`, etc.); use forward slashes (\`C:/...\`, \`Default/Network/Cookies\`) or raw \`r'...'\` WITHOUT a trailing backslash.`;
+	}}
+	if (/SyntaxError:\s*unterminated string literal/i.test(outText)) {{
+		return `[ap py-rawstr-tip] Unterminated Python string (often trailing \`\\\` inside raw \`r'...'\\\\'\` or nested quotes); use forward slashes, \`ap probe win --pipes\` for named pipes, or \`python - <<'PY'\`.`;
+	}}
 	if (QUOTE_OR_BS_ERR.test(outText)) {{
 		return `[ap quote-tip] Avoid nested quotes/backslashes inside inline python -c; use a single-quoted heredoc (python - <<'PY' ... PY) or write a script file via write/ap_edit.`;
 	}}
@@ -2473,6 +2488,27 @@ export function healMsysPathConv(raw: string, toolName = "bash"): string | undef
 	return `MSYS_NO_PATHCONV=1 ${{converted}}`;
 }}
 
+export function healCmdForLoop(raw: string, toolName = "bash"): string | undefined {{
+	if (!raw || toolName !== "bash") return undefined;
+	if (/\bfor\s+\/[frld]\b/i.test(raw)) return undefined;
+	const m = raw.trim().match(
+		/^(?:(cd(?:\s+\/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(([^)\r\n]+)\)\s+do\s+([\s\S]+?)\s*$/i,
+	);
+	if (!m) return undefined;
+	const cdRaw = m[1] ? `${{m[1].trim().replace(/^cd\s+\/d\s+/i, "cd ").replace(/\\/g, "/")}} && ` : "";
+	const v = m[2];
+	const items = m[3].trim();
+	if (!items) return undefined;
+	let body = m[4].trim();
+	if (body.startsWith("@")) body = body.slice(1).trim();
+	if (body.startsWith("(") && body.endsWith(")") && body.length >= 2) {{
+		body = body.slice(1, -1).trim();
+	}}
+	body = body.replace(new RegExp(`%%?${{v}}(?!\\w)`, "g"), () => "${{" + v + "}}");
+	body = body.replace(/(?<![&>])(?:\s+&\s*|\s*&\s+)(?![&>])/g, "; ");
+	return `${{cdRaw}}for ${{v}} in ${{items}}; do ${{body.trim()}}; done`;
+}}
+
 export function healCommand(raw: string, toolName: string): string | undefined {{
 	if (!raw) return undefined;
 	let cmd = raw;
@@ -2570,14 +2606,25 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		}}
 	}}
 
-	// 3. Auto-fix unescaped Windows drive backslashes inside `python -c` & `python <<'PY'` non-raw literals
-	if (PY_WIN_BS.test(cmd)) {{
-		const fixed = cmd.replace(
+	// 2e. Rewrite Windows CMD `for %x in (...) do ...` inside Git Bash into valid Bash loops
+	const healedFor = healCmdForLoop(cmd, toolName);
+	if (healedFor) {{
+		cmd = healedFor;
+		changed = true;
+	}}
+
+	// 3. Auto-fix unescaped Windows drive & relative path backslashes inside `python -c` & `python <<'PY'` non-raw literals
+	if (PY_INVOKE.test(cmd) && /(?:-c\b|<<)/.test(cmd)) {{
+		let fixed = cmd.replace(
 			/(?<![rR])(['"])([A-Za-z]:)(\\(?!\\)[^'"\r\n]+)\1/g,
 			(m, q: string, drv: string, rest: string) => {{
 				if (/\\[nrt]$/.test(rest)) return m;
 				return q + drv + rest.replace(/\\/g, "/") + q;
 			}},
+		);
+		fixed = fixed.replace(
+			/(?<![rR])(['"])([^'"\r\n]*\\(?:Users|Network|Windows|AppData|Local|Roaming|System32|Program Files|Temp|Desktop|Documents|Default)(?:\\[^'"\r\n]*)?)\1/g,
+			(m, q: string, inner: string) => (inner.includes("\\\\") ? m : q + inner.replace(/\\/g, "/") + q),
 		);
 		if (fixed !== cmd) {{
 			cmd = fixed;
@@ -5606,6 +5653,7 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("shellQuoteBashPat")
                 && s.contains("normalizeWindowsToolPath")
                 && s.contains("healMsysPathConv")
+                && s.contains("healCmdForLoop")
         })
         .unwrap_or(false);
 
