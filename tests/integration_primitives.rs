@@ -8121,3 +8121,152 @@ fn test_v249_multi_harness_mcp_git_history_and_post_edit_hook() {
         "tests/test_engine.py"
     );
 }
+
+#[test]
+fn test_v250_ast_structural_search_cd_accel_mcp_20251125_and_codemode_hoist() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+
+    // 1. Real multi-language files + comments + strings + test block + eq-self bug
+    fs::write(
+        root.join("src/client.js"),
+        r#"
+// fetch("https://commented.invalid")
+const doc = "fetch('https://string.invalid')";
+export function syncData(cfg) {
+    return fetch(
+        "https://api.example.com/v1/items",
+        { method: "POST", body: cfg }
+    );
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/logic.py"),
+        r#"
+# foo == foo
+def validate(a, b):
+    if a.score == a.score:
+        return True
+    if a.score == b.score:
+        return False
+    return None
+
+def test_validate():
+    if b.score == b.score:
+        assert True
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/test_client.py"),
+        "def test_stub():\n    if x == x:\n        pass\n",
+    )
+    .unwrap();
+
+    // AST metavariable search (`fetch($URL, $$$)`) skips comment/string literals and captures $URL cleanly
+    let root_s = root.to_string_lossy().to_string();
+    let ast_fetch = run_ap(
+        root,
+        &["search", "--ast", "fetch($URL, $$$)", &root_s, "--json"],
+        None,
+        &[],
+    );
+    assert!(ast_fetch.status.success());
+    let af_v: Value = serde_json::from_slice(&ast_fetch.stdout).unwrap();
+    let af_matches = af_v["matches"].as_array().unwrap();
+    assert_eq!(af_matches.len(), 1, "{af_v}");
+    assert_eq!(
+        af_matches[0]["captures"]["URL"],
+        "\"https://api.example.com/v1/items\""
+    );
+
+    // AST unification `$X == $X` + `--no-tests` matches only production `a.score == a.score`
+    let ast_eq = run_ap(
+        root,
+        &["search", "--ast", "$X == $X", "--no-tests", "--json"],
+        None,
+        &[],
+    );
+    assert!(ast_eq.status.success());
+    let eq_v: Value = serde_json::from_slice(&ast_eq.stdout).unwrap();
+    let eq_matches = eq_v["matches"].as_array().unwrap();
+    assert_eq!(eq_matches.len(), 1, "{eq_v}");
+    assert_eq!(eq_matches[0]["captures"]["X"], "a.score");
+    assert!(eq_v["filtered_tests"].as_u64().unwrap_or(0) >= 1, "{eq_v}");
+
+    // 2. MCP `2025-11-25` protocol negotiation + rich `serverInfo` + `ap_search(ast=...)` + exact 37 tools
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_search",
+            "arguments": {
+                "ast": "fetch($URL, $$$)",
+                "path": root_s,
+                "json": true
+            }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(resps[0]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(
+        resps[0]["result"]["serverInfo"]["title"],
+        "Agent Primitives"
+    );
+    assert_eq!(
+        resps[0]["result"]["serverInfo"]["websiteUrl"],
+        "https://github.com/xgbtxy/ap"
+    );
+    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    let m_sc = &resps[2]["result"]["structuredContent"];
+    assert_eq!(
+        m_sc["matches"][0]["captures"]["URL"],
+        "\"https://api.example.com/v1/items\""
+    );
+
+    // 3. `ap init -a pi --with-hooks` emits `zz-ap-accelerator.ts` with `// @options:` hoist, `cd &&` accel & `codemod` alias
+    let pi_home = root.join("pi_home");
+    fs::create_dir_all(&pi_home).unwrap();
+    let pi_home_s = pi_home.to_string_lossy().to_string();
+    let init_pi = run_ap(
+        root,
+        &[
+            "init",
+            "--home",
+            &pi_home_s,
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+        ],
+        None,
+        &[
+            ("HOME", pi_home.as_path()),
+            ("USERPROFILE", pi_home.as_path()),
+        ],
+    );
+    assert!(init_pi.status.success());
+    let ts_src = fs::read_to_string(
+        pi_home
+            .join(".pi")
+            .join("agent")
+            .join("extensions")
+            .join("zz-ap-accelerator.ts"),
+    )
+    .unwrap();
+    assert!(ts_src.contains("codemod: \"codemode\""));
+    assert!(ts_src.contains("cdLeadPfx"));
+    assert!(ts_src.contains("@options"));
+}

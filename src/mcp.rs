@@ -67,11 +67,12 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "ap_search",
-            "description": "Fast single-pass .gitignore-aware regex search (supports multi-pattern batching via `patterns`) across codebases (with AST spans/blocks), minified JS bundles, SourceMaps (`.map`), Electron `.asar`/`.vsix`/`.zip`, Office/PDF docs, and binary ASCII/UTF-16LE strings.",
+            "description": "Fast single-pass .gitignore-aware regex & Tree-sitter AST structural search (`ast`: e.g. `kind:call`, `fetch($URL, $$$)`, `$X == $X`, `Command::new($BIN)`) across codebases, minified JS bundles, SourceMaps (`.map`), Electron `.asar`/`.vsix`/`.zip`, Office/PDF docs, and binary ASCII/UTF-16LE strings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "Primary regex or literal search pattern" },
+                    "pattern": { "type": "string", "description": "Primary regex or literal search pattern (optional when `ast` is specified)" },
+                    "ast": { "type": "string", "description": "Structural Tree-sitter AST query across Py/TS/JS/Go/Rust/C: node kinds (`kind:call`, `kind:fn`, `kind:import`) or metavariable patterns (`fetch($URL, $$$)`, `Command::new($BIN)`, `$X == $X`) ignoring comments & strings" },
                     "patterns": {
                         "type": "array",
                         "description": "Optional batch of extra regex patterns evaluated in the same single filesystem walk",
@@ -1389,6 +1390,11 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             run_self_captured(&cli, None)
         }
         "ap_search" => {
+            let ast_expr = args
+                .get("ast")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let mut all_pats: Vec<String> = Vec::new();
             if let Some(p) = args
                 .get("pattern")
@@ -1405,14 +1411,21 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     }
                 }
             }
-            if all_pats.is_empty() {
+            if all_pats.is_empty() && ast_expr.is_none() {
                 return (
                     false,
-                    "Pass non-empty `pattern` or `patterns` to `ap_search`.".to_string(),
+                    "Pass non-empty `pattern`, `patterns`, or `ast` to `ap_search`.".to_string(),
                 );
             }
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            let mut cli = vec!["search".to_string(), all_pats[0].clone(), path.to_string()];
+            let first_pat = all_pats.first().cloned().unwrap_or_default();
+            let mut cli = vec!["search".to_string()];
+            if let Some(ae) = ast_expr {
+                cli.push("--ast".to_string());
+                cli.push(ae.to_string());
+            }
+            cli.push(first_pat);
+            cli.push(path.to_string());
             for extra in all_pats.iter().skip(1) {
                 cli.push("--pat".to_string());
                 cli.push(extra.clone());
@@ -3502,12 +3515,16 @@ fn handle_rpc_request(req: &Value, profile: McpProfile) -> Option<Value> {
             let client_proto = req
                 .pointer("/params/protocolVersion")
                 .and_then(Value::as_str)
-                .unwrap_or("2025-06-18");
+                .unwrap_or("2025-11-25");
+            let negotiated_proto = match client_proto {
+                "2025-11-25" | "2025-06-18" | "2025-03-26" | "2024-11-05" => client_proto,
+                _ => "2025-11-25",
+            };
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "protocolVersion": client_proto,
+                    "protocolVersion": negotiated_proto,
                     "capabilities": {
                         "tools": {},
                         "resources": {},
@@ -3515,7 +3532,10 @@ fn handle_rpc_request(req: &Value, profile: McpProfile) -> Option<Value> {
                     },
                     "serverInfo": {
                         "name": "agent-primitives",
+                        "title": "Agent Primitives",
                         "version": env!("CARGO_PKG_VERSION"),
+                        "description": "Pure-Rust single-binary universal execution core & 37-tool MCP server",
+                        "websiteUrl": "https://github.com/xgbtxy/ap",
                         "profile": profile.as_str()
                     }
                 }

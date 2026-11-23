@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod ast_search;
 pub mod blast;
 pub mod check;
 pub mod patch;

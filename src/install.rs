@@ -1498,6 +1498,19 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (fenced) {{
 		next = fenced[1];
 	}}
+	// Hoist any non-line-1 `// @options: {{...}}` directive cleanly to line 1 so Pi codemode never rejects it
+	const firstNl = next.indexOf("\n");
+	const firstLine = firstNl >= 0 ? next.slice(0, firstNl) : next;
+	if (!/^[ \t]*\/\/[ \t]*@options\b/.test(firstLine)) {{
+		const hoistM = next.match(/(?:^|\r?\n)([ \t]*\/\/[ \t]*@options[ \t]*:[^\r\n]*)/);
+		if (hoistM && hoistM.index !== undefined) {{
+			const optText = hoistM[1].trim();
+			const before = next.slice(0, hoistM.index);
+			const after = next.slice(hoistM.index + hoistM[0].length);
+			const rest = `${{before}}${{after}}`.replace(/^(?:[ \t]*\r?\n)+/, "");
+			next = `${{optText}}\n${{rest}}`;
+		}}
+	}}
 	if (next.includes("tools.mcp__agent-primitives__")) {{
 		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
 	}}
@@ -3067,13 +3080,16 @@ export function healCommand(
 		return changed ? cmd : undefined;
 	}}
 
-	// 1. Recursive GNU `grep`, minified `grep -oE`, `for ... grep`, `cat | grep -oE` -> `<50ms` `ap search` / `rg`
+	// 1. Recursive GNU `grep`, minified `grep -oE`, `for ... grep`, `cat | grep -oE` -> `<50ms` `ap search` / `rg` (supports leading `cd <dir> &&`)
 	const fastGrep = rewriteSlowRecursiveGrep(cmd, toolName);
 	if (fastGrep) {{
 		return fastGrep;
 	}}
-	if (!/[|;&>]/.test(cmd)) {{
-		const gm = cmd.match(BARE_SLOW_GREP);
+	const cdLeadM = cmd.match(/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$/);
+	const cdLeadPfx = cdLeadM ? cdLeadM[1] : "";
+	const cmdTailBody = cdLeadM ? cdLeadM[2] : cmd;
+	if (!/[|;&>]/.test(cmdTailBody)) {{
+		const gm = cmdTailBody.match(BARE_SLOW_GREP);
 		if (gm && /[rR]/.test(gm[1])) {{
 			const flags = gm[1];
 			const rawPat = gm[2] || gm[3] || gm[4] || "";
@@ -3085,7 +3101,7 @@ export function healCommand(
 				flags.includes("o") ? " -o" : "",
 				flags.includes("i") ? " -i" : "",
 			].join("");
-			return `${{prefix}}"${{AP_BIN}}" search${{extra}} ${{quotedPat}} "${{target}}"`;
+			return `${{cdLeadPfx}}${{prefix}}"${{AP_BIN}}" search${{extra}} ${{quotedPat}} "${{target}}"`;
 		}}
 	}}
 
@@ -3102,13 +3118,13 @@ export function healCommand(
 		}}
 	}}
 
-	// 1c. Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` in Git Bash -> bounded `ap ls`
-	if (toolName === "bash" && !/[|;&>]/.test(cmd)) {{
-		const dirM = cmd.trim().match(/^dir\s+(?:(\/s)\s+\/b|\/b(?:\s+(\/s))?)(?:\s+(?:"([^"]+)"|'([^']+)'|(\S+)))?\s*$/i);
+	// 1c. Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` (incl. after `cd <dir> &&`) in Git Bash -> bounded `ap ls`
+	if (toolName === "bash" && !/[|;&>]/.test(cmdTailBody)) {{
+		const dirM = cmdTailBody.trim().match(/^dir\s+(?:(\/s)\s+\/b|\/b(?:\s+(\/s))?)(?:\s+(?:"([^"]+)"|'([^']+)'|(\S+)))?\s*$/i);
 		if (dirM) {{
 			const depthFlag = dirM[1] || dirM[2] ? " --depth 3" : "";
 			const tgt = dirM[3] || dirM[4] || dirM[5] || ".";
-			return `"${{AP_BIN}}" ls "${{tgt}}"${{depthFlag}}`;
+			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{tgt}}"${{depthFlag}}`;
 		}}
 	}}
 
@@ -3283,10 +3299,12 @@ const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{
 	code_mode: "codemode",
 	"code-mode": "codemode",
 	codemodep: "codemode",
+	codemod: "codemode",
 	codemodocode: "codemode",
 	codemodode: "codemode",
 	codemask: "codemode",
 	code_exec: "codemode",
+	code_scan: "codemode",
 	code: "codemode",
 	codemap_placeholder: "codemode",
 	read_file: "read",

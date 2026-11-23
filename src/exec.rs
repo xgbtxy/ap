@@ -251,13 +251,27 @@ pub fn try_cap_long_sleep(raw: &str, max_sec: u64) -> Option<String> {
     }
 }
 
+fn split_leading_cd_prefix(raw: &str) -> (Option<&str>, &str) {
+    static CD_PFX_RE: OnceLock<Regex> = OnceLock::new();
+    let re = CD_PFX_RE.get_or_init(|| {
+        Regex::new(r#"^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$"#).unwrap()
+    });
+    if let Some(caps) = re.captures(raw) {
+        if let (Some(p), Some(rest)) = (caps.get(1), caps.get(2)) {
+            return (Some(p.as_str()), rest.as_str());
+        }
+    }
+    (None, raw)
+}
+
 /// Detect bare recursive GNU `grep -rn` / `grep -rl` `<pat> [path]` (which hangs 60-180s on large Windows trees)
-/// and rewrite cleanly to sub-50ms `ap search` (or `ap search --files-only` when `-l` is present).
+/// — including after a leading `cd <dir> &&` prefix — and rewrite cleanly to sub-50ms `ap search`.
 pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
-    if raw.contains('|') || raw.contains(';') || raw.contains("&&") || raw.contains('>') {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if body.contains('|') || body.contains(';') || body.contains("&&") || body.contains('>') {
         return None;
     }
-    let cap = heal_re().slow_grep.captures(raw)?;
+    let cap = heal_re().slow_grep.captures(body)?;
     let flags = cap.get(1).map(|m| m.as_str()).unwrap_or("");
     let pat = cap
         .get(2)
@@ -300,17 +314,19 @@ pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
         args_out.push_str(" --fixed-strings");
     }
     Some(format!(
-        "\"{ap_bin}\" search{args_out} \"{pat_esc}\" \"{target}\""
+        "{}\"{ap_bin}\" search{args_out} \"{pat_esc}\" \"{target}\"",
+        cd_pfx.unwrap_or("")
     ))
 }
 
-/// Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` (which fails in Git Bash with `dir: cannot access '/b'`)
+/// Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` (even after leading `cd <dir> &&`)
 /// cleanly to bounded `ap ls` with optional depth for `/s`.
 pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
-    if raw.contains('|') || raw.contains(';') || raw.contains("&&") || raw.contains('>') {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if body.contains('|') || body.contains(';') || body.contains("&&") || body.contains('>') {
         return None;
     }
-    let trimmed = raw.trim();
+    let trimmed = body.trim();
     let lower = trimmed.to_ascii_lowercase();
     if !(lower == "dir /b"
         || lower.starts_with("dir /b ")
@@ -345,15 +361,19 @@ pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
         .unwrap_or_else(|| "ap".to_string());
     let depth_flag = if recursive { " --depth 3" } else { "" };
     let tgt_arg = target.unwrap_or(".");
-    Some(format!("\"{ap_bin}\" ls \"{tgt_arg}\"{depth_flag}"))
+    Some(format!(
+        "{}\"{ap_bin}\" ls \"{tgt_arg}\"{depth_flag}",
+        cd_pfx.unwrap_or("")
+    ))
 }
 
-/// Retry bare `rg <pattern>` commands that exited 2 with `rg: regex parse error` as literal `rg -F <pattern>`.
+/// Retry bare `rg <pattern>` commands (including after leading `cd <dir> &&`) that exited 2 with `rg: regex parse error` as literal `rg -F <pattern>`.
 pub fn try_build_rg_fixed_retry(raw: &str) -> Option<String> {
-    if raw.contains('|') || raw.contains(';') || raw.contains("&&") || raw.contains('>') {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if body.contains('|') || body.contains(';') || body.contains("&&") || body.contains('>') {
         return None;
     }
-    let trimmed = raw.trim_start();
+    let trimmed = body.trim_start();
     let lower = trimmed.to_ascii_lowercase();
     let prefix_len = if lower.starts_with("rg.exe ") || lower.starts_with("rg.exe\t") {
         6
@@ -369,7 +389,11 @@ pub fn try_build_rg_fixed_retry(raw: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{} -F{tail}", &trimmed[..prefix_len]))
+    Some(format!(
+        "{}{} -F{tail}",
+        cd_pfx.unwrap_or(""),
+        &trimmed[..prefix_len]
+    ))
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -576,6 +600,39 @@ pub fn try_heal_cmd_for_loop(raw: &str) -> Option<String> {
     ))
 }
 
+fn route_accelerated_cmd(
+    rewritten: String,
+    has_pwsh7: bool,
+    has_git_bash: bool,
+) -> (ShellKind, String) {
+    if let (Some(cd_p), tail) = split_leading_cd_prefix(&rewritten) {
+        if has_git_bash {
+            return (ShellKind::GitBash, rewritten);
+        }
+        let ps_body = format!("& {tail}");
+        if has_pwsh7 {
+            return (ShellKind::Pwsh7, format!("{cd_p}{ps_body}"));
+        }
+        let cd_clean = cd_p
+            .trim_end()
+            .trim_end_matches("&&")
+            .trim_end_matches(';')
+            .trim_end();
+        return (
+            ShellKind::PowerShell5,
+            format!("{cd_clean}; if ($?) {{ {ps_body} }}"),
+        );
+    }
+    (
+        if has_pwsh7 {
+            ShellKind::Pwsh7
+        } else {
+            ShellKind::PowerShell5
+        },
+        format!("& {rewritten}"),
+    )
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn heal_windows_command(
     raw: &str,
@@ -586,27 +643,13 @@ pub fn heal_windows_command(
     let mut heals: Vec<&'static str> = Vec::new();
     if let Some(fast_search) = try_accelerate_slow_grep(raw) {
         heals.push("slow-grep->ap-search");
-        return (
-            if has_pwsh7 {
-                ShellKind::Pwsh7
-            } else {
-                ShellKind::PowerShell5
-            },
-            format!("& {fast_search}"),
-            heals,
-        );
+        let (kind, cmd_out) = route_accelerated_cmd(fast_search, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
     }
     if let Some(fast_ls) = try_heal_windows_dir_cmd(raw) {
         heals.push("dir-/b->ap-ls");
-        return (
-            if has_pwsh7 {
-                ShellKind::Pwsh7
-            } else {
-                ShellKind::PowerShell5
-            },
-            format!("& {fast_ls}"),
-            heals,
-        );
+        let (kind, cmd_out) = route_accelerated_cmd(fast_ls, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
     }
     if has_git_bash {
         if let Some(healed_for) = try_heal_cmd_for_loop(raw) {
@@ -1319,6 +1362,36 @@ mod tests {
                 && h12.contains(r#"r'Default\Raw\Stay'"#)
                 && tags12.contains(&"py-win-backslash->slash"),
             "unexpected py heal: {h12}"
+        );
+
+        // Leading `cd <dir> &&` prefix still triggers `slow-grep`, `dir /b`, and `rg -F` retry acceleration cleanly without emitting `& cd`
+        let (k13, h13, tags13) =
+            heal_windows_command("cd /c/work/demo && grep -rn 'secretToken' src", true, true);
+        assert_eq!(k13, ShellKind::GitBash);
+        assert!(
+            h13.starts_with("cd /c/work/demo && ")
+                && h13.contains("search \"secretToken\" \"src\""),
+            "{h13}"
+        );
+        assert!(tags13.contains(&"slow-grep->ap-search"));
+
+        let (k14, h14, tags14) =
+            heal_windows_command("cd /c/work/demo && dir /s /b src", true, true);
+        assert_eq!(k14, ShellKind::GitBash);
+        assert!(
+            h14.starts_with("cd /c/work/demo && ") && h14.contains("ls \"src\" --depth 3"),
+            "{h14}"
+        );
+        assert!(tags14.contains(&"dir-/b->ap-ls"));
+
+        let (k14b, h14b, _) =
+            heal_windows_command("cd D:/work && grep -rn 'tok' src", false, false);
+        assert_eq!(k14b, ShellKind::PowerShell5);
+        assert!(h14b.contains("cd D:/work; if ($?) { & "), "{h14b}");
+
+        assert_eq!(
+            try_build_rg_fixed_retry("cd /c/work && rg \"foo(bar\" src").as_deref(),
+            Some("cd /c/work && rg -F \"foo(bar\" src")
         );
     }
 }

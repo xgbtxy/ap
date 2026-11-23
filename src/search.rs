@@ -34,6 +34,10 @@ pub struct SearchMatch {
     pub line: usize,
     pub scope: String,
     pub snippet: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub ast_kind: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub captures: BTreeMap<String, String>,
 }
 
 #[derive(Parser, Debug)]
@@ -126,6 +130,9 @@ struct SearchCli {
     /// Exclude matching relative paths or glob suffixes (repeatable: `-x fixtures -x *.gen.ts`)
     #[arg(short = 'x', long = "exclude")]
     exclude: Vec<String>,
+    /// Structural Tree-sitter AST query across Py/TS/JS/Go/Rust/C (`kind:call`, `kind:fn`, `fetch($URL, $$$)`, `$X == $X`, `Command::new($BIN)`)
+    #[arg(long, default_value = "")]
+    ast: String,
     /// Emit structured JSON output
     #[arg(long)]
     json: bool,
@@ -368,6 +375,8 @@ fn push_text_matches(
                 line: ln_no,
                 scope,
                 snippet: snip,
+                ast_kind: String::new(),
+                captures: BTreeMap::new(),
             });
             if matches.len() >= opts.max_hits {
                 return;
@@ -414,6 +423,8 @@ fn push_text_matches(
                         line: ln_no,
                         scope: scope.clone(),
                         snippet: tok.chars().take(300).collect(),
+                        ast_kind: String::new(),
+                        captures: BTreeMap::new(),
                     });
                     if matches.len() >= opts.max_hits {
                         return;
@@ -440,6 +451,8 @@ fn push_text_matches(
                         line: ln_no,
                         scope: format!("minified @off={abs_off}"),
                         snippet: snip,
+                        ast_kind: String::new(),
+                        captures: BTreeMap::new(),
                     });
                     if matches.len() >= opts.max_hits {
                         return;
@@ -504,6 +517,8 @@ fn push_text_matches(
                     line: ln_no,
                     scope,
                     snippet: snip,
+                    ast_kind: String::new(),
+                    captures: BTreeMap::new(),
                 });
                 if matches.len() >= opts.max_hits {
                     return;
@@ -555,9 +570,30 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
+    let ast_raw = cli.ast.trim();
+    let ast_query: Option<ap_splice::ast_search::AstQuery> = if ast_raw.is_empty() {
+        None
+    } else {
+        match ap_splice::ast_search::AstQuery::parse(ast_raw) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        }
+    };
+    let mut cli_pattern = cli.pattern.clone();
+    let mut cli_path = cli.path.clone();
+    if ast_query.is_some() && !cli_pattern.trim().is_empty() && cli_path == "." {
+        let pat_as_path = crate::ls::normalize_cli_path(&cli_pattern);
+        if Path::new(&pat_as_path).exists() {
+            cli_path = std::mem::take(&mut cli_pattern);
+        }
+    }
+
     let mut raw_pats: Vec<String> = Vec::new();
-    if !cli.pattern.trim().is_empty() {
-        raw_pats.push(cli.pattern.clone());
+    if !cli_pattern.trim().is_empty() {
+        raw_pats.push(cli_pattern);
     }
     for ep in &cli.extra_pats {
         if !ep.trim().is_empty() && !raw_pats.contains(ep) {
@@ -574,8 +610,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
         }
     }
-    if raw_pats.is_empty() {
-        eprintln!("[ap search] provide at least one pattern (positional, --pat, or --stdin)");
+    if raw_pats.is_empty() && ast_query.is_none() {
+        eprintln!("[ap search] provide a search pattern or `--ast <expr>`");
         return 2;
     }
     let multi_mode = raw_pats.len() > 1;
@@ -595,11 +631,26 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
         }
     }
-    let combined_label = compiled
-        .iter()
-        .map(|(p, _)| p.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let combined_label = if let Some(aq_raw) = (!ast_raw.is_empty()).then_some(ast_raw) {
+        if compiled.is_empty() {
+            format!("ast:{aq_raw}")
+        } else {
+            format!(
+                "ast:{aq_raw} + {}",
+                compiled
+                    .iter()
+                    .map(|(p, _)| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )
+        }
+    } else {
+        compiled
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
     let s_opts = SearchOpts {
         around: cli.around,
         pretty: cli.pretty,
@@ -618,7 +669,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         only_matching: cli.only_matching,
     };
 
-    let norm_root_str = crate::ls::normalize_cli_path(&cli.path);
+    let norm_root_str = crate::ls::normalize_cli_path(&cli_path);
     let root = Path::new(&norm_root_str);
     if !root.exists() {
         eprintln!("[ap search] path not found: {norm_root_str}");
@@ -649,6 +700,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     let skip_set: HashSet<&'static str> = SKIP_DIRS.iter().copied().collect();
 
     let explicit_file = root_canon.is_file();
+    let ast_query_arc = Arc::new(ast_query);
     let compiled_arc = Arc::new(compiled);
     let ext_allow_arc = Arc::new(ext_allow);
     let include_arc = Arc::new(include_paths);
@@ -670,6 +722,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         ext_allow: &HashSet<String>,
         includes: &[String],
         excludes: &[String],
+        ast_query: Option<&ap_splice::ast_search::AstQuery>,
         compiled: &[(String, Regex)],
         multi_mode: bool,
         s_opts: SearchOpts,
@@ -1025,6 +1078,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                             line: idx + 1,
                             scope: "BINARY".to_string(),
                             snippet: ln.chars().take(200).collect(),
+                            ast_kind: String::new(),
+                            captures: BTreeMap::new(),
                         });
                         if local_matches.len() >= s_opts.max_hits {
                             return local_matches;
@@ -1036,6 +1091,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
 
         let is_office = matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "pdf");
+        if ast_query.is_some() && (is_office || ap_splice::ast::language_for_ext(&ext).is_none()) {
+            return local_matches;
+        }
         let text = if is_office {
             match extract_office_or_pdf_plain(&bytes, &ext) {
                 Ok(s) => s,
@@ -1050,6 +1108,46 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             decode_any_bytes(&bytes).0
         };
+
+        if let Some(aq) = ast_query {
+            let test_ranges = if s_opts.no_tests {
+                ap_splice::ast::collect_test_block_ranges(&text, &ext)
+            } else {
+                Vec::new()
+            };
+            let ast_hits =
+                ap_splice::ast_search::search_ast_source(&text, &ext, aq, s_opts.max_hits);
+            for ah in ast_hits {
+                if !test_ranges.is_empty()
+                    && ap_splice::ast::range_is_covered(&test_ranges, ah.start_byte, ah.end_byte)
+                {
+                    filtered_tests.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let raw_span = &text[ah.start_byte.min(text.len())..ah.end_byte.min(text.len())];
+                if !compiled.is_empty() && !compiled.iter().any(|(_, r)| r.is_match(raw_span)) {
+                    continue;
+                }
+                let snip = if s_opts.block {
+                    raw_span.lines().take(30).collect::<Vec<_>>().join("\n")
+                } else {
+                    ah.snippet
+                };
+                local_matches.push(SearchMatch {
+                    pattern: String::new(),
+                    file: rel.clone(),
+                    line: ah.line,
+                    scope: ah.scope,
+                    snippet: snip,
+                    ast_kind: ah.kind,
+                    captures: ah.captures,
+                });
+                if local_matches.len() >= s_opts.max_hits {
+                    break;
+                }
+            }
+            return local_matches;
+        }
 
         for (pl, r) in compiled {
             let lbl = if multi_mode { pl.as_str() } else { "" };
@@ -1080,6 +1178,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             &ext_allow_arc,
             &include_arc,
             &exclude_arc,
+            ast_query_arc.as_ref().as_ref(),
             &compiled_arc,
             multi_mode,
             s_opts,
@@ -1105,6 +1204,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             .build_parallel();
 
         walker.run(|| {
+            let ast_q_c = Arc::clone(&ast_query_arc);
             let compiled_c = Arc::clone(&compiled_arc);
             let ext_allow_c = Arc::clone(&ext_allow_arc);
             let include_c = Arc::clone(&include_arc);
@@ -1131,6 +1231,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     &ext_allow_c,
                     &include_c,
                     &exclude_c,
+                    ast_q_c.as_ref().as_ref(),
                     &compiled_c,
                     multi_mode,
                     s_opts,
@@ -1256,14 +1357,24 @@ pub fn run_cli(args: &[String]) -> i32 {
             } else {
                 format!(" [{}]", m.scope)
             };
+            let cap_tag = if m.captures.is_empty() {
+                String::new()
+            } else {
+                let pairs: Vec<String> = m
+                    .captures
+                    .iter()
+                    .map(|(k, v)| format!("${k}={v}"))
+                    .collect();
+                format!(" {{{}}}", pairs.join(", "))
+            };
             if m.snippet.contains('\n') {
                 out_lines.push(format!(
-                    "- {ptag}`{}:{}`{sc}\n{}",
+                    "- {ptag}`{}:{}`{sc}{cap_tag}\n{}",
                     m.file, m.line, m.snippet
                 ));
             } else {
                 out_lines.push(format!(
-                    "- {ptag}`{}:{}`{sc} — `{}`",
+                    "- {ptag}`{}:{}`{sc}{cap_tag} — `{}`",
                     m.file, m.line, m.snippet
                 ));
             }
