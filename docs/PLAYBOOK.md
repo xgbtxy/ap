@@ -1,8 +1,8 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.53)
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.54)
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives` (`v2.53`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP `2025-11-25` / `2025-06-18` (`37`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
+`agent-primitives` (`v2.54`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP `2025-11-25` / `2025-06-18` (`37`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
 
 ---
 
@@ -48,7 +48,7 @@ ap uninstall          # or: ap uninstall --here
 | **Orient / Deps / Dead-Code / History** (`ap_orient`, `ap_impact(file=..., dead=true)`, `atlas deps/changes/history`) | Personalized PageRank repo map, `<40ms` cross-file `atlas deps --dead` (outbound imports, multi-hop inbound blast radius, cycles, orphan modules &amp; unused exports), `<60ms` 9-axis surface frontier, `<25ms` fault localization, `atlas changes` selective test commands, &amp; `atlas history`. | `6–60 ms` |
 | **AST Edit, Codex Diff &amp; Checkpoints** (`ap_edit`, `ap splice view/apply/rename/rewrite/check --hook`, `ap undo`) | Codex `*** Begin Patch` + hunk-window unified diffs + chain-of-resiliency patching (`@L`, smart-quote rescue, Hashline), Tree-sitter `rename` &amp; `rewrite` (`, $$$ARGS` elision), 6-lang+JSON/TOML AST gate, `<5ms` `PostToolUse` hook, plus named `ap undo --save/--diff/--keep`. | `0.7–15 ms` |
 | **Runtime, Network & UI QA** (`ap_smoke`, `ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`) | Ephemeral `PORT` + process-tree cleanup; headless Edge/Chrome dual-viewport UI/network audit; non-destructive live `cdp --watch-ms`; single/batch/race/CORS/CDP-session `http` QA; RFC 6455 `ws --origin-matrix`; AST mutation testing & chaos fuzzing. | `0.2–4.5 s` |
-| **Deep Verify, Guard, Shell & Sieve** (`ap_verify`, `ap guard verify --deep/sec/diff/pack`, `ap exec`, `ap sieve`) | 1-call fused 6-gate verification (tests + vacuous/`.only` block + OWASP C/C++/Java/TS/Py/Go/Rust `sec` + semantic `diff` + cross-file contracts + active-file `mutate`), `3x` doom-loop breaker, Windows UTF-8/long-`PATH` healing & FTS5 log compression (`-98.8%`). | `<2 ms` (+ tests) |
+| **Deep Verify, Guard, Shell &amp; Sieve** (`ap_verify`, `ap guard verify --deep/sec/diff/pack`, `ap exec`, `ap sieve`) | 1-call fused 6-gate verification (tests + `.only` block + OWASP &amp; supply-chain `sec` for `package.json`/lockfile/`requirements.txt`/`.mcp.json` + semantic `diff` w/ breaking-API alerts + contracts + `mutate`), `3x` loop breaker, UTF-8/PS/`sed`/`head` healing &amp; `-98.8%` sieve. | `<2 ms` (+ tests) |
 | **Pi Runtime, Baton & Recall** (`ap pi`, `ap baton frontier/claim/dedup`, `ap recall`) | 12 idempotent Pi v1.5+/v1.6 runtime patches (`codemode` `text()`/`.output` shim, keep-alive, serial shell barrier, CJK compaction, tool-order cache lock), orthogonal exploration frontier, atomic TTL leases, and `3.3ms` CJK+BM25 recall. | `<15 ms` |
 
 ---

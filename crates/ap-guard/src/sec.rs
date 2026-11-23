@@ -484,6 +484,7 @@ pub fn scan_security_issues(root: &Path) -> Vec<SecFinding> {
             }
         }
     }
+    findings.extend(crate::deps_sec::scan_supply_chain_issues(root));
     findings
 }
 

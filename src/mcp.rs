@@ -209,7 +209,7 @@ fn mcp_tools_schema() -> Value {
                             "required": ["path", "symbol", "content"]
                         }
                     },
-                    "diff": { "type": "string", "description": "Optional standard Git unified diff (`--- a/...`, `+++ b/...`, `@@ ... @@`)" },
+                    "diff": { "type": "string", "description": "Optional standard Git unified diff (`--- a/...`, `+++ b/...`, `@@ ... @@`) or Codex `*** Begin Patch` envelope (`*** Update File:` / `*** Add File:`)" },
                     "run_tests": { "type": "boolean", "description": "Run auto-detected test suite after applying" }
                 }
             }
@@ -1718,11 +1718,16 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
             {
-                if let Ok(parsed) = ap_splice::patch::parse_edit_spec(diff_raw) {
-                    for p_op in parsed {
-                        if let Ok(v) = serde_json::to_value(p_op) {
-                            ops.push(v);
+                match ap_splice::patch::parse_edit_spec(diff_raw) {
+                    Ok(parsed) => {
+                        for p_op in parsed {
+                            if let Ok(v) = serde_json::to_value(p_op) {
+                                ops.push(v);
+                            }
                         }
+                    }
+                    Err(e) => {
+                        return (false, format!("[ap_edit] invalid `diff` patch: {e}"));
                     }
                 }
             }

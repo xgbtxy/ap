@@ -1,5 +1,6 @@
 use base64::Engine;
 use clap::{Parser, Subcommand};
+pub mod deps_sec;
 pub mod diff_audit;
 pub mod pack;
 pub mod rules;
@@ -1353,6 +1354,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                         "lines_added": rep.lines_added,
                         "lines_deleted": rep.lines_deleted,
                         "findings": rep.findings,
+                        "api_changes": rep.api_changes,
                     }))
                     .unwrap_or_default()
                 );
@@ -1363,6 +1365,12 @@ pub fn run_cli(args: &[String]) -> i32 {
                     "[guard diff] PASS — {} file(s) changed (+{}/-{}), 0 test-weakening, debug-leftover, or mass-deletion issues.",
                     rep.files_changed, rep.lines_added, rep.lines_deleted
                 );
+                if !rep.api_changes.is_empty() {
+                    println!("  API Surface Shifts ({}):", rep.api_changes.len());
+                    for ac in &rep.api_changes {
+                        println!("  - [{}] {}", ac.kind, ac.detail);
+                    }
+                }
             } else {
                 eprintln!(
                     "[GUARD DIFF BLOCKED | exit 2] {} regression(s) in git diff ({} file(s), +{}/-{}):",
@@ -1373,6 +1381,12 @@ pub fn run_cli(args: &[String]) -> i32 {
                 );
                 for f in &rep.findings {
                     eprintln!("  - [{}] {}", f.kind, f.detail);
+                }
+                if !rep.api_changes.is_empty() {
+                    eprintln!("  API Surface Shifts ({}):", rep.api_changes.len());
+                    for ac in &rep.api_changes {
+                        eprintln!("  - [{}] {}", ac.kind, ac.detail);
+                    }
                 }
             }
             if rep.findings.is_empty() {

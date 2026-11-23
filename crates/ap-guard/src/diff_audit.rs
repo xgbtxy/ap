@@ -1,12 +1,22 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffFinding {
     pub kind: String,
     pub file: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiShift {
+    pub kind: String,
+    pub file: String,
+    pub symbol: String,
     pub detail: String,
 }
 
@@ -17,6 +27,8 @@ pub struct DiffAuditReport {
     pub lines_added: usize,
     pub lines_deleted: usize,
     pub findings: Vec<DiffFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_changes: Vec<ApiShift>,
 }
 
 fn is_test_path(p: &str) -> bool {
@@ -106,6 +118,80 @@ fn has_incomplete_stub(s: &str) -> Option<&'static str> {
     None
 }
 
+fn norm_sig_params(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn extract_public_decl(file: &str, line: &str) -> Option<(String, Option<String>)> {
+    struct ApiRes {
+        rs_fn: Regex,
+        rs_type: Regex,
+        jsts_fn: Regex,
+        jsts_type: Regex,
+        py_fn: Regex,
+        py_cls: Regex,
+        go_fn: Regex,
+        go_type: Regex,
+    }
+    static RE: OnceLock<ApiRes> = OnceLock::new();
+    let re = RE.get_or_init(|| ApiRes {
+        rs_fn: Regex::new(r"^\s*pub\s+(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*\(([^)]*)\)").unwrap(),
+        rs_type: Regex::new(r"^\s*pub\s+(?:struct|enum|trait|type)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
+        jsts_fn: Regex::new(r"^\s*export\s+(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>]*>)?\s*\(([^)]*)\)").unwrap(),
+        jsts_type: Regex::new(r"^\s*export\s+(?:declare\s+)?(?:class|interface|type|const|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)").unwrap(),
+        py_fn: Regex::new(r"^(?:async\s+)?def\s+([A-Za-z][A-Za-z0-9_]*)\s*\(([^)]*)\)").unwrap(),
+        py_cls: Regex::new(r"^class\s+([A-Za-z][A-Za-z0-9_]*)").unwrap(),
+        go_fn: Regex::new(r"^func\s+(?:\([^)]+\)\s*)?([A-Z][A-Za-z0-9_]*)\s*\(([^)]*)\)").unwrap(),
+        go_type: Regex::new(r"^type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface)\b").unwrap(),
+    });
+
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => {
+            if let Some(c) = re.rs_fn.captures(line) {
+                return Some((c[1].to_string(), Some(norm_sig_params(&c[2]))));
+            }
+            if let Some(c) = re.rs_type.captures(line) {
+                return Some((c[1].to_string(), None));
+            }
+        }
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => {
+            if let Some(c) = re.jsts_fn.captures(line) {
+                return Some((c[1].to_string(), Some(norm_sig_params(&c[2]))));
+            }
+            if let Some(c) = re.jsts_type.captures(line) {
+                return Some((c[1].to_string(), None));
+            }
+        }
+        "py" => {
+            if let Some(c) = re.py_fn.captures(line) {
+                if !c[1].starts_with('_') {
+                    return Some((c[1].to_string(), Some(norm_sig_params(&c[2]))));
+                }
+            }
+            if let Some(c) = re.py_cls.captures(line) {
+                if !c[1].starts_with('_') {
+                    return Some((c[1].to_string(), None));
+                }
+            }
+        }
+        "go" => {
+            if let Some(c) = re.go_fn.captures(line) {
+                return Some((c[1].to_string(), Some(norm_sig_params(&c[2]))));
+            }
+            if let Some(c) = re.go_type.captures(line) {
+                return Some((c[1].to_string(), None));
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
     let check_git = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -119,6 +205,7 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
             lines_added: 0,
             lines_deleted: 0,
             findings: Vec::new(),
+            api_changes: Vec::new(),
         };
     }
 
@@ -144,6 +231,10 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
     let mut per_file_del: HashMap<String, usize> = HashMap::new();
     let mut per_file_assert_add: HashMap<String, usize> = HashMap::new();
     let mut per_file_assert_del: HashMap<String, usize> = HashMap::new();
+    let mut per_file_del_decls: BTreeMap<String, BTreeMap<String, Option<String>>> =
+        BTreeMap::new();
+    let mut per_file_add_decls: BTreeMap<String, BTreeMap<String, Option<String>>> =
+        BTreeMap::new();
     let mut findings: Vec<DiffFinding> = Vec::new();
     let mut total_add = 0usize;
     let mut total_del = 0usize;
@@ -181,6 +272,12 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
                     });
                 }
             } else {
+                if let Some((sym, params)) = extract_public_decl(&cur_file, added) {
+                    per_file_add_decls
+                        .entry(cur_file.clone())
+                        .or_default()
+                        .insert(sym, params);
+                }
                 if let Some(tok) = has_debug_leftover(added) {
                     findings.push(DiffFinding {
                         kind: "DEBUG-LEFTOVER".to_string(),
@@ -216,8 +313,49 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
         } else if let Some(deleted) = ln.strip_prefix('-') {
             total_del += 1;
             *per_file_del.entry(cur_file.clone()).or_insert(0) += 1;
-            if is_test_path(&cur_file) && is_assertion_line(deleted) {
-                *per_file_assert_del.entry(cur_file.clone()).or_insert(0) += 1;
+            if is_test_path(&cur_file) {
+                if is_assertion_line(deleted) {
+                    *per_file_assert_del.entry(cur_file.clone()).or_insert(0) += 1;
+                }
+            } else if let Some((sym, params)) = extract_public_decl(&cur_file, deleted) {
+                per_file_del_decls
+                    .entry(cur_file.clone())
+                    .or_default()
+                    .insert(sym, params);
+            }
+        }
+    }
+
+    let mut api_changes: Vec<ApiShift> = Vec::new();
+    for (file, del_map) in &per_file_del_decls {
+        let add_map = per_file_add_decls.get(file);
+        for (sym, del_params) in del_map {
+            match add_map.and_then(|m| m.get(sym)) {
+                None => {
+                    api_changes.push(ApiShift {
+                        kind: "BREAKING-API-REMOVED".to_string(),
+                        file: file.clone(),
+                        symbol: sym.clone(),
+                        detail: format!(
+                            "Public declaration `{sym}` removed/renamed in `{file}` — run `ap atlas impact {sym}` to verify callers."
+                        ),
+                    });
+                }
+                Some(Some(add_p)) => {
+                    if let Some(del_p) = del_params {
+                        if del_p != add_p {
+                            api_changes.push(ApiShift {
+                                kind: "BREAKING-API-SIGNATURE".to_string(),
+                                file: file.clone(),
+                                symbol: sym.clone(),
+                                detail: format!(
+                                    "Signature changed `({del_p})` -> `({add_p})` for `{sym}` in `{file}` — run `ap atlas impact {sym}` to verify callers."
+                                ),
+                            });
+                        }
+                    }
+                }
+                Some(None) => {}
             }
         }
     }
@@ -255,5 +393,79 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
         lines_added: total_add,
         lines_deleted: total_del,
         findings,
+        api_changes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn detects_removed_export_and_changed_signature_as_advisory_api_changes() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ap_diff_api_{n}"));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let ok_git = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok_git {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let _ = Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(&dir)
+            .status();
+        let _ = Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .status();
+        fs::write(
+            dir.join("src/api.ts"),
+            "export function charge(amount: number) { return amount; }\nexport function legacyDrop() { return 0; }\n",
+        )
+        .unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .status();
+
+        fs::write(
+            dir.join("src/api.ts"),
+            "export function charge(amount: number, currency: string) { return `${amount}${currency}`; }\n",
+        )
+        .unwrap();
+
+        let rep = audit_git_diff(&dir);
+        assert!(rep.is_git_repo);
+        assert!(rep.findings.is_empty(), "{:?}", rep.findings);
+        assert!(
+            rep.api_changes
+                .iter()
+                .any(|c| c.kind == "BREAKING-API-SIGNATURE" && c.symbol == "charge"),
+            "{:?}",
+            rep.api_changes
+        );
+        assert!(
+            rep.api_changes
+                .iter()
+                .any(|c| c.kind == "BREAKING-API-REMOVED" && c.symbol == "legacyDrop"),
+            "{:?}",
+            rep.api_changes
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
