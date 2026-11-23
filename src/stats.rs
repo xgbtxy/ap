@@ -8,6 +8,38 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+pub(crate) static AP_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct ApHomeTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl ApHomeTestGuard {
+    pub(crate) fn set(path: &std::path::Path) -> Self {
+        let guard = AP_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("AP_HOME");
+        std::env::set_var("AP_HOME", path);
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ApHomeTestGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("AP_HOME", v),
+            None => std::env::remove_var("AP_HOME"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatEvent {
     pub ts: u64,

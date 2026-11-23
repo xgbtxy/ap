@@ -9220,3 +9220,105 @@ fn test_v256_scrub_sanitizer_enclosing_impact_trace_and_dir_heal() {
         "{r_txt}"
     );
 }
+
+#[test]
+fn test_v257_piped_grep_cat_slice_and_pi_hook_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/sample.txt"),
+        "L1 MATCH_ME a\nL2 MATCH_ME b\nL3 MATCH_ME c\nL4 MATCH_ME d\nL5 MATCH_ME e\n",
+    )
+    .unwrap();
+
+    // 1. Piped `grep -rn ... | head -n 2` accelerates cleanly to `ap search --max 2`
+    let pg = run_ap(
+        root,
+        &[
+            "exec",
+            "--cwd",
+            ".",
+            "-c",
+            "grep -rn MATCH_ME src 2>/dev/null | head -n 2",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        pg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pg.stderr)
+    );
+    let pg_s = String::from_utf8_lossy(&pg.stdout);
+    assert!(pg_s.contains("MATCH_ME"), "{pg_s}");
+    assert!(
+        !pg_s.contains("L5 MATCH_ME e"),
+        "expected `--max 2` to bound hits cleanly: {pg_s}"
+    );
+
+    // 2. `cat <file> | tail -n 2` & `cat <file> | sed -n '2,3p'` accelerate cleanly to `ap read`
+    let ct = run_ap(
+        root,
+        &["exec", "--cwd", ".", "-c", "cat src/sample.txt | tail -n 2"],
+        None,
+        &[],
+    );
+    assert!(ct.status.success());
+    let ct_s = String::from_utf8_lossy(&ct.stdout);
+    assert!(
+        ct_s.contains("L4 MATCH_ME d")
+            && ct_s.contains("L5 MATCH_ME e")
+            && !ct_s.contains("L1 MATCH_ME"),
+        "{ct_s}"
+    );
+
+    let cs = run_ap(
+        root,
+        &[
+            "exec",
+            "--cwd",
+            ".",
+            "-c",
+            "cat src/sample.txt | sed -n '2,3p'",
+        ],
+        None,
+        &[],
+    );
+    assert!(cs.status.success());
+    let cs_s = String::from_utf8_lossy(&cs.stdout);
+    assert!(
+        cs_s.contains("L2 MATCH_ME b")
+            && cs_s.contains("L3 MATCH_ME c")
+            && !cs_s.contains("L4 MATCH_ME"),
+        "{cs_s}"
+    );
+
+    // 3. `ap init -a pi --with-hooks --no-rules` syncs Layer 3 Pi hook parity
+    let fake_home = root.join("pi_home");
+    fs::create_dir_all(fake_home.join(".pi/agent")).unwrap();
+    let init_p = run_ap(
+        root,
+        &["init", "-a", "pi", "--with-hooks", "--no-rules"],
+        None,
+        &[
+            ("HOME", &fake_home),
+            ("USERPROFILE", &fake_home),
+            ("AP_HOME", &fake_home),
+        ],
+    );
+    assert!(
+        init_p.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_p.stderr)
+    );
+    let ts_src =
+        fs::read_to_string(fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    assert!(
+        ts_src.contains("--tail")
+            && ts_src.contains("codemap: \"codemode\"")
+            && ts_src.contains("bashexec: \"bash\"")
+            && ts_src.contains("low === \"/b\""),
+        "Pi hook missing v2.57 parity"
+    );
+}

@@ -977,7 +977,7 @@ mod tests {
         fs::create_dir_all(&dist_utils).unwrap();
         fs::write(dist_utils.join("shell.js"), PATCH_SPECS[13].hunks[1].old).unwrap();
 
-        std::env::set_var("AP_HOME", &ap_home);
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&ap_home);
         let pi_str = pi_dir.to_string_lossy().to_string();
 
         let before = inspect_pi_patches(Some(&pi_str));

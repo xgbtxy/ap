@@ -471,8 +471,7 @@ mod tests {
         let target = td.join("demo.txt");
         fs::write(&target, "line1\nline2\n").unwrap();
 
-        let prev = std::env::var_os("AP_HOME");
-        std::env::set_var("AP_HOME", &ap_home);
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&ap_home);
 
         let tx =
             record_named_snapshot(&td, Some("pre-refactor"), &["demo.txt".to_string()]).unwrap();
@@ -499,10 +498,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "line1\nline2\n");
         assert!(resolve_checkpoint(&undo_dir(), Some("pre-refactor")).is_some());
 
-        match prev {
-            Some(v) => std::env::set_var("AP_HOME", v),
-            None => std::env::remove_var("AP_HOME"),
-        }
         let _ = fs::remove_dir_all(&td);
     }
 }

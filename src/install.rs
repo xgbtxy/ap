@@ -3118,13 +3118,94 @@ export function healCommand(
 		}}
 	}}
 
-	// 1c. Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` (incl. after `cd <dir> &&`) in Git Bash -> bounded `ap ls`
-	if (toolName === "bash" && !/[|;&>]/.test(cmdTailBody)) {{
-		const dirM = cmdTailBody.trim().match(/^dir\s+(?:(\/s)\s+\/b|\/b(?:\s+(\/s))?)(?:\s+(?:"([^"]+)"|'([^']+)'|(\S+)))?\s*$/i);
-		if (dirM) {{
-			const depthFlag = dirM[1] || dirM[2] ? " --depth 3" : "";
-			const tgt = dirM[3] || dirM[4] || dirM[5] || ".";
-			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{tgt}}"${{depthFlag}}`;
+	// 1c. Rewrite MS-DOS `dir /b [flags] [path]` (incl. `/a-d`, `/o:n`, `/s`, leading `cd <dir> &&`) in Git Bash -> bounded `ap ls`
+	if (toolName === "bash" && !/[|;&>]/.test(cmdTailBody) && /\bdir\b/i.test(cmdTailBody)) {{
+		const toks = cmdTailBody.trim().match(/"[^"]*"|'[^']*'|\S+/g) || [];
+		if (toks.length >= 2 && toks[0].toLowerCase() === "dir") {{
+			let hasBare = false;
+			let recursive = false;
+			let tgt: string | undefined = undefined;
+			let ok = true;
+			for (let i = 1; i < toks.length; i += 1) {{
+				const rawTok = toks[i];
+				const unq = rawTok.replace(/^(['"])(.*)\1$/, "$2");
+				const low = unq.toLowerCase();
+				if (low === "/b") {{
+					hasBare = true;
+				}} else if (low === "/s") {{
+					recursive = true;
+				}} else if (unq.startsWith("/") && unq.length >= 2) {{
+					continue;
+				}} else if (tgt === undefined && !/[*?,]/.test(unq)) {{
+					tgt = unq;
+				}} else {{
+					ok = false;
+					break;
+				}}
+			}}
+			if (ok && hasBare) {{
+				const depthFlag = recursive ? " --depth 3" : "";
+				return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{tgt || "."}}"${{depthFlag}}`;
+			}}
+		}}
+	}}
+
+	// 1d. Rewrite bare `sed -n '<A>,<B>p'`, `head -n <N>`, `tail -n <N>`, or `cat <file> | head|tail|sed` -> bounded `ap read`
+	if (toolName === "bash" && !/[;&><{{}}`]|\$\(/.test(cmdTailBody)) {{
+		const trimmedTail = cmdTailBody.trim();
+		const qPathOk = (f: string) => Boolean(f) && f !== "-" && !/[*?,]/.test(f);
+		if (!trimmedTail.includes("|")) {{
+			const sedM = trimmedTail.match(
+				/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
+			);
+			if (sedM) {{
+				const s = Number(sedM[1] || sedM[3] || sedM[5]);
+				const e = Number(sedM[2] || sedM[4] || sedM[6]);
+				const f = sedM[7] || sedM[8] || sedM[9] || "";
+				if (s >= 1 && e >= s && qPathOk(f)) {{
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}`;
+				}}
+			}}
+			const headM = trimmedTail.match(/^head\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			if (headM) {{
+				const n = Number(headM[1] || headM[2]);
+				const f = headM[3] || headM[4] || headM[5] || "";
+				if (n >= 1 && qPathOk(f)) {{
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}`;
+				}}
+			}}
+			const tailM = trimmedTail.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			if (tailM) {{
+				const n = Number(tailM[1] || tailM[2]);
+				const f = tailM[3] || tailM[4] || tailM[5] || "";
+				if (n >= 1 && qPathOk(f)) {{
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}`;
+				}}
+			}}
+		}} else {{
+			const parts = trimmedTail.split("|");
+			if (parts.length === 2) {{
+				const catM = parts[0].trim().match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
+				const rhs = parts[1].trim();
+				const f = catM ? catM[1] || catM[2] || catM[3] || "" : "";
+				if (qPathOk(f)) {{
+					const rHead = rhs.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
+					const rTail = rhs.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
+					const rSed = rhs.match(/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)$/);
+					const esc = f.replace(/"/g, '\\"');
+					if (rHead) {{
+						const n = Number(rHead[1] || rHead[2]);
+						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines 1-${{n}}`;
+					}} else if (rTail) {{
+						const n = Number(rTail[1] || rTail[2]);
+						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --tail ${{n}}`;
+					}} else if (rSed) {{
+						const s = Number(rSed[1] || rSed[3] || rSed[5]);
+						const e = Number(rSed[2] || rSed[4] || rSed[6]);
+						if (s >= 1 && e >= s) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{s}}-${{e}}`;
+					}}
+				}}
+			}}
 		}}
 	}}
 
@@ -3306,6 +3387,7 @@ const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{
 	code_exec: "codemode",
 	code_scan: "codemode",
 	code: "codemode",
+	codemap: "codemode",
 	codemap_placeholder: "codemode",
 	read_file: "read",
 	view_file: "read",
