@@ -239,6 +239,18 @@ enum SubCmd {
         /// Multi-principal AuthZ/IDOR matrix (`--principal "owner=Authorization: Bearer A" --principal "anon="`)
         #[arg(long = "principal")]
         principals: Vec<String>,
+        /// Reuse live cookies in-memory from a local `127.0.0.1` CDP browser port (zero tabs opened, values never printed)
+        #[arg(long)]
+        cdp_cookies: Option<u16>,
+        /// Multi-principal AuthZ matrix reusing live local CDP browser sessions (`--principal-cdp owner=9451 --principal-cdp other=9470`)
+        #[arg(long = "principal-cdp")]
+        principal_cdps: Vec<String>,
+        /// Send a cross-origin `Origin: <url>` header and audit Access-Control-Allow-Origin / Allow-Credentials / Vary reflection
+        #[arg(long)]
+        cors_origin: Option<String>,
+        /// Extract a dot-separated JSON path (supports `[*]` array projection) from JSON responses
+        #[arg(long)]
+        select: Option<String>,
         /// Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps
         #[arg(long)]
         audit_headers: bool,
@@ -596,6 +608,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             max_variants,
             dry_run,
             principals,
+            cdp_cookies,
+            principal_cdps,
+            cors_origin,
+            select,
             audit_headers,
             race,
             json,
@@ -608,13 +624,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                     &headers,
                     body.as_deref(),
                     race,
+                    cdp_cookies,
                     timeout,
                     insecure,
                     follow,
                     json,
                 );
             }
-            if !principals.is_empty() {
+            if !principals.is_empty() || !principal_cdps.is_empty() {
                 return http_probe::run_http_auth_matrix(
                     vary_request.as_deref(),
                     url.as_deref(),
@@ -622,6 +639,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                     &headers,
                     body.as_deref(),
                     &principals,
+                    &principal_cdps,
+                    cors_origin.as_deref(),
+                    select.as_deref(),
                     audit_headers,
                     timeout,
                     insecure,
@@ -641,6 +661,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     rate_ms,
                     max_variants,
                     dry_run,
+                    cdp_cookies,
                     timeout,
                     insecure,
                     follow,
@@ -656,6 +677,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                 insecure,
                 follow,
                 batch_stdin,
+                cdp_cookies,
+                cors_origin.as_deref(),
+                select.as_deref(),
                 audit_headers,
                 json,
             )

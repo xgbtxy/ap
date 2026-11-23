@@ -36,6 +36,15 @@ fn free_port() -> Result<u16, String> {
     Ok(p)
 }
 
+fn extract_origin_prefix(url: &str) -> String {
+    if let Some(idx) = url.find("://") {
+        let rest = &url[idx + 3..];
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        return url[..idx + 3 + end].to_string();
+    }
+    String::new()
+}
+
 fn read_exact_bytes(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), String> {
     stream.read_exact(buf).map_err(|e| format!("ws read: {e}"))
 }
@@ -188,7 +197,6 @@ impl CdpSession {
                 "--no-default-browser-check",
                 "--remote-debugging-address=127.0.0.1",
                 &format!("--remote-debugging-port={port}"),
-                "--remote-allow-origins=*",
                 &format!("--user-data-dir={}", profile_dir.display()),
                 "about:blank",
             ])
@@ -320,6 +328,57 @@ impl CdpSession {
         let _ = sess.call("Log.enable", json!({}));
         let _ = sess.call("Network.enable", json!({}));
         Ok(sess)
+    }
+
+    /// Fetch live cookies matching `url` in-memory from a local loopback (`127.0.0.1`/`localhost`)
+    /// browser DevTools port without opening any new tabs or writing cookies to disk.
+    pub fn fetch_cookies_for_url(
+        host: &str,
+        port: u16,
+        url: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let host_low = host.trim().to_ascii_lowercase();
+        if !matches!(host_low.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+            return Err(format!(
+                "refusing CDP cookie reuse from non-loopback host `{host}`"
+            ));
+        }
+        let targets = Self::list_targets(host, port)?;
+        let pages: Vec<&CdpTarget> = targets
+            .iter()
+            .filter(|t| t.target_type == "page" && !t.ws_url.is_empty())
+            .collect();
+        if pages.is_empty() {
+            return Err(format!(
+                "no attachable page target found on CDP {host}:{port}"
+            ));
+        }
+        let url_origin = extract_origin_prefix(url);
+        let chosen = pages
+            .iter()
+            .copied()
+            .find(|t| !url_origin.is_empty() && t.url.starts_with(&url_origin))
+            .unwrap_or(pages[0]);
+        let mut sess = Self::attach(&chosen.ws_url)?;
+        let res = sess.call("Network.getCookies", json!({ "urls": [url] }))?;
+        let mut out = Vec::new();
+        if let Some(arr) = res.get("cookies").and_then(Value::as_array) {
+            for c in arr {
+                let name = c
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let val = c.get("value").and_then(Value::as_str).unwrap_or("");
+                if !name.is_empty()
+                    && !name.contains(['\r', '\n', ';', '='])
+                    && !val.contains(['\r', '\n'])
+                {
+                    out.push((name.to_string(), val.to_string()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {

@@ -308,6 +308,14 @@ fn mcp_tools_schema() -> Value {
                     "description": "Multi-principal AuthZ/IDOR matrix specs like ['owner=Authorization: Bearer A', 'other=Authorization: Bearer B', 'anon=']",
                     "items": { "type": "string" }
                 },
+                "cdp_cookies": { "type": "integer", "description": "Reuse live cookies in-memory from a local 127.0.0.1 CDP browser port (values never printed)" },
+                "principal_cdps": {
+                    "type": "array",
+                    "description": "Multi-principal AuthZ matrix reusing live local CDP browser sessions like ['owner=9451', 'other=9470']",
+                    "items": { "type": "string" }
+                },
+                "cors_origin": { "type": "string", "description": "Send a cross-origin Origin header and audit ACAO/Allow-Credentials/Vary reflection" },
+                "select": { "type": "string", "description": "Optional dot-path JSON selector (e.g. 'data.items[*].id') to extract from JSON responses" },
                 "audit_headers": { "type": "boolean", "description": "Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps" },
                 "race": { "type": "integer", "description": "Synchronized Barrier concurrency/TOCTOU race burst thread count (2..=32)" },
                 "timeout": { "type": "integer", "description": "Per-request timeout in seconds (default: 15)" },
@@ -1735,6 +1743,34 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     cli.push("--principal".into());
                     cli.push(p.to_string());
                 }
+            }
+            if let Some(cp) = args.get("cdp_cookies").and_then(Value::as_u64) {
+                if cp > 0 && cp <= 65535 {
+                    cli.push("--cdp-cookies".into());
+                    cli.push(cp.to_string());
+                }
+            }
+            if let Some(pcp) = args.get("principal_cdps").and_then(Value::as_array) {
+                for p in pcp.iter().filter_map(Value::as_str) {
+                    cli.push("--principal-cdp".into());
+                    cli.push(p.to_string());
+                }
+            }
+            if let Some(co) = args
+                .get("cors_origin")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--cors-origin".into());
+                cli.push(co.trim().to_string());
+            }
+            if let Some(sel) = args
+                .get("select")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--select".into());
+                cli.push(sel.trim().to_string());
             }
             if args
                 .get("audit_headers")

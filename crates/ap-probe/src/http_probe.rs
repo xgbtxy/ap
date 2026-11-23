@@ -30,6 +30,18 @@ pub fn execute_http_probe(
     insecure: bool,
     follow: bool,
 ) -> HttpProbeResult {
+    execute_http_probe_with_raw(method, url, headers, body, timeout_sec, insecure, follow).0
+}
+
+fn execute_http_probe_with_raw(
+    method: &str,
+    url: &str,
+    headers: &[String],
+    body: Option<&str>,
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+) -> (HttpProbeResult, String) {
     let t0 = Instant::now();
     let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
     let mut cmd = Command::new(curl_bin);
@@ -67,30 +79,36 @@ pub fn execute_http_probe(
     let out = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
-            return HttpProbeResult {
-                method: method.to_string(),
-                url: url.to_string(),
-                status: 0,
-                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0).round(),
-                content_type: String::new(),
-                headers: Vec::new(),
-                body_preview: String::new(),
-                error: format!("failed to spawn {curl_bin}: {e}"),
-            };
+            return (
+                HttpProbeResult {
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    status: 0,
+                    elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                    content_type: String::new(),
+                    headers: Vec::new(),
+                    body_preview: String::new(),
+                    error: format!("failed to spawn {curl_bin}: {e}"),
+                },
+                String::new(),
+            );
         }
     };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0).round();
     if !out.status.success() && out.stdout.is_empty() {
-        return HttpProbeResult {
-            method: method.to_string(),
-            url: url.to_string(),
-            status: 0,
-            elapsed_ms,
-            content_type: String::new(),
-            headers: Vec::new(),
-            body_preview: String::new(),
-            error: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        };
+        return (
+            HttpProbeResult {
+                method: method.to_string(),
+                url: url.to_string(),
+                status: 0,
+                elapsed_ms,
+                content_type: String::new(),
+                headers: Vec::new(),
+                body_preview: String::new(),
+                error: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            },
+            String::new(),
+        );
     }
 
     let raw = String::from_utf8_lossy(&out.stdout).to_string();
@@ -142,16 +160,163 @@ pub fn execute_http_probe(
         body_raw.to_string()
     };
 
-    HttpProbeResult {
-        method: method.to_string(),
-        url: url.to_string(),
-        status,
-        elapsed_ms,
-        content_type: ct,
-        headers: hdrs,
-        body_preview: preview,
-        error: String::new(),
+    (
+        HttpProbeResult {
+            method: method.to_string(),
+            url: url.to_string(),
+            status,
+            elapsed_ms,
+            content_type: ct,
+            headers: hdrs,
+            body_preview: preview,
+            error: String::new(),
+        },
+        body_raw.to_string(),
+    )
+}
+
+fn has_header_name(headers: &[String], target: &str) -> bool {
+    headers.iter().any(|h| {
+        h.split_once(':')
+            .map(|(k, _)| k.trim().eq_ignore_ascii_case(target))
+            .unwrap_or(false)
+    })
+}
+
+/// Fetch live cookies from a local loopback CDP port strictly in-memory as a `Cookie: ...` header.
+/// Never prints, logs, or serializes cookie names or values.
+fn resolve_cdp_cookie_header(port: u16, url: &str) -> Result<(Option<String>, usize), String> {
+    let pairs = crate::cdp::CdpSession::fetch_cookies_for_url("127.0.0.1", port, url)?;
+    if pairs.is_empty() {
+        return Ok((None, 0));
     }
+    let count = pairs.len();
+    let joined = pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok((Some(format!("Cookie: {joined}")), count))
+}
+
+/// Parse `--principal-cdp` spec (`label=port` or bare `port`).
+pub fn parse_principal_cdp_spec(raw: &str) -> Result<(String, u16), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty --principal-cdp spec".to_string());
+    }
+    let (label, port_str) = match trimmed.split_once('=') {
+        Some((l, p)) => (l.trim().to_string(), p.trim()),
+        None => (format!("cdp:{trimmed}"), trimmed),
+    };
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port `{port_str}` in --principal-cdp `{raw}`"))?;
+    if port == 0 {
+        return Err(format!("port must be 1..=65535 in --principal-cdp `{raw}`"));
+    }
+    let final_label = if label.is_empty() {
+        format!("cdp:{port}")
+    } else {
+        label
+    };
+    Ok((final_label, port))
+}
+
+/// Extract a lightweight dot-path JSON selector (supports `[*]` array projection and numeric indices).
+pub fn extract_json_select(body: &str, select_expr: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(body.trim()).ok()?;
+    let tokens: Vec<&str> = select_expr
+        .trim()
+        .trim_start_matches("$.")
+        .trim_start_matches('.')
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Some(parsed);
+    }
+    fn step(cur: &Value, toks: &[&str]) -> Option<Value> {
+        let Some((&head, rest)) = toks.split_first() else {
+            return Some(cur.clone());
+        };
+        if let Some(field) = head.strip_suffix("[*]") {
+            let arr_val = if field.is_empty() {
+                cur
+            } else {
+                cur.get(field)?
+            };
+            let arr = arr_val.as_array()?;
+            let mapped: Vec<Value> = arr.iter().filter_map(|el| step(el, rest)).collect();
+            return Some(Value::Array(mapped));
+        }
+        if head == "*" {
+            let arr = cur.as_array()?;
+            let mapped: Vec<Value> = arr.iter().filter_map(|el| step(el, rest)).collect();
+            return Some(Value::Array(mapped));
+        }
+        if let Ok(idx) = head.parse::<usize>() {
+            if let Some(arr) = cur.as_array() {
+                return arr.get(idx).and_then(|el| step(el, rest));
+            }
+        }
+        cur.get(head).and_then(|next| step(next, rest))
+    }
+    step(&parsed, &tokens)
+}
+
+/// Audit HTTP response headers specifically for cross-origin CORS reflection & Vary: Origin posture.
+pub fn audit_cors_reflection(sent_origin: &str, headers: &[String]) -> Vec<String> {
+    let sent = sent_origin.trim();
+    if sent.is_empty() {
+        return Vec::new();
+    }
+    let mut acao: Option<String> = None;
+    let mut acac = false;
+    let mut vary_vals: Vec<String> = Vec::new();
+    for h in headers {
+        if let Some((k, v)) = h.split_once(':') {
+            let kl = k.trim().to_ascii_lowercase();
+            let vt = v.trim();
+            if kl == "access-control-allow-origin" {
+                acao = Some(vt.to_string());
+            } else if kl == "access-control-allow-credentials" {
+                acac = vt.eq_ignore_ascii_case("true");
+            } else if kl == "vary" {
+                vary_vals.push(vt.to_ascii_lowercase());
+            }
+        }
+    }
+    let mut findings = Vec::new();
+    if let Some(ref allow) = acao {
+        let reflected = allow.eq_ignore_ascii_case(sent);
+        let wildcard_or_null = allow == "*" || allow.eq_ignore_ascii_case("null");
+        if reflected && acac {
+            findings.push(format!(
+                "CORS-CRITICAL: reflected Origin `{sent}` with Access-Control-Allow-Credentials: true"
+            ));
+        } else if reflected {
+            findings.push(format!(
+                "CORS-WARN: reflected Origin `{sent}` (without Allow-Credentials)"
+            ));
+        } else if wildcard_or_null && acac {
+            findings.push(format!(
+                "CORS-CRITICAL: Access-Control-Allow-Origin `{allow}` with Allow-Credentials: true"
+            ));
+        }
+        if reflected {
+            let has_vary_origin = vary_vals
+                .iter()
+                .any(|v| v.split(',').any(|p| p.trim() == "origin" || p.trim() == "*"));
+            if !has_vary_origin {
+                findings.push(
+                    "CORS-WARN: dynamic Access-Control-Allow-Origin missing `Vary: Origin`"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    findings
 }
 
 fn parse_json_http_job(v: &Value) -> Option<(String, String, Vec<String>, Option<String>)> {
@@ -201,6 +366,9 @@ pub fn run_http_cli(
     insecure: bool,
     follow: bool,
     batch_stdin: bool,
+    cdp_cookies_port: Option<u16>,
+    cors_origin: Option<&str>,
+    select_expr: Option<&str>,
     audit_headers: bool,
     as_json: bool,
 ) -> i32 {
@@ -263,11 +431,41 @@ pub fn run_http_cli(
         return 2;
     }
 
+    let cors_orig_clean = cors_origin.map(str::trim).filter(|s| !s.is_empty());
+    let select_clean = select_expr.map(str::trim).filter(|s| !s.is_empty());
     let mut results = Vec::new();
+    let mut raw_bodies = Vec::new();
     for (m, u, extra_hdrs, b) in jobs.into_iter().take(25) {
         let mut merged_hdrs = headers.to_vec();
         merged_hdrs.extend(extra_hdrs);
-        results.push(execute_http_probe(
+        if let Some(orig) = cors_orig_clean {
+            if !has_header_name(&merged_hdrs, "origin") {
+                merged_hdrs.push(format!("Origin: {orig}"));
+            }
+        }
+        if let Some(port) = cdp_cookies_port {
+            if !has_header_name(&merged_hdrs, "cookie") {
+                match resolve_cdp_cookie_header(port, &u) {
+                    Ok((Some(ch), _cnt)) => merged_hdrs.push(ch),
+                    Ok((None, _)) => {}
+                    Err(e) => {
+                        results.push(HttpProbeResult {
+                            method: m,
+                            url: u,
+                            status: 0,
+                            elapsed_ms: 0.0,
+                            content_type: String::new(),
+                            headers: Vec::new(),
+                            body_preview: String::new(),
+                            error: format!("cdp-cookies:{port}: {e}"),
+                        });
+                        raw_bodies.push(String::new());
+                        continue;
+                    }
+                }
+            }
+        }
+        let (res, raw_b) = execute_http_probe_with_raw(
             &m,
             &u,
             &merged_hdrs,
@@ -275,27 +473,59 @@ pub fn run_http_cli(
             timeout_sec,
             insecure,
             follow,
-        ));
+        );
+        results.push(res);
+        raw_bodies.push(raw_b);
     }
 
     let any_err = results.iter().any(|r| !r.error.is_empty() || r.status == 0);
-    let header_audits: Vec<Vec<String>> = if audit_headers {
+    let do_audit = audit_headers || cors_orig_clean.is_some();
+    let header_audits: Vec<Vec<String>> = if do_audit {
         results
             .iter()
-            .map(|r| audit_response_headers(&r.url, r.status, &r.content_type, &r.headers))
+            .map(|r| {
+                let mut gaps = if audit_headers {
+                    audit_response_headers(&r.url, r.status, &r.content_type, &r.headers)
+                } else {
+                    Vec::new()
+                };
+                if let Some(orig) = cors_orig_clean {
+                    gaps.extend(audit_cors_reflection(orig, &r.headers));
+                }
+                gaps
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let selected_vals: Vec<Option<Value>> = if let Some(sel) = select_clean {
+        raw_bodies
+            .iter()
+            .map(|rb| extract_json_select(rb, sel))
             .collect()
     } else {
         Vec::new()
     };
     if as_json {
-        let out_val = if audit_headers {
+        let out_val = if do_audit || select_clean.is_some() {
             let enriched: Vec<Value> = results
                 .iter()
-                .zip(header_audits.iter())
-                .map(|(r, findings)| {
+                .enumerate()
+                .map(|(i, r)| {
                     let mut v = serde_json::to_value(r).unwrap_or_else(|_| json!({}));
                     if let Some(m) = v.as_object_mut() {
-                        m.insert("header_findings".to_string(), json!(findings));
+                        if do_audit {
+                            m.insert(
+                                "header_findings".to_string(),
+                                json!(header_audits.get(i).cloned().unwrap_or_default()),
+                            );
+                        }
+                        if select_clean.is_some() {
+                            m.insert(
+                                "selected".to_string(),
+                                selected_vals.get(i).cloned().flatten().unwrap_or(Value::Null),
+                            );
+                        }
                     }
                     v
                 })
@@ -303,6 +533,7 @@ pub fn run_http_cli(
             json!({
                 "ok": !any_err,
                 "count": results.len(),
+                "cors_origin": cors_orig_clean,
                 "results": enriched,
             })
         } else {
@@ -328,15 +559,18 @@ pub fn run_http_cli(
             for h in r.headers.iter().take(10) {
                 println!("  {h}");
             }
-            if audit_headers {
+            if do_audit {
                 let gaps = header_audits.first().cloned().unwrap_or_default();
                 if gaps.is_empty() {
-                    println!("  [header-audit] PASS (0 security/two-phase gaps)");
+                    println!("  [header-audit] PASS (0 security/CORS gaps)");
                 } else {
                     println!("  [header-audit] {} gap(s): {}", gaps.len(), gaps.join(" | "));
                 }
             }
-            if !r.body_preview.is_empty() {
+            if let Some(sel) = select_clean {
+                let sval = selected_vals.first().cloned().flatten().unwrap_or(Value::Null);
+                println!("  [select:{sel}] {sval}");
+            } else if !r.body_preview.is_empty() {
                 println!("\n{}", r.body_preview);
             }
         }
@@ -346,13 +580,24 @@ pub fn run_http_cli(
             if !r.error.is_empty() {
                 println!("  {}. {} {} -> ERR ({})", i + 1, r.method, r.url, r.error);
             } else {
-                let snip: String = r
-                    .body_preview
-                    .replace(['\r', '\n'], " ")
-                    .chars()
-                    .take(120)
-                    .collect();
-                let gap_tag = if audit_headers {
+                let snip: String = if select_clean.is_some() {
+                    selected_vals
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".to_string())
+                        .chars()
+                        .take(120)
+                        .collect()
+                } else {
+                    r.body_preview
+                        .replace(['\r', '\n'], " ")
+                        .chars()
+                        .take(120)
+                        .collect()
+                };
+                let gap_tag = if do_audit {
                     let g = header_audits.get(i).map(|v| v.len()).unwrap_or(0);
                     format!(" [gaps={g}]")
                 } else {
@@ -669,6 +914,7 @@ pub fn run_http_vary(
     rate_ms: u64,
     max_variants: usize,
     dry_run: bool,
+    cdp_cookies_port: Option<u16>,
     timeout_sec: u64,
     insecure: bool,
     follow: bool,
@@ -694,6 +940,20 @@ pub fn run_http_vary(
         return 2;
     };
     hdrs.extend(headers.iter().cloned());
+    if !dry_run {
+        if let Some(port) = cdp_cookies_port {
+            if !has_header_name(&hdrs, "cookie") {
+                match resolve_cdp_cookie_header(port, &u) {
+                    Ok((Some(ch), _)) => hdrs.push(ch),
+                    Ok((None, _)) => {}
+                    Err(e) => {
+                        eprintln!("[probe http vary] cdp-cookies:{port}: {e}");
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
 
     let variants =
         build_single_field_variants(&m, &u, &hdrs, b.as_deref(), field, alt_value, max_variants);
@@ -1036,6 +1296,9 @@ pub fn run_http_auth_matrix(
     headers: &[String],
     body: Option<&str>,
     principals: &[String],
+    principal_cdps: &[String],
+    cors_origin: Option<&str>,
+    select_expr: Option<&str>,
     audit_headers: bool,
     timeout_sec: u64,
     insecure: bool,
@@ -1062,25 +1325,78 @@ pub fn run_http_auth_matrix(
         return 2;
     };
     base_hdrs.extend(headers.iter().cloned());
+    let cors_orig_clean = cors_origin.map(str::trim).filter(|s| !s.is_empty());
+    let select_clean = select_expr.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(orig) = cors_orig_clean {
+        if !has_header_name(&base_hdrs, "origin") {
+            base_hdrs.push(format!("Origin: {orig}"));
+        }
+    }
 
-    let parsed: Vec<(String, Vec<String>)> = principals.iter().map(|p| parse_principal_spec(p)).collect();
-    let mut rows: Vec<(String, HttpProbeResult, Vec<String>)> = Vec::new();
-    for (label, phdrs) in &parsed {
+    // (label, extra_headers, optional_cookie_count, optional_resolve_err)
+    let mut resolved: Vec<(String, Vec<String>, Option<usize>, Option<String>)> = Vec::new();
+    for raw_cdp in principal_cdps {
+        match parse_principal_cdp_spec(raw_cdp) {
+            Ok((label, port)) => match resolve_cdp_cookie_header(port, &u) {
+                Ok((Some(ch), cnt)) => resolved.push((label, vec![ch], Some(cnt), None)),
+                Ok((None, 0)) => resolved.push((label, Vec::new(), Some(0), None)),
+                Ok((None, cnt)) => resolved.push((label, Vec::new(), Some(cnt), None)),
+                Err(e) => resolved.push((label, Vec::new(), Some(0), Some(format!("cdp:{port}: {e}")))),
+            },
+            Err(e) => {
+                eprintln!("[probe http auth-matrix] {e}");
+                return 2;
+            }
+        }
+    }
+    for p in principals {
+        let (label, phdrs) = parse_principal_spec(p);
+        resolved.push((label, phdrs, None, None));
+    }
+
+    let do_audit = audit_headers || cors_orig_clean.is_some();
+    let mut rows: Vec<(String, HttpProbeResult, Vec<String>, Option<usize>, Option<Value>)> =
+        Vec::new();
+    for (label, phdrs, cookie_cnt, resolve_err) in &resolved {
+        if let Some(ref err_msg) = resolve_err {
+            rows.push((
+                label.clone(),
+                HttpProbeResult {
+                    method: m.clone(),
+                    url: u.clone(),
+                    status: 0,
+                    elapsed_ms: 0.0,
+                    content_type: String::new(),
+                    headers: Vec::new(),
+                    body_preview: String::new(),
+                    error: err_msg.clone(),
+                },
+                Vec::new(),
+                *cookie_cnt,
+                None,
+            ));
+            continue;
+        }
         let strip_auth = phdrs.is_empty();
         let req_hdrs = merge_principal_headers(&base_hdrs, phdrs, strip_auth);
-        let res = execute_http_probe(&m, &u, &req_hdrs, b.as_deref(), timeout_sec, insecure, follow);
-        let gaps = if audit_headers {
+        let (res, raw_b) =
+            execute_http_probe_with_raw(&m, &u, &req_hdrs, b.as_deref(), timeout_sec, insecure, follow);
+        let mut gaps = if audit_headers {
             audit_response_headers(&res.url, res.status, &res.content_type, &res.headers)
         } else {
             Vec::new()
         };
-        rows.push((label.clone(), res, gaps));
+        if let Some(orig) = cors_orig_clean {
+            gaps.extend(audit_cors_reflection(orig, &res.headers));
+        }
+        let sel_val = select_clean.and_then(|expr| extract_json_select(&raw_b, expr));
+        rows.push((label.clone(), res, gaps, *cookie_cnt, sel_val));
     }
 
-    let baseline = rows.first().map(|(_, r, _)| r.clone());
+    let baseline = rows.first().map(|(_, r, _, _, _)| r.clone());
     let mut bypasses = Vec::new();
     let mut json_rows = Vec::new();
-    for (idx, (label, r, gaps)) in rows.iter().enumerate() {
+    for (idx, (label, r, gaps, cookie_cnt, sel_val)) in rows.iter().enumerate() {
         let (possible_bypass, reason) = if idx == 0 {
             (false, "baseline principal".to_string())
         } else if let Some(ref base) = baseline {
@@ -1096,7 +1412,7 @@ pub fn run_http_auth_matrix(
                 "body_preview": r.body_preview.chars().take(240).collect::<String>(),
             }));
         }
-        json_rows.push(json!({
+        let mut row_obj = json!({
             "principal": label,
             "status": r.status,
             "elapsed_ms": r.elapsed_ms,
@@ -1107,7 +1423,16 @@ pub fn run_http_auth_matrix(
             "header_findings": gaps,
             "error": r.error,
             "body_preview": r.body_preview.chars().take(360).collect::<String>(),
-        }));
+        });
+        if let Some(map) = row_obj.as_object_mut() {
+            if let Some(cc) = cookie_cnt {
+                map.insert("cdp_cookie_count".to_string(), json!(cc));
+            }
+            if select_clean.is_some() {
+                map.insert("selected".to_string(), sel_val.clone().unwrap_or(Value::Null));
+            }
+        }
+        json_rows.push(row_obj);
     }
 
     if as_json {
@@ -1117,6 +1442,7 @@ pub fn run_http_auth_matrix(
                 "ok": true,
                 "method": m,
                 "url": u,
+                "cors_origin": cors_orig_clean,
                 "principal_count": rows.len(),
                 "possible_bypass_count": bypasses.len(),
                 "possible_bypasses": bypasses,
@@ -1138,12 +1464,19 @@ pub fn run_http_auth_matrix(
             } else {
                 "[ok]"
             };
+            let gap_str = if do_audit {
+                let n = item["header_findings"].as_array().map(|a| a.len()).unwrap_or(0);
+                if n > 0 { format!(" [gaps={n}]") } else { String::new() }
+            } else {
+                String::new()
+            };
             println!(
-                "  - {:<14} HTTP {} ({}B) {} — {}",
+                "  - {:<14} HTTP {} ({}B) {}{} — {}",
                 item["principal"].as_str().unwrap_or("?"),
                 item["status"].as_u64().unwrap_or(0),
                 item["body_len"].as_u64().unwrap_or(0),
                 flag,
+                gap_str,
                 item["diff_reason"].as_str().unwrap_or("")
             );
         }
@@ -1160,6 +1493,7 @@ pub fn run_http_race(
     headers: &[String],
     body: Option<&str>,
     race_n: usize,
+    cdp_cookies_port: Option<u16>,
     timeout_sec: u64,
     insecure: bool,
     follow: bool,
@@ -1185,6 +1519,18 @@ pub fn run_http_race(
         return 2;
     };
     hdrs.extend(headers.iter().cloned());
+    if let Some(port) = cdp_cookies_port {
+        if !has_header_name(&hdrs, "cookie") {
+            match resolve_cdp_cookie_header(port, &u) {
+                Ok((Some(ch), _)) => hdrs.push(ch),
+                Ok((None, _)) => {}
+                Err(e) => {
+                    eprintln!("[probe http race] cdp-cookies:{port}: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
 
     let n = race_n.clamp(2, 32);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
@@ -1346,5 +1692,42 @@ mod tests {
         assert!(classify_auth_matrix_diff(&base, &leaked).0);
         assert!(!classify_auth_matrix_diff(&base, &denied_403).0);
         assert!(!classify_auth_matrix_diff(&base, &soft_denied_200).0);
+    }
+
+    #[test]
+    fn audits_cors_reflection_and_vary_origin() {
+        let crit = audit_cors_reflection(
+            "https://untrusted.example",
+            &[
+                "Access-Control-Allow-Origin: https://untrusted.example".to_string(),
+                "Access-Control-Allow-Credentials: true".to_string(),
+            ],
+        );
+        let j = crit.join(" | ");
+        assert!(j.contains("CORS-CRITICAL"), "expected CORS-CRITICAL: {j}");
+        assert!(j.contains("Vary: Origin"), "expected missing Vary: {j}");
+
+        let safe = audit_cors_reflection(
+            "https://untrusted.example",
+            &[
+                "Access-Control-Allow-Origin: https://trusted.example".to_string(),
+                "Access-Control-Allow-Credentials: true".to_string(),
+                "Vary: Origin".to_string(),
+            ],
+        );
+        assert!(safe.is_empty(), "safe origin should yield 0 findings: {safe:?}");
+    }
+
+    #[test]
+    fn parses_principal_cdp_specs_and_json_select() {
+        assert_eq!(parse_principal_cdp_spec("owner=9222").unwrap(), ("owner".to_string(), 9222));
+        assert_eq!(parse_principal_cdp_spec("9223").unwrap(), ("cdp:9223".to_string(), 9223));
+        assert!(parse_principal_cdp_spec("owner=0").is_err());
+        assert!(parse_principal_cdp_spec("owner=abc").is_err());
+
+        let body = r#"{"ok":true,"data":{"items":[{"id":1,"role":"a"},{"id":2,"role":"b"}]}}"#;
+        assert_eq!(extract_json_select(body, "data.items[*].id"), Some(json!([1, 2])));
+        assert_eq!(extract_json_select(body, "data.items.1.role"), Some(json!("b")));
+        assert_eq!(extract_json_select(body, "ok"), Some(json!(true)));
     }
 }
