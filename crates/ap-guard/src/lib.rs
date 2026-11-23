@@ -4,6 +4,7 @@ pub mod deps_sec;
 pub mod diff_audit;
 pub mod pack;
 pub mod rules;
+pub mod sanitize;
 pub mod sec;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,14 @@ enum SubCmd {
         max_lines: Option<usize>,
         #[arg(long = "require-header")]
         require_headers: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deterministically redact leaked credentials and defang indirect prompt-injection signals from untrusted files or stdin
+    Scrub {
+        file: Option<PathBuf>,
+        #[arg(long)]
+        stdin: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1458,5 +1467,40 @@ pub fn run_cli(args: &[String]) -> i32 {
             require_headers,
             json,
         } => pack::run_pack_audit(&dir, max_lines, &require_headers, json),
+        SubCmd::Scrub { file, stdin, json } => {
+            let input = if let Some(ref p) = file {
+                match fs::read_to_string(p) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[ap guard scrub] failed to read {}: {e}", p.display());
+                        return 1;
+                    }
+                }
+            } else {
+                let mut buf = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                    eprintln!("[ap guard scrub] failed to read stdin: {e}");
+                    return 1;
+                }
+                let _ = stdin;
+                buf
+            };
+            let rep = sanitize::scrub_untrusted_text(&input);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+            } else {
+                if rep.secrets_redacted > 0 || rep.injections_flagged > 0 {
+                    eprintln!(
+                        "[ap guard scrub] redacted {} secret(s), defanged {} prompt-injection signal(s)",
+                        rep.secrets_redacted, rep.injections_flagged
+                    );
+                }
+                print!("{}", rep.sanitized);
+                if !rep.sanitized.is_empty() && !rep.sanitized.ends_with('\n') {
+                    println!();
+                }
+            }
+            0
+        }
     }
 }

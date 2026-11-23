@@ -45,6 +45,9 @@ struct ExecCli {
     /// Disable automatic sieve compression on large outputs
     #[arg(long)]
     raw: bool,
+    /// Scrub leaked secrets and defang indirect prompt-injection signals from output
+    #[arg(long)]
+    scrub: bool,
     /// Emit structured JSON output
     #[arg(long)]
     json: bool,
@@ -319,35 +322,39 @@ pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
     ))
 }
 
-/// Rewrite MS-DOS `dir /b [path]` or `dir /s /b [path]` (even after leading `cd <dir> &&`)
-/// cleanly to bounded `ap ls` with optional depth for `/s`.
+/// Rewrite MS-DOS `dir /b [flags] [path]` (even after leading `cd <dir> &&`, and including `/a-d`, `/a:-d`, `/o:n`, etc.)
+/// cleanly to bounded `ap ls` with `--depth 3` when `/s` is present. Passes through pipes and globs safely.
 pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    if body.contains('|') || body.contains(';') || body.contains("&&") || body.contains('>') {
+    if has_unsafe_shell_meta(body) {
         return None;
     }
-    let trimmed = body.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower == "dir /b"
-        || lower.starts_with("dir /b ")
-        || lower == "dir /s /b"
-        || lower.starts_with("dir /s /b ")
-        || lower == "dir /b /s"
-        || lower.starts_with("dir /b /s "))
-    {
+    let toks = split_ps_args(body.trim())?;
+    let head = toks.first()?;
+    if !head.eq_ignore_ascii_case("dir") {
         return None;
     }
-    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut bare = false;
     let mut recursive = false;
-    let mut target: Option<&str> = None;
+    let mut target: Option<String> = None;
     for tok in toks.into_iter().skip(1) {
-        if tok.eq_ignore_ascii_case("/s") {
+        if tok.eq_ignore_ascii_case("/b") {
+            bare = true;
+        } else if tok.eq_ignore_ascii_case("/s") {
             recursive = true;
-        } else if tok.starts_with('/') && tok.len() <= 4 {
+        } else if tok.starts_with('/') && tok.len() >= 2 {
             continue;
+        } else if target.is_none() {
+            if tok.contains('*') || tok.contains('?') || tok.contains(',') {
+                return None;
+            }
+            target = Some(tok);
         } else {
-            target = Some(tok.trim_matches('"').trim_matches('\''));
+            return None;
         }
+    }
+    if !bare {
+        return None;
     }
     let ap_bin = std::env::current_exe()
         .ok()
@@ -360,9 +367,10 @@ pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|| "ap".to_string());
     let depth_flag = if recursive { " --depth 3" } else { "" };
-    let tgt_arg = target.unwrap_or(".");
+    let tgt_arg = target.unwrap_or_else(|| ".".to_string());
+    let tgt_esc = tgt_arg.replace('"', "\\\"");
     Some(format!(
-        "{}\"{ap_bin}\" ls \"{tgt_arg}\"{depth_flag}",
+        "{}\"{ap_bin}\" ls \"{tgt_esc}\"{depth_flag}",
         cd_pfx.unwrap_or("")
     ))
 }
@@ -1623,6 +1631,25 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     }
 
+    let (mut combined, mut win_heals_scrub) = (combined, false);
+    if cli.scrub {
+        let rep = ap_guard::sanitize::scrub_untrusted_text(&combined);
+        let total_flagged = rep.secrets_redacted + rep.injections_flagged;
+        if total_flagged > 0 {
+            win_heals_scrub = true;
+            combined = format!(
+                "[ap guard scrub] redacted {} secret(s), defanged {} prompt-injection signal(s)\n{}",
+                rep.secrets_redacted, rep.injections_flagged, rep.sanitized
+            );
+        } else {
+            combined = rep.sanitized;
+        }
+    }
+    if win_heals_scrub {
+        heals.push("scrub");
+        win_heals += 1;
+    }
+
     let raw_len = combined.len() as u64;
     let final_text = if !cli.raw && combined.len() > 1800 {
         let sieve_store = std::env::var("SIEVE_HOME")
@@ -1946,5 +1973,25 @@ mod tests {
         assert!(try_accelerate_tail_slice("tail -f app.log").is_none());
         assert!(try_accelerate_tail_slice("tail -n +5 app.log").is_none());
         assert!(try_accelerate_tail_slice("cat app.log | tail -n 10").is_none());
+
+        // `try_heal_windows_dir_cmd` handles `/a-d`, `/o:n`, quoted paths & `/s /b` while rejecting globs & pipes
+        let (_, h26, tags26) = heal_windows_command("dir /a-d /b src", true, true);
+        assert!(h26.contains("ls \"src\""), "{h26}");
+        assert!(tags26.contains(&"dir-/b->ap-ls"));
+
+        let (_, h27, tags27) = heal_windows_command("dir /s /b /a:-d \"my dir\"", true, true);
+        assert!(h27.contains("ls \"my dir\" --depth 3"), "{h27}");
+        assert!(tags27.contains(&"dir-/b->ap-ls"));
+
+        let (k28, h28, tags28) = heal_windows_command("cd sub && dir /b /o:n .", true, true);
+        assert_eq!(k28, ShellKind::GitBash);
+        assert!(
+            h28.starts_with("cd sub && ") && h28.contains("ls \".\""),
+            "{h28}"
+        );
+        assert!(tags28.contains(&"dir-/b->ap-ls"));
+
+        assert!(try_heal_windows_dir_cmd("dir /b *.rs").is_none());
+        assert!(try_heal_windows_dir_cmd("dir /b | head").is_none());
     }
 }

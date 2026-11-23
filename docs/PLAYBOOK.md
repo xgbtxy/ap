@@ -1,8 +1,8 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.55)
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.56)
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives` (`v2.55`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP `2025-11-25` / `2025-06-18` (`37`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
+`agent-primitives` (`v2.56`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP `2025-11-25` / `2025-06-18` (`37`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
 
 ---
 

@@ -42,7 +42,8 @@ fn mcp_tools_schema() -> Value {
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins" },
                     "jwt": { "type": "boolean", "description": "Decode JWT header/claims/UTC timestamps & defensive security posture flags (accepts file or inline eyJ... token)" },
                     "secrets": { "type": "boolean", "description": "Scan file or archive entry for hardcoded keys/tokens/URI credentials (all values auto-redacted)" },
-                    "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) for fast patch-diffing" }
+                    "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) for fast patch-diffing" },
+                    "scrub": { "type": "boolean", "description": "Scrub leaked secrets (API keys/tokens/PEM/URI creds) and defang indirect prompt-injection payloads before returning output" }
                 }
             }
         },
@@ -541,7 +542,8 @@ fn mcp_tools_schema() -> Value {
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
                     "command": { "type": "string", "description": "Shell command string to execute safely" },
                     "timeout": { "type": "integer", "description": "Timeout in seconds (default: 120)" },
-                    "free_port": { "type": "integer", "description": "Optional local TCP port to free before running" }
+                    "free_port": { "type": "integer", "description": "Optional local TCP port to free before running" },
+                    "scrub": { "type": "boolean", "description": "Scrub leaked secrets (API keys/tokens/PEM/URI creds) and defang indirect prompt-injection payloads from command output" }
                 },
                 "required": ["command"]
             }
@@ -1356,6 +1358,9 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push("--diff".to_string());
                 cli.push(df.trim().to_string());
             }
+            if args.get("scrub").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--scrub".to_string());
+            }
             run_self_captured(&cli, None)
         }
         "ap_query" => {
@@ -1967,6 +1972,9 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if let Some(fp) = args.get("free_port").and_then(Value::as_u64) {
                 cli.push("--free-port".to_string());
                 cli.push(fp.to_string());
+            }
+            if args.get("scrub").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--scrub".to_string());
             }
             run_self_captured(&cli, None)
         }

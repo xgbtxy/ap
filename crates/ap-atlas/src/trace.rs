@@ -109,6 +109,9 @@ fn node_name(node: Node, src: &[u8]) -> Option<String> {
 
 fn collect_called_idents(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
     let k = node.kind();
+    if k.contains("comment") || k.contains("string") || k == "template_string" {
+        return;
+    }
     if matches!(k, "identifier" | "property_identifier" | "field_identifier") {
         if let Ok(s) = node.utf8_text(src) {
             let trimmed = s.trim();
@@ -147,6 +150,35 @@ fn extract_fns(node: Node, src: &str, rel: &str, out: &mut Vec<FnDef>) {
                 end_line: node.end_position().row + 1,
                 called_idents: idents,
             });
+        }
+    } else if node.kind() == "variable_declarator" {
+        if let (Some(nm_n), Some(val_n)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("value"),
+        ) {
+            if matches!(
+                val_n.kind(),
+                "arrow_function" | "function_expression" | "function"
+            ) {
+                if let Ok(name) = nm_n.utf8_text(src.as_bytes()) {
+                    let clean_name = name.trim();
+                    if !clean_name.is_empty() {
+                        let mut idents = Vec::new();
+                        if let Some(body) = val_n.child_by_field_name("body") {
+                            collect_called_idents(body, src.as_bytes(), &mut idents);
+                        } else {
+                            collect_called_idents(val_n, src.as_bytes(), &mut idents);
+                        }
+                        out.push(FnDef {
+                            name: clean_name.to_string(),
+                            file: rel.to_string(),
+                            start_line: node.start_position().row + 1,
+                            end_line: val_n.end_position().row + 1,
+                            called_idents: idents,
+                        });
+                    }
+                }
+            }
         }
     }
     let mut cur = node.walk();
@@ -367,4 +399,39 @@ pub fn render_trace_md(rep: &TraceReport) -> String {
         ));
     }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_resolves_arrow_callers_and_ignores_string_comment_mentions() {
+        let dir = std::env::temp_dir().join(format!("ap_trace_arrow_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("app.ts"),
+            "export function leafCheck(x: number) { return fetch('/api') ? x : 0; }\n\
+             export const arrowCaller = (n: number) => leafCheck(n);\n\
+             export const decoyFn = () => { const msg = 'leafCheck'; // leafCheck\n  return msg; };\n",
+        )
+        .unwrap();
+
+        let rep = trace_symbol_chain(&dir, "leafCheck", 3);
+        assert_eq!(rep.definitions.len(), 1);
+        assert!(
+            rep.upstream_callers
+                .iter()
+                .any(|e| e.symbol == "arrowCaller"),
+            "{:?}",
+            rep.upstream_callers
+        );
+        assert!(
+            !rep.upstream_callers.iter().any(|e| e.symbol == "decoyFn"),
+            "{:?}",
+            rep.upstream_callers
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

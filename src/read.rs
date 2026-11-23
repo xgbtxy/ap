@@ -110,6 +110,9 @@ struct ReadCli {
     /// Maximum characters before smart outline + pagination kicks in
     #[arg(long, default_value_t = 8000)]
     max_chars: usize,
+    /// Scrub leaked secrets and defang indirect prompt-injection signals before output
+    #[arg(long)]
+    scrub: bool,
     /// Emit structured JSON output
     #[arg(long)]
     json: bool,
@@ -750,6 +753,30 @@ fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+fn scrub_rendered_and_json(rendered: &mut String, jv: &mut serde_json::Value) {
+    let rep = ap_guard::sanitize::scrub_untrusted_text(rendered);
+    let total_flagged = rep.secrets_redacted + rep.injections_flagged;
+    let scrubbed = if total_flagged > 0 {
+        format!(
+            "[ap guard scrub] redacted {} secret(s), defanged {} prompt-injection signal(s)\n{}",
+            rep.secrets_redacted, rep.injections_flagged, rep.sanitized
+        )
+    } else {
+        rep.sanitized
+    };
+    *rendered = scrubbed.clone();
+    if let Some(obj) = jv.as_object_mut() {
+        obj.insert("content".to_string(), json!(scrubbed));
+        obj.insert(
+            "scrub".to_string(),
+            json!({
+                "secrets_redacted": rep.secrets_redacted,
+                "injections_flagged": rep.injections_flagged,
+            }),
+        );
+    }
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let mut cli = match ReadCli::try_parse_from(args) {
         Ok(c) => c,
@@ -780,7 +807,10 @@ pub fn run_cli(args: &[String]) -> i32 {
         let mut had_err = false;
         for t in &all_targets {
             match read_single_target(&sub_cli, t.trim()) {
-                Ok((md, jv)) => {
+                Ok((mut md, mut jv)) => {
+                    if sub_cli.scrub {
+                        scrub_rendered_and_json(&mut md, &mut jv);
+                    }
                     rendered_blocks.push(md);
                     json_files.push(jv);
                 }
@@ -809,7 +839,10 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     let norm_target = crate::ls::normalize_cli_path(&cli.target);
     match read_single_target(&cli, norm_target.trim()) {
-        Ok((rendered, jv)) => {
+        Ok((mut rendered, mut jv)) => {
+            if cli.scrub {
+                scrub_rendered_and_json(&mut rendered, &mut jv);
+            }
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&jv).unwrap_or_default());
             } else {

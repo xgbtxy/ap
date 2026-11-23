@@ -1,8 +1,8 @@
-# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.55）
+# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.56）
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives`（`v2.55`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP `2025-11-25` / `2025-06-18`（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
+`agent-primitives`（`v2.56`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP `2025-11-25` / `2025-06-18`（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
 
 ---
 

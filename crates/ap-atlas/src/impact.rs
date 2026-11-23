@@ -13,6 +13,8 @@ pub struct ImpactSite {
     pub file: String,
     pub line: usize,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub enclosing: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +115,81 @@ fn classify_ident_node(node: Node) -> &'static str {
     "ref"
 }
 
+fn find_enclosing_symbol(node: Node, src: &[u8]) -> String {
+    let mut fn_name: Option<String> = None;
+    let mut owner_name: Option<String> = None;
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        let pk = p.kind();
+        let is_own_decl_name = |decl: Node| -> bool {
+            decl.child_by_field_name("name")
+                .map(|nm| nm.start_byte() <= node.start_byte() && node.end_byte() <= nm.end_byte())
+                .unwrap_or(false)
+        };
+        if fn_name.is_none()
+            && matches!(
+                pk,
+                "function_declaration"
+                    | "function_definition"
+                    | "function_item"
+                    | "method_definition"
+                    | "method_declaration"
+            )
+            && !is_own_decl_name(p)
+        {
+            if let Some(nm) = p
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(src).ok())
+            {
+                let clean = nm.trim();
+                if !clean.is_empty() {
+                    fn_name = Some(clean.to_string());
+                }
+            }
+        } else if fn_name.is_none() && pk == "variable_declarator" && !is_own_decl_name(p) {
+            if let (Some(nm), Some(val)) = (
+                p.child_by_field_name("name"),
+                p.child_by_field_name("value"),
+            ) {
+                if matches!(
+                    val.kind(),
+                    "arrow_function" | "function_expression" | "function"
+                ) {
+                    if let Ok(s) = nm.utf8_text(src) {
+                        let clean = s.trim();
+                        if !clean.is_empty() {
+                            fn_name = Some(clean.to_string());
+                        }
+                    }
+                }
+            }
+        } else if owner_name.is_none()
+            && matches!(
+                pk,
+                "class_declaration" | "class_definition" | "struct_item" | "impl_item"
+            )
+            && !is_own_decl_name(p)
+        {
+            let owner_node = p
+                .child_by_field_name("name")
+                .or_else(|| p.child_by_field_name("type"));
+            if let Some(s) = owner_node.and_then(|n| n.utf8_text(src).ok()) {
+                let clean = s.trim();
+                if !clean.is_empty() {
+                    owner_name = Some(clean.to_string());
+                }
+            }
+        }
+        cur = p.parent();
+    }
+    match (owner_name, fn_name) {
+        (Some(o), Some(f)) => format!("{o}.{f}"),
+        (None, Some(f)) => f,
+        (Some(o), None) => o,
+        (None, None) => String::new(),
+    }
+}
+
 fn collect_ast_hits(
     node: Node,
     src: &[u8],
@@ -132,6 +209,7 @@ fn collect_ast_hits(
                 let ln = node.start_position().row + 1;
                 if seen_line_sym.insert((ln, txt.to_string())) {
                     let role = classify_ident_node(node);
+                    let enclosing = find_enclosing_symbol(node, src);
                     let raw_ln = lines.get(ln - 1).copied().unwrap_or("").trim();
                     let snip: String = raw_ln.chars().take(140).collect();
                     out.push(ImpactSite {
@@ -140,6 +218,7 @@ fn collect_ast_hits(
                         file: rel_file.to_string(),
                         line: ln,
                         snippet: snip,
+                        enclosing,
                     });
                 }
             }
@@ -277,8 +356,13 @@ pub fn render_impact_md(rep: &ImpactReport) -> String {
             rep.callers_and_refs.len()
         ));
         for c in rep.callers_and_refs.iter().take(40) {
+            let enc = if c.enclosing.is_empty() {
+                String::new()
+            } else {
+                format!(" (in `{}`)", c.enclosing)
+            };
             out.push(format!(
-                "- `{}:{}` [{}] — `{}`",
+                "- `{}:{}` [{}]{enc} — `{}`",
                 c.file, c.line, c.kind, c.snippet
             ));
         }
@@ -286,11 +370,68 @@ pub fn render_impact_md(rep: &ImpactReport) -> String {
     if !rep.test_refs.is_empty() {
         out.push(format!("\n## Related Tests ({})", rep.test_refs.len()));
         for t in rep.test_refs.iter().take(20) {
+            let enc = if t.enclosing.is_empty() {
+                String::new()
+            } else {
+                format!(" (in `{}`)", t.enclosing)
+            };
             out.push(format!(
-                "- `{}:{}` [{}] — `{}`",
+                "- `{}:{}` [{}]{enc} — `{}`",
                 t.file, t.line, t.kind, t.snippet
             ));
         }
     }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn impact_attributes_enclosing_method_and_impl_while_ignoring_comments() {
+        let dir = std::env::temp_dir().join(format!("ap_impact_enc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/auth.ts"),
+            "export function verifyToken(t: string) { return t.length > 0; }\n\
+             export class AuthHandler {\n\
+               handleLogin(tok: string) {\n\
+                 // verifyToken comment\n\
+                 return verifyToken(tok);\n\
+               }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/engine.rs"),
+            "pub struct Engine;\n\
+             impl Engine {\n\
+               pub fn run(&self) { verifyToken(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let rep = analyze_symbol_impact(&dir, &["verifyToken".to_string()], &[]);
+        assert_eq!(rep.definitions.len(), 1);
+        assert!(rep.definitions[0].enclosing.is_empty());
+        assert!(
+            rep.callers_and_refs
+                .iter()
+                .any(|c| c.file == "src/auth.ts" && c.enclosing == "AuthHandler.handleLogin"),
+            "{:?}",
+            rep.callers_and_refs
+        );
+        assert!(
+            rep.callers_and_refs
+                .iter()
+                .any(|c| c.file == "src/engine.rs" && c.enclosing == "Engine.run"),
+            "{:?}",
+            rep.callers_and_refs
+        );
+        let md = render_impact_md(&rep);
+        assert!(md.contains("(in `AuthHandler.handleLogin`)"), "{md}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
