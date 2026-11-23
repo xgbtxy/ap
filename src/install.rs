@@ -2254,19 +2254,63 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		}}
 	}}
 
-	// 7. Lock UTF-8 output encoding when Git Bash spawns `powershell -Command "..."` (eliminates GBK mojibake)
+	// 7. Lock UTF-8 output encoding & shield PowerShell `$var` when Git Bash spawns `powershell -Command "..."`
 	if (
 		toolName === "bash" &&
 		/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd) &&
 		!/OutputEncoding|UTF8Encoding|-EncodedCommand\b|-enc\b/i.test(cmd)
 	) {{
-		const psFixed = cmd.replace(
-			/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
-			"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
+		let psFixed = cmd;
+		const psDq = cmd.match(
+			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:powershell|pwsh)(?:\.exe)?(?:\s+-[A-Za-z-]+)*\s+-(?:Command|c)\s+)"([\s\S]+)"(\s*)$/i,
 		);
+		if (
+			psDq &&
+			!psDq[3].includes("'") &&
+			!/\$\(/.test(psDq[3]) &&
+			/\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*)/i.test(psDq[3])
+		) {{
+			const inner = psDq[3].replace(/\\"/g, '"').replace(/\\\$/g, "$");
+			psFixed = `${{psDq[1]}}${{psDq[2]}}'[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${{inner}}'${{psDq[4]}}`;
+		}} else {{
+			psFixed = cmd.replace(
+				/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
+				"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
+			);
+		}}
 		if (psFixed !== cmd) {{
 			cmd = psFixed;
 			changed = true;
+		}}
+	}}
+
+	// 8. Auto-switch bare `rg "pattern"` with unbalanced `(` or `[` to `rg -F` (eliminates `rg: regex parse error`)
+	if (
+		toolName === "bash" &&
+		!/[|;&><]/.test(cmd) &&
+		/^\s*(?:rg|rg\.exe)\s+/i.test(cmd) &&
+		!/\s(?:-F|--fixed-strings|-P|--pcre2)\b/.test(cmd)
+	) {{
+		const rgPat = cmd.match(/^\s*(?:rg|rg\.exe)\s+(?:-[A-Za-z]+\s+)*(['"])([\s\S]+?)\1/);
+		if (rgPat) {{
+			const p = rgPat[2];
+			let parens = 0;
+			let brackets = 0;
+			let esc = false;
+			let broken = false;
+			for (let i = 0; i < p.length; i++) {{
+				const ch = p[i];
+				if (esc) {{ esc = false; continue; }}
+				if (ch === "\\") {{ esc = true; continue; }}
+				if (ch === "(") parens++;
+				else if (ch === ")") {{ if (--parens < 0) broken = true; }}
+				else if (ch === "[") brackets++;
+				else if (ch === "]") {{ if (--brackets < 0) broken = true; }}
+			}}
+			if (broken || parens !== 0 || brackets !== 0) {{
+				cmd = cmd.replace(/^\s*(rg(?:\.exe)?)\s+/i, "$1 -F ");
+				changed = true;
+			}}
 		}}
 	}}
 

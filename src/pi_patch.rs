@@ -23,7 +23,7 @@ enum PiSubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Idempotently apply all 11 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
+    /// Idempotently apply all 12 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
     Patch {
         #[arg(long)]
         pi_dir: Option<String>,
@@ -306,6 +306,26 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: "\t\toutput(\"text\", rendered);\n\t}\n\n\tfunction imageUrl(value) {",
                 alt_olds: &[],
                 new: "\t\toutput(\"text\", rendered);\n\t\treturn rendered;\n\t}\n\n\tfunction imageUrl(value) {",
+            },
+        ],
+    },
+    PatchSpec {
+        id: "codemode_result_output_shim",
+        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects lacking .output (eliminates TypeError on r.output.slice())",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_codemode_result_output_shim",
+                rel_hint: None,
+                old: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                alt_olds: &[],
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+            },
+            PatchHunk {
+                id: "prelude_codemode_result_output_shim",
+                rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
+                old: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                alt_olds: &[],
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
         ],
     },
@@ -874,16 +894,20 @@ mod tests {
         fs::write(
             chunks.join("codemode-worker.js"),
             format!(
-                "{}\r\n{}\r\n{}\r\n",
+                "{}\r\n{}\r\n{}\r\n{}\r\n",
                 CODEMODE_BUILTINS_OLD.replace('\n', "\r\n"),
                 CODEMODE_WRAPPER_OLD,
-                PATCH_SPECS[10].hunks[0].old.replace('\n', "\r\n")
+                PATCH_SPECS[10].hunks[0].old.replace('\n', "\r\n"),
+                PATCH_SPECS[11].hunks[0].old.replace('\n', "\r\n")
             ),
         )
         .unwrap();
         fs::write(
             prelude_dir.join("prelude-source.js"),
-            PATCH_SPECS[10].hunks[1].old,
+            format!(
+                "{}\n{}\n",
+                PATCH_SPECS[10].hunks[1].old, PATCH_SPECS[11].hunks[1].old
+            ),
         )
         .unwrap();
         fs::write(core_ext.join("runner.js"), PATCH_SPECS[0].hunks[2].old).unwrap();
@@ -903,7 +927,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 11);
+        assert_eq!(applied["report"]["applied_count"], 12);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));

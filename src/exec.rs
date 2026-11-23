@@ -77,7 +77,7 @@ fn heal_re() -> &'static HealRegexes {
         )
         .unwrap(),
         slow_grep: Regex::new(
-            r#"^\s*grep\s+-[rR][nwiEH]*\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$"#,
+            r#"^\s*grep\s+(-[rR][lnwiEH]*)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$"#,
         )
         .unwrap(),
         py_win_backslash: Regex::new(r#"(?i)\b(?:python3?|py)\s+-c\s+.*['"][A-Za-z]:\\"#).unwrap(),
@@ -88,22 +88,23 @@ fn heal_re() -> &'static HealRegexes {
     })
 }
 
-/// Detect bare recursive GNU `grep -rn <pat> [path]` (which hangs 60-180s on large Windows trees)
-/// and rewrite cleanly to sub-50ms `ap search <pat> <path>`.
+/// Detect bare recursive GNU `grep -rn` / `grep -rl` `<pat> [path]` (which hangs 60-180s on large Windows trees)
+/// and rewrite cleanly to sub-50ms `ap search` (or `ap search --files-only` when `-l` is present).
 pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
     if raw.contains('|') || raw.contains(';') || raw.contains("&&") || raw.contains('>') {
         return None;
     }
     let cap = heal_re().slow_grep.captures(raw)?;
+    let flags = cap.get(1).map(|m| m.as_str()).unwrap_or("");
     let pat = cap
-        .get(1)
-        .or_else(|| cap.get(2))
+        .get(2)
         .or_else(|| cap.get(3))
+        .or_else(|| cap.get(4))
         .map(|m| m.as_str())?;
     let target = cap
-        .get(4)
-        .or_else(|| cap.get(5))
+        .get(5)
         .or_else(|| cap.get(6))
+        .or_else(|| cap.get(7))
         .map(|m| m.as_str())
         .unwrap_or(".");
     let ap_bin = std::env::current_exe()
@@ -117,7 +118,37 @@ pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|| "ap".to_string());
     let pat_esc = pat.replace('"', "\\\"");
-    Some(format!("\"{ap_bin}\" search \"{pat_esc}\" \"{target}\""))
+    if flags.contains('l') {
+        Some(format!(
+            "\"{ap_bin}\" search --files-only \"{pat_esc}\" \"{target}\""
+        ))
+    } else {
+        Some(format!("\"{ap_bin}\" search \"{pat_esc}\" \"{target}\""))
+    }
+}
+
+/// Retry bare `rg <pattern>` commands that exited 2 with `rg: regex parse error` as literal `rg -F <pattern>`.
+pub fn try_build_rg_fixed_retry(raw: &str) -> Option<String> {
+    if raw.contains('|') || raw.contains(';') || raw.contains("&&") || raw.contains('>') {
+        return None;
+    }
+    let trimmed = raw.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let prefix_len = if lower.starts_with("rg.exe ") || lower.starts_with("rg.exe\t") {
+        6
+    } else if lower.starts_with("rg ") || lower.starts_with("rg\t") {
+        2
+    } else {
+        return None;
+    };
+    let tail = &trimmed[prefix_len..];
+    if tail
+        .split_whitespace()
+        .any(|t| t == "-F" || t == "--fixed-strings" || t == "-P" || t == "--pcre2")
+    {
+        return None;
+    }
+    Some(format!("{} -F{tail}", &trimmed[..prefix_len]))
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -669,6 +700,39 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         combined.push_str(&err_str);
     }
+    let mut exit_code = exit_code;
+    let mut heals = heals;
+    if exit_code == 2 && !timed_out && shell_str.is_some() && combined.contains("regex parse error")
+    {
+        if let Some(retry_raw) = try_build_rg_fixed_retry(&label) {
+            let (mut rcmd, _) = build_shell_command(&retry_raw);
+            let (aug2, _) = build_augmented_path();
+            rcmd.current_dir(&cli.cwd)
+                .env("PATH", aug2)
+                .env("PYTHONUTF8", "1")
+                .env("PYTHONIOENCODING", "utf-8")
+                .env("LC_ALL", "C.UTF-8")
+                .env("LANG", "C.UTF-8")
+                .stdin(Stdio::null());
+            if let Ok(rout) = rcmd.output() {
+                let r_code = rout.status.code().unwrap_or(1);
+                let mut r_comb = String::from_utf8_lossy(strip_bom(&rout.stdout)).to_string();
+                let r_err = String::from_utf8_lossy(strip_bom(&rout.stderr));
+                if !r_err.is_empty() {
+                    if !r_comb.is_empty() && !r_comb.ends_with('\n') {
+                        r_comb.push('\n');
+                    }
+                    r_comb.push_str(&r_err);
+                }
+                exit_code = r_code;
+                combined = format!(
+                    "[ap exec auto-healed: rg regex parse error -> retried with -F fixed-strings]\n{r_comb}"
+                );
+                heals.push("rg-regex->-F");
+                win_heals += 1;
+            }
+        }
+    }
     if timed_out {
         combined.push_str(&format!(
             "\n[ap exec] TIMEOUT after {}s — killed orphaned process tree cleanly.\n",
@@ -793,5 +857,18 @@ mod tests {
         assert!(h6.contains(r"r'C:\Users\demo\a.txt'"));
         assert!(h6.contains(r"'C:\\Users\\demo\\b.txt'"));
         assert!(!tags6.contains(&"py-win-backslash->slash"));
+
+        // Recursive `grep -rl` accelerates directly to `ap search --files-only`
+        let (_, h7, tags7) = heal_windows_command("grep -rl 'authToken' src", true, true);
+        assert!(h7.contains("search --files-only \"authToken\" \"src\""));
+        assert!(tags7.contains(&"slow-grep->ap-search"));
+
+        // `try_build_rg_fixed_retry` inserts `-F` cleanly on bare `rg` commands only
+        assert_eq!(
+            try_build_rg_fixed_retry("rg \"foo(bar\" src").as_deref(),
+            Some("rg -F \"foo(bar\" src")
+        );
+        assert!(try_build_rg_fixed_retry("rg -F \"foo(bar\" src").is_none());
+        assert!(try_build_rg_fixed_retry("rg \"foo\" src | head -n 5").is_none());
     }
 }

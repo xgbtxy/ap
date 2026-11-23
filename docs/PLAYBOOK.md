@@ -1,4 +1,4 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.40)
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.41)
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -22,7 +22,7 @@ curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | ie
 # Onboard ONLY the current directory (or enable optional Pi runtime patches):
 ap init --here -a opencode
 ap init --here --with-hooks --with-mcp
-ap pi patch           # Applies 11 idempotent Pi v1.5+/v1.6 runtime patches (see docs/PI_RUNTIME.md)
+ap pi patch           # Applies 12 idempotent Pi v1.5+/v1.6 runtime patches (see docs/PI_RUNTIME.md)
 
 # Clean 1-command uninstall (restores original configs untouched):
 ap uninstall          # or: ap uninstall --here
@@ -31,7 +31,7 @@ ap uninstall          # or: ap uninstall --here
 ### Supported Agents Out-of-the-Box (`$0` Free & Commercial)
 - **OpenCode (`opencode`)**: Auto-wires `"agent-primitives"` MCP into `~/.config/opencode/opencode.json` (or repo `opencode.json`). Free models (`opencode/big-pickle`, `glm-5.3-flash-free`, `deepseek-flash`) call native MCP tools with zero shell quoting.
 - **Qwen Code (`qwen`) & Google Gemini CLI (`gemini`)**: Auto-wires `"trust": true` MCP config into `~/.qwen/settings.json` & `~/.gemini/settings.json`.
-- **Pi (`pi` / `pi-coding-agent`) & Goose (`goose`)**: Syncs `~/.pi/agent/skills/`, `"exposure": "codemode"` in `mcp.json`, zero-prompt-bloat `zz-ap-accelerator.ts`, plus **11 idempotent runtime patches** via `ap pi status|patch|restore`.
+- **Pi (`pi` / `pi-coding-agent`) & Goose (`goose`)**: Syncs `~/.pi/agent/skills/`, `"exposure": "codemode"` in `mcp.json`, zero-prompt-bloat `zz-ap-accelerator.ts`, plus **12 idempotent runtime patches** via `ap pi status|patch|restore`.
 - **Claude Code (`claude`), OpenAI Codex (`codex`), Antigravity (`agy`), Grok (`grok`), Cursor, Windsurf, VS Code, Claude Desktop, OpenClaw, Hermes**: Auto-wires MCP, minimal routing rules, and `<2ms` `exit 2` / JSON hooks with `rtk`-style test output auto-sieving.
 
 ---
@@ -45,7 +45,7 @@ ap uninstall          # or: ap uninstall --here
 | **AST Edit & Refactor** (`ap_edit`, `ap splice view/apply/rename/check`, `ap undo`) | Chain-of-resiliency patching (strips accidental read gutters, `@L<start>-L<end>` disambiguation, smart-quote rescue + candidate diagnostics, 4-tier indent/blank-line + Hashline `L:HH\|`), Tree-sitter `rename` ignoring comments/strings, 6-lang + JSON/JSONC/TOML AST gate, `<5ms` linker & non-Git snapshots. | `0.7–5 ms` |
 | **Runtime, Network & UI QA** (`ap_smoke`, `ap probe smoke/ui/cdp/http/ws/tls/tcp/listen/ps/fs/mutate/fuzz`) | Ephemeral `PORT` + process-tree cleanup; headless Edge/Chrome dual-viewport UI/network audit; non-destructive live `cdp --watch-ms`; single/batch/race/CORS/CDP-session `http` QA; RFC 6455 `ws --origin-matrix`; AST mutation testing & chaos fuzzing. | `0.2–4.5 s` |
 | **Deep Verify, Guard, Shell & Sieve** (`ap_verify`, `ap guard verify --deep/sec/diff/pack`, `ap exec`, `ap sieve`) | 1-call fused 6-gate verification (tests + vacuous/`.only` block + OWASP C/C++/Java/TS/Py/Go/Rust `sec` + semantic `diff` + cross-file contracts + active-file `mutate`), `3x` doom-loop breaker, Windows UTF-8/long-`PATH` healing & FTS5 log compression (`-98.8%`). | `<2 ms` (+ tests) |
-| **Pi Runtime, Baton & Recall** (`ap pi`, `ap baton frontier/claim/dedup`, `ap recall`) | 11 idempotent Pi v1.5+/v1.6 runtime patches (`codemode` `text()` return, keep-alive, serial shell barrier, CJK compaction, tool-order cache lock), orthogonal exploration frontier, atomic TTL leases, and `3.3ms` CJK+BM25 recall. | `<15 ms` |
+| **Pi Runtime, Baton & Recall** (`ap pi`, `ap baton frontier/claim/dedup`, `ap recall`) | 12 idempotent Pi v1.5+/v1.6 runtime patches (`codemode` `text()`/`.output` shim, keep-alive, serial shell barrier, CJK compaction, tool-order cache lock), orthogonal exploration frontier, atomic TTL leases, and `3.3ms` CJK+BM25 recall. | `<15 ms` |
 
 ---
 

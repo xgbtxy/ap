@@ -8,7 +8,7 @@
 # Inspect detected @earendil-works/pi-coding-agent package and patch status
 ap pi status
 
-# Apply all 11 generic runtime patches idempotently (originals backed up to ~/.ap/pi-backups/<version>/)
+# Apply all 12 generic runtime patches idempotently (originals backed up to ~/.ap/pi-backups/<version>/)
 ap pi patch
 
 # Preview without modifying files
@@ -20,7 +20,7 @@ ap pi restore
 
 Pass `--pi-dir <path>` (or set `PI_PACKAGE_DIR`) if Pi is installed in a non-standard location.
 
-## Maintained Generic Pi v1.5+ Runtime Patches (11/11)
+## Maintained Generic Pi v1.5+ Runtime Patches (12/12)
 
 1. **`before_agent_start_entries`**: Extends `emitBeforeAgentStart` & `AgentSession._prepareRun` so `before_agent_start` handlers can return `entries?: SessionBoundaryDraft[]` for zero-latency programmatic clean-slate compaction without breaking KV-cache prefix reuse.
 2. **`windows_python_utf8`**: Auto-injects `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`, `LANG=C.UTF-8`, and `LC_ALL=C.UTF-8` into Pi's Windows subprocess environment to eliminate GBK codec crashes.
@@ -33,6 +33,7 @@ Pass `--pi-dir <path>` (or set `PI_PACKAGE_DIR`) if Pi is installed in a non-sta
 9. **`cjk_calibrated_compaction_budget`**: Weights CJK/fullwidth characters and calibrates `keepRecentTokens` against provider-reported `prompt_tokens` to prevent 2–3x compaction overshoot.
 10. **`deterministic_tool_order`**: Sorts resolved transcript tools deterministically by name so MCP reconnects or reloads never bust prompt KV-cache.
 11. **`codemode_text_returns_rendered`**: Returns the rendered string from `codemode`'s `text(value)` helper (both bundle and prelude) to eliminate `TypeError: cannot read property 'slice' of undefined`.
+12. **`codemode_result_output_shim`**: Attaches a non-enumerable `.output` string shim on resolved `codemode` tool-result objects (in both bundle worker and prelude) so `r.output.slice(...)` never throws `TypeError` when downstream callers expect `.output` alongside rendered text.
 
 ## Pairing with Guard-Aware `ap atlas surface` & `ap baton frontier`
 

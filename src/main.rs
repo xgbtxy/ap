@@ -6,6 +6,7 @@ pub mod binary;
 pub mod exec;
 pub mod inspect;
 pub mod install;
+pub mod ls;
 pub mod mcp;
 pub mod pi_patch;
 pub mod query;
@@ -68,6 +69,8 @@ enum TopCmd {
     },
     /// Read any file (.docx, .xlsx, .pptx, .pdf, .csv, GBK/UTF-16) or URL without context overflow
     Read { target: Option<String> },
+    /// Fast, token-efficient directory listing with depth, sorting, filters & Windows/Git-Bash path support
+    Ls { path: Option<String> },
     /// Run exact SQL joins & aggregations across .xlsx, GBK/UTF-8 .csv/.tsv & .json files
     Query {
         #[arg(short = 'f', long = "file")]
@@ -123,6 +126,19 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
     let from_mcp = std::env::var("AP_MCP_CHILD").ok().as_deref() == Some("1");
     let code = match name {
         "read" => return Some(read::run_cli(&sub_argv)),
+        "ls" => return Some(ls::run_cli(&sub_argv)),
+        "bin" | "pe_info" | "pe" => {
+            sub_argv[0] = "read".to_string();
+            return Some(read::run_cli(&sub_argv));
+        }
+        "cdp" | "http" | "ws" | "tls" | "tcp" | "listen" | "ports" | "ps" | "ui" | "smoke"
+        | "fuzz" | "mutate" => {
+            let mut probe_argv = Vec::with_capacity(tail_args.len() + 2);
+            probe_argv.push("probe".to_string());
+            probe_argv.push(name.to_string());
+            probe_argv.extend_from_slice(tail_args);
+            return Some(ap_probe::run_cli(&probe_argv));
+        }
         "query" => return Some(query::run_cli(&sub_argv)),
         "search" => return Some(search::run_cli(&sub_argv)),
         "exec" => return Some(exec::run_cli(&sub_argv)),
@@ -236,6 +252,7 @@ fn main() {
         TopCmd::Stats { .. } => stats::run_cli(&args[1..]),
         TopCmd::Doctor { json } => install::cmd_doctor(json),
         TopCmd::Read { .. } => read::run_cli(&args[1..]),
+        TopCmd::Ls { .. } => ls::run_cli(&args[1..]),
         TopCmd::Query { .. } => query::run_cli(&args[1..]),
         TopCmd::Search { .. } => search::run_cli(&args[1..]),
         TopCmd::Exec { .. } => exec::run_cli(&args[1..]),

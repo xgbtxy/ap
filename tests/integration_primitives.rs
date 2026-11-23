@@ -6393,7 +6393,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 11);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 12);
     }
 }
 
@@ -6642,4 +6642,242 @@ fn test_v240_mcp_profiles_ast_code_search_and_resilient_splice() {
     let call_sc = &def_resps[2]["result"]["structuredContent"];
     assert_eq!(call_sc["ok"], true);
     assert_eq!(call_sc["matches"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_v241_ls_aliases_read_section_search_ergonomics_and_exec_rg_heal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src/nested/deep")).unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+
+    fs::write(
+        root.join("src/small.rs"),
+        "pub fn alpha() { /* FN_TARGET(X) */ }\n// ALPHA_NEEDLE\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/big.rs"),
+        format!(
+            "pub fn beta() {{\n// fn_target(x)\n{}\n}}\n",
+            "// pad\n".repeat(40)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/app.ts"),
+        "export const tsNeedle = 'fn_target(x)';\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/nested/deep/leaf.txt"), "deep leaf content\n").unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "console.log(1);\n").unwrap();
+    fs::write(root.join(".hidden"), "secret\n").unwrap();
+
+    // 1. Native `ap ls` (depth, sort size, files-only, ext filter, limit/max, prune vendor/hidden)
+    let ls_out = run_ap(
+        root,
+        &[
+            "ls",
+            "--depth",
+            "2",
+            "--sort",
+            "size",
+            "--files-only",
+            "--ext",
+            "rs,ts",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(ls_out.status.success(), "{:?}", ls_out);
+    let ls_json: Value = serde_json::from_slice(&ls_out.stdout).unwrap();
+    assert_eq!(ls_json["ok"], true);
+    let entries = ls_json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3, "{ls_json}");
+    assert_eq!(entries[0]["path"], "src/big.rs");
+    assert!(entries.iter().all(|e| e["kind"] == "file"));
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e["path"].as_str().unwrap_or("").contains("node_modules")),
+        "{ls_json}"
+    );
+
+    let ls_cap = run_ap(
+        root,
+        &["ls", "--depth", "1", "--max", "1", "--json"],
+        None,
+        &[],
+    );
+    assert!(ls_cap.status.success());
+    let cap_json: Value = serde_json::from_slice(&ls_cap.stdout).unwrap();
+    assert_eq!(cap_json["shown"], 1);
+    assert!(cap_json["total"].as_u64().unwrap() >= 2);
+
+    // 2. Top-level CLI aliases (`bin` -> `read`, `ports` -> `probe ports`) + C++ `.cpp` outline
+    fs::write(
+        root.join("widget.cpp"),
+        "#include <string>\nnamespace engine {\nclass Widget {\npublic:\n  int id() const { return 1; }\n};\nint compute_hash(int x) {\n  return x * 31;\n}\n}\n",
+    )
+    .unwrap();
+    let bin_alias = run_ap(root, &["bin", "widget.cpp", "--outline"], None, &[]);
+    assert!(bin_alias.status.success());
+    let cpp_out = String::from_utf8_lossy(&bin_alias.stdout);
+    assert!(
+        cpp_out.contains("Widget") && cpp_out.contains("compute_hash"),
+        "{cpp_out}"
+    );
+
+    let ports_alias = run_ap(root, &["ports", "--json"], None, &[]);
+    assert!(
+        ports_alias.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ports_alias.stderr)
+    );
+
+    // 3. `ap read` Markdown `--section`/`--heading` extraction & regex literal fallback w/ `--around`/`--max-hits`
+    let md_doc = format!(
+        "# Architecture\nIntro text {pad}\n## Deployment\nDEPLOY_TOKEN_V241\n### Substep\nSUBSTEP_OK\n## Security\nNEXT_SECTION_DO_NOT_LEAK\n",
+        pad = "word ".repeat(120)
+    );
+    fs::write(root.join("docs/guide.md"), md_doc).unwrap();
+    let sec_out = run_ap(
+        root,
+        &[
+            "read",
+            "docs/guide.md",
+            "--section",
+            "Deployment",
+            "--max-chars",
+            "4000",
+        ],
+        None,
+        &[],
+    );
+    assert!(sec_out.status.success());
+    let sec_s = String::from_utf8_lossy(&sec_out.stdout);
+    assert!(
+        sec_s.contains("DEPLOY_TOKEN_V241") && sec_s.contains("SUBSTEP_OK"),
+        "{sec_s}"
+    );
+    assert!(!sec_s.contains("NEXT_SECTION_DO_NOT_LEAK"), "{sec_s}");
+
+    fs::write(
+        root.join("logs.txt"),
+        "before_1\nmatch one foo(bar here\nafter_1\nbefore_2\nmatch two foo(bar here\nafter_2\n",
+    )
+    .unwrap();
+    let q_out = run_ap(
+        root,
+        &[
+            "read",
+            "logs.txt",
+            "--query",
+            "foo(bar",
+            "--around",
+            "1",
+            "--max-hits",
+            "1",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        q_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&q_out.stderr)
+    );
+    let q_s = String::from_utf8_lossy(&q_out.stdout);
+    assert!(
+        q_s.contains("before_1") && q_s.contains("match one foo(bar"),
+        "{q_s}"
+    );
+    assert!(!q_s.contains("match two foo(bar"), "{q_s}");
+
+    // 4. `ap search` ergonomics (`-F`, `-i`, `-n`, `--max`, `--include`)
+    let srch = run_ap(
+        root,
+        &[
+            "search",
+            "fn_target(x",
+            ".",
+            "-F",
+            "-i",
+            "-n",
+            "--max",
+            "1",
+            "--include",
+            "*.rs",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        srch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&srch.stderr)
+    );
+    let srch_json: Value = serde_json::from_slice(&srch.stdout).unwrap();
+    assert_eq!(srch_json["ok"], true);
+    let hits = srch_json["matches"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{srch_json}");
+    let hit_file = hits[0]["file"].as_str().unwrap_or("");
+    assert!(hit_file.ends_with(".rs"), "{srch_json}");
+
+    // 5. `ap exec -c "grep -rl ..."` auto-heal -> `ap search --files-only`
+    let grep_rl = run_ap(root, &["exec", "-c", "grep -rl ALPHA_NEEDLE ."], None, &[]);
+    assert!(
+        grep_rl.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&grep_rl.stderr)
+    );
+    let grep_s = String::from_utf8_lossy(&grep_rl.stdout);
+    assert!(grep_s.contains("small.rs"), "{grep_s}");
+
+    // 6. MCP `ap_read` (`section`) and `ap_search` (`fixed_strings` + `ignore_case` + `include`) via `ap_call`
+    let mut mcp_cmd = std::process::Command::new(ap_bin());
+    mcp_cmd
+        .args(["mcp", "--profile", "deferred"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = mcp_cmd.spawn().unwrap();
+    let rpc_in = format!(
+        "{}\n{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ap_call", "arguments": {"tool": "ap_read", "arguments": {"target": "docs/guide.md", "section": "Deployment", "max_chars": 4000}}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_call", "arguments": {"tool": "ap_search", "arguments": {"pattern": "fn_target(x", "path": ".", "fixed_strings": true, "ignore_case": true, "include": ["*.rs"], "max_hits": 5, "json": true}}}}),
+    );
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(rpc_in.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let mcp_out = child.wait_with_output().unwrap();
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(resps.len(), 2);
+    let r1 = &resps[0]["result"]["structuredContent"];
+    assert_eq!(r1["ok"], true);
+    assert!(r1["text"]
+        .as_str()
+        .unwrap_or("")
+        .contains("DEPLOY_TOKEN_V241"));
+    assert!(!r1["text"]
+        .as_str()
+        .unwrap_or("")
+        .contains("NEXT_SECTION_DO_NOT_LEAK"));
+    let r2 = &resps[1]["result"]["structuredContent"];
+    assert_eq!(r2["ok"], true);
+    assert_eq!(r2["matches"].as_array().unwrap().len(), 2, "{r2}");
 }

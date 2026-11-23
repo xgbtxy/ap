@@ -80,6 +80,15 @@ struct ReadCli {
     /// Patch-diff this binary/archive (PE/ELF/Go/.asar/.zip/.jar/.vsix) against an older file path
     #[arg(long)]
     diff: Option<String>,
+    /// Extract ONLY the matching Markdown `# Heading` section cleanly (substring match, auto-ends at next heading of same/higher level)
+    #[arg(long, alias = "heading")]
+    section: Option<String>,
+    /// Context window for `--query` (bytes on each side for minified files, lines for normal files)
+    #[arg(long, default_value_t = 0)]
+    around: usize,
+    /// Maximum `--query` match windows/blocks to return (default: 12 minified / 25 normal)
+    #[arg(long, alias = "max", default_value_t = 0)]
+    max_hits: usize,
     /// Maximum characters before smart outline + pagination kicks in
     #[arg(long, default_value_t = 8000)]
     max_chars: usize,
@@ -727,8 +736,10 @@ pub fn run_cli(args: &[String]) -> i32 {
     };
 
     if !cli.extra_targets.is_empty() {
-        let mut all_targets = vec![cli.target.clone()];
-        all_targets.extend(cli.extra_targets.iter().take(11).cloned());
+        let mut all_targets = vec![crate::ls::normalize_cli_path(&cli.target)];
+        for t in cli.extra_targets.iter().take(11) {
+            all_targets.push(crate::ls::normalize_cli_path(t));
+        }
         let per_budget = (cli.max_chars / all_targets.len().max(1)).max(1600);
         let mut sub_cli = cli;
         sub_cli.max_chars = per_budget;
@@ -766,7 +777,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         return if had_err { 1 } else { 0 };
     }
 
-    match read_single_target(&cli, cli.target.trim()) {
+    let norm_target = crate::ls::normalize_cli_path(&cli.target);
+    match read_single_target(&cli, norm_target.trim()) {
         Ok((rendered, jv)) => {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&jv).unwrap_or_default());
@@ -782,6 +794,86 @@ pub fn run_cli(args: &[String]) -> i32 {
             code
         }
     }
+}
+
+fn scan_cpp_outline_lines(source: &str) -> Vec<String> {
+    static CPP_RE: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (type_re, fn_re) = CPP_RE.get_or_init(|| {
+        let t = Regex::new(
+            r"^\s*(?:template\s*<[^>]+>\s*)?(class|struct|enum|namespace)\s+([A-Za-z_]\w*)",
+        )
+        .unwrap();
+        let f = Regex::new(
+            r"^(?:[\w:\*&\s<>]+?)\b([A-Za-z_~]\w*(?:::[A-Za-z_~]\w*)?)\s*\([^;]*\)\s*(?:const\s*)?(?:override\s*)?(?:noexcept\s*)?(?:\{|$)",
+        )
+        .unwrap();
+        (t, f)
+    });
+    let mut out = Vec::new();
+    for (idx, raw_ln) in source.lines().enumerate() {
+        let trimmed = raw_ln.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(cap) = type_re.captures(raw_ln) {
+            out.push(format!("L{}: {} {}", idx + 1, &cap[1], &cap[2]));
+            continue;
+        }
+        if !raw_ln.starts_with(' ') && !raw_ln.starts_with('\t') && raw_ln.contains('{') {
+            if let Some(cap) = fn_re.captures(trimmed) {
+                let sym = &cap[1];
+                if !matches!(sym, "if" | "for" | "while" | "switch" | "catch" | "return") {
+                    out.push(format!("L{}: fn {sym}", idx + 1));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn extract_md_section(
+    all_lines: &[&str],
+    query: &str,
+) -> Result<(usize, usize, String), Vec<String>> {
+    let q_low = query.trim().to_ascii_lowercase();
+    let mut headings: Vec<(usize, usize, String)> = Vec::new();
+    let mut in_fence = false;
+    for (idx, ln) in all_lines.iter().enumerate() {
+        let trimmed = ln.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+            let title = trimmed[hashes..].trim().to_string();
+            headings.push((idx, hashes, title));
+        }
+    }
+    let hit = headings
+        .iter()
+        .position(|(_, _, t)| t.to_ascii_lowercase().contains(&q_low));
+    let Some(h_pos) = hit else {
+        return Err(headings
+            .into_iter()
+            .take(30)
+            .map(|(i, lvl, t)| format!("L{}: {} {t}", i + 1, "#".repeat(lvl)))
+            .collect());
+    };
+    let (start_0, start_lvl, _) = &headings[h_pos];
+    let end_0 = headings[h_pos + 1..]
+        .iter()
+        .find(|(_, lvl, _)| *lvl <= *start_lvl)
+        .map(|(i, _, _)| *i)
+        .unwrap_or(all_lines.len());
+    let slice = (*start_0..end_0)
+        .map(|k| format!("{:5}: {}", k + 1, all_lines[k]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((*start_0 + 1, end_0.max(*start_0 + 1), slice))
 }
 
 fn read_single_target(
@@ -1346,6 +1438,17 @@ fn read_single_target(
                     lines_out.join("\n")
                 }
             )
+        } else if matches!(ext.as_str(), "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx") {
+            let cpp_syms = scan_cpp_outline_lines(&converted);
+            format!(
+                "# OUTLINE `{label}` [{} C/C++ outline symbol(s) across {total_lines} lines | {format_tag}]\n{}",
+                cpp_syms.len(),
+                if cpp_syms.is_empty() {
+                    "*(no C/C++ outline symbols detected)*".to_string()
+                } else {
+                    cpp_syms.iter().take(100).cloned().collect::<Vec<_>>().join("\n")
+                }
+            )
         } else {
             let headings: Vec<String> = all_lines
                 .iter()
@@ -1363,6 +1466,23 @@ fn read_single_target(
                     headings.join("\n")
                 }
             )
+        }
+    } else if let Some(ref sec_q) = cli.section {
+        match extract_md_section(&all_lines, sec_q) {
+            Ok((s, e, slice)) => format!(
+                "# READ `{label}` [section='{sec_q}' | L{s}-L{e} of {total_lines} | {format_tag}]\n{slice}"
+            ),
+            Err(avail) => {
+                let hint = if avail.is_empty() {
+                    "no Markdown headings found".to_string()
+                } else {
+                    avail.join("; ")
+                };
+                return Err((
+                    1,
+                    format!("[ap read] section `{sec_q}` not found in `{label}` (available: {hint})"),
+                ));
+            }
         }
     } else if let Some(ref sym_spec) = cli.symbol {
         if ap_splice::ast::language_for_ext(&ext).is_none() {
@@ -1513,10 +1633,16 @@ fn read_single_target(
             let q_re = Regex::new(&format!("(?i){q}"))
                 .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
                 .unwrap();
+            let around = if cli.around > 0 { cli.around } else { 240 };
+            let limit = if cli.max_hits > 0 {
+                cli.max_hits.min(100)
+            } else {
+                12
+            };
             let mut hits = Vec::new();
-            for m in q_re.find_iter(&converted).take(12) {
-                let s = floor_boundary(&converted, m.start().saturating_sub(200));
-                let e = ceil_boundary(&converted, m.end().saturating_add(240));
+            for m in q_re.find_iter(&converted).take(limit) {
+                let s = floor_boundary(&converted, m.start().saturating_sub(around));
+                let e = ceil_boundary(&converted, m.end().saturating_add(around));
                 let raw_snip = &converted[s..e];
                 let body = if cli.pretty {
                     crate::binary::pretty_format_js_snippet(raw_snip)
@@ -1536,18 +1662,30 @@ fn read_single_target(
                 }
             )
         } else {
-            let q_low = q.to_ascii_lowercase();
+            let q_re = Regex::new(&format!("(?i){q}"))
+                .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
+                .unwrap();
+            let ctx_n = if cli.around > 0 {
+                cli.around.min(20)
+            } else {
+                1
+            };
+            let limit = if cli.max_hits > 0 {
+                cli.max_hits.min(100)
+            } else {
+                25
+            };
             let mut hits = Vec::new();
             for (idx, ln) in all_lines.iter().enumerate() {
-                if ln.to_ascii_lowercase().contains(&q_low) {
-                    let s = idx.saturating_sub(1);
-                    let e = (idx + 1).min(total_lines.saturating_sub(1));
+                if q_re.is_match(ln) {
+                    let s = idx.saturating_sub(ctx_n);
+                    let e = (idx + ctx_n).min(total_lines.saturating_sub(1));
                     let ctx = (s..=e)
                         .map(|k| format!("  {}: {}", k + 1, all_lines[k]))
                         .collect::<Vec<_>>()
                         .join("\n");
                     hits.push(ctx);
-                    if hits.len() >= 25 {
+                    if hits.len() >= limit {
                         break;
                     }
                 }
@@ -1602,6 +1740,22 @@ fn read_single_target(
                     "AST Symbol Outline ({} total):\n{}{more}\n\n",
                     syms.len(),
                     sym_lines.join("\n")
+                )
+            }
+        } else if matches!(ext.as_str(), "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx") {
+            let cpp_syms = scan_cpp_outline_lines(&converted);
+            if cpp_syms.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "C/C++ Outline ({} total; pass `--outline`):\n{}\n\n",
+                    cpp_syms.len(),
+                    cpp_syms
+                        .iter()
+                        .take(25)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 )
             }
         } else {

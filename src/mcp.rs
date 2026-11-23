@@ -17,9 +17,12 @@ fn mcp_tools_schema() -> Value {
                         "items": { "type": "string" }
                     },
                     "symbol": { "type": "string", "description": "Optional Tree-sitter AST symbol name(s) to extract cleanly (comma-separated, e.g. 'Engine.commit,parse_spec')" },
-                    "outline": { "type": "boolean", "description": "Emit ONLY the compact Tree-sitter AST symbol outline (for code) or heading outline (for Markdown)" },
+                    "outline": { "type": "boolean", "description": "Emit ONLY the compact Tree-sitter AST symbol outline (for code), C/C++ outline, or heading outline (for Markdown)" },
+                    "section": { "type": "string", "description": "Optional Markdown heading substring to extract ONLY that `# Heading` section cleanly" },
                     "lines": { "type": "string", "description": "Optional line window or comma-separated multi-ranges, e.g. '1-30,120-160'" },
                     "query": { "type": "string", "description": "Optional keyword/regex filter for rows, minified slices, archive entries, or binary strings" },
+                    "around": { "type": "integer", "description": "Optional `--query` context window (bytes each side for minified bundles, lines for normal files)" },
+                    "max_hits": { "type": "integer", "description": "Optional max `--query` match windows/blocks to return" },
                     "sheet": { "type": "string", "description": "Optional worksheet filter for .xlsx" },
                     "entry": { "type": "string", "description": "Optional archive entry path inside .asar/.zip/.vsix/.jar/.apk/.whl" },
                     "offset": { "type": "string", "description": "Optional byte offset or comma-separated multi-offsets (e.g. '18000,95000') for slicing minified bundles in 1 call" },
@@ -78,6 +81,13 @@ fn mcp_tools_schema() -> Value {
                     "context": { "type": "integer", "description": "Show N surrounding lines before & after each match (like `rg -C N`)" },
                     "files_only": { "type": "boolean", "description": "Return only unique matching file paths (like `rg -l`)" },
                     "count": { "type": "boolean", "description": "Return per-file match counts (like `rg -c`)" },
+                    "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal fixed string instead of regex (like `rg -F`)" },
+                    "ignore_case": { "type": "boolean", "description": "Force case-insensitive matching even with uppercase chars (like `rg -i`)" },
+                    "include": {
+                        "type": "array",
+                        "description": "Include only matching glob/path filters (e.g. ['*.rs', 'src/*'])",
+                        "items": { "type": "string" }
+                    },
                     "code_only": { "type": "boolean", "description": "Skip non-code doc/config files AND skip matches inside Tree-sitter comments & string literals" },
                     "no_tests": { "type": "boolean", "description": "Skip test/fixture paths AND inline Rust #[cfg(test)]/Python test_* blocks" },
                     "exclude": {
@@ -1169,6 +1179,26 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push("--query".to_string());
                 cli.push(q.to_string());
             }
+            if let Some(sec) = args
+                .get("section")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--section".to_string());
+                cli.push(sec.trim().to_string());
+            }
+            if let Some(ar) = args.get("around").and_then(Value::as_u64) {
+                if ar > 0 {
+                    cli.push("--around".to_string());
+                    cli.push(ar.to_string());
+                }
+            }
+            if let Some(mh) = args.get("max_hits").and_then(Value::as_u64) {
+                if mh > 0 {
+                    cli.push("--max-hits".to_string());
+                    cli.push(mh.to_string());
+                }
+            }
             if let Some(sh) = args
                 .get("sheet")
                 .and_then(Value::as_str)
@@ -1366,6 +1396,28 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             if args.get("count").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--count".to_string());
+            }
+            if args
+                .get("fixed_strings")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--fixed-strings".to_string());
+            }
+            if args
+                .get("ignore_case")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--ignore-case".to_string());
+            }
+            if let Some(inc_arr) = args.get("include").and_then(Value::as_array) {
+                for item in inc_arr {
+                    if let Some(inc) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        cli.push("--include".to_string());
+                        cli.push(inc.to_string());
+                    }
+                }
             }
             if args
                 .get("code_only")

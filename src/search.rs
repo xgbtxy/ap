@@ -57,11 +57,23 @@ struct SearchCli {
     /// Case-sensitive matching (default is smart case: case-insensitive unless pattern has uppercase)
     #[arg(short = 's', long)]
     case_sensitive: bool,
+    /// Force case-insensitive matching even when pattern has uppercase (like `rg -i`)
+    #[arg(short = 'i', long)]
+    ignore_case: bool,
+    /// Treat pattern as literal string instead of regex (like `rg -F`)
+    #[arg(short = 'F', long)]
+    fixed_strings: bool,
+    /// Accepted for `grep`/`rg -n` muscle-memory compatibility (line numbers are always shown)
+    #[arg(short = 'n', long = "line-number")]
+    _line_number: bool,
     /// Optional glob extension filter, e.g. `ts,js` or `xlsx,docx`
     #[arg(short = 'e', long = "ext", default_value = "")]
     ext_filter: String,
+    /// Include only files matching glob/path filters (repeatable: `--include "*.rs" --include "src/*"`)
+    #[arg(long = "include")]
+    include: Vec<String>,
     /// Maximum matches to return
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, alias = "max", default_value_t = 50)]
     max_hits: usize,
     /// Context characters on each side when slicing matches inside giant/minified single-line bundles
     #[arg(long, default_value_t = 160)]
@@ -157,6 +169,58 @@ fn is_test_rel_path(rel: &str) -> bool {
         || (fname.starts_with("test_") && fname.ends_with(".py"))
 }
 
+fn glob_match_ci(pat: &str, text: &str) -> bool {
+    let p = pat.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_p = Some(pi);
+            pi += 1;
+            star_t = ti;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn matches_include_paths(rel: &str, includes: &[String]) -> bool {
+    if includes.is_empty() {
+        return true;
+    }
+    let rel_norm = rel.replace('\\', "/");
+    let fname = rel_norm.rsplit('/').next().unwrap_or(rel_norm.as_str());
+    for raw in includes {
+        let p = raw.trim().trim_start_matches("./");
+        if p.is_empty() {
+            continue;
+        }
+        if p.contains('*') || p.contains('?') {
+            if glob_match_ci(p, &rel_norm) || (!p.contains('/') && glob_match_ci(p, fname)) {
+                return true;
+            }
+        } else if rel_norm
+            .to_ascii_lowercase()
+            .contains(&p.to_ascii_lowercase())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn matches_exclude(rel: &str, excludes: &[String]) -> bool {
     if excludes.is_empty() {
         return false;
@@ -167,8 +231,8 @@ fn matches_exclude(rel: &str, excludes: &[String]) -> bool {
         if p.is_empty() {
             continue;
         }
-        if let Some(suf) = p.strip_prefix("*.") {
-            if rel_low.ends_with(&format!(".{suf}")) {
+        if p.contains('*') || p.contains('?') {
+            if glob_match_ci(&p, &rel_low) {
                 return true;
             }
         } else if rel_low.contains(&p) {
@@ -386,13 +450,29 @@ fn push_text_matches(
     }
 }
 
-fn build_search_regex(pat: &str, force_case: bool, multiline: bool) -> Result<Regex, String> {
-    let has_upper = pat.chars().any(|c| c.is_uppercase());
-    let case_insens = !force_case && !has_upper;
-    RegexBuilder::new(pat)
+fn build_search_regex(
+    pat: &str,
+    force_case: bool,
+    force_ignore_case: bool,
+    fixed_strings: bool,
+    multiline: bool,
+) -> Result<Regex, String> {
+    let case_insens = if force_ignore_case {
+        true
+    } else if force_case {
+        false
+    } else {
+        !pat.chars().any(|c| c.is_uppercase())
+    };
+    let effective = if fixed_strings {
+        regex::escape(pat)
+    } else {
+        pat.to_string()
+    };
+    RegexBuilder::new(&effective)
         .case_insensitive(case_insens)
-        .multi_line(multiline)
-        .dot_matches_new_line(multiline)
+        .multi_line(multiline && !fixed_strings)
+        .dot_matches_new_line(multiline && !fixed_strings)
         .build()
         .or_else(|_| {
             RegexBuilder::new(&regex::escape(pat))
@@ -437,7 +517,13 @@ pub fn run_cli(args: &[String]) -> i32 {
     let multi_mode = raw_pats.len() > 1;
     let mut compiled: Vec<(String, Regex)> = Vec::new();
     for p in raw_pats.into_iter().take(20) {
-        match build_search_regex(&p, cli.case_sensitive, cli.multiline) {
+        match build_search_regex(
+            &p,
+            cli.case_sensitive,
+            cli.ignore_case,
+            cli.fixed_strings,
+            cli.multiline,
+        ) {
             Ok(r) => compiled.push((p, r)),
             Err(e) => {
                 eprintln!("[ap search] {e}");
@@ -465,24 +551,40 @@ pub fn run_cli(args: &[String]) -> i32 {
         no_tests: cli.no_tests,
     };
 
-    let root = Path::new(&cli.path);
+    let norm_root_str = crate::ls::normalize_cli_path(&cli.path);
+    let root = Path::new(&norm_root_str);
     if !root.exists() {
-        eprintln!("[ap search] path not found: {}", cli.path);
+        eprintln!("[ap search] path not found: {norm_root_str}");
         return 1;
     }
     let t0 = Instant::now();
     let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let ext_allow: HashSet<String> = cli
+    let mut ext_allow: HashSet<String> = cli
         .ext_filter
         .split(',')
         .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect();
+    let mut include_paths: Vec<String> = Vec::new();
+    for inc in &cli.include {
+        let t = inc.trim().trim_start_matches("./");
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(suf) = t.strip_prefix("*.") {
+            if !suf.contains('/') && !suf.contains('*') {
+                ext_allow.insert(suf.to_ascii_lowercase());
+                continue;
+            }
+        }
+        include_paths.push(t.to_string());
+    }
     let skip_set: HashSet<&'static str> = SKIP_DIRS.iter().copied().collect();
 
     let explicit_file = root_canon.is_file();
     let compiled_arc = Arc::new(compiled);
     let ext_allow_arc = Arc::new(ext_allow);
+    let include_arc = Arc::new(include_paths);
     let exclude_arc = Arc::new(cli.exclude);
     let root_canon_arc = Arc::new(root_canon.clone());
     let all_matches: Arc<Mutex<Vec<SearchMatch>>> = Arc::new(Mutex::new(Vec::new()));
@@ -499,6 +601,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         root_canon: &Path,
         explicit_file: bool,
         ext_allow: &HashSet<String>,
+        includes: &[String],
         excludes: &[String],
         compiled: &[(String, Regex)],
         multi_mode: bool,
@@ -523,6 +626,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                 .to_string_lossy()
                 .replace('\\', "/")
         };
+        if !matches_include_paths(&rel, includes) {
+            return local_matches;
+        }
         if matches_exclude(&rel, excludes) {
             return local_matches;
         }
@@ -843,6 +949,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             &root_canon,
             true,
             &ext_allow_arc,
+            &include_arc,
             &exclude_arc,
             &compiled_arc,
             multi_mode,
@@ -871,6 +978,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         walker.run(|| {
             let compiled_c = Arc::clone(&compiled_arc);
             let ext_allow_c = Arc::clone(&ext_allow_arc);
+            let include_c = Arc::clone(&include_arc);
             let exclude_c = Arc::clone(&exclude_arc);
             let root_c = Arc::clone(&root_canon_arc);
             let matches_c = Arc::clone(&all_matches);
@@ -892,6 +1000,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     &root_c,
                     false,
                     &ext_allow_c,
+                    &include_c,
                     &exclude_c,
                     &compiled_c,
                     multi_mode,
