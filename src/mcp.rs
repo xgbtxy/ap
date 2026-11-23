@@ -553,18 +553,22 @@ fn mcp_tools_schema() -> Value {
     let mut extra = vec![
         json!({
             "name": "ap_rename",
-            "description": "Tree-sitter AST-exact workspace symbol rename across Py/TS/TSX/JS/Go/Rust/C. Replaces only real identifier AST nodes (never touches comments, strings, or substrings), validates 100% syntax before writing, records an `ap_undo` checkpoint, and supports `dry_run` + `run_tests` rollback.",
+            "description": "Tree-sitter AST-exact workspace symbol rename (`old_name`+`new_name`) OR structural AST pattern codemod/rewrite (`pattern`+`replacement`, supporting `$VAR` and `$$$ARGS`, across Py/TS/TSX/JS/Go/Rust/C). Never touches comments or strings, validates 100% syntax before writing, records an `ap_undo` checkpoint, and supports `dry_run` + `run_tests` rollback.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "old_name": { "type": "string", "description": "Existing identifier name to rename" },
-                    "new_name": { "type": "string", "description": "New identifier name" },
+                    "old_name": { "type": "string", "description": "Existing identifier name to rename (symbol-rename mode)" },
+                    "new_name": { "type": "string", "description": "New identifier name (symbol-rename mode)" },
+                    "pattern": { "type": "string", "description": "Structural AST pattern with `$VAR` / `$$$ARGS` (rewrite mode, e.g. `oldFetch($URL, $OPTS)`)" },
+                    "replacement": { "type": "string", "description": "Replacement template using `$VAR` / `$$$ARGS` (rewrite mode, e.g. `apiClient.request($URL, $OPTS)`)" },
+                    "ext": { "type": "string", "description": "Optional comma-separated extension filter in rewrite mode (e.g. `ts,tsx`)" },
+                    "no_tests": { "type": "boolean", "description": "Skip test files in rewrite mode" },
                     "path": { "type": "string", "description": "Workspace root directory (default: '.')" },
                     "dry_run": { "type": "boolean", "description": "Preview affected files and lines without modifying disk" },
-                    "run_tests": { "type": "boolean", "description": "Run project checks/tests after applying rename" },
+                    "run_tests": { "type": "boolean", "description": "Run project checks/tests after applying rename/rewrite" },
                     "rollback_on_test_fail": { "type": "boolean", "description": "Atomically restore all files if tests fail" }
                 },
-                "required": ["old_name", "new_name"]
+                "required": []
             }
         }),
         json!({
@@ -2515,22 +2519,6 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             )
         }
         "ap_rename" => {
-            let old_name = args
-                .get("old_name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            let new_name = args
-                .get("new_name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if old_name.is_empty() || new_name.is_empty() {
-                return (
-                    false,
-                    "Pass non-empty `old_name` and `new_name` to `ap_rename`.".to_string(),
-                );
-            }
             let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
             let root_p = std::path::Path::new(root);
             let dry_run = args
@@ -2545,6 +2533,84 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .get("rollback_on_test_fail")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !pattern.is_empty() {
+                let Some(replacement) = args.get("replacement").and_then(Value::as_str) else {
+                    return (
+                        false,
+                        "Pass `replacement` when using `pattern` in `ap_rename`.".to_string(),
+                    );
+                };
+                let ext = args.get("ext").and_then(Value::as_str).unwrap_or("");
+                let no_tests = args
+                    .get("no_tests")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !dry_run {
+                    let preview = ap_splice::rewrite::rewrite_pattern_workspace(
+                        root_p,
+                        pattern,
+                        replacement,
+                        ext,
+                        no_tests,
+                        true,
+                        false,
+                        "",
+                        false,
+                    );
+                    if preview.ok && !preview.changes.is_empty() {
+                        let touched: Vec<String> =
+                            preview.changes.iter().map(|c| c.path.clone()).collect();
+                        let _ = crate::undo::record_pre_edit_snapshot(root_p, &touched);
+                    }
+                }
+                let rep = ap_splice::rewrite::rewrite_pattern_workspace(
+                    root_p,
+                    pattern,
+                    replacement,
+                    ext,
+                    no_tests,
+                    dry_run,
+                    run_tests,
+                    "",
+                    rollback,
+                );
+                if rep.ok && !dry_run && rep.total_replacements > 0 {
+                    crate::stats::record_event(
+                        "rewrite",
+                        0,
+                        0,
+                        0,
+                        rep.files_changed as u32,
+                        "mcp-rewrite",
+                    );
+                }
+                let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
+                return (rep.ok, js);
+            }
+
+            let old_name = args
+                .get("old_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let new_name = args
+                .get("new_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if old_name.is_empty() || new_name.is_empty() {
+                return (
+                    false,
+                    "Pass non-empty `old_name` and `new_name` (or `pattern` and `replacement`) to `ap_rename`."
+                        .to_string(),
+                );
+            }
             if !dry_run {
                 let preview = ap_splice::rename::rename_symbol_workspace(
                     root_p, old_name, new_name, true, false, "", false,

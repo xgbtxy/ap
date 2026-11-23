@@ -26,6 +26,8 @@ pub struct ChangesReport {
     pub modified_symbols: Vec<String>,
     pub external_callers: Vec<ImpactSite>,
     pub related_tests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_test_cmds: Vec<String>,
 }
 
 pub(crate) fn lang_for_ext(ext: &str) -> Option<Language> {
@@ -96,6 +98,130 @@ fn hunk_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@").unwrap())
 }
 
+fn is_py_test_rel(norm: &str) -> bool {
+    let fname = norm.rsplit('/').next().unwrap_or(norm);
+    norm.ends_with(".py") && (fname.starts_with("test_") || fname.ends_with("_test.py"))
+}
+
+fn is_jsts_test_rel(norm: &str) -> bool {
+    let fname = norm.rsplit('/').next().unwrap_or(norm);
+    (fname.contains(".test.") || fname.contains(".spec."))
+        && matches!(
+            fname.rsplit('.').next().unwrap_or(""),
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts"
+        )
+}
+
+fn push_unique(out: &mut Vec<String>, cmd: String) {
+    if !cmd.is_empty() && !out.iter().any(|existing| existing == &cmd) {
+        out.push(cmd);
+    }
+}
+
+pub fn build_suggested_test_cmds(
+    root: &Path,
+    related_tests: &[String],
+    files: &[ChangedFileStat],
+) -> Vec<String> {
+    let mut all_paths: Vec<String> = Vec::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    for t in related_tests {
+        let norm = t.replace('\\', "/");
+        if seen_paths.insert(norm.clone()) {
+            all_paths.push(norm);
+        }
+    }
+    for f in files {
+        let norm = f.path.replace('\\', "/");
+        let low = norm.to_ascii_lowercase();
+        let is_test = is_py_test_rel(&low)
+            || is_jsts_test_rel(&low)
+            || low.ends_with("_test.go")
+            || (low.starts_with("tests/") && low.ends_with(".rs"));
+        if is_test && seen_paths.insert(norm.clone()) {
+            all_paths.push(norm);
+        }
+    }
+
+    let mut py_tests: Vec<String> = Vec::new();
+    let mut rust_int_tests: Vec<String> = Vec::new();
+    let mut rust_crates: Vec<String> = Vec::new();
+    let mut jsts_tests: Vec<String> = Vec::new();
+    let mut go_dirs: Vec<String> = Vec::new();
+
+    for p in &all_paths {
+        let low = p.to_ascii_lowercase();
+        if is_py_test_rel(&low) && py_tests.len() < 6 {
+            py_tests.push(p.clone());
+        } else if low.starts_with("tests/") && low.ends_with(".rs") && rust_int_tests.len() < 4 {
+            if let Some(stem) = Path::new(p).file_stem().and_then(|s| s.to_str()) {
+                rust_int_tests.push(stem.to_string());
+            }
+        } else if is_jsts_test_rel(&low) && jsts_tests.len() < 6 {
+            jsts_tests.push(p.clone());
+        } else if low.ends_with("_test.go") && go_dirs.len() < 4 {
+            let dir = Path::new(p)
+                .parent()
+                .map(|d| d.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let pkg = if dir.is_empty() || dir == "." {
+                ".".to_string()
+            } else {
+                format!("./{dir}...")
+            };
+            if !go_dirs.contains(&pkg) {
+                go_dirs.push(pkg);
+            }
+        }
+    }
+
+    for f in files {
+        let norm = f.path.replace('\\', "/");
+        if let Some(rest) = norm.strip_prefix("crates/") {
+            if let Some(crate_dir) = rest.split('/').next() {
+                if !crate_dir.is_empty()
+                    && root
+                        .join("crates")
+                        .join(crate_dir)
+                        .join("Cargo.toml")
+                        .is_file()
+                    && !rust_crates.contains(&crate_dir.to_string())
+                    && rust_crates.len() < 3
+                {
+                    rust_crates.push(crate_dir.to_string());
+                }
+            }
+        }
+    }
+
+    let mut cmds: Vec<String> = Vec::new();
+    if !py_tests.is_empty() {
+        push_unique(&mut cmds, format!("pytest -q {}", py_tests.join(" ")));
+    }
+    for stem in rust_int_tests {
+        push_unique(&mut cmds, format!("cargo test --test {stem}"));
+    }
+    for krate in rust_crates {
+        push_unique(&mut cmds, format!("cargo test -p {krate}"));
+    }
+    if !jsts_tests.is_empty() {
+        let pkg_json = fs::read_to_string(root.join("package.json")).unwrap_or_default();
+        let pkg_low = pkg_json.to_ascii_lowercase();
+        let runner = if pkg_low.contains("\"vitest\"") {
+            "npx vitest run"
+        } else if pkg_low.contains("\"jest\"") {
+            "npx jest"
+        } else {
+            "node --test"
+        };
+        push_unique(&mut cmds, format!("{runner} {}", jsts_tests.join(" ")));
+    }
+    for pkg in go_dirs {
+        push_unique(&mut cmds, format!("go test {pkg}"));
+    }
+    cmds
+}
+
 pub fn analyze_git_changes(
     root: &Path,
     base_opt: Option<&str>,
@@ -123,6 +249,7 @@ pub fn analyze_git_changes(
             modified_symbols: Vec::new(),
             external_callers: Vec::new(),
             related_tests: Vec::new(),
+            suggested_test_cmds: Vec::new(),
         };
     }
 
@@ -242,6 +369,8 @@ pub fn analyze_git_changes(
         }
     }
 
+    let related_tests: Vec<String> = related_test_set.into_iter().collect();
+    let suggested_test_cmds = build_suggested_test_cmds(root, &related_tests, &file_stats);
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
     ChangesReport {
         is_git_repo: true,
@@ -250,7 +379,8 @@ pub fn analyze_git_changes(
         files: file_stats,
         modified_symbols,
         external_callers,
-        related_tests: related_test_set.into_iter().collect(),
+        related_tests,
+        suggested_test_cmds,
     }
 }
 
@@ -304,5 +434,101 @@ pub fn render_changes_md(rep: &ChangesReport) -> String {
             out.push(format!("- `{t}`"));
         }
     }
+    if !rep.suggested_test_cmds.is_empty() {
+        out.push(format!(
+            "\n## Suggested Selective Test Commands ({})",
+            rep.suggested_test_cmds.len()
+        ));
+        for cmd in &rep.suggested_test_cmds {
+            out.push(format!("- `{cmd}`"));
+        }
+    }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct TempDirClean(PathBuf);
+    impl Drop for TempDirClean {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mk_tmp(label: &str) -> TempDirClean {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("ap_atlas_changes_{label}_{n}"));
+        fs::create_dir_all(&d).unwrap();
+        TempDirClean(d)
+    }
+
+    #[test]
+    fn suggested_test_cmds_covers_py_rust_jsts_and_go() {
+        let td = mk_tmp("selective");
+        fs::create_dir_all(td.0.join("crates/ap-demo")).unwrap();
+        fs::write(
+            td.0.join("crates/ap-demo/Cargo.toml"),
+            "[package]\nname = \"ap-demo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("package.json"),
+            r#"{"name":"web","devDependencies":{"vitest":"^2.0.0"}}"#,
+        )
+        .unwrap();
+
+        let files = vec![
+            ChangedFileStat {
+                path: "crates/ap-demo/src/lib.rs".into(),
+                added: 4,
+                deleted: 1,
+                modified_symbols: vec!["solve".into()],
+            },
+            ChangedFileStat {
+                path: "tests/integration_primitives.rs".into(),
+                added: 10,
+                deleted: 0,
+                modified_symbols: vec![],
+            },
+        ];
+        let related = vec![
+            "tests/test_billing.py".into(),
+            "web/auth.test.ts".into(),
+            "pkg/cache/store_test.go".into(),
+        ];
+
+        let cmds = build_suggested_test_cmds(&td.0, &related, &files);
+        assert!(
+            cmds.iter().any(|c| c == "pytest -q tests/test_billing.py"),
+            "{cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c == "cargo test --test integration_primitives"),
+            "{cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c == "cargo test -p ap-demo"),
+            "{cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c == "npx vitest run web/auth.test.ts"),
+            "{cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c == "go test ./pkg/cache..."),
+            "{cmds:?}"
+        );
+
+        // Without vitest/jest in package.json, defaults to `node --test`
+        fs::remove_file(td.0.join("package.json")).unwrap();
+        let cmds_node = build_suggested_test_cmds(&td.0, &["web/auth.test.mjs".into()], &[]);
+        assert_eq!(cmds_node, vec!["node --test web/auth.test.mjs"]);
+    }
 }

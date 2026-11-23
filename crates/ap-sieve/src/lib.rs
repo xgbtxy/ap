@@ -1010,21 +1010,25 @@ fn try_summarize_diff(clean: &str) -> Option<String> {
 }
 
 fn try_summarize_compiler(clean: &str) -> Option<String> {
-    static COMP_RES: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
-    let (rust_diag, rust_loc, tsc_diag, generic_diag) = COMP_RES.get_or_init(|| {
-        (
-            Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_-]+)\])?:\s+(.+)$").unwrap(),
-            Regex::new(r"^\s*-->\s+(.+:\d+:\d+)\s*$").unwrap(),
-            Regex::new(
-                r"^([^\s(]+)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$",
+    static COMP_RES: OnceLock<(Regex, Regex, Regex, Regex, Regex, Regex)> = OnceLock::new();
+    let (rust_diag, rust_loc, tsc_diag, generic_diag, go_diag, go_msg_kw) =
+        COMP_RES.get_or_init(|| {
+            (
+                Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_-]+)\])?:\s+(.+)$").unwrap(),
+                Regex::new(r"^\s*-->\s+(.+:\d+:\d+)\s*$").unwrap(),
+                Regex::new(r"^([^\s(]+)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$")
+                    .unwrap(),
+                Regex::new(
+                    r"^([A-Za-z0-9_./\\-]+\.(?:rs|ts|tsx|js|jsx|go|c|cc|cpp|h|hpp|py)):(\d+)(?::(\d+))?:\s*(?:-\s*)?(error|warning)(?:\s+([A-Za-z0-9_-]+))?:\s+(.+)$",
+                )
+                .unwrap(),
+                Regex::new(r"^([A-Za-z0-9_./\\-]+\.go):(\d+):(\d+):\s+(.+)$").unwrap(),
+                Regex::new(
+                    r"(?i)(?:\bundefined:|cannot use\b|\bsyntax error\b|\bdeclared and not used\b|\bimported and not used\b|\btoo many arguments\b|\bnot enough arguments\b|\bcannot assign\b|\binvalid operation\b|\bmissing return\b|\bredeclared in this block\b|\bhas no field or method\b)",
+                )
+                .unwrap(),
             )
-            .unwrap(),
-            Regex::new(
-                r"^([A-Za-z0-9_./\\-]+\.(?:rs|ts|tsx|js|jsx|go|c|cc|cpp|h|hpp|py)):(\d+)(?::(\d+))?:\s*(?:-\s*)?(error|warning)(?:\s+([A-Za-z0-9_-]+))?:\s+(.+)$",
-            )
-            .unwrap(),
-        )
-    });
+        });
 
     let lines: Vec<&str> = clean.lines().collect();
     let mut err_count = 0usize;
@@ -1122,12 +1126,23 @@ fn try_summarize_compiler(clean: &str) -> Option<String> {
                     warnings.push(format!("  - {entry}"));
                 }
             }
+        } else if let Some(cap) = go_diag.captures(ln) {
+            let msg = cap[4].trim();
+            if !msg.starts_with("warning:") && go_msg_kw.is_match(msg) {
+                let loc = format!("{}:{}:{}", &cap[1], &cap[2], &cap[3]);
+                let entry = format!("{loc} | error[go]: {}", trunc_chars(msg, 110));
+                let dedup_key = format!("go::{loc}::{}", trunc_chars(msg, 60));
+                err_count += 1;
+                if seen_err.insert(dedup_key) && errors.len() < 14 {
+                    errors.push(format!("  - {entry}"));
+                }
+            }
         }
         i += 1;
     }
 
     let total_diags = err_count + warn_count;
-    if total_diags < 2 {
+    if err_count == 0 && total_diags < 2 {
         return None;
     }
     let mut out = vec![format!(
@@ -1726,5 +1741,29 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiler_digest_handles_single_rust_error_and_go_errors() {
+        let rust_log = "   Compiling demo v0.1.0\nerror[E0308]: mismatched types\n --> src/main.rs:42:12\n  |\n42|     let x: i32 = \"oops\";\nerror: could not compile `demo` due to 1 previous error\n";
+        let rust_digest = try_summarize_compiler(rust_log).expect("expected rust 1-error digest");
+        assert!(rust_digest.contains("errors=1"), "{rust_digest}");
+        assert!(
+            rust_digest.contains("src/main.rs:42:12 | error[E0308]"),
+            "{rust_digest}"
+        );
+
+        let go_log = "# example.com/pkg\npkg/handler.go:18:9: undefined: missingHelper\npkg/handler.go:24:2: x declared and not used\n";
+        let go_digest = try_summarize_compiler(go_log).expect("expected go compiler digest");
+        assert!(go_digest.contains("errors=2"), "{go_digest}");
+        assert!(
+            go_digest.contains("pkg/handler.go:18:9 | error[go]"),
+            "{go_digest}"
+        );
     }
 }

@@ -14,6 +14,8 @@ pub struct AstSearchMatch {
     pub snippet: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub captures: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub raw_captures: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,7 +334,7 @@ fn match_tokens_at(
     li: usize,
     pats: &[PatTok],
     pi: usize,
-    bindings: &mut BTreeMap<String, String>,
+    bindings: &mut BTreeMap<String, (String, usize, usize)>,
     steps: &mut usize,
 ) -> Option<usize> {
     *steps += 1;
@@ -385,7 +387,7 @@ fn match_tokens_at(
                     let cand = normalized_capture_text(&leaves[li..end_idx]);
                     if name != "_" {
                         if let Some(prev_val) = bindings.get(name) {
-                            if prev_val != &cand {
+                            if prev_val.0 != cand {
                                 continue;
                             }
                             if let Some(res_end) =
@@ -397,7 +399,7 @@ fn match_tokens_at(
                         }
                     }
                     let had = if name != "_" {
-                        bindings.insert(name.clone(), cand)
+                        bindings.insert(name.clone(), (cand, li, end_idx))
                     } else {
                         None
                     };
@@ -446,11 +448,11 @@ fn match_tokens_at(
                 let mut old_val = None;
                 if let Some(name) = opt_name.as_ref().filter(|n| n.as_str() != "_") {
                     if let Some(prev) = bindings.get(name) {
-                        if prev != &cand {
+                        if prev.0 != cand {
                             continue;
                         }
                     } else {
-                        old_val = bindings.insert(name.clone(), cand);
+                        old_val = bindings.insert(name.clone(), (cand, li, end_idx));
                         inserted = true;
                     }
                 }
@@ -521,6 +523,7 @@ pub fn search_ast_source(
                         scope: enclosing_scope(&spans, s_line),
                         snippet: compact_snippet(raw_slice, 200),
                         captures: BTreeMap::new(),
+                        raw_captures: BTreeMap::new(),
                     });
                     if results.len() >= max_hits {
                         return results;
@@ -548,6 +551,19 @@ pub fn search_ast_source(
                         let s_line = leaves[idx].start_line;
                         let e_line = leaves[end_leaf_idx - 1].end_line.max(s_line);
                         let raw_slice = &source[s_byte..e_byte];
+                        let mut captures = BTreeMap::new();
+                        let mut raw_captures = BTreeMap::new();
+                        for (k, (norm_val, sl, el)) in bindings {
+                            let raw_val = if el > sl && el <= leaves.len() {
+                                let sb = leaves[sl].start_byte;
+                                let eb = leaves[el - 1].end_byte.min(source.len());
+                                source.get(sb..eb).unwrap_or(&norm_val).to_string()
+                            } else {
+                                String::new()
+                            };
+                            captures.insert(k.clone(), norm_val);
+                            raw_captures.insert(k, raw_val);
+                        }
                         results.push(AstSearchMatch {
                             line: s_line,
                             end_line: e_line,
@@ -556,7 +572,8 @@ pub fn search_ast_source(
                             kind: "ast_pattern".to_string(),
                             scope: enclosing_scope(&spans, s_line),
                             snippet: compact_snippet(raw_slice, 200),
-                            captures: bindings,
+                            captures,
+                            raw_captures,
                         });
                         if results.len() >= max_hits {
                             return results;
@@ -595,6 +612,27 @@ function run(userInput) {
             Some("userInput")
         );
         assert!(hits[0].scope.contains("run"), "{:?}", hits[0].scope);
+
+        let multiline_ts = r#"
+function load() {
+    return oldFetch("/x", {
+        method: "POST",
+        keepalive: true
+    });
+}
+"#;
+        let mq = AstQuery::parse("oldFetch($URL, $OPTS)").unwrap();
+        let mhits = search_ast_source(multiline_ts, "ts", &mq, 10);
+        assert_eq!(mhits.len(), 1, "{mhits:?}");
+        assert!(
+            mhits[0]
+                .raw_captures
+                .get("OPTS")
+                .map(|s| s.contains('\n') && s.contains("keepalive: true"))
+                .unwrap_or(false),
+            "{:?}",
+            mhits[0].raw_captures
+        );
 
         let rust_src = r#"
 use std::process::Command;

@@ -4,6 +4,7 @@ pub mod blast;
 pub mod check;
 pub mod patch;
 pub mod rename;
+pub mod rewrite;
 
 use ast::{find_symbol_span, scan_symbols, verify_syntax};
 use base64::Engine;
@@ -101,6 +102,27 @@ enum SubCmd {
         new_name: String,
         #[arg(default_value = ".")]
         root: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        test: bool,
+        #[arg(long, default_value = "")]
+        test_cmd: String,
+        #[arg(long)]
+        rollback_on_test_fail: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tree-sitter structural AST pattern codemod/rewrite across Py/TS/JS/Go/Rust/C (supports $VAR & $$$ARGS)
+    Rewrite {
+        pattern: String,
+        replacement: String,
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "")]
+        ext: String,
+        #[arg(long)]
+        no_tests: bool,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -1074,6 +1096,42 @@ pub fn run_cli(args: &[String]) -> i32 {
                 println!("{}", rename::render_rename_human(&rep));
             } else {
                 eprintln!("{}", rename::render_rename_human(&rep));
+            }
+            if rep.ok {
+                0
+            } else {
+                1
+            }
+        }
+        SubCmd::Rewrite {
+            pattern,
+            replacement,
+            root,
+            ext,
+            no_tests,
+            dry_run,
+            test,
+            test_cmd,
+            rollback_on_test_fail,
+            json: as_json,
+        } => {
+            let rep = rewrite::rewrite_pattern_workspace(
+                &root,
+                &pattern,
+                &replacement,
+                &ext,
+                no_tests,
+                dry_run,
+                test,
+                &test_cmd,
+                rollback_on_test_fail,
+            );
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+            } else if rep.ok {
+                println!("{}", rewrite::render_rewrite_human(&rep));
+            } else {
+                eprintln!("{}", rewrite::render_rewrite_human(&rep));
             }
             if rep.ok {
                 0

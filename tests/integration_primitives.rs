@@ -8270,3 +8270,202 @@ def test_validate():
     assert!(ts_src.contains("cdLeadPfx"));
     assert!(ts_src.contains("@options"));
 }
+
+#[test]
+fn test_v251_ast_structural_rewrite_selective_tests_and_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+
+    // 1. Structural AST codemod/rewrite (`ap splice rewrite`) across JS + TS, skipping comments & strings, + empty variadic `, $$$ARGS` elision
+    fs::write(
+        root.join("src/api.ts"),
+        r#"// oldFetch("/commented", opts)
+const label = "oldFetch(a, b)";
+export function loadItem(id: string) {
+    return oldFetch(
+        `/items/${id}`,
+        {
+            method: "GET"
+        }
+    );
+}
+export function poll() {
+    fetch("/ping");
+    fetch("/pong", { cache: "no-store" });
+}
+"#,
+    )
+    .unwrap();
+
+    let root_s = root.to_string_lossy().to_string();
+    let rw1 = run_ap(
+        root,
+        &[
+            "splice",
+            "rewrite",
+            "oldFetch($URL, $OPTS)",
+            "apiClient.request($URL, $OPTS)",
+            &root_s,
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        rw1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rw1.stderr)
+    );
+    let rw1_v: Value = serde_json::from_slice(&rw1.stdout).unwrap();
+    assert_eq!(rw1_v["ok"], true);
+    assert_eq!(rw1_v["total_replacements"], 1);
+    let after1 = fs::read_to_string(root.join("src/api.ts")).unwrap();
+    assert!(after1.contains(r#"// oldFetch("/commented", opts)"#));
+    assert!(after1.contains(r#"const label = "oldFetch(a, b)";"#));
+    assert!(
+        after1.contains(
+            "apiClient.request(`/items/${id}`, {\n            method: \"GET\"\n        })"
+        ),
+        "{after1}"
+    );
+
+    let rw2 = run_ap(
+        root,
+        &[
+            "splice",
+            "rewrite",
+            "fetch($URL, $$$ARGS)",
+            "httpGet($URL, $$$ARGS)",
+            &root_s,
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(rw2.status.success());
+    let after2 = fs::read_to_string(root.join("src/api.ts")).unwrap();
+    assert!(after2.contains("httpGet(\"/ping\");"), "{after2}");
+    assert!(
+        after2.contains("httpGet(\"/pong\", { cache: \"no-store\" });"),
+        "{after2}"
+    );
+
+    // 2. MCP exact `37` tools + `ap_rename(pattern=..., replacement=...)` + `ap_undo` restores cleanly
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "ap_rename",
+            "arguments": {
+                "pattern": "httpGet($URL, $$$ARGS)",
+                "replacement": "clientFetch($URL, $$$ARGS)",
+                "path": root_s
+            }
+        }}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "ap_undo",
+            "arguments": { "path": root_s }
+        }}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    let tools = resps[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 37);
+    let rename_tool = tools.iter().find(|t| t["name"] == "ap_rename").unwrap();
+    assert!(rename_tool["inputSchema"]["properties"]
+        .get("pattern")
+        .is_some());
+    assert!(rename_tool["inputSchema"]["properties"]
+        .get("replacement")
+        .is_some());
+    assert_eq!(resps[2]["result"]["isError"], false, "{}", resps[2]);
+    assert_eq!(resps[3]["result"]["isError"], false, "{}", resps[3]);
+    let after_undo = fs::read_to_string(root.join("src/api.ts")).unwrap();
+    assert!(after_undo.contains("httpGet(\"/ping\");"), "{after_undo}");
+
+    // 3. `ap sieve pipe` compresses noisy 1.5KB+ compiler log even on a single root-cause `error[E0308]`
+    let mut noisy_cargo = String::new();
+    for i in 0..35 {
+        noisy_cargo.push_str(&format!(
+            "   Compiling dep_pkg_{i} v0.1.{i} (/workspace/deps/{i})\n"
+        ));
+    }
+    noisy_cargo.push_str(
+        "error[E0308]: mismatched types\n --> src/lib.rs:19:5\n  |\n19|     return \"bad\";\n",
+    );
+    assert!(noisy_cargo.len() > 1400);
+    let sieve_out = run_ap(root, &["sieve", "pipe", "--json"], Some(&noisy_cargo), &[]);
+    assert!(sieve_out.status.success());
+    let sieve_v: Value = serde_json::from_slice(&sieve_out.stdout).unwrap();
+    assert_eq!(sieve_v["mode"], "compiler", "{sieve_v}");
+    assert!(
+        sieve_v["rendered"]
+            .as_str()
+            .unwrap_or("")
+            .contains("src/lib.rs:19:5"),
+        "{sieve_v}"
+    );
+
+    // 4. `ap atlas changes --json` in a git repo emits `suggested_test_cmds` (`pytest -q ...`)
+    let repo = root.join("git_proj");
+    fs::create_dir_all(repo.join("tests")).unwrap();
+    fs::write(
+        repo.join("calc.py"),
+        "def compute_total(x):\n    return x * 2\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("tests/test_calc.py"),
+        "from calc import compute_total\ndef test_compute():\n    assert compute_total(3) == 6\n",
+    )
+    .unwrap();
+    let git_ok = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if git_ok {
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo)
+            .status();
+        fs::write(
+            repo.join("calc.py"),
+            "def compute_total(x):\n    return x * 3\n",
+        )
+        .unwrap();
+        let ch_out = run_ap(&repo, &["atlas", "changes", ".", "--json"], None, &[]);
+        assert!(ch_out.status.success());
+        let ch_v: Value = serde_json::from_slice(&ch_out.stdout).unwrap();
+        let cmds = ch_v["suggested_test_cmds"].as_array().unwrap();
+        assert!(
+            cmds.iter().any(|c| c
+                .as_str()
+                .unwrap_or("")
+                .contains("pytest -q tests/test_calc.py")),
+            "{ch_v}"
+        );
+    }
+}

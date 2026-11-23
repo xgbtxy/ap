@@ -367,6 +367,138 @@ pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
     ))
 }
 
+fn split_ps_args(s: &str) -> Option<Vec<String>> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in s.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !cur.is_empty() {
+                toks.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    Some(toks)
+}
+
+/// Rewrite bare PowerShell `Select-String -Pattern <pat> -Path <path>` (or `sls`, optionally after leading `cd <dir> &&`)
+/// cleanly to sub-50ms `ap search`, while bailing out safely on pipes, arrays, wildcards, or unsupported flags.
+pub fn try_accelerate_select_string(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    if body.contains('|')
+        || body.contains(';')
+        || body.contains("&&")
+        || body.contains('>')
+        || body.contains('<')
+        || body.contains('{')
+        || body.contains('}')
+        || body.contains("$(")
+        || body.contains('`')
+    {
+        return None;
+    }
+    let toks = split_ps_args(body.trim())?;
+    let head = toks.first()?.to_ascii_lowercase();
+    if head != "select-string" && head != "sls" {
+        return None;
+    }
+
+    let mut pattern: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut simple_match = false;
+    let mut case_sensitive = false;
+    let mut files_only = false;
+
+    let mut i = 1usize;
+    while i < toks.len() {
+        let tok = &toks[i];
+        let low = tok.to_ascii_lowercase();
+        if low == "-pattern" {
+            let val = toks.get(i + 1)?;
+            pattern = Some(val.clone());
+            i += 2;
+        } else if low == "-path" || low == "-literalpath" {
+            let val = toks.get(i + 1)?;
+            if val.contains(',') || val.contains('*') || val.contains('?') {
+                return None;
+            }
+            path = Some(val.clone());
+            i += 2;
+        } else if low == "-simplematch" {
+            simple_match = true;
+            i += 1;
+        } else if low == "-casesensitive" {
+            case_sensitive = true;
+            i += 1;
+        } else if low == "-list" {
+            files_only = true;
+            i += 1;
+        } else if tok.starts_with('-') {
+            return None;
+        } else if pattern.is_none() {
+            pattern = Some(tok.clone());
+            i += 1;
+        } else if path.is_none() {
+            if tok.contains(',') || tok.contains('*') || tok.contains('?') {
+                return None;
+            }
+            path = Some(tok.clone());
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+
+    let pat = pattern?;
+    if pat.is_empty() {
+        return None;
+    }
+    let tgt = path.unwrap_or_else(|| ".".to_string());
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+
+    let mut flags = String::new();
+    if files_only {
+        flags.push_str(" --files-only");
+    }
+    if simple_match {
+        flags.push_str(" --fixed-strings");
+    }
+    if !case_sensitive {
+        flags.push_str(" --ignore-case");
+    }
+    let pat_esc = pat.replace('"', "\\\"");
+    let tgt_esc = tgt.replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" search{flags} \"{pat_esc}\" \"{tgt_esc}\"",
+        cd_pfx.unwrap_or("")
+    ))
+}
+
 /// Retry bare `rg <pattern>` commands (including after leading `cd <dir> &&`) that exited 2 with `rg: regex parse error` as literal `rg -F <pattern>`.
 pub fn try_build_rg_fixed_retry(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
@@ -649,6 +781,11 @@ pub fn heal_windows_command(
     if let Some(fast_ls) = try_heal_windows_dir_cmd(raw) {
         heals.push("dir-/b->ap-ls");
         let (kind, cmd_out) = route_accelerated_cmd(fast_ls, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_sls) = try_accelerate_select_string(raw) {
+        heals.push("select-string->ap-search");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_sls, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -1393,5 +1530,31 @@ mod tests {
             try_build_rg_fixed_retry("cd /c/work && rg \"foo(bar\" src").as_deref(),
             Some("cd /c/work && rg -F \"foo(bar\" src")
         );
+
+        // `try_accelerate_select_string` accelerates bare PowerShell `Select-String` / `sls` safely
+        let (k15, h15, tags15) =
+            heal_windows_command("Select-String -Pattern authToken -Path src", true, true);
+        assert!(
+            h15.contains("search --ignore-case \"authToken\" \"src\""),
+            "{h15}"
+        );
+        assert!(tags15.contains(&"select-string->ap-search"));
+        let _ = k15;
+
+        let (_, h16, tags16) = heal_windows_command(
+            "cd sub && Select-String -SimpleMatch -CaseSensitive -Pattern \"a+b\" -Path app.py",
+            false,
+            false,
+        );
+        assert!(
+            h16.contains("cd sub; if ($?) { & ")
+                && h16.contains("search --fixed-strings \"a+b\" \"app.py\""),
+            "{h16}"
+        );
+        assert!(tags16.contains(&"select-string->ap-search"));
+        assert!(try_accelerate_select_string(
+            "Select-String -Pattern foo -Path app.py | Select-Object Line"
+        )
+        .is_none());
     }
 }
