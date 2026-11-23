@@ -607,7 +607,15 @@ fn remove_antigravity_hooks(hooks_path: &Path) -> bool {
     true
 }
 
-fn merge_opencode_mcp(cfg_path: &Path, ap_bin_posix: &str) -> String {
+fn mcp_args_for_profile(mcp_profile: &str) -> Vec<&'static str> {
+    match mcp_profile {
+        "core" => vec!["mcp", "--profile", "core"],
+        "deferred" => vec!["mcp", "--profile", "deferred"],
+        _ => vec!["mcp"],
+    }
+}
+
+fn merge_opencode_mcp(cfg_path: &Path, ap_bin_posix: &str, mcp_profile: &str) -> String {
     let mut data: Value = if cfg_path.exists() {
         fs::read_to_string(cfg_path)
             .ok()
@@ -626,11 +634,13 @@ fn merge_opencode_mcp(cfg_path: &Path, ap_bin_posix: &str) -> String {
     if !mcp.is_object() {
         *mcp = json!({});
     }
+    let mut cmd = vec![ap_bin_posix];
+    cmd.extend(mcp_args_for_profile(mcp_profile));
     mcp.as_object_mut().unwrap().insert(
         "agent-primitives".to_string(),
         json!({
             "type": "local",
-            "command": [ap_bin_posix, "mcp"],
+            "command": cmd,
             "enabled": true
         }),
     );
@@ -677,7 +687,12 @@ fn remove_opencode_mcp(cfg_path: &Path) {
     }
 }
 
-fn merge_mcp_servers_json(cfg_path: &Path, ap_bin_posix: &str, include_trust: bool) -> String {
+fn merge_mcp_servers_json(
+    cfg_path: &Path,
+    ap_bin_posix: &str,
+    include_trust: bool,
+    mcp_profile: &str,
+) -> String {
     let mut data: Value = if cfg_path.exists() {
         fs::read_to_string(cfg_path)
             .ok()
@@ -699,7 +714,7 @@ fn merge_mcp_servers_json(cfg_path: &Path, ap_bin_posix: &str, include_trust: bo
     }
     let mut entry = json!({
         "command": ap_bin_posix,
-        "args": ["mcp"]
+        "args": mcp_args_for_profile(mcp_profile)
     });
     if include_trust {
         entry["trust"] = json!(true);
@@ -750,7 +765,7 @@ fn remove_mcp_servers_json(cfg_path: &Path) {
     }
 }
 
-fn merge_pi_mcp(cfg_path: &Path, ap_bin_posix: &str) -> String {
+fn merge_pi_mcp(cfg_path: &Path, ap_bin_posix: &str, mcp_profile: &str) -> String {
     let mut data: Value = if cfg_path.exists() {
         fs::read_to_string(cfg_path)
             .ok()
@@ -774,9 +789,9 @@ fn merge_pi_mcp(cfg_path: &Path, ap_bin_posix: &str) -> String {
         "agent-primitives".to_string(),
         json!({
             "command": ap_bin_posix,
-            "args": ["mcp"],
+            "args": mcp_args_for_profile(mcp_profile),
             "exposure": "codemode",
-            "description": "Fast Pure-Rust MCP 2025-06-18 (36 annotated tools, Resources, Prompts; batch via Promise.allSettled in codemode): AST ap_read (--symbol/--outline/batch), parallel ap_search (-l/-c/-C), ap_edit/ap_rename, ap_orient/ap_surface/ap_impact/ap_changes/ap_locate/ap_trace, ap_query (named records), ap_sieve (compiler/test/diff), ap_baton/ap_frontier/ap_recall & CDP/HTTP/TCP/WS/TLS probes"
+            "description": "Fast Pure-Rust MCP 2025-06-18 (37 annotated tools, Resources, Prompts; batch via Promise.allSettled in codemode): AST ap_read (--symbol/--outline/batch), parallel ap_search (-l/-c/-C), ap_edit/ap_rename, ap_orient/ap_surface/ap_impact/ap_changes/ap_locate/ap_trace, ap_query (named records), ap_sieve (compiler/test/diff), ap_baton/ap_frontier/ap_recall & CDP/HTTP/TCP/WS/TLS/Win probes"
         }),
     );
     if let Some(p) = cfg_path.parent() {
@@ -976,11 +991,211 @@ export function stabilizeProviderTools(payload: unknown): unknown {{
 const CODEMODE_SETTIMEOUT_SHIM =
 	`const setTimeout = (fn, ms = 0, ...a) => {{ if (typeof sleep === "function") {{ sleep(ms).then(() => {{ if (typeof fn === "function") fn(...a); }}); }} else if (typeof fn === "function") {{ fn(...a); }} return 0; }};`;
 
+export interface ApProfileOverrides {{
+	modelProfile: string;
+	sieveHardChars?: number;
+	kvSafeSleepSec?: number;
+	maskHighWaterTokens?: number;
+	dsmlRecovery?: boolean;
+}}
+
+const MODEL_PROFILE_KNOBS: Readonly<Record<string, Omit<ApProfileOverrides, "modelProfile">>> = {{
+	balanced: {{ sieveHardChars: 20000, kvSafeSleepSec: 60, maskHighWaterTokens: 180000, dsmlRecovery: false }},
+	deepseek: {{ sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 210000, dsmlRecovery: true }},
+	fast: {{ sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 140000, dsmlRecovery: false }},
+	reasoning: {{ sieveHardChars: 16000, kvSafeSleepSec: 45, maskHighWaterTokens: 180000, dsmlRecovery: false }},
+	small: {{ sieveHardChars: 10000, kvSafeSleepSec: 45, maskHighWaterTokens: 90000, dsmlRecovery: false }},
+}};
+
+/**
+ * Load optional Layer 3 declarative profile overrides (`~/.ap/profile.json`) once on startup.
+ * Returns `undefined` when missing or set to `auto` (zero overhead when unused).
+ */
+export function loadApProfile(profilePath?: string): ApProfileOverrides | undefined {{
+	try {{
+		const p = profilePath || join(homedir(), ".ap", "profile.json");
+		if (!existsSync(p)) return undefined;
+		const parsed = JSON.parse(readFileSync(p, "utf8")) as {{ model_profile?: unknown }};
+		const mp = typeof parsed?.model_profile === "string" ? parsed.model_profile.trim().toLowerCase() : "";
+		if (!mp || mp === "auto") return undefined;
+		const knobs = MODEL_PROFILE_KNOBS[mp];
+		if (!knobs) return undefined;
+		return {{ modelProfile: mp, ...knobs }};
+	}} catch {{
+		return undefined;
+	}}
+}}
+
+/**
+ * Lexically escape unescaped raw newlines inside single/double-quoted JS strings while leaving
+ * comments, regex literals, and multiline backtick template literals untouched (prevents QuickJS EOS errors).
+ */
+export function healJsStringRawNewlines(code: string): string | undefined {{
+	if (!code || (!code.includes("\n") && !code.includes("\r"))) return undefined;
+	const n = code.length;
+	let out = "";
+	let lastFlush = 0;
+	let changed = false;
+	let i = 0;
+
+	const scanRegexLiteral = (startSlash: number): number => {{
+		let prev = startSlash - 1;
+		while (prev >= 0 && (code[prev] === " " || code[prev] === "\t")) prev--;
+		let allowRegex = prev < 0 || "([,=;:!&|?{{}}~+-*%^<>\n\r".includes(code[prev]);
+		if (!allowRegex && prev >= 0 && /[A-Za-z_$0-9]/.test(code[prev])) {{
+			let wStart = prev;
+			while (wStart > 0 && /[A-Za-z_$0-9]/.test(code[wStart - 1])) wStart--;
+			const word = code.slice(wStart, prev + 1);
+			allowRegex = /^(?:return|throw|case|typeof|void|delete|await|yield|in|of|new)$/.test(word);
+		}}
+		if (!allowRegex) return -1;
+		let j = startSlash + 1;
+		let inClass = false;
+		while (j < n) {{
+			const rc = code[j];
+			if (rc === "\n" || rc === "\r") return -1;
+			if (rc === "\\") {{
+				if (j + 1 >= n || code[j + 1] === "\n" || code[j + 1] === "\r") return -1;
+				j += 2;
+				continue;
+			}}
+			if (rc === "[") {{
+				inClass = true;
+				j++;
+				continue;
+			}}
+			if (rc === "]" && inClass) {{
+				inClass = false;
+				j++;
+				continue;
+			}}
+			if (rc === "/" && !inClass) {{
+				j++;
+				while (j < n && /[a-z]/i.test(code[j])) j++;
+				return j;
+			}}
+			j++;
+		}}
+		return -1;
+	}};
+
+	const scanQuoted = (quote: string) => {{
+		i++;
+		while (i < n) {{
+			const ch = code[i];
+			if (ch === "\\") {{
+				i += i + 1 < n ? 2 : 1;
+				continue;
+			}}
+			if (ch === "\r") {{
+				out += code.slice(lastFlush, i);
+				if (code[i + 1] === "\n") {{
+					out += "\\n";
+					i += 2;
+				}} else {{
+					out += "\\r";
+					i++;
+				}}
+				lastFlush = i;
+				changed = true;
+				continue;
+			}}
+			if (ch === "\n") {{
+				out += code.slice(lastFlush, i) + "\\n";
+				i++;
+				lastFlush = i;
+				changed = true;
+				continue;
+			}}
+			if (ch === quote) {{
+				i++;
+				break;
+			}}
+			i++;
+		}}
+	}};
+
+	const scanTemplate = () => {{
+		i++;
+		while (i < n) {{
+			const ch = code[i];
+			if (ch === "\\") {{
+				i += i + 1 < n ? 2 : 1;
+				continue;
+			}}
+			if (ch === "$" && code[i + 1] === "{{") {{
+				i += 2;
+				scanNormal(true);
+				continue;
+			}}
+			if (ch === "`") {{
+				i++;
+				break;
+			}}
+			i++;
+		}}
+	}};
+
+	const scanNormal = (stopOnCloseBrace: boolean) => {{
+		let braceDepth = 0;
+		while (i < n) {{
+			const ch = code[i];
+			if (ch === "{{" && stopOnCloseBrace) {{
+				braceDepth++;
+				i++;
+				continue;
+			}}
+			if (ch === "}}" && stopOnCloseBrace) {{
+				if (braceDepth === 0) {{
+					i++;
+					return;
+				}}
+				braceDepth--;
+				i++;
+				continue;
+			}}
+			if (ch === "/" && code[i + 1] === "/") {{
+				const nl = code.indexOf("\n", i + 2);
+				i = nl < 0 ? n : nl + 1;
+				continue;
+			}}
+			if (ch === "/" && code[i + 1] === "*") {{
+				const end = code.indexOf("*/", i + 2);
+				i = end < 0 ? n : end + 2;
+				continue;
+			}}
+			if (ch === "/" && code[i + 1] !== "/" && code[i + 1] !== "*") {{
+				const rEnd = scanRegexLiteral(i);
+				if (rEnd > i) {{
+					i = rEnd;
+					continue;
+				}}
+			}}
+			if (ch === "'" || ch === '"') {{
+				scanQuoted(ch);
+				continue;
+			}}
+			if (ch === "`") {{
+				scanTemplate();
+				continue;
+			}}
+			i++;
+		}}
+	}};
+
+	scanNormal(false);
+	if (!changed) return undefined;
+	out += code.slice(lastFlush);
+	return out;
+}}
+
 /**
  * Lossless pre-execution auto-heal for Pi `codemode` JS scripts:
  * 1) Strips outer markdown code fences (```js ... ```) that break QuickJS parsing / `// @options:` line 1.
  * 2) Repairs `tools.mcp__agent-primitives__` -> `tools.mcp__agent_primitives__` (avoids JS subtraction ReferenceError).
- * 3) Auto-shims `setTimeout(...)` via host `sleep(ms)` (eliminating 100% of QuickJS timer ReferenceErrors while keeping `// @options:` on line 1).
+ * 3) Escapes raw newlines inside single/double-quoted strings (`healJsStringRawNewlines`).
+ * 4) Strips accidental TypeScript variable/parameter/return annotations and `as <Type>` casts.
+ * 5) Auto-shims `setTimeout(...)` via host `sleep(ms)` (eliminating 100% of QuickJS timer ReferenceErrors while keeping `// @options:` on line 1).
  */
 export function healCodemodeSource(code: string): string | undefined {{
 	if (!code) return undefined;
@@ -992,11 +1207,36 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (next.includes("tools.mcp__agent-primitives__")) {{
 		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
 	}}
-	// Strip accidental TypeScript variable type annotations (`const x: string = ...`) and `as <Type>` casts in QuickJS scripts
+	const healedNewlines = healJsStringRawNewlines(next);
+	if (healedNewlines) {{
+		next = healedNewlines;
+	}}
+	// Strip accidental TypeScript variable type annotations (`const x: string = ...`), function param types & `as <Type>` casts in QuickJS scripts
 	if (/\b(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:/.test(next)) {{
 		next = next.replace(
 			/(^|[;\n]\s*)(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:string|number|boolean|any|unknown|object|Record<[^>\n]+>|Array<[^>\n]+>|(?:string|number|boolean|any|unknown)\[\])\s*=/gm,
 			"$1$2 $3 =",
+		);
+	}}
+	const cleanTsParamList = (params: string): string =>
+		params.replace(
+			/(\b[A-Za-z_$][A-Za-z0-9_$]*)\s*\??\s*:\s*(?:string|number|boolean|any|unknown|void|object|Record<[^>\n,)]+>|Array<[^>\n,)]+>|(?:string|number|boolean|any|unknown)\[\])/g,
+			"$1",
+		);
+	if (/:/.test(next)) {{
+		next = next.replace(
+			/(^|[^.\w$])((?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*|(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?:async\s*)?)\(([^()\n]*)\)/gm,
+			(m, pre: string, head: string, params: string) =>
+				params.includes(":") ? `${{pre}}${{head}}(${{cleanTsParamList(params)}})` : m,
+		);
+		next = next.replace(
+			/(\(\s*|(?:map|filter|forEach|find|some|every|reduce|sort|flatMap)\s*\(\s*)\(([^()\n]+)\)(\s*=>)/g,
+			(m, pre: string, params: string, arrow: string) =>
+				params.includes(":") ? `${{pre}}(${{cleanTsParamList(params)}})${{arrow}}` : m,
+		);
+		next = next.replace(
+			/\)\s*:\s*(?:void|string|number|boolean|any|unknown|Promise<[^>\n]+>)\s*(?=\{{|=>)/g,
+			") ",
 		);
 	}}
 	if (/\bas\s+(?:any|unknown|string|number|boolean|object|const)\b/.test(next)) {{
@@ -1264,9 +1504,16 @@ export function serializeMessagesForCompaction(
 	return parts.join("\n\n");
 }}
 
-export function shouldAutoSieveShellOutput(text: string, isFastModel = false): boolean {{
+export function shouldAutoSieveShellOutput(
+	text: string,
+	isFastModel = false,
+	hardLimitOverride?: number,
+): boolean {{
 	if (!text) return false;
-	const hardLimit = isFastModel ? 12000 : SIEVE_HARD_CHARS;
+	let hardLimit = isFastModel ? 12000 : SIEVE_HARD_CHARS;
+	if (typeof hardLimitOverride === "number" && hardLimitOverride > 0) {{
+		hardLimit = hardLimitOverride;
+	}}
 	if (text.length >= hardLimit) return true;
 	const lines = text.split("\n");
 	if (lines.some((l) => l.length > SIEVE_GIANT_LINE_CHARS)) return true;
@@ -2509,7 +2756,11 @@ export function healCmdForLoop(raw: string, toolName = "bash"): string | undefin
 	return `${{cdRaw}}for ${{v}} in ${{items}}; do ${{body.trim()}}; done`;
 }}
 
-export function healCommand(raw: string, toolName: string): string | undefined {{
+export function healCommand(
+	raw: string,
+	toolName: string,
+	kvSleepOverrideSec?: number,
+): string | undefined {{
 	if (!raw) return undefined;
 	let cmd = raw;
 	let changed = false;
@@ -2716,8 +2967,8 @@ export function healCommand(raw: string, toolName: string): string | undefined {
 		}}
 	}}
 
-	// 9. Clamp long foreground sleeps (>=60s) to 45s to avoid evicting LLM KV-caches
-	const clampedSleep = clampKvSafeSleep(cmd, toolName, 45);
+	// 9. Clamp long foreground sleeps (>=60s) to kvSleepOverrideSec (default 45s) to avoid evicting LLM KV-caches
+	const clampedSleep = clampKvSafeSleep(cmd, toolName, kvSleepOverrideSec ?? 45);
 	if (clampedSleep) {{
 		cmd = clampedSleep;
 		changed = true;
@@ -3351,6 +3602,7 @@ function extractEditedPathsFromTool(toolName: string, input: Record<string, unkn
 }}
 
 export default function (pi: ExtensionAPI) {{
+	const apProfileOverrides = loadApProfile();
 	const recentShellFps: string[] = [];
 	const unchangedReads = new Map<string, number>();
 	const outlinedPaths = new Set<string>();
@@ -4280,10 +4532,17 @@ export default function (pi: ExtensionAPI) {{
 		const protectFreshColdRebuild =
 			justRebuiltColdCache && (effTokens === null || effTokens < MASK_TIER2_TOKENS);
 		if (Array.isArray(contextEntries) && cooldownReady && !protectFreshColdRebuild) {{
+			const basePlanOpts = deepCacheDiscount
+				? {{ highWaterTokens: 210000, staleCharsFallback: 360000 }}
+				: {{}};
+			const maskOpts =
+				typeof apProfileOverrides?.maskHighWaterTokens === "number"
+					? {{ ...basePlanOpts, highWaterTokens: apProfileOverrides.maskHighWaterTokens }}
+					: basePlanOpts;
 			const plan = planObservationMasking(contextEntries, {{
 				usagePercent: usage?.percent ?? null,
 				usageTokens: effTokens,
-				...(deepCacheDiscount ? {{ highWaterTokens: 210000, staleCharsFallback: 360000 }} : {{}}),
+				...maskOpts,
 			}});
 			if (plan.edits.length > 0) {{
 				lastMaskTurn = sessionTurnCount;
@@ -4553,7 +4812,7 @@ export default function (pi: ExtensionAPI) {{
 		}}
 		const ephGuarded = event.toolName === "bash" ? guardEphemeralServerCommand(cmd) : undefined;
 		const cmdStage1 = ephGuarded ?? cmd;
-		const healed = healCommand(cmdStage1, event.toolName);
+		const healed = healCommand(cmdStage1, event.toolName, apProfileOverrides?.kvSafeSleepSec);
 		const finalCmd = healed ?? cmdStage1;
 		if (finalCmd !== cmd) {{
 			event.input.command = finalCmd;
@@ -4835,7 +5094,7 @@ export default function (pi: ExtensionAPI) {{
 				cmd.includes("ap.exe") ||
 				/\bap\s+(?:read|search|query|atlas|probe|guard|sieve|baton|splice|recall)\b/.test(cmd);
 			const isFast = isDeepCacheDiscountModel((ctx as {{ model?: {{ id?: string; api?: string }} }} | undefined)?.model);
-			if (!skipSieve && shouldAutoSieveShellOutput(outText, isFast)) {{
+			if (!skipSieve && shouldAutoSieveShellOutput(outText, isFast, apProfileOverrides?.sieveHardChars)) {{
 				const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-bash"], {{
 					input: outText,
 					encoding: "utf8",
@@ -4932,7 +5191,7 @@ fn remove_pi_accelerator_extension(ext_dir: &Path) {
     let _ = fs::remove_file(ext_dir.join("zz-ap-accelerator.ts"));
 }
 
-fn merge_vscode_mcp(cfg_path: &Path, ap_bin_posix: &str) -> String {
+fn merge_vscode_mcp(cfg_path: &Path, ap_bin_posix: &str, mcp_profile: &str) -> String {
     let mut data: Value = if cfg_path.exists() {
         fs::read_to_string(cfg_path)
             .ok()
@@ -4957,7 +5216,7 @@ fn merge_vscode_mcp(cfg_path: &Path, ap_bin_posix: &str) -> String {
         json!({
             "type": "stdio",
             "command": ap_bin_posix,
-            "args": ["mcp"]
+            "args": mcp_args_for_profile(mcp_profile)
         }),
     );
     if let Some(p) = cfg_path.parent() {
@@ -5012,12 +5271,29 @@ pub fn cmd_init(
     with_hooks: bool,
     with_mcp: bool,
     no_rules: bool,
+    mcp_profile_arg: &str,
+    model_profile_arg: &str,
 ) -> i32 {
     let home = home_opt
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(default_home_dir);
     let check_bins = fs::canonicalize(&home).ok() == fs::canonicalize(default_home_dir()).ok();
+
+    let explicit_mcp = match crate::profile::parse_mcp_profile_arg(mcp_profile_arg) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[ap init] {e}");
+            return 2;
+        }
+    };
+    let explicit_model = match crate::profile::parse_model_profile_arg(model_profile_arg) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[ap init] {e}");
+            return 2;
+        }
+    };
 
     let selected: Vec<&str> = only_arg
         .split(',')
@@ -5047,6 +5323,48 @@ pub fn cmd_init(
         }
     };
     let explicit_agents = !matches!(agent_arg.trim().to_ascii_lowercase().as_str(), "" | "auto");
+
+    let mut stored_profile = if !here && dir_opt.is_none() {
+        crate::profile::load_profile(&home)
+    } else {
+        None
+    };
+    if !here && dir_opt.is_none() && (explicit_mcp.is_some() || explicit_model.is_some()) {
+        let mut cfg = stored_profile.unwrap_or_default();
+        if let Some(mp) = explicit_model {
+            cfg.model_profile = mp.as_str().to_string();
+        }
+        if let Some(mcp_p) = explicit_mcp {
+            if explicit_agents && !harnesses.is_empty() && harnesses.len() < HARNESS_SPECS.len() {
+                for &hid in &harnesses {
+                    cfg.harness_mcp_profiles
+                        .insert(hid.to_string(), mcp_p.to_string());
+                }
+            } else {
+                cfg.default_mcp_profile = Some(mcp_p.to_string());
+            }
+        }
+        if let Err(e) = crate::profile::save_profile(&home, &cfg) {
+            eprintln!("[ap init] {e}");
+            return 1;
+        }
+        stored_profile = Some(cfg);
+    }
+    let effective_model_profile = explicit_model
+        .or_else(|| {
+            stored_profile
+                .as_ref()
+                .and_then(|c| crate::profile::ModelProfile::parse(&c.model_profile))
+        })
+        .unwrap_or(crate::profile::ModelProfile::Auto);
+    let mcp_for = |h: &str| -> &'static str {
+        crate::profile::resolve_mcp_profile_for_harness(
+            stored_profile.as_ref(),
+            h,
+            explicit_mcp.unwrap_or(""),
+            effective_model_profile,
+        )
+    };
 
     if here || dir_opt.is_some() {
         let repo_dir = fs::canonicalize(dir_opt.unwrap_or("."))
@@ -5143,6 +5461,7 @@ pub fn cmd_init(
             mcp_paths.push(merge_opencode_mcp(
                 &repo_dir.join("opencode.json"),
                 &ap_abs_here,
+                mcp_for("opencode"),
             ));
         }
         if with_mcp || (explicit_agents && harnesses.contains(&"qwen")) {
@@ -5150,6 +5469,7 @@ pub fn cmd_init(
                 &repo_dir.join(".qwen").join("settings.json"),
                 &ap_abs_here,
                 true,
+                mcp_for("qwen"),
             ));
         }
         if with_mcp || (explicit_agents && harnesses.contains(&"gemini-cli")) {
@@ -5157,6 +5477,7 @@ pub fn cmd_init(
                 &repo_dir.join(".gemini").join("settings.json"),
                 &ap_abs_here,
                 true,
+                mcp_for("gemini-cli"),
             ));
         }
         if with_mcp
@@ -5167,6 +5488,7 @@ pub fn cmd_init(
                 &repo_dir.join(".cursor").join("mcp.json"),
                 &ap_abs_here,
                 false,
+                mcp_for("cursor"),
             ));
         }
         if with_mcp
@@ -5176,6 +5498,7 @@ pub fn cmd_init(
             mcp_paths.push(merge_vscode_mcp(
                 &repo_dir.join(".vscode").join("mcp.json"),
                 &ap_abs_here,
+                mcp_for("vscode"),
             ));
         }
         if with_mcp
@@ -5185,6 +5508,7 @@ pub fn cmd_init(
             mcp_paths.push(merge_pi_mcp(
                 &repo_dir.join(".pi").join("mcp.json"),
                 &ap_abs_here,
+                mcp_for("pi"),
             ));
             if with_hooks {
                 hook_paths.push(install_pi_accelerator_extension(
@@ -5198,6 +5522,7 @@ pub fn cmd_init(
                 &repo_dir.join(".mcp.json"),
                 &ap_abs_here,
                 false,
+                explicit_mcp.unwrap_or("full"),
             ));
         }
 
@@ -5345,12 +5670,14 @@ pub fn cmd_init(
         mcp_paths.push(merge_pi_mcp(
             &home.join(".pi").join("agent").join("mcp.json"),
             &global_bin_posix,
+            mcp_for("pi"),
         ));
     }
     if harnesses.contains(&"opencode") {
         mcp_paths.push(merge_opencode_mcp(
             &home.join(".config").join("opencode").join("opencode.json"),
             &global_bin_posix,
+            mcp_for("opencode"),
         ));
     }
     if harnesses.contains(&"qwen") {
@@ -5358,6 +5685,7 @@ pub fn cmd_init(
             &home.join(".qwen").join("settings.json"),
             &global_bin_posix,
             true,
+            mcp_for("qwen"),
         ));
     }
     if harnesses.contains(&"gemini-cli") {
@@ -5365,6 +5693,7 @@ pub fn cmd_init(
             &home.join(".gemini").join("settings.json"),
             &global_bin_posix,
             true,
+            mcp_for("gemini-cli"),
         ));
     }
     if harnesses.contains(&"cursor") {
@@ -5372,6 +5701,7 @@ pub fn cmd_init(
             &home.join(".cursor").join("mcp.json"),
             &global_bin_posix,
             false,
+            mcp_for("cursor"),
         ));
     }
     if harnesses.contains(&"windsurf") {
@@ -5382,6 +5712,7 @@ pub fn cmd_init(
                 .join("mcp_config.json"),
             &global_bin_posix,
             false,
+            mcp_for("windsurf"),
         ));
     }
     if harnesses.contains(&"claude-desktop") {
@@ -5404,6 +5735,7 @@ pub fn cmd_init(
             &home.join(cd_rel).join("claude_desktop_config.json"),
             &global_bin_posix,
             false,
+            mcp_for("claude-desktop"),
         ));
     }
 
@@ -5427,6 +5759,13 @@ pub fn cmd_init(
             .join(", ")
     );
     println!("  - Installed native single binary: {global_bin_posix}");
+    if stored_profile.is_some() || explicit_mcp.is_some() || explicit_model.is_some() {
+        println!(
+            "  - Layer 3 adapter profile : model={}, mcp={}",
+            effective_model_profile.as_str(),
+            explicit_mcp.unwrap_or(effective_model_profile.knobs().recommended_mcp_profile)
+        );
+    }
     if !wired_rules.is_empty() {
         println!(
             "  - Global routing blocks wired: {}",
@@ -5585,6 +5924,7 @@ pub fn cmd_uninstall(here: bool, dir_opt: Option<&str>, home_opt: Option<&str>) 
             let _ = fs::remove_file(&f);
         }
     }
+    let _ = fs::remove_file(crate::profile::profile_path(&home));
     let _ = fs::remove_dir_all(home.join(".agent-primitives"));
     println!("[ap uninstall] Removed {count} installed skill folder(s) and {rules_cleaned} global rule block(s).");
     0
@@ -5626,6 +5966,8 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("serializeMessagesForCompaction")
                 && s.contains("stabilizeProviderTools")
                 && s.contains("healCodemodeSource")
+                && s.contains("healJsStringRawNewlines")
+                && s.contains("loadApProfile")
                 && s.contains("normalizeEditArgs")
                 && s.contains("findAllEditOccurrenceLines")
                 && s.contains("extractAllToolResultText")
@@ -5921,6 +6263,144 @@ fn inspect_pi_runtime(home: &Path) -> Value {
     })
 }
 
+fn extract_mcp_profile_from_entry(entry: &Value, arr_ptr: &str) -> &'static str {
+    let Some(arr) = entry.pointer(arr_ptr).and_then(Value::as_array) else {
+        return "full";
+    };
+    for pair in arr.windows(2) {
+        if pair[0].as_str() == Some("--profile") {
+            match pair[1].as_str() {
+                Some("core") => return "core",
+                Some("deferred") => return "deferred",
+                _ => return "full",
+            }
+        }
+    }
+    "full"
+}
+
+fn has_ap_hook_file(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|s| s.contains("agent-primitives") || s.contains("ap exec") || s.contains("ap.exe"))
+        .unwrap_or(false)
+}
+
+pub fn inspect_wired_harness_profiles(home: &Path) -> Value {
+    let cd_rel = [
+        "AppData/Roaming/Claude",
+        "Library/Application Support/Claude",
+        ".config/Claude",
+    ]
+    .iter()
+    .copied()
+    .find(|d| home.join(d).join("claude_desktop_config.json").is_file())
+    .unwrap_or(if cfg!(windows) {
+        "AppData/Roaming/Claude"
+    } else if cfg!(target_os = "macos") {
+        "Library/Application Support/Claude"
+    } else {
+        ".config/Claude"
+    });
+
+    let mcp_specs: [(&str, PathBuf, &str, &str); 7] = [
+        (
+            "pi",
+            home.join(".pi").join("agent").join("mcp.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+        (
+            "opencode",
+            home.join(".config").join("opencode").join("opencode.json"),
+            "/mcp/agent-primitives",
+            "/command",
+        ),
+        (
+            "cursor",
+            home.join(".cursor").join("mcp.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+        (
+            "gemini-cli",
+            home.join(".gemini").join("settings.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+        (
+            "qwen",
+            home.join(".qwen").join("settings.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+        (
+            "windsurf",
+            home.join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+        (
+            "claude-desktop",
+            home.join(cd_rel).join("claude_desktop_config.json"),
+            "/mcpServers/agent-primitives",
+            "/args",
+        ),
+    ];
+
+    let mut rows = Vec::new();
+    for (hid, cfg_p, entry_ptr, arr_ptr) in mcp_specs {
+        let Ok(raw) = fs::read_to_string(&cfg_p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(entry) = v.pointer(entry_ptr) else {
+            continue;
+        };
+        let mcp_profile = extract_mcp_profile_from_entry(entry, arr_ptr);
+        let codemode_deferred =
+            hid == "pi" && entry.get("exposure").and_then(Value::as_str) == Some("codemode");
+        let hooks = if hid == "pi" {
+            home.join(".pi")
+                .join("agent")
+                .join("extensions")
+                .join("zz-ap-accelerator.ts")
+                .is_file()
+        } else {
+            false
+        };
+        rows.push(json!({
+            "harness": hid,
+            "mcp_profile": mcp_profile,
+            "codemode_deferred": codemode_deferred,
+            "hooks": hooks,
+        }));
+    }
+
+    for (hid, hook_p) in [
+        ("claude", home.join(".claude").join("settings.json")),
+        ("codex", home.join(".codex").join("hooks.json")),
+        (
+            "antigravity",
+            home.join(".gemini").join("config").join("hooks.json"),
+        ),
+    ] {
+        if has_ap_hook_file(&hook_p) {
+            rows.push(json!({
+                "harness": hid,
+                "mcp_profile": "hook-only",
+                "codemode_deferred": false,
+                "hooks": true,
+            }));
+        }
+    }
+
+    Value::Array(rows)
+}
+
 pub fn cmd_doctor(as_json: bool) -> i32 {
     let mut ok = true;
     let fts5_ok = Connection::open_in_memory()
@@ -6033,6 +6513,20 @@ pub fn cmd_doctor(as_json: bool) -> i32 {
     }
 
     let pi_runtime = inspect_pi_runtime(&home);
+    let stored_profile = crate::profile::load_profile(&home);
+    let active_model_profile = stored_profile
+        .as_ref()
+        .map(|c| c.model_profile.as_str())
+        .unwrap_or("auto");
+    let wired_harnesses = inspect_wired_harness_profiles(&home);
+    let adapter_layers = json!({
+        "core_version": env!("CARGO_PKG_VERSION"),
+        "mcp_tools": 37,
+        "idle_skill_tokens": 390,
+        "model_profile": active_model_profile,
+        "profile_file_present": stored_profile.is_some(),
+        "wired_harnesses": wired_harnesses,
+    });
 
     if as_json {
         println!(
@@ -6052,6 +6546,7 @@ pub fn cmd_doctor(as_json: bool) -> i32 {
                 "wired_hooks_count": wired_hooks_count,
                 "sieve_archives": sieve_archives,
                 "sieve_kb": ((sieve_bytes as f64 / 1024.0) * 10.0).round() / 10.0,
+                "adapter_layers": adapter_layers,
                 "pi_runtime": pi_runtime,
             }))
             .unwrap_or_default()
@@ -6106,6 +6601,12 @@ pub fn cmd_doctor(as_json: bool) -> i32 {
         "  [OK] Agent Wiring      : {wired_mcp_count} MCP config(s), {wired_hooks_count} hook/extension(s), global bin={} | ~/.ap/sieve: {sieve_archives} archive(s) ({:.1} KB)",
         global_bin_version.as_deref().unwrap_or("not installed"),
         sieve_bytes as f64 / 1024.0
+    );
+    let wired_n = wired_harnesses.as_array().map(|a| a.len()).unwrap_or(0);
+    println!(
+        "  [OK] Adapter Layers    : Core v{} (37 MCP tools, 390 idle tok) | model_profile={active_model_profile} (custom={}) | wired_adapters={wired_n}",
+        env!("CARGO_PKG_VERSION"),
+        stored_profile.is_some()
     );
     if pi_runtime["detected"].as_bool() == Some(true) {
         let accel_ok = pi_runtime["accelerator_up_to_date"].as_bool() == Some(true);

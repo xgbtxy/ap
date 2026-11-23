@@ -1,8 +1,8 @@
-# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.47)
+# Real-World Efficiency Playbook: 1-Command Pure-Rust Setup (`ap` v2.48)
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [Handbook](./HANDBOOK.md) · [Architecture](./DESIGN.md) · [Contributing](../CONTRIBUTING.md) · [PR Template](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives` (`v2.39`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP 2025-06-18 (`36`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
+`agent-primitives` (`v2.48`) ships as **one native Rust binary (`ap` / `ap.exe`)** embedding **6 Tree-sitter C grammars** (`Py`/`TS`/`JS`/`Go`/`Rust`/`C`), **bundled SQLite FTS5/BM25**, a **Pure-Rust Interactive Headless Edge/Chrome CDP runner**, a **universal file/binary/archive/network inspector**, and a **full MCP 2025-06-18 (`37`-tool) stdio server (`ap mcp`)**—requiring **zero Python, Node, Playwright, or Rust toolchain on user machines**.
 
 ---
 
@@ -19,10 +19,14 @@ curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | ie
 ```
 
 ```bash
-# Onboard ONLY the current directory (or enable optional Pi runtime patches):
-ap init --here -a opencode
-ap init --here --with-hooks --with-mcp
-ap pi patch           # Applies 12 idempotent Pi v1.5+/v1.6 runtime patches (see docs/PI_RUNTIME.md)
+# Onboard ONLY the current directory, pick on-demand Layer 3 adapters, or enable Pi patches:
+ap init --here -a opencode --mcp-profile core
+ap init -a cursor --mcp-profile deferred --model-profile small
+ap profile show                            # View Universal Core + Layer 3 harness/model knobs
+ap profile set --model deepseek --apply    # Compose Core + DeepSeek KV/sieve profile on demand
+ap profile recommend                       # Suggest adapters from zero-PII local telemetry
+ap profile reset                           # Remove declarative profile overrides cleanly
+ap pi patch                                # Applies 14 idempotent Pi v1.5+/v1.6 runtime patches
 
 # Clean 1-command uninstall (restores original configs untouched):
 ap uninstall          # or: ap uninstall --here
@@ -31,12 +35,12 @@ ap uninstall          # or: ap uninstall --here
 ### Supported Agents Out-of-the-Box (`$0` Free & Commercial)
 - **OpenCode (`opencode`)**: Auto-wires `"agent-primitives"` MCP into `~/.config/opencode/opencode.json` (or repo `opencode.json`). Free models (`opencode/big-pickle`, `glm-5.3-flash-free`, `deepseek-flash`) call native MCP tools with zero shell quoting.
 - **Qwen Code (`qwen`) & Google Gemini CLI (`gemini`)**: Auto-wires `"trust": true` MCP config into `~/.qwen/settings.json` & `~/.gemini/settings.json`.
-- **Pi (`pi` / `pi-coding-agent`) & Goose (`goose`)**: Syncs `~/.pi/agent/skills/`, `"exposure": "codemode"` in `mcp.json`, zero-prompt-bloat `zz-ap-accelerator.ts`, plus **12 idempotent runtime patches** via `ap pi status|patch|restore`.
-- **Claude Code (`claude`), OpenAI Codex (`codex`), Antigravity (`agy`), Grok (`grok`), Cursor, Windsurf, VS Code, Claude Desktop, OpenClaw, Hermes**: Auto-wires MCP, minimal routing rules, and `<2ms` `exit 2` / JSON hooks with `rtk`-style test output auto-sieving.
+- **Pi (`pi` / `pi-coding-agent`) & Goose (`goose`)**: Syncs `~/.pi/agent/skills/`, `"exposure": "codemode"` in `mcp.json`, zero-prompt-bloat `zz-ap-accelerator.ts`, plus **14 idempotent runtime patches** via `ap pi status|patch|restore`.
+- **Claude Code (`claude`), OpenAI Codex (`codex`), Antigravity (`agy`), Grok (`grok`), Cursor, Windsurf, VS Code, Claude Desktop, OpenClaw, Hermes**: Auto-wires MCP (`--mcp-profile full|core|deferred`), minimal routing rules, and `<2ms` `exit 2` / JSON hooks with `rtk`-style test output auto-sieving.
 
 ---
 
-## 2. How the 36 MCP 2025-06-18 Tools (`--profile full|core|deferred`) & CLI Primitives Work Together
+## 2. How the 37 MCP 2025-06-18 Tools (`--profile full|core|deferred`) & CLI Primitives Work Together
 
 | Capability Group (`ap mcp` + CLI) | Cognitive / OS Bottleneck Eliminated | Typical Latency |
 | :--- | :--- | ---: |

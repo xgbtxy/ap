@@ -1,8 +1,8 @@
-# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.47）
+# 实战提效手册：免费与主流编程智能体的一行纯 Rust 接入指南（`ap` v2.48）
 
 [English](./PLAYBOOK.md) | [简体中文](./PLAYBOOK.zh-CN.md) · [演进总手册](./HANDBOOK.zh-CN.md) · [架构深潜](./DESIGN.zh-CN.md) · [共同维护](../CONTRIBUTING.zh-CN.md) · [PR 模板](../.github/PULL_REQUEST_TEMPLATE.md)
 
-`agent-primitives`（`v2.39`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP 2025-06-18（36 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
+`agent-primitives`（`v2.48`）交付为**单个零依赖原生 Rust 可执行文件（`ap` / `ap.exe`）**，静态内嵌 **6 语言 Tree-sitter 语法器**（`Py`/`TS`/`JS`/`Go`/`Rust`/`C`）、**内置 SQLite FTS5/BM25**、**纯 Rust 无头 Edge/Chrome CDP 引擎**、**万能文件/二进制/归档/网络审计器**以及**完整 MCP 2025-06-18（37 工具）标准服务端（`ap mcp`）**——用户电脑**无需安装 Python、Node、Playwright 或 Rust 编译器**。
 
 ---
 
@@ -19,10 +19,14 @@ curl.exe -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.ps1 | ie
 ```
 
 ```bash
-# 仅接入当前项目目录（或一键应用 Pi 运行时补丁）：
-ap init --here -a opencode
-ap init --here --with-hooks --with-mcp
-ap pi patch           # 幂等应用 12 项 Pi v1.5+/v1.6 运行时补丁（详见 docs/PI_RUNTIME.zh-CN.md）
+# 仅接入当前项目目录，按需挂载第 3 层模型 × 框架适配，或应用 Pi 补丁：
+ap init --here -a opencode --mcp-profile core
+ap init -a cursor --mcp-profile deferred --model-profile small
+ap profile show                            # 查看第 1 层底座 + 第 3 层按需模型/宿主参数
+ap profile set --model deepseek --apply    # 按需组装 Core + DeepSeek 缓存/脱水配置
+ap profile recommend                       # 基于本地零隐私多宿主日志推荐按需适配组合
+ap profile reset                           # 一键清除声明式覆盖配置，恢复底座默认
+ap pi patch                                # 幂等应用 14 项 Pi v1.5+/v1.6 运行时补丁
 
 # 随时一行无损卸载（完整保留你原有的个人配置）：
 ap uninstall          # 或卸载当前项目：ap uninstall --here
@@ -31,12 +35,12 @@ ap uninstall          # 或卸载当前项目：ap uninstall --here
 ### 原生支持的免费开源与商业智能体矩阵（$0 零 Key 即可提效）
 - **OpenCode（`opencode`）**：自动写入 `opencode.json` 启用 `ap mcp`。哪怕使用 `$0` 免费模型（`opencode/big-pickle`、`glm-5.3-flash-free`、`deepseek-flash`），也能直接调用结构化工具，彻底告别 Windows 引号报错。
 - **Qwen Code（`qwen`）与 Google Gemini CLI（`gemini`）**：自动向 `~/.qwen/settings.json` 与 `~/.gemini/settings.json` 注入 `"trust": true` 的 `ap mcp` 配置，免去每次弹窗确认。
-- **Pi（`pi`）与 Goose（`goose`）**：自动同步 `~/.pi/agent/skills/`、`"exposure": "codemode"` 的 `mcp.json`、零前导词膨胀的 `zz-ap-accelerator.ts`，以及 **`ap pi status|patch|restore` 12 项运行时补丁**。
-- **Claude Code、Codex、Antigravity、Grok、Cursor、Windsurf、VS Code、Claude Desktop、OpenClaw、Hermes**：自动接入 MCP、极简路由及 `<2ms` `exit 2` / JSON Hook（含 `rtk` 式测试日志自动脱水）。
+- **Pi（`pi`）与 Goose（`goose`）**：自动同步 `~/.pi/agent/skills/`、`"exposure": "codemode"` 的 `mcp.json`、零前导词膨胀的 `zz-ap-accelerator.ts`，以及 **`ap pi status|patch|restore` 14 项运行时补丁**。
+- **Claude Code、Codex、Antigravity、Grok、Cursor、Windsurf、VS Code、Claude Desktop、OpenClaw、Hermes**：自动接入 MCP（`--mcp-profile full|core|deferred`）、极简路由及 `<2ms` `exit 2` / JSON Hook（含 `rtk` 式测试日志自动脱水）。
 
 ---
 
-## 2. 36 个原生 MCP 2025-06-18 工具（`--profile full|core|deferred`）与 CLI 原语协同矩阵
+## 2. 37 个原生 MCP 2025-06-18 工具（`--profile full|core|deferred`）与 CLI 原语协同矩阵
 
 | 能力域（`ap mcp` + CLI） | 直接消除的模型思考与 OS 卡点 | 典型延迟 |
 | :--- | :--- | ---: |

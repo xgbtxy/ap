@@ -9,6 +9,7 @@ pub mod install;
 pub mod ls;
 pub mod mcp;
 pub mod pi_patch;
+pub mod profile;
 pub mod query;
 pub mod read;
 pub mod search;
@@ -49,6 +50,12 @@ enum TopCmd {
         with_mcp: bool,
         #[arg(long)]
         no_rules: bool,
+        /// MCP tool schema profile (`full`, `core`, or `deferred`)
+        #[arg(long, default_value = "")]
+        mcp_profile: String,
+        /// On-demand Layer 3 model profile (`auto`, `balanced`, `deepseek`, `fast`, `reasoning`, `small`)
+        #[arg(long, default_value = "")]
+        model_profile: String,
     },
     /// View prevented thinking derailments, browser verifications & efficiency gains
     #[command(visible_alias = "gain")]
@@ -107,7 +114,7 @@ enum TopCmd {
     },
     /// Start native Model Context Protocol (MCP) stdio JSON-RPC server
     Mcp {
-        /// Exposed tool profile: full (36 tools, default), core (8 everyday tools + ap_discover/ap_call), or deferred (only ap_discover + ap_call, ~94% fewer schema tokens)
+        /// Exposed tool profile: full (37 tools, default), core (8 everyday tools + ap_discover/ap_call), or deferred (only ap_discover + ap_call, ~94% fewer schema tokens)
         #[arg(long, default_value = "")]
         profile: String,
     },
@@ -145,6 +152,7 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
         "undo" => return Some(undo::run_cli(&sub_argv)),
         "stats" | "gain" => return Some(stats::run_cli(&sub_argv)),
         "pi" => return Some(pi_patch::run_cli(&sub_argv)),
+        "profile" => return Some(profile::run_cli(&sub_argv)),
         "sieve" => Some(ap_sieve::run_cli(&sub_argv)),
         "baton" => Some(ap_baton::run_cli(&sub_argv)),
         "recall" => Some(ap_recall::run_cli(&sub_argv)),
@@ -239,6 +247,8 @@ fn main() {
             with_hooks,
             with_mcp,
             no_rules,
+            mcp_profile,
+            model_profile,
         } => install::cmd_init(
             &agent,
             &only,
@@ -248,6 +258,8 @@ fn main() {
             with_hooks,
             with_mcp,
             no_rules,
+            &mcp_profile,
+            &model_profile,
         ),
         TopCmd::Stats { .. } => stats::run_cli(&args[1..]),
         TopCmd::Doctor { json } => install::cmd_doctor(json),

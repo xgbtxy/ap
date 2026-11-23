@@ -7697,3 +7697,120 @@ fn test_v247_elf_macho_tar_cpp_symbol_search_ctx_and_har_routes() {
         "{mo_s}"
     );
 }
+
+#[test]
+fn test_v248_layered_profile_init_mcp_profile_and_fast_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let home_s = home.to_string_lossy().to_string();
+
+    // 1. `ap init --mcp-profile deferred --model-profile small` persists Layer 3 profile & wires harness MCP args cleanly
+    let init_res = run_ap(
+        dir.path(),
+        &[
+            "init",
+            "--home",
+            &home_s,
+            "-a",
+            "opencode",
+            "--mcp-profile",
+            "deferred",
+            "--model-profile",
+            "small",
+            "--no-rules",
+        ],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let oc_cfg =
+        fs::read_to_string(home.join(".config").join("opencode").join("opencode.json")).unwrap();
+    assert!(
+        oc_cfg.contains("\"--profile\"") && oc_cfg.contains("\"deferred\""),
+        "{oc_cfg}"
+    );
+    let prof_raw = fs::read_to_string(home.join(".ap").join("profile.json")).unwrap();
+    assert!(
+        prof_raw.contains("\"model_profile\": \"small\""),
+        "{prof_raw}"
+    );
+
+    // 2. `ap profile show --json` inspects Core + Layer 3 knobs + wired harnesses
+    let show_res = run_ap(
+        dir.path(),
+        &["profile", "show", "--home", &home_s, "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(show_res.status.success());
+    let show_v: Value = serde_json::from_slice(&show_res.stdout).unwrap();
+    assert_eq!(show_v["model_profile"], "small");
+    assert_eq!(show_v["knobs"]["recommended_mcp_profile"], "deferred");
+    assert_eq!(show_v["wired_harnesses"][0]["harness"], "opencode");
+    assert_eq!(show_v["wired_harnesses"][0]["mcp_profile"], "deferred");
+
+    // 3. `ap profile set` updates declarative config, and `ap profile reset` removes it cleanly
+    let set_res = run_ap(
+        dir.path(),
+        &[
+            "profile",
+            "set",
+            "--home",
+            &home_s,
+            "--model",
+            "deepseek",
+            "--mcp-profile",
+            "core",
+            "--json",
+        ],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(set_res.status.success());
+    let set_v: Value = serde_json::from_slice(&set_res.stdout).unwrap();
+    assert_eq!(set_v["model_profile"], "deepseek");
+
+    let reset_res = run_ap(
+        dir.path(),
+        &["profile", "reset", "--home", &home_s, "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(reset_res.status.success());
+    assert!(!home.join(".ap").join("profile.json").exists());
+
+    // 4. `ap audit --maintainer --json` emits model_families_detected & recommended_adapters with zero secret leak
+    let pi_sess = home.join(".pi").join("agent").join("sessions");
+    fs::create_dir_all(&pi_sess).unwrap();
+    let sample_log = [
+        serde_json::json!({ "type": "model_change", "provider": "deepseek", "modelId": "deepseek-flash-private-alias" }).to_string(),
+        serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "model": "deepseek-flash",
+                "content": [{ "type": "toolCall", "name": "bash", "arguments": { "command": "python -c 'print(1)' # FAKE_SECRET_999" } }]
+            }
+        }).to_string(),
+    ].join("\n");
+    fs::write(pi_sess.join("s1.jsonl"), sample_log).unwrap();
+
+    let aud_res = run_ap(
+        dir.path(),
+        &["audit", "--home", &home_s, "--maintainer", "--json"],
+        None,
+        &[("HOME", home.as_path()), ("USERPROFILE", home.as_path())],
+    );
+    assert!(aud_res.status.success());
+    let aud_str = String::from_utf8_lossy(&aud_res.stdout);
+    let aud_v: Value = serde_json::from_slice(&aud_res.stdout).unwrap();
+    assert_eq!(aud_v["model_families_detected"]["deepseek"]["sessions"], 1);
+    assert!(!aud_v["recommended_adapters"].as_array().unwrap().is_empty());
+    assert!(!aud_str.contains("FAKE_SECRET_999"));
+    assert!(!aud_str.contains("deepseek-flash-private-alias"));
+}

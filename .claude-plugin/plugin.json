@@ -1,7 +1,7 @@
 {
   "name": "agent-primitives",
-  "version": "2.47.0",
-  "description": "Single-binary zero-dependency Rust engine & 36-tool MCP 2025-06-18 server for AI coding and desktop agents (Tree-sitter AST, SQLite FTS5, headless CDP, shell auto-heal)",
+  "version": "2.48.0",
+  "description": "Single-binary zero-dependency Rust engine & 37-tool MCP 2025-06-18 server for AI coding and desktop agents (Tree-sitter AST, SQLite FTS5, headless CDP, shell auto-heal)",
   "author": {
     "name": "xgbtxy",
     "url": "https://github.com/xgbtxy"

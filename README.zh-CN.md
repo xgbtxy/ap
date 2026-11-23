@@ -56,7 +56,8 @@ curl -fsSL https://raw.githubusercontent.com/xgbtxy/ap/main/install.sh | sh
 ```text
 +-------------------------------------------------------------------+
 |  3. 按需适配层（按当前使用的 Agent 框架 x 模型家族按需装配）         |
-|     - 宿主接线与 MCP 档位：`ap init -a <harness>` / `--profile`    |
+|     - 宿主接线与 MCP 档位：`ap init -a <harness>` / `--mcp-profile` |
+|     - 声明式档位管理：`ap profile show|set|recommend|reset`        |
 |     - 可选运行时补丁包：`ap pi patch`（14 项 Pi 运行时增强）        |
 |     - 模型特性经济学：KV-Cache 续热、快模型脱水阈值与 Schema 裁剪   |
 +-------------------------------------------------------------------+

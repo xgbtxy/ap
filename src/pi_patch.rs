@@ -23,7 +23,7 @@ enum PiSubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Idempotently apply all 12 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
+    /// Idempotently apply all 14 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
     Patch {
         #[arg(long)]
         pi_dir: Option<String>,
@@ -312,7 +312,7 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "codemode_result_output_shim",
-        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects lacking string .output (eliminates TypeError on r.output.slice())",
+        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects lacking string .output (template-literal-safe String.fromCharCode(10) join; eliminates TypeError & PRELUDE SyntaxError)",
         hunks: &[
             PatchHunk {
                 id: "bundle_codemode_result_output_shim",
@@ -320,8 +320,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 alt_olds: &[
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 ],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
             PatchHunk {
                 id: "prelude_codemode_result_output_shim",
@@ -329,8 +330,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 alt_olds: &[
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 ],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
         ],
     },
@@ -1003,5 +1005,32 @@ mod tests {
         assert_eq!(after_restore.applied_count, 0);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prelude_patch_hunks_are_template_literal_safe() {
+        assert!(!CODEMODE_BUILTINS_NEW.contains(r#""\n""#));
+        assert!(!CODEMODE_BUILTINS_NEW.contains(r#""\r""#));
+        let spec = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "codemode_result_output_shim")
+            .unwrap();
+        assert_eq!(spec.hunks.len(), 2);
+        for h in spec.hunks {
+            assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
+            assert!(!h.new.contains(r#""\r""#), "unsafe \\r in {}", h.id);
+            assert!(h.new.contains("String.fromCharCode(10)"));
+            assert_eq!(h.alt_olds.len(), 2);
+            assert!(
+                h.alt_olds
+                    .iter()
+                    .any(|a| a.contains("typeof value.output !== \"string\"")
+                        && a.contains(r#""\n""#))
+            );
+            assert!(h
+                .alt_olds
+                .iter()
+                .any(|a| a.contains("!(\"output\" in value)") && a.contains(r#""\n""#)));
+        }
     }
 }

@@ -2,12 +2,18 @@ use clap::Parser;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
+
+const MAX_LINE_PARSE_BYTES: usize = 512 * 1024;
+const MODEL_FAMILIES: [&str; 7] = [
+    "deepseek", "claude", "openai", "gemini", "grok", "qwen", "other",
+];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -79,6 +85,88 @@ impl Counters {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct SessionScan {
+    counters: Counters,
+    model_family: Option<&'static str>,
+}
+
+/// Strictly map arbitrary raw model strings to an allowlisted public family name (never leaks custom/private endpoints).
+pub fn classify_model_family(raw: &str) -> &'static str {
+    let low = raw.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return "other";
+    }
+    if low.contains("deepseek") || low.contains("flash-auto") {
+        return "deepseek";
+    }
+    if low.contains("claude")
+        || low.contains("sonnet")
+        || low.contains("opus")
+        || low.contains("haiku")
+    {
+        return "claude";
+    }
+    if low.contains("gpt-")
+        || low.starts_with("gpt")
+        || low.contains("openai")
+        || low.contains("codex")
+        || low.starts_with("o1")
+        || low.starts_with("o3")
+        || low.starts_with("o4")
+        || low.contains("/o1")
+        || low.contains("/o3")
+        || low.contains("/o4")
+    {
+        return "openai";
+    }
+    if low.contains("gemini") {
+        return "gemini";
+    }
+    if low.contains("grok") {
+        return "grok";
+    }
+    if low.contains("qwen") {
+        return "qwen";
+    }
+    "other"
+}
+
+fn family_index(fam: &'static str) -> usize {
+    MODEL_FAMILIES
+        .iter()
+        .position(|&x| x == fam)
+        .unwrap_or(MODEL_FAMILIES.len() - 1)
+}
+
+fn record_model_hint(hist: &mut [usize; 7], raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let fam = classify_model_family(trimmed);
+    hist[family_index(fam)] += 1;
+}
+
+fn pick_dominant_family(hist: &[usize; 7]) -> Option<&'static str> {
+    let mut best_idx = None;
+    let mut best_cnt = 0usize;
+    for (idx, &cnt) in hist[..MODEL_FAMILIES.len() - 1].iter().enumerate() {
+        if cnt > best_cnt {
+            best_cnt = cnt;
+            best_idx = Some(idx);
+        }
+    }
+    if let Some(i) = best_idx {
+        return Some(MODEL_FAMILIES[i]);
+    }
+    let other_idx = MODEL_FAMILIES.len() - 1;
+    if hist[other_idx] > 0 {
+        return Some("other");
+    }
+    None
+}
+
 fn cmd_regexes() -> &'static (Regex, Regex, Regex) {
     static RE: OnceLock<(Regex, Regex, Regex)> = OnceLock::new();
     RE.get_or_init(|| {
@@ -109,6 +197,7 @@ fn classify_err(txt: &str, st: &mut Counters) {
         "The '&&' operator",
         "The '<' operator",
         "unterminated triple-quoted",
+        "Script sandbox failed",
     ]
     .iter()
     .any(|k| txt.contains(k))
@@ -152,12 +241,50 @@ fn classify_err(txt: &str, st: &mut Counters) {
     if low.contains("timed out") || low.contains("etimedout") || low.contains("deadline exceeded") {
         st.shell_timeouts += 1;
     }
-    if (low.contains("no such file")
+    if ((low.contains("no such file")
         || low.contains("cannot find the path")
         || low.contains("filenotfounderror"))
-        && (low.contains("/mnt/") || low.contains("unicodeescape"))
+        && (low.contains("/mnt/") || low.contains("unicodeescape")))
+        || txt.contains("Program Files/Git/")
+        || txt.contains("Program Files\\Git\\")
     {
         st.path_translation_errors += 1;
+    }
+}
+
+fn for_each_bounded_line(file: File, max_parse_bytes: usize, mut cb: impl FnMut(&str, usize)) {
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut buf = Vec::with_capacity(16 * 1024);
+    loop {
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+        let raw_len = buf.len();
+        if raw_len <= max_parse_bytes {
+            let s = String::from_utf8_lossy(&buf);
+            cb(&s, raw_len);
+        } else {
+            let head_len = max_parse_bytes.min(raw_len);
+            let head = String::from_utf8_lossy(&buf[..head_len]);
+            let tail_start = raw_len.saturating_sub(16 * 1024).max(head_len);
+            if tail_start < raw_len {
+                let tail = String::from_utf8_lossy(&buf[tail_start..]);
+                let mut bounded = String::with_capacity(head.len() + tail.len() + 1);
+                bounded.push_str(&head);
+                bounded.push('\n');
+                bounded.push_str(&tail);
+                cb(&bounded, raw_len);
+            } else {
+                cb(&head, raw_len);
+            }
+        }
     }
 }
 
@@ -181,24 +308,44 @@ fn track_sliding_loop(win: &mut VecDeque<String>, nk: String) -> bool {
     win.iter().filter(|x| x.as_str() == nk.as_str()).count() >= 3
 }
 
-fn scan_codex(f: &Path) -> Counters {
+fn scan_codex(f: &Path) -> SessionScan {
     let mut st = Counters::default();
-    let Ok(file) = File::open(f) else { return st };
+    let mut hist = [0usize; 7];
+    let Ok(file) = File::open(f) else {
+        return SessionScan::default();
+    };
     let mut recent: VecDeque<String> = VecDeque::with_capacity(7);
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("call") {
-            continue;
-        }
-        if line.contains("_call_output\"") {
-            if line.len() >= 8192 {
+    for_each_bounded_line(file, MAX_LINE_PARSE_BYTES, |line, raw_len| {
+        if raw_len > MAX_LINE_PARSE_BYTES {
+            if line.contains("_call_output\"") && raw_len >= 8192 {
                 st.outputs_over_8kb += 1;
             }
-            classify_err(&line, &mut st);
-            continue;
+            classify_err(line, &mut st);
+            return;
         }
-        let Ok(o) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        if !line.contains("call") && !line.contains("\"model") {
+            return;
+        }
+        if line.contains("_call_output\"") {
+            if raw_len >= 8192 {
+                st.outputs_over_8kb += 1;
+            }
+            classify_err(line, &mut st);
+            return;
+        }
+        let Ok(o) = serde_json::from_str::<Value>(line) else {
+            return;
         };
+        for m in [
+            o["payload"]["model"].as_str(),
+            o["model"].as_str(),
+            o["payload"]["model_provider"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            record_model_hint(&mut hist, m);
+        }
         let pt = o["payload"]["type"].as_str().unwrap_or("");
         if pt == "function_call" || pt == "custom_tool_call" {
             st.tool_calls += 1;
@@ -217,18 +364,32 @@ fn scan_codex(f: &Path) -> Counters {
             }
             classify_err(out_s, &mut st);
         }
+    });
+    SessionScan {
+        counters: st,
+        model_family: pick_dominant_family(&hist),
     }
-    st
 }
 
-fn scan_agy(f: &Path) -> Counters {
+fn scan_agy(f: &Path) -> SessionScan {
     let mut st = Counters::default();
-    let Ok(file) = File::open(f) else { return st };
+    let mut hist = [0usize; 7];
+    let Ok(file) = File::open(f) else {
+        return SessionScan::default();
+    };
     let mut seen_reads: HashMap<String, usize> = HashMap::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(o) = serde_json::from_str::<Value>(&line) else {
-            continue;
+    for_each_bounded_line(file, MAX_LINE_PARSE_BYTES, |line, raw_len| {
+        if raw_len > MAX_LINE_PARSE_BYTES {
+            st.outputs_over_8kb += 1;
+            classify_err(line, &mut st);
+            return;
+        }
+        let Ok(o) = serde_json::from_str::<Value>(line) else {
+            return;
         };
+        if let Some(m) = o["model"].as_str() {
+            record_model_hint(&mut hist, m);
+        }
         if let Some(c) = o["content"].as_str() {
             if c.len() >= 8192 {
                 st.outputs_over_8kb += 1;
@@ -266,21 +427,40 @@ fn scan_agy(f: &Path) -> Counters {
                 }
             }
         }
+    });
+    SessionScan {
+        counters: st,
+        model_family: pick_dominant_family(&hist),
     }
-    st
 }
 
-fn scan_claude(f: &Path) -> Counters {
+fn scan_claude(f: &Path) -> SessionScan {
     let mut st = Counters::default();
-    let Ok(file) = File::open(f) else { return st };
+    let mut hist = [0usize; 7];
+    let Ok(file) = File::open(f) else {
+        return SessionScan::default();
+    };
     let mut seen_reads: HashMap<String, usize> = HashMap::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("tool_") {
-            continue;
+    for_each_bounded_line(file, MAX_LINE_PARSE_BYTES, |line, raw_len| {
+        if raw_len > MAX_LINE_PARSE_BYTES {
+            if line.contains("tool_result") && raw_len >= 8192 {
+                st.outputs_over_8kb += 1;
+            }
+            classify_err(line, &mut st);
+            return;
         }
-        let Ok(o) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        if !line.contains("tool_") && !line.contains("\"model\"") {
+            return;
+        }
+        let Ok(o) = serde_json::from_str::<Value>(line) else {
+            return;
         };
+        if let Some(m) = o["message"]["model"]
+            .as_str()
+            .or_else(|| o["model"].as_str())
+        {
+            record_model_hint(&mut hist, m);
+        }
         if let Some(arr) = o["message"]["content"].as_array() {
             for blk in arr {
                 match blk["type"].as_str().unwrap_or("") {
@@ -315,30 +495,49 @@ fn scan_claude(f: &Path) -> Counters {
                 }
             }
         }
+    });
+    SessionScan {
+        counters: st,
+        model_family: pick_dominant_family(&hist),
     }
-    st
 }
 
-fn scan_grok(f: &Path) -> Counters {
+fn scan_grok(f: &Path) -> SessionScan {
     let mut st = Counters::default();
-    let Ok(file) = File::open(f) else { return st };
+    let mut hist = [0usize; 7];
+    let Ok(file) = File::open(f) else {
+        return SessionScan::default();
+    };
     let mut seen_reads: HashMap<String, usize> = HashMap::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("tool_call") {
-            continue;
+    for_each_bounded_line(file, MAX_LINE_PARSE_BYTES, |line, raw_len| {
+        if raw_len > MAX_LINE_PARSE_BYTES {
+            if line.contains("\"tool_call_update\"") && raw_len >= 8192 {
+                st.outputs_over_8kb += 1;
+            }
+            classify_err(line, &mut st);
+            return;
+        }
+        if !line.contains("tool_call") && !line.contains("\"model\"") {
+            return;
         }
         if line.contains("\"tool_call_update\"") {
             if line.contains("\"completed\"") || line.contains("\"failed\"") {
-                if line.len() >= 8192 {
+                if raw_len >= 8192 {
                     st.outputs_over_8kb += 1;
                 }
-                classify_err(&line, &mut st);
+                classify_err(line, &mut st);
             }
-            continue;
+            return;
         }
-        let Ok(o) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        let Ok(o) = serde_json::from_str::<Value>(line) else {
+            return;
         };
+        if let Some(m) = o["model"]
+            .as_str()
+            .or_else(|| o["params"]["model"].as_str())
+        {
+            record_model_hint(&mut hist, m);
+        }
         let upd = &o["params"]["update"];
         match upd["sessionUpdate"].as_str().unwrap_or("") {
             "tool_call" => {
@@ -375,13 +574,19 @@ fn scan_grok(f: &Path) -> Counters {
             }
             _ => {}
         }
+    });
+    SessionScan {
+        counters: st,
+        model_family: pick_dominant_family(&hist),
     }
-    st
 }
 
-fn scan_pi(f: &Path) -> Counters {
+fn scan_pi(f: &Path) -> SessionScan {
     let mut st = Counters::default();
-    let Ok(file) = File::open(f) else { return st };
+    let mut hist = [0usize; 7];
+    let Ok(file) = File::open(f) else {
+        return SessionScan::default();
+    };
     let mut seen_reads: HashMap<String, usize> = HashMap::new();
     let mut recent: VecDeque<String> = VecDeque::with_capacity(7);
     let mut prev_prompt_tokens = 0u64;
@@ -392,22 +597,43 @@ fn scan_pi(f: &Path) -> Counters {
         }
         *run = 0;
     };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("\"message\"") {
-            continue;
-        }
-        if line.contains("\"toolResult\"") {
-            if line.len() >= 8192 {
+    for_each_bounded_line(file, MAX_LINE_PARSE_BYTES, |line, raw_len| {
+        if raw_len > MAX_LINE_PARSE_BYTES {
+            if line.contains("\"toolResult\"") && raw_len >= 8192 {
                 st.outputs_over_8kb += 1;
             }
-            classify_err(&line, &mut st);
-            continue;
+            classify_err(line, &mut st);
+            return;
         }
-        let Ok(o) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        if !line.contains("\"message\"") && !line.contains("\"model_change\"") {
+            return;
+        }
+        if line.contains("\"toolResult\"") && raw_len <= MAX_LINE_PARSE_BYTES {
+            if raw_len >= 8192 {
+                st.outputs_over_8kb += 1;
+            }
+            classify_err(line, &mut st);
+            return;
+        }
+        let Ok(o) = serde_json::from_str::<Value>(line) else {
+            return;
         };
-        if o["type"].as_str() != Some("message") {
-            continue;
+        let top_type = o["type"].as_str().unwrap_or("");
+        if top_type == "model_change" {
+            for m in [
+                o["modelId"].as_str(),
+                o["provider"].as_str(),
+                o["model"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                record_model_hint(&mut hist, m);
+            }
+            return;
+        }
+        if top_type != "message" {
+            return;
         }
         let msg = &o["message"];
         match msg["role"].as_str().unwrap_or("") {
@@ -415,6 +641,12 @@ fn scan_pi(f: &Path) -> Counters {
                 flush_serial(&mut serial_1tool_run, &mut st);
             }
             "assistant" => {
+                for m in [msg["model"].as_str(), msg["provider"].as_str()]
+                    .into_iter()
+                    .flatten()
+                {
+                    record_model_hint(&mut hist, m);
+                }
                 let stop_reason = msg["stopReason"].as_str().unwrap_or("");
                 if let Some(u) = msg["usage"].as_object() {
                     let u_in = u.get("input").and_then(Value::as_u64).unwrap_or(0);
@@ -502,9 +734,12 @@ fn scan_pi(f: &Path) -> Counters {
             }
             _ => {}
         }
-    }
+    });
     flush_serial(&mut serial_1tool_run, &mut st);
-    st
+    SessionScan {
+        counters: st,
+        model_family: pick_dominant_family(&hist),
+    }
 }
 
 fn collect_matching_files(
@@ -629,22 +864,32 @@ pub fn default_home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn scan_gemini(f: &Path) -> Counters {
+fn scan_gemini(f: &Path) -> SessionScan {
     let mut st = Counters::default();
+    let mut hist = [0usize; 7];
     let Ok(raw) = fs::read_to_string(f) else {
-        return st;
+        return SessionScan::default();
     };
     if raw.len() > 25_000_000 {
-        return st;
+        return SessionScan::default();
     }
     let Ok(v) = serde_json::from_str::<Value>(&raw) else {
-        return st;
+        return SessionScan::default();
     };
+    if let Some(m) = v["model"].as_str() {
+        record_model_hint(&mut hist, m);
+    }
     let Some(msgs) = v.get("messages").and_then(Value::as_array) else {
-        return st;
+        return SessionScan {
+            counters: st,
+            model_family: pick_dominant_family(&hist),
+        };
     };
     let mut seen_reads: HashMap<String, usize> = HashMap::new();
     for m in msgs {
+        if let Some(mm) = m.get("model").and_then(Value::as_str) {
+            record_model_hint(&mut hist, mm);
+        }
         if let Some(tcs) = m.get("toolCalls").and_then(Value::as_array) {
             for tc in tcs {
                 st.tool_calls += 1;
@@ -678,7 +923,10 @@ fn scan_gemini(f: &Path) -> Counters {
             }
         }
     }
-    st
+    SessionScan {
+        counters: st,
+        model_family: pick_dominant_family(&hist),
+    }
 }
 
 pub fn build_maintainer_targets(totals: &Counters) -> Vec<Value> {
@@ -753,11 +1001,97 @@ pub fn build_maintainer_targets(totals: &Counters) -> Vec<Value> {
             + totals.kv_cache_cold_drops,
         "reasoning_and_cache_friction",
         "Heavy-thinking churn, DSML tool leaks, serial 1-tool loops, or KV-cache cold drops",
-        &["src/pi_patch.rs", "src/install.rs"],
-        "Refine Pi runtime patches, KV-cache prefix stability, parallel tool batching hints, and tool-name self-healing",
+        &["src/pi_patch.rs", "src/install.rs", "src/profile.rs"],
+        "Refine Pi runtime patches, KV-cache prefix stability, model-tier profiles, parallel tool batching hints, and tool-name self-healing",
     );
     items.sort_by_key(|a| std::cmp::Reverse(a.0));
     items.into_iter().map(|(_, v)| v).collect()
+}
+
+pub fn build_adapter_recommendations(
+    harnesses: &serde_json::Map<String, Value>,
+    model_families: &serde_json::Map<String, Value>,
+    totals: &Counters,
+) -> Vec<Value> {
+    let mut recs = Vec::new();
+    let core_friction = totals.adhoc_inline_python
+        + totals.shell_quoting_collision
+        + totals.redundant_same_file_rereads
+        + totals.outputs_over_8kb;
+    if core_friction > 0 || !harnesses.is_empty() {
+        recs.push(json!({
+            "layer": "Layer 1: Universal Core",
+            "target": "all_harnesses",
+            "command": "ap init",
+            "reason": format!(
+                "{} ad-hoc scripts, {} shell/quoting crashes, {} redundant re-reads, {} >8KB log spills benefit across all hosts via `ap read/search/query/splice/exec`",
+                totals.adhoc_inline_python,
+                totals.shell_quoting_collision,
+                totals.redundant_same_file_rereads,
+                totals.outputs_over_8kb
+            ),
+        }));
+    }
+    if harnesses.contains_key("pi_cli")
+        && (totals.heavy_thinking_turns
+            + totals.dsml_tool_leaks
+            + totals.kv_cache_cold_drops
+            + totals.outputs_over_8kb
+            > 0)
+    {
+        recs.push(json!({
+            "layer": "Layer 3: Pi x DeepSeek/Long-Ctx Adapter",
+            "target": "pi_cli",
+            "command": "ap init -a pi --with-hooks && ap pi patch && ap profile set --model deepseek",
+            "reason": format!(
+                "Pi runtime patches (incl. template-literal-safe codemode shim), KV-cache warming, DSML recovery ({} leaks) & 12KB fast auto-sieve",
+                totals.dsml_tool_leaks
+            ),
+        }));
+    } else if model_families.contains_key("deepseek") {
+        recs.push(json!({
+            "layer": "Layer 3: DeepSeek Model Profile",
+            "target": "deepseek",
+            "command": "ap profile set --model deepseek --apply",
+            "reason": "Configures 45s KV-cache-safe sleep clamp, 12KB auto-sieve threshold, 210k masking high-water, and DSML recovery",
+        }));
+    }
+    let has_non_codemode_cli = [
+        "codex_cli",
+        "claude_code",
+        "gemini_cli",
+        "grok_cli",
+        "antigravity_cli",
+    ]
+    .iter()
+    .any(|k| {
+        harnesses
+            .get(*k)
+            .and_then(|v| v.get("tool_calls"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    });
+    if has_non_codemode_cli {
+        recs.push(json!({
+            "layer": "Layer 3: Non-Codemode CLI MCP Profile",
+            "target": "cli_harnesses",
+            "command": "ap profile set --mcp-profile core --apply",
+            "reason": "Keep 8 everyday MCP tools loaded + on-demand `ap_discover`/`ap_call` (or `--mcp-profile deferred` for small models to trim ~94% upfront schema tokens)",
+        }));
+    }
+    recs
+}
+
+#[derive(Default)]
+struct ModelFamilyAgg {
+    sessions: usize,
+    tool_calls: usize,
+    kv_cache_cold_drops: usize,
+    dsml_tool_leaks: usize,
+    outputs_over_8kb: usize,
+    adhoc_inline_python: usize,
+    shell_quoting_collision: usize,
 }
 
 pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
@@ -767,7 +1101,7 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
         PathBuf,
         &'a str,
         Option<&'a str>,
-        fn(&Path) -> Counters,
+        fn(&Path) -> SessionScan,
     );
     let specs: [AuditSpec; 6] = [
         (
@@ -814,32 +1148,106 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
         ),
     ];
 
+    struct ScanJob {
+        harness_idx: usize,
+        file_idx: usize,
+        path: PathBuf,
+        scanner: fn(&Path) -> SessionScan,
+    }
+
+    let mut per_harness_counts = [0usize; 6];
+    let mut jobs: Vec<ScanJob> = Vec::new();
+    for (h_idx, (_, hdir, suf, pref, scanner)) in specs.iter().enumerate() {
+        let mut files = collect_matching_files(hdir, suf, *pref);
+        files.truncate(max_per_harness);
+        per_harness_counts[h_idx] = files.len();
+        for (f_idx, path) in files.into_iter().enumerate() {
+            jobs.push(ScanJob {
+                harness_idx: h_idx,
+                file_idx: f_idx,
+                path,
+                scanner: *scanner,
+            });
+        }
+    }
+
+    let mut per_harness_scans: [Vec<Option<SessionScan>>; 6] =
+        std::array::from_fn(|i| vec![None; per_harness_counts[i]]);
+    if !jobs.is_empty() {
+        let next_idx = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 8)
+            .min(jobs.len());
+        let results_lock = Mutex::new(&mut per_harness_scans);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= jobs.len() {
+                        break;
+                    }
+                    let job = &jobs[idx];
+                    let scan = (job.scanner)(&job.path);
+                    let mut guard = results_lock.lock().unwrap();
+                    guard[job.harness_idx][job.file_idx] = Some(scan);
+                });
+            }
+        });
+    }
+
     let mut harnesses = serde_json::Map::new();
     let mut comparisons = serde_json::Map::new();
     let mut totals = Counters::default();
+    let mut family_aggs: BTreeMap<&'static str, ModelFamilyAgg> = BTreeMap::new();
 
-    for (hname, hdir, suf, pref, scanner) in specs {
-        let mut files = collect_matching_files(&hdir, suf, pref);
-        files.truncate(max_per_harness);
-        if files.is_empty() {
+    for (h_idx, (hname, _, _, _, _)) in specs.iter().enumerate() {
+        let scans = &per_harness_scans[h_idx];
+        if scans.is_empty() {
             continue;
         }
         let mut h_agg = Counters::default();
-        let mut per_session = Vec::new();
-        for f in &files {
-            let st = scanner(f);
-            h_agg.add(&st);
-            per_session.push(st);
+        let mut per_session = Vec::with_capacity(scans.len());
+        for scan in scans.iter().flatten() {
+            h_agg.add(&scan.counters);
+            if let Some(fam) = scan.model_family {
+                let agg = family_aggs.entry(fam).or_default();
+                agg.sessions += 1;
+                agg.tool_calls += scan.counters.tool_calls;
+                agg.kv_cache_cold_drops += scan.counters.kv_cache_cold_drops;
+                agg.dsml_tool_leaks += scan.counters.dsml_tool_leaks;
+                agg.outputs_over_8kb += scan.counters.outputs_over_8kb;
+                agg.adhoc_inline_python += scan.counters.adhoc_inline_python;
+                agg.shell_quoting_collision += scan.counters.shell_quoting_collision;
+            }
+            per_session.push(scan.counters.clone());
         }
         totals.add(&h_agg);
         let mut hv = serde_json::to_value(&h_agg).unwrap_or_default();
-        hv["sessions"] = json!(files.len());
-        harnesses.insert(hname.to_string(), hv);
+        hv["sessions"] = json!(scans.len());
+        harnesses.insert((*hname).to_string(), hv);
         if compare {
             if let Some(cmp) = compute_half_comparison(&per_session) {
-                comparisons.insert(hname.to_string(), cmp);
+                comparisons.insert((*hname).to_string(), cmp);
             }
         }
+    }
+
+    let mut model_families_detected = serde_json::Map::new();
+    for (fam, agg) in family_aggs {
+        model_families_detected.insert(
+            fam.to_string(),
+            json!({
+                "sessions": agg.sessions,
+                "tool_calls": agg.tool_calls,
+                "kv_cache_cold_drops": agg.kv_cache_cold_drops,
+                "dsml_tool_leaks": agg.dsml_tool_leaks,
+                "outputs_over_8kb": agg.outputs_over_8kb,
+                "adhoc_inline_python": agg.adhoc_inline_python,
+                "shell_quoting_collision": agg.shell_quoting_collision,
+            }),
+        );
     }
 
     let mut recs = Vec::new();
@@ -898,12 +1306,16 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
     let maintainer_targets = build_maintainer_targets(&totals);
+    let recommended_adapters =
+        build_adapter_recommendations(&harnesses, &model_families_detected, &totals);
     let mut out = json!({
-        "privacy_guarantee": "100% local & strictly anonymized: zero prompts, zero code snippets, zero file paths, and zero credentials emitted.",
+        "privacy_guarantee": "100% local & strictly anonymized: zero prompts, zero code snippets, zero file paths, and zero raw model IDs/credentials emitted.",
         "elapsed_ms": elapsed_ms,
         "harnesses_detected": harnesses,
+        "model_families_detected": model_families_detected,
         "aggregate_friction_counts": totals,
         "recommended_primitives": recs,
+        "recommended_adapters": recommended_adapters,
         "maintainer_targets": maintainer_targets,
     });
     if compare {
@@ -940,7 +1352,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             "# ap Maintainer Friction-to-Source Brief (scanned in {} ms — 100% local, zero-PII)",
             report["elapsed_ms"]
         );
-        println!("> Privacy Guarantee: numeric process-friction counters ONLY — zero prompts, zero user paths, zero code, zero secrets.\n");
+        println!("> Privacy Guarantee: numeric process-friction counters ONLY — zero prompts, zero user paths, zero code, zero raw model endpoints, zero secrets.\n");
         let Some(hmap) = report["harnesses_detected"].as_object() else {
             return 0;
         };
@@ -954,6 +1366,21 @@ pub fn run_cli(args: &[String]) -> i32 {
                 "- **{h}**: {} sessions, {} tool calls",
                 st["sessions"], st["tool_calls"]
             );
+        }
+        if let Some(fmap) = report["model_families_detected"]
+            .as_object()
+            .filter(|m| !m.is_empty())
+        {
+            println!("\n## Allowlisted Model Families Sampled");
+            for (fam, st) in fmap {
+                println!(
+                    "- **{fam}**: {} sessions, {} calls, {} cold KV drops, {} >8KB spills",
+                    st["sessions"],
+                    st["tool_calls"],
+                    st["kv_cache_cold_drops"],
+                    st["outputs_over_8kb"]
+                );
+            }
         }
         println!("\n## Ranked Optimization Targets Mapped to `ap` Source Modules");
         if let Some(targets) = report["maintainer_targets"].as_array() {
@@ -982,6 +1409,21 @@ pub fn run_cli(args: &[String]) -> i32 {
                 }
             }
         }
+        if let Some(adapters) = report["recommended_adapters"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+        {
+            println!("\n## Recommended On-Demand Adapters (Core + Harness x Model)");
+            for (i, a) in adapters.iter().enumerate() {
+                println!(
+                    "{}. **[{}]** `{}`\n   - {}",
+                    i + 1,
+                    a["layer"].as_str().unwrap_or(""),
+                    a["command"].as_str().unwrap_or(""),
+                    a["reason"].as_str().unwrap_or(""),
+                );
+            }
+        }
         println!("\n## Required Verification Before Opening a PR");
         println!("```bash\ncargo fmt --all -- --check\ncargo clippy --workspace --all-targets -- -D warnings\ncargo test --workspace\n```");
         return 0;
@@ -1004,6 +1446,18 @@ pub fn run_cli(args: &[String]) -> i32 {
             "- **{h}**: {} recent sessions, {} tool calls",
             st["sessions"], st["tool_calls"]
         );
+    }
+    if let Some(fmap) = report["model_families_detected"]
+        .as_object()
+        .filter(|m| !m.is_empty())
+    {
+        println!("\n## Model Families Scanned (Allowlisted)");
+        for (fam, st) in fmap {
+            println!(
+                "- **{fam}**: {} sessions, {} calls, {} cold drops",
+                st["sessions"], st["tool_calls"], st["kv_cache_cold_drops"]
+            );
+        }
     }
     let c = &report["aggregate_friction_counts"];
     println!("\n## Measured Process Bottlenecks Across Your Sessions");
@@ -1078,6 +1532,20 @@ pub fn run_cli(args: &[String]) -> i32 {
             );
         }
     }
+    if let Some(adapters) = report["recommended_adapters"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+    {
+        println!("\n## Recommended On-Demand Adapters (Core + Harness x Model)");
+        for a in adapters {
+            println!(
+                "- **[{}]** `{}` — {}",
+                a["layer"].as_str().unwrap_or(""),
+                a["command"].as_str().unwrap_or(""),
+                a["reason"].as_str().unwrap_or("")
+            );
+        }
+    }
     0
 }
 
@@ -1086,16 +1554,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audit_home_emits_zero_private_paths_or_prompt_text() {
+    fn audit_home_emits_zero_private_paths_or_prompt_text_and_maps_models() {
+        assert_eq!(classify_model_family("deepseek-flash"), "deepseek");
+        assert_eq!(classify_model_family("claude-sonnet-4"), "claude");
+        assert_eq!(classify_model_family("gpt-5-codex"), "openai");
+        assert_eq!(classify_model_family("gemini-2.5-pro"), "gemini");
+        assert_eq!(classify_model_family("corp-secret-endpoint-999"), "other");
+
         let tmp = std::env::temp_dir().join(format!("ap_audit_privacy_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let codex_dir = tmp.join(".codex").join("sessions");
+        let pi_dir = tmp.join(".pi").join("agent").join("sessions");
         fs::create_dir_all(&codex_dir).unwrap();
-        let fake_log = codex_dir.join("rollout-sample.jsonl");
-        let lines = [
+        fs::create_dir_all(&pi_dir).unwrap();
+
+        let codex_lines = [
             json!({
                 "payload": {
                     "type": "function_call",
+                    "model": "corp-secret-endpoint-999",
                     "arguments": "python -c \"open('C:/PrivateCorp/payroll_2026.csv')\" # SECRET_TOKEN_XYZ_999"
                 }
             })
@@ -1109,7 +1586,24 @@ mod tests {
             .to_string(),
         ]
         .join("\n");
-        fs::write(&fake_log, lines).unwrap();
+        fs::write(codex_dir.join("rollout-sample.jsonl"), codex_lines).unwrap();
+
+        let pi_lines = [
+            json!({ "type": "model_change", "provider": "deepseek", "modelId": "deepseek-flash" })
+                .to_string(),
+            json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "model": "deepseek-flash",
+                    "usage": { "input": 5000, "cacheRead": 50000 },
+                    "content": [{ "type": "toolCall", "name": "bash", "arguments": { "command": "python -c 'print(1)'" } }]
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(pi_dir.join("pi-sample.jsonl"), pi_lines).unwrap();
 
         let report = audit_home(&tmp, 10, false);
         let _ = fs::remove_dir_all(&tmp);
@@ -1118,7 +1612,7 @@ mod tests {
             report["aggregate_friction_counts"]["adhoc_inline_python"]
                 .as_u64()
                 .unwrap_or(0)
-                >= 1
+                >= 2
         );
         assert!(
             report["aggregate_friction_counts"]["shell_quoting_collision"]
@@ -1132,9 +1626,16 @@ mod tests {
                 .unwrap_or(0)
                 >= 1
         );
+        assert_eq!(report["model_families_detected"]["deepseek"]["sessions"], 1);
+        assert_eq!(report["model_families_detected"]["other"]["sessions"], 1);
         assert!(!report["maintainer_targets"].as_array().unwrap().is_empty());
+        assert!(!report["recommended_adapters"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(!serialized.contains("PrivateCorp"));
         assert!(!serialized.contains("payroll_2026"));
         assert!(!serialized.contains("SECRET_TOKEN_XYZ_999"));
+        assert!(!serialized.contains("corp-secret-endpoint-999"));
     }
 }

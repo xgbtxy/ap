@@ -57,6 +57,7 @@ When we audited **101,108 real tool calls** and raw `<thinking>` traces across c
 +-------------------------------------------------------------------+
 |  3. On-Demand Adapters (Selected per Harness x Model Family)      |
 |     - Harness hooks/MCP wiring: `ap init -a <harness>` / profiles |
+|     - Declarative profile CLI: `ap profile show|set|recommend|reset` |
 |     - Optional runtime patches: `ap pi patch` (Pi v1.5+/v1.6)    |
 |     - Model-tier economics: KV-cache TTL keep, sieve limits,      |
 |       `--profile core|deferred` schema slimming                   |
