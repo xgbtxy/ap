@@ -3768,6 +3768,37 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		if (grepPipeOut) return grepPipeOut;
 		const lsPipeOut = accelerateLsPipeline(trimmedTail, cdLeadPfx);
 		if (lsPipeOut) return lsPipeOut;
+		const duClean = stripErr(trimmedTail);
+		if (!hasUnsafeOutsideQuotes(duClean)) {{
+			const duToks = (duClean.match(/"[^"]*"|'[^']*'|\S+/g) || []).map((t) =>
+				t.replace(/^(['"])(.*)\1$/, "$2"),
+			);
+			if (duToks.length >= 2 && duToks[0] === "du") {{
+				let hasSummary = false;
+				let duTgt: string | undefined = undefined;
+				let duOk = true;
+				for (let di = 1; di < duToks.length; di += 1) {{
+					const tok = duToks[di];
+					if (tok.startsWith("-")) {{
+						if (/^(?:-s|-h|-sh|-hs|-k|-m|--summarize|--human-readable)$/.test(tok)) {{
+							hasSummary = true;
+						}} else {{
+							duOk = false;
+							break;
+						}}
+					}} else if (duTgt === undefined && !/[*?,]/.test(tok)) {{
+						duTgt = tok;
+					}} else {{
+						duOk = false;
+						break;
+					}}
+				}}
+				if (duOk && hasSummary) {{
+					const escDu = (duTgt || ".").replace(/"/g, '\\"');
+					return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{escDu}}" --du`;
+				}}
+			}}
+		}}
 		const catStages = splitUnquotedPipes(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
 		if (catStages && catStages.length === 2) {{
 			const catLhs = stripErr(catStages[0]);

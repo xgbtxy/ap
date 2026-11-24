@@ -159,6 +159,69 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
             }
             return Some(read::run_cli(&str_argv));
         }
+        "stat" => {
+            let mut stat_argv = Vec::with_capacity(tail_args.len() + 2);
+            stat_argv.push("ls".to_string());
+            if !is_help {
+                stat_argv.push("--stat".to_string());
+            }
+            stat_argv.extend_from_slice(tail_args);
+            return Some(ls::run_cli(&stat_argv));
+        }
+        "sha256" | "sha256sum" => {
+            let mut sha_argv = Vec::with_capacity(tail_args.len() + 3);
+            sha_argv.push("ls".to_string());
+            if !is_help {
+                sha_argv.push("--stat".to_string());
+                sha_argv.push("--hash".to_string());
+            }
+            sha_argv.extend_from_slice(tail_args);
+            return Some(ls::run_cli(&sha_argv));
+        }
+        "du" => {
+            let mut du_argv = Vec::with_capacity(tail_args.len() + 2);
+            du_argv.push("ls".to_string());
+            if !is_help {
+                du_argv.push("--du".to_string());
+                for a in tail_args {
+                    if matches!(
+                        a.as_str(),
+                        "-s" | "-h"
+                            | "-sh"
+                            | "-hs"
+                            | "-k"
+                            | "-m"
+                            | "--summarize"
+                            | "--human-readable"
+                    ) {
+                        continue;
+                    }
+                    du_argv.push(a.clone());
+                }
+            } else {
+                du_argv.extend_from_slice(tail_args);
+            }
+            return Some(ls::run_cli(&du_argv));
+        }
+        "wc" => {
+            let mut wc_argv = Vec::with_capacity(tail_args.len() + 2);
+            wc_argv.push("ls".to_string());
+            if !is_help {
+                wc_argv.push("--lines".to_string());
+                for a in tail_args {
+                    if matches!(
+                        a.as_str(),
+                        "-l" | "-c" | "-w" | "-lc" | "-cl" | "-lw" | "-wl" | "--lines" | "--bytes"
+                    ) {
+                        continue;
+                    }
+                    wc_argv.push(a.clone());
+                }
+            } else {
+                wc_argv.extend_from_slice(tail_args);
+            }
+            return Some(ls::run_cli(&wc_argv));
+        }
         "cdp" | "http" | "ws" | "tls" | "tcp" | "listen" | "ports" | "ps" | "win" | "ui"
         | "smoke" | "fuzz" | "mutate" => {
             let mut probe_argv = Vec::with_capacity(tail_args.len() + 2);

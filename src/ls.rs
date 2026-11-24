@@ -2,7 +2,9 @@ use crate::stats::record_event;
 use clap::Parser;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -25,6 +27,8 @@ struct LsCli {
     /// Directory or file path (supports Windows, POSIX & MSYS2 `/c/...` paths)
     #[arg(default_value = ".")]
     path: String,
+    /// Optional extra files or directories (used in `--lines`/`--hash`/`--du`/`--stat` metrics mode)
+    extra_paths: Vec<String>,
     /// Recursion depth (1 = direct children, max 5)
     #[arg(short = 'L', long, default_value_t = 1)]
     depth: usize,
@@ -49,6 +53,18 @@ struct LsCli {
     /// Include dotfiles and build/vendor dirs (`node_modules`, `target`, `.git`) when recursing
     #[arg(short = 'a', long)]
     all: bool,
+    /// Count exact lines & bytes for files (`ap wc` compatible)
+    #[arg(long)]
+    lines: bool,
+    /// Compute SHA-256 hex digests for files (`ap sha256` compatible)
+    #[arg(long, alias = "sha256")]
+    hash: bool,
+    /// Compute recursive directory disk usage (`ap du` compatible, skips vendor dirs unless `-a`)
+    #[arg(long, alias = "summary")]
+    du: bool,
+    /// Emit compact metadata (`bytes`, UTC `mtime`, `lines` / `du`, optional `--hash`) for 1+ paths
+    #[arg(long)]
+    stat: bool,
     /// Maximum entries to display
     #[arg(long, alias = "max", default_value_t = 120)]
     limit: usize,
@@ -227,6 +243,219 @@ fn collect_entries_recursive(
     }
 }
 
+fn count_file_lines_bytes(path: &Path) -> std::io::Result<(usize, u64)> {
+    let f = fs::File::open(path)?;
+    let mut reader = BufReader::new(f);
+    let mut buf = [0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    let mut lines = 0usize;
+    let mut last_byte = b'\n';
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        for &b in &buf[..n] {
+            if b == b'\n' {
+                lines += 1;
+            }
+        }
+        last_byte = buf[n - 1];
+    }
+    if bytes > 0 && last_byte != b'\n' {
+        lines += 1;
+    }
+    Ok((lines, bytes))
+}
+
+fn compute_file_sha256(path: &Path) -> std::io::Result<String> {
+    let f = fs::File::open(path)?;
+    let mut reader = BufReader::new(f);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn compute_dir_usage(dir: &Path, show_all: bool) -> (u64, usize, usize) {
+    let mut bytes = 0u64;
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&cur) else {
+            continue;
+        };
+        for item in rd.flatten() {
+            let name = item.file_name().to_string_lossy().to_string();
+            if !show_all && name.starts_with('.') {
+                continue;
+            }
+            let Ok(meta) = item.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                dirs += 1;
+                if show_all || !PRUNE_RECURSIVE_DIRS.contains(&name.as_str()) {
+                    stack.push(item.path());
+                }
+            } else {
+                files += 1;
+                bytes = bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    (bytes, files, dirs)
+}
+
+fn run_metrics_mode(cli: &LsCli) -> i32 {
+    let t0 = Instant::now();
+    let mut entries_json: Vec<serde_json::Value> = Vec::new();
+    let mut text_lines: Vec<String> = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut total_lines = 0usize;
+    let mut valid_count = 0usize;
+
+    for raw_t in std::iter::once(&cli.path).chain(cli.extra_paths.iter()) {
+        let norm = normalize_cli_path(raw_t);
+        let p = Path::new(&norm);
+        if !p.exists() {
+            if !cli.extra_paths.is_empty() {
+                eprintln!("[ap ls] warning: path not found: {norm}");
+            }
+            continue;
+        }
+        valid_count += 1;
+        let disp = norm.replace('\\', "/");
+        let meta = fs::metadata(p).ok();
+        let mtime_secs = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mtime_utc = format_date_utc(mtime_secs);
+        if p.is_file() {
+            let (lines, bytes) = if cli.lines || cli.stat {
+                count_file_lines_bytes(p)
+                    .unwrap_or((0, meta.as_ref().map(|m| m.len()).unwrap_or(0)))
+            } else {
+                (0, meta.as_ref().map(|m| m.len()).unwrap_or(0))
+            };
+            let sha = if cli.hash {
+                compute_file_sha256(p).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            total_bytes = total_bytes.saturating_add(bytes);
+            total_lines += lines;
+            let human = format_bytes(bytes);
+            let mut obj = json!({
+                "path": disp,
+                "kind": "file",
+                "bytes": bytes,
+                "human_size": human,
+                "mtime_utc": mtime_utc,
+            });
+            if cli.lines || cli.stat {
+                obj["lines"] = json!(lines);
+            }
+            if cli.hash {
+                obj["sha256"] = json!(sha);
+            }
+            entries_json.push(obj);
+            let line_tag = if cli.lines || cli.stat {
+                format!(" lines={lines}")
+            } else {
+                String::new()
+            };
+            let sha_tag = if cli.hash {
+                format!(" sha256={sha}")
+            } else {
+                String::new()
+            };
+            text_lines.push(format!(
+                "f {bytes:>10} ({human:>8})  {mtime_utc}  {disp}{line_tag}{sha_tag}"
+            ));
+        } else {
+            let (bytes, files, dirs) = compute_dir_usage(p, cli.all);
+            total_bytes = total_bytes.saturating_add(bytes);
+            let human = format_bytes(bytes);
+            entries_json.push(json!({
+                "path": disp,
+                "kind": "dir",
+                "bytes": bytes,
+                "human_size": human,
+                "files": files,
+                "dirs": dirs,
+                "mtime_utc": mtime_utc,
+            }));
+            text_lines.push(format!(
+                "d {bytes:>10} ({human:>8})  {mtime_utc}  {disp}  ({files} files, {dirs} dirs)"
+            ));
+        }
+    }
+
+    if valid_count == 0 {
+        eprintln!("[ap ls] path not found: {}", normalize_cli_path(&cli.path));
+        return 1;
+    }
+
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+    let mode = if cli.stat && cli.hash {
+        "stat+hash"
+    } else if cli.stat {
+        "stat"
+    } else if cli.hash {
+        "hash"
+    } else if cli.du {
+        "du"
+    } else if cli.lines {
+        "lines"
+    } else {
+        "multi"
+    };
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "mode": mode,
+                "elapsed_ms": elapsed_ms,
+                "total_bytes": total_bytes,
+                "total_lines": total_lines,
+                "entries": entries_json,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        if valid_count > 1 || cli.stat || cli.lines {
+            text_lines.push(format!(
+                "# TOTAL: {} ({total_bytes} B){} across {valid_count} path(s) in {elapsed_ms}ms",
+                format_bytes(total_bytes),
+                if total_lines > 0 {
+                    format!(", {total_lines} lines")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        let out = text_lines.join("\n");
+        record_event("ls", total_bytes, out.len() as u64, 0, 0, mode);
+        println!("{out}");
+    }
+    0
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let cli = match LsCli::try_parse_from(args) {
         Ok(c) => c,
@@ -236,6 +465,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
+
+    if cli.stat || cli.lines || cli.hash || cli.du || !cli.extra_paths.is_empty() {
+        return run_metrics_mode(&cli);
+    }
 
     let t0 = Instant::now();
     let norm_path = normalize_cli_path(&cli.path);
@@ -429,5 +662,25 @@ mod tests {
             normalize_windows_tmp_path("C:/tmp/local.txt", "C:/Temp"),
             None
         );
+    }
+
+    #[test]
+    fn file_lines_sha256_and_dir_usage_metrics_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fp = root.join("data.txt");
+        fs::write(&fp, b"one\ntwo\nthree").unwrap();
+        let (lines, bytes) = count_file_lines_bytes(&fp).unwrap();
+        assert_eq!((lines, bytes), (3, 13));
+        let hex = compute_file_sha256(&fp).unwrap();
+        assert_eq!(hex.len(), 64);
+
+        let vendor = root.join("node_modules");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("big.js"), vec![b'x'; 200]).unwrap();
+        let (pruned_b, pruned_f, _) = compute_dir_usage(root, false);
+        assert_eq!((pruned_b, pruned_f), (13, 1));
+        let (all_b, all_f, _) = compute_dir_usage(root, true);
+        assert_eq!((all_b, all_f), (213, 2));
     }
 }

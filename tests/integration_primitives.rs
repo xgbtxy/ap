@@ -11603,3 +11603,198 @@ assert.ok(ga2 && ga2.includes("search --max 10 --unique -o 'err_[0-9]+' \"app.lo
         );
     }
 }
+
+#[test]
+fn test_v269_ast_symbol_insert_delete_ls_metrics_aliases_and_du_accel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. AST Symbol Surgery (`@@ INSERT_AFTER:`, `@@ INSERT_BEFORE:`, MCP `ap_edit` `mode`, `delete`, atomic rollback)
+    let lib_rs = root.join("lib.rs");
+    fs::write(
+        &lib_rs,
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+
+    let sp_spec = "@@ INSERT_AFTER: lib.rs :: alpha\n<<<\npub fn middle() -> i32 {\n    15\n}\n>>>\n@@ INSERT_BEFORE: lib.rs :: alpha\n<<<\npub fn header() -> i32 {\n    0\n}\n>>>\n";
+    let sp_res = run_ap(root, &["splice", "apply", "--stdin"], Some(sp_spec), &[]);
+    assert!(
+        sp_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sp_res.stderr)
+    );
+    let after_sp = fs::read_to_string(&lib_rs).unwrap();
+    let h_pos = after_sp.find("fn header").unwrap();
+    let a_pos = after_sp.find("fn alpha").unwrap();
+    let m_pos = after_sp.find("fn middle").unwrap();
+    let b_pos = after_sp.find("fn beta").unwrap();
+    assert!(
+        h_pos < a_pos && a_pos < m_pos && m_pos < b_pos,
+        "{after_sp}"
+    );
+
+    // Invalid syntax inside @@ INSERT_AFTER: must roll back atomically!
+    let bad_spec = "@@ INSERT_AFTER: lib.rs :: middle\n<<<\npub fn broken( {\n>>>\n";
+    let bad_res = run_ap(root, &["splice", "apply", "--stdin"], Some(bad_spec), &[]);
+    assert!(!bad_res.status.success());
+    assert_eq!(fs::read_to_string(&lib_rs).unwrap(), after_sp);
+
+    // MCP `ap_edit` symbols[].mode: `insert_after` + `delete`
+    let mcp_req = format!(
+        "{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_edit",
+                "arguments": {
+                    "cwd": root.to_str().unwrap(),
+                    "symbols": [
+                        {
+                            "path": "lib.rs",
+                            "symbol": "middle",
+                            "mode": "insert_after",
+                            "content": "pub fn after_mid() -> i32 {\n    16\n}"
+                        },
+                        {
+                            "path": "lib.rs",
+                            "symbol": "beta",
+                            "mode": "delete"
+                        }
+                    ]
+                }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mv: Value = serde_json::from_str(
+        String::from_utf8_lossy(&mcp_out.stdout)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mv["result"]["isError"], Value::Bool(false), "{mv}");
+    let final_rs = fs::read_to_string(&lib_rs).unwrap();
+    assert!(
+        final_rs.contains("fn after_mid") && !final_rs.contains("fn beta"),
+        "{final_rs}"
+    );
+
+    // 2. Native `ap ls` metrics & top-level aliases (`ap wc`, `ap sha256`, `ap du`, `ap stat`)
+    let wc_res = run_ap(root, &["wc", "-l", "lib.rs", "--json"], None, &[]);
+    assert!(
+        wc_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wc_res.stderr)
+    );
+    let wc_jv: Value = serde_json::from_slice(&wc_res.stdout).unwrap();
+    assert_eq!(wc_jv["ok"], Value::Bool(true));
+    assert!(wc_jv["total_lines"].as_u64().unwrap_or(0) >= 8, "{wc_jv}");
+
+    let sha_res = run_ap(root, &["sha256", "lib.rs", "--json"], None, &[]);
+    assert!(
+        sha_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sha_res.stderr)
+    );
+    let sha_jv: Value = serde_json::from_slice(&sha_res.stdout).unwrap();
+    let hex = sha_jv["entries"][0]["sha256"].as_str().unwrap_or("");
+    assert_eq!(hex.len(), 64, "{sha_jv}");
+
+    let du_res = run_ap(root, &["du", "-sh", ".", "--json"], None, &[]);
+    assert!(
+        du_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&du_res.stderr)
+    );
+    let du_jv: Value = serde_json::from_slice(&du_res.stdout).unwrap();
+    assert!(du_jv["total_bytes"].as_u64().unwrap_or(0) > 0, "{du_jv}");
+
+    let st_res = run_ap(root, &["stat", "lib.rs", "."], None, &[]);
+    assert!(
+        st_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st_res.stderr)
+    );
+    let st_s = String::from_utf8_lossy(&st_res.stdout);
+    assert!(st_s.contains("lib.rs") && st_s.contains("lines="), "{st_s}");
+
+    // 3. Layer 1 `ap exec` & Layer 3 `zz-ap-accelerator.ts` `du -sh` acceleration
+    let ex_du = run_ap(root, &["exec", "-c", "du -sh ."], None, &[]);
+    assert!(
+        ex_du.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ex_du.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ex_du.stdout).contains("files"),
+        "{}",
+        String::from_utf8_lossy(&ex_du.stdout)
+    );
+
+    let home = root.join("home_v269");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand } = mod;
+
+const d1 = healCommand('cd "C:/work" && du -sh src 2>/dev/null', "bash");
+assert.ok(d1 && d1.includes('ls "src" --du'), d1);
+
+assert.equal(healCommand("du -sh * | sort -h", "bash"), undefined);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.69 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

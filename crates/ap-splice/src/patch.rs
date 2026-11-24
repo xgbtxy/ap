@@ -34,7 +34,7 @@ fn patch_regexes() -> &'static PatchRegexes {
     static RE: OnceLock<PatchRegexes> = OnceLock::new();
     RE.get_or_init(|| PatchRegexes {
         hdr: Regex::new(
-            r"(?i)^@@\s*(FILE_ALL|FILE|EDIT|REPLACE|SYMBOL|WRITE|APPEND|PREPEND)\s*:\s*(.+?)\s*$",
+            r"(?i)^@@\s*(FILE_ALL|FILE|EDIT|REPLACE|SYMBOL|INSERT_AFTER|INSERT_BEFORE|DELETE_SYMBOL|WRITE|APPEND|PREPEND)\s*:\s*(.+?)\s*$",
         )
         .unwrap(),
         open: Regex::new(r"(?i)^<<<(?:\s*(?:OLD|SEARCH|EOF))?\s*$").unwrap(),
@@ -152,14 +152,19 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
                     ));
                 }
             }
-            "SYMBOL" => {
+            "SYMBOL" | "INSERT_AFTER" | "INSERT_BEFORE" => {
                 let Some((p_raw, s_raw)) = rest.split_once("::") else {
                     return Err(format!(
-                        "`@@ SYMBOL: {rest}` must use `@@ SYMBOL: <path> :: <SymbolName>`."
+                        "`@@ {kind}: {rest}` must use `@@ {kind}: <path> :: <SymbolName>`."
                     ));
                 };
                 let path = p_raw.trim().to_string();
                 let sym = s_raw.trim().to_string();
+                let op_name = match kind.as_str() {
+                    "INSERT_AFTER" => "insert_after_symbol",
+                    "INSERT_BEFORE" => "insert_before_symbol",
+                    _ => "replace_symbol",
+                };
                 while i < n && lines[i].trim().is_empty() {
                     i += 1;
                 }
@@ -172,7 +177,7 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
                     }
                     if i >= n {
                         return Err(format!(
-                            "Unclosed `@@ SYMBOL: {path} :: {sym}` block: missing `>>>`."
+                            "Unclosed `@@ {kind}: {path} :: {sym}` block: missing `>>>`."
                         ));
                     }
                     i += 1;
@@ -184,11 +189,28 @@ pub fn parse_text_spec(raw_spec: &str) -> Result<Vec<EditOp>, String> {
                 }
                 ops.push(EditOp {
                     path,
-                    op: "replace_symbol".to_string(),
+                    op: op_name.to_string(),
                     old: String::new(),
                     new: body_buf.join("\n"),
                     content: None,
                     symbol: sym,
+                    all: false,
+                    line_hint: None,
+                });
+            }
+            "DELETE_SYMBOL" => {
+                let Some((p_raw, s_raw)) = rest.split_once("::") else {
+                    return Err(format!(
+                        "`@@ DELETE_SYMBOL: {rest}` must use `@@ DELETE_SYMBOL: <path> :: <SymbolName>`."
+                    ));
+                };
+                ops.push(EditOp {
+                    path: p_raw.trim().to_string(),
+                    op: "delete_symbol".to_string(),
+                    old: String::new(),
+                    new: String::new(),
+                    content: None,
+                    symbol: s_raw.trim().to_string(),
                     all: false,
                     line_hint: None,
                 });
@@ -1265,5 +1287,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("L2:") && err.contains("L5:"), "{err}");
+    }
+
+    #[test]
+    fn parses_symbol_insert_after_insert_before_and_delete_symbol() {
+        let spec = "@@ INSERT_AFTER: src/mod.rs :: alpha\n<<<\nfn beta() {}\n>>>\n@@ INSERT_BEFORE: src/mod.rs :: alpha\n<<<\nfn init() {}\n>>>\n@@ DELETE_SYMBOL: src/mod.rs :: legacy\n";
+        let ops = parse_text_spec(spec).expect("symbol ops parse");
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert_eq!(ops[0].op, "insert_after_symbol");
+        assert_eq!(ops[0].symbol, "alpha");
+        assert_eq!(ops[0].new, "fn beta() {}");
+        assert_eq!(ops[1].op, "insert_before_symbol");
+        assert_eq!(ops[1].symbol, "alpha");
+        assert_eq!(ops[1].new, "fn init() {}");
+        assert_eq!(ops[2].op, "delete_symbol");
+        assert_eq!(ops[2].symbol, "legacy");
     }
 }

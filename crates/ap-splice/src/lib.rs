@@ -592,6 +592,123 @@ fn apply_spec_inner(
                         "lines": format!("L{}-L{}", sp.start_line, sp.end_line)
                     }));
                 }
+                "insert_after_symbol" => {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let sp = find_symbol_span(&cur_lf, ext, &item.symbol).ok_or_else(|| {
+                        format!("Symbol `{}` not found in `{}`.", item.symbol, item.path)
+                    })?;
+                    let raw_body = if !item.new.is_empty() {
+                        item.new.as_str()
+                    } else {
+                        item.content.as_deref().unwrap_or("")
+                    };
+                    let indented = dedent_and_reindent(raw_body, sp.indent_col);
+                    let src_lines: Vec<&str> = cur_lf.split('\n').collect();
+                    let mut updated_lines: Vec<String> = src_lines[..sp.end_line]
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect();
+                    let prev_nonempty = updated_lines
+                        .last()
+                        .map(|l| !l.trim().is_empty())
+                        .unwrap_or(false);
+                    let first_nonempty = indented
+                        .first()
+                        .map(|l| !l.trim().is_empty())
+                        .unwrap_or(false);
+                    if prev_nonempty && first_nonempty {
+                        updated_lines.push(String::new());
+                    }
+                    updated_lines.extend(indented);
+                    if sp.end_line < src_lines.len() {
+                        updated_lines
+                            .extend(src_lines[sp.end_line..].iter().map(|s| (*s).to_string()));
+                    }
+                    working_text.insert(p.clone(), (updated_lines.join("\n"), nl_sep));
+                    applied_summary.push(json!({
+                        "index": idx,
+                        "path": item.path,
+                        "op": "insert_after_symbol",
+                        "symbol": item.symbol,
+                        "after_line": sp.end_line
+                    }));
+                }
+                "insert_before_symbol" => {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let sp = find_symbol_span(&cur_lf, ext, &item.symbol).ok_or_else(|| {
+                        format!("Symbol `{}` not found in `{}`.", item.symbol, item.path)
+                    })?;
+                    let raw_body = if !item.new.is_empty() {
+                        item.new.as_str()
+                    } else {
+                        item.content.as_deref().unwrap_or("")
+                    };
+                    let indented = dedent_and_reindent(raw_body, sp.indent_col);
+                    let src_lines: Vec<&str> = cur_lf.split('\n').collect();
+                    let mut updated_lines: Vec<String> = src_lines[..sp.start_line - 1]
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect();
+                    let last_ins_nonempty = indented
+                        .last()
+                        .map(|l| !l.trim().is_empty())
+                        .unwrap_or(false);
+                    updated_lines.extend(indented);
+                    if sp.start_line - 1 < src_lines.len() {
+                        let next_nonempty = !src_lines[sp.start_line - 1].trim().is_empty();
+                        if last_ins_nonempty && next_nonempty {
+                            updated_lines.push(String::new());
+                        }
+                        updated_lines.extend(
+                            src_lines[sp.start_line - 1..]
+                                .iter()
+                                .map(|s| (*s).to_string()),
+                        );
+                    }
+                    working_text.insert(p.clone(), (updated_lines.join("\n"), nl_sep));
+                    applied_summary.push(json!({
+                        "index": idx,
+                        "path": item.path,
+                        "op": "insert_before_symbol",
+                        "symbol": item.symbol,
+                        "before_line": sp.start_line
+                    }));
+                }
+                "delete_symbol" => {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let sp = find_symbol_span(&cur_lf, ext, &item.symbol).ok_or_else(|| {
+                        format!("Symbol `{}` not found in `{}`.", item.symbol, item.path)
+                    })?;
+                    let src_lines: Vec<&str> = cur_lf.split('\n').collect();
+                    let mut updated_lines: Vec<String> = src_lines[..sp.start_line - 1]
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect();
+                    let mut tail_start = sp.end_line;
+                    if updated_lines
+                        .last()
+                        .map(|l| l.trim().is_empty())
+                        .unwrap_or(false)
+                        && src_lines
+                            .get(tail_start)
+                            .map(|l| l.trim().is_empty())
+                            .unwrap_or(false)
+                    {
+                        tail_start += 1;
+                    }
+                    if tail_start < src_lines.len() {
+                        updated_lines
+                            .extend(src_lines[tail_start..].iter().map(|s| (*s).to_string()));
+                    }
+                    working_text.insert(p.clone(), (updated_lines.join("\n"), nl_sep));
+                    applied_summary.push(json!({
+                        "index": idx,
+                        "path": item.path,
+                        "op": "delete_symbol",
+                        "symbol": item.symbol,
+                        "lines": format!("L{}-L{}", sp.start_line, sp.end_line)
+                    }));
+                }
                 other => return Err(format!("Unsupported op `{other}` at index {idx}")),
             }
         }

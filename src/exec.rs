@@ -1358,6 +1358,48 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
     ))
 }
 
+/// Rewrite bare unpiped `du -sh [dir] [2>/dev/null]` (with optional leading `cd <dir> &&`)
+/// cleanly to `ap ls "<dir>" --du`. Passes through globs, `-a`, and piped commands safely.
+pub fn try_accelerate_du_summary(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    let clean = strip_trailing_stderr_null(body.trim());
+    if has_unsafe_shell_meta(clean) {
+        return None;
+    }
+    let toks = split_shell_tokens(clean)?;
+    if toks.len() < 2 || toks[0] != "du" {
+        return None;
+    }
+    let mut has_summary = false;
+    let mut target: Option<&str> = None;
+    for tok in &toks[1..] {
+        if tok.starts_with('-') {
+            if matches!(
+                tok.as_str(),
+                "-s" | "-h" | "-sh" | "-hs" | "-k" | "-m" | "--summarize" | "--human-readable"
+            ) {
+                has_summary = true;
+            } else {
+                return None;
+            }
+        } else if target.is_none() && !tok.contains('*') && !tok.contains('?') && !tok.contains(',')
+        {
+            target = Some(tok.as_str());
+        } else {
+            return None;
+        }
+    }
+    if !has_summary {
+        return None;
+    }
+    let ap_bin = current_ap_bin();
+    let esc = target.unwrap_or(".").replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" ls \"{esc}\" --du",
+        cd_pfx.as_deref().unwrap_or("")
+    ))
+}
+
 /// Rewrite bounded `ls [safe flags] [dir] [2>/dev/null] | head (-n <N> | -<N>)` cleanly to
 /// `ap ls "<dir>" [-a] [-t] [-S] --depth 1 --limit <N>`. Rejects `-d`/`-R`/`-r`/globs/complex pipes.
 pub fn try_accelerate_ls_slice(raw: &str) -> Option<String> {
@@ -1964,6 +2006,11 @@ pub fn heal_windows_command(
     if let Some(fast_ls) = try_accelerate_ls_slice(raw) {
         heals.push("ls-head->ap-ls");
         let (kind, cmd_out) = route_accelerated_cmd(fast_ls, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_du) = try_accelerate_du_summary(raw) {
+        heals.push("du-summary->ap-ls");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_du, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if let Some(fast_grep_pipe) = try_accelerate_grep_pipeline(raw) {

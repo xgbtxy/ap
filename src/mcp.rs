@@ -209,15 +209,16 @@ fn mcp_tools_schema() -> Value {
                     },
                     "symbols": {
                         "type": "array",
-                        "description": "Tree-sitter AST-exact function/class/struct symbol replacements [{path, symbol, content}]",
+                        "description": "Tree-sitter AST-exact function/class/struct symbol operations [{path, symbol, mode?, content}]",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "path": { "type": "string" },
                                 "symbol": { "type": "string" },
+                                "mode": { "type": "string", "description": "Operation: 'replace' (default), 'insert_after', 'insert_before', or 'delete' (content optional when mode='delete')" },
                                 "content": { "type": "string" }
                             },
-                            "required": ["path", "symbol", "content"]
+                            "required": ["path", "symbol"]
                         }
                     },
                     "diff": { "type": "string", "description": "Optional standard Git unified diff (`--- a/...`, `+++ b/...`, `@@ ... @@`) or Codex `*** Begin Patch` envelope (`*** Update File:` / `*** Add File:`)" },
@@ -1765,13 +1766,30 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             if let Some(symbols) = args.get("symbols").and_then(Value::as_array) {
                 for s in symbols {
-                    if let (Some(p), Some(sym), Some(c)) = (
+                    if let (Some(p), Some(sym)) = (
                         s.get("path").and_then(Value::as_str),
                         s.get("symbol").and_then(Value::as_str),
-                        s.get("content").and_then(Value::as_str),
                     ) {
+                        let mode = s
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or("replace")
+                            .trim()
+                            .to_ascii_lowercase();
+                        let op_name = match mode.as_str() {
+                            "insert_after" | "insert-after" | "after" => "insert_after_symbol",
+                            "insert_before" | "insert-before" | "before" => "insert_before_symbol",
+                            "delete" | "remove" => "delete_symbol",
+                            _ => "replace_symbol",
+                        };
+                        let c = s.get("content").and_then(Value::as_str).unwrap_or("");
+                        if op_name != "delete_symbol"
+                            && s.get("content").and_then(Value::as_str).is_none()
+                        {
+                            continue;
+                        }
                         ops.push(json!({
-                            "op": "replace_symbol",
+                            "op": op_name,
                             "path": p,
                             "symbol": sym,
                             "new": c
