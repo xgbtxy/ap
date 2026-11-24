@@ -312,7 +312,7 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "codemode_result_output_shim",
-        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects lacking string .output (template-literal-safe String.fromCharCode(10) join; eliminates TypeError & PRELUDE SyntaxError)",
+        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects and String.prototype.output (eliminates TypeError on raw string results)",
         hunks: &[
             PatchHunk {
                 id: "bundle_codemode_result_output_shim",
@@ -321,8 +321,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 alt_olds: &[
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 ],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\") {\n\t\t\t\tObject.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
             PatchHunk {
                 id: "prelude_codemode_result_output_shim",
@@ -331,8 +332,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 alt_olds: &[
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 ],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\") {\n\t\t\t\tObject.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
         ],
     },
@@ -1065,7 +1067,13 @@ mod tests {
             assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
             assert!(!h.new.contains(r#""\r""#), "unsafe \\r in {}", h.id);
             assert!(h.new.contains("String.fromCharCode(10)"));
-            assert_eq!(h.alt_olds.len(), 2);
+            assert!(h.new.contains("String.prototype"));
+            assert_eq!(h.alt_olds.len(), 3);
+            assert!(h
+                .alt_olds
+                .iter()
+                .any(|a| a.contains("String.fromCharCode(10)")
+                    && a.contains("typeof value.output !== \"string\"")));
             assert!(
                 h.alt_olds
                     .iter()
@@ -1094,7 +1102,7 @@ mod tests {
             .iter()
             .find(|s| s.id == "codemode_global_log_helper")
             .unwrap();
-        assert_eq!(log_spec.hunks.len(), 2);
+        assert!(log_spec.hunks.len() == 2);
         for h in log_spec.hunks {
             assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
             assert!(
@@ -1103,5 +1111,61 @@ mod tests {
                 h.id
             );
         }
+    }
+
+    #[test]
+    fn patch15_upgrades_from_v269_alt_old_and_handles_raw_strings() {
+        let base = std::env::temp_dir().join(format!("ap_pi_p15_upg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        let prelude_dir = pi_dir
+            .join("node_modules")
+            .join("@earendil-works")
+            .join("pi-codemode")
+            .join("dist")
+            .join("runtime");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&prelude_dir).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.0-test"}"#,
+        )
+        .unwrap();
+
+        let p15 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "codemode_result_output_shim")
+            .unwrap();
+        let v269_worker_shim = p15.hunks[0].alt_olds[2];
+        let v269_prelude_shim = p15.hunks[1].alt_olds[2];
+        fs::write(chunks.join("codemode-worker.js"), v269_worker_shim).unwrap();
+        fs::write(prelude_dir.join("prelude-source.js"), v269_prelude_shim).unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(newly.contains(
+            &"codemode_result_output_shim:bundle_codemode_result_output_shim".to_string()
+        ));
+        assert!(newly.contains(
+            &"codemode_result_output_shim:prelude_codemode_result_output_shim".to_string()
+        ));
+        assert!(fs::read_to_string(chunks.join("codemode-worker.js"))
+            .unwrap()
+            .contains("String.prototype"));
+        assert!(fs::read_to_string(prelude_dir.join("prelude-source.js"))
+            .unwrap()
+            .contains("String.prototype"));
+
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&base);
     }
 }
