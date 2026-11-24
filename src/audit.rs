@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 
-const MAX_LINE_PARSE_BYTES: usize = 512 * 1024;
+const MAX_LINE_PARSE_BYTES: usize = 128 * 1024;
+const MAX_FILE_TAIL_BYTES: u64 = 16 * 1024 * 1024;
 const MODEL_FAMILIES: [&str; 7] = [
     "deepseek", "claude", "openai", "gemini", "grok", "qwen", "other",
 ];
@@ -190,7 +191,53 @@ fn classify_cmd(cmd: &str, st: &mut Counters) {
     }
 }
 
+#[inline]
+fn contains_ascii_ci(hay: &str, needle: &str) -> bool {
+    let hb = hay.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    if hb.len() < nb.len() {
+        return false;
+    }
+    hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb))
+}
+
+#[inline]
+fn safe_head_slice(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[inline]
+fn safe_tail_slice(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 fn classify_err(txt: &str, st: &mut Counters) {
+    let (head, tail) = if txt.len() <= 8192 {
+        (txt, "")
+    } else {
+        (safe_head_slice(txt, 4096), safe_tail_slice(txt, 4096))
+    };
+    let has = |k: &str| head.contains(k) || (!tail.is_empty() && tail.contains(k));
+    let has_ci =
+        |k: &str| contains_ascii_ci(head, k) || (!tail.is_empty() && contains_ascii_ci(tail, k));
+
     if [
         "ParserError",
         "Unexpected token",
@@ -200,14 +247,13 @@ fn classify_err(txt: &str, st: &mut Counters) {
         "Script sandbox failed",
     ]
     .iter()
-    .any(|k| txt.contains(k))
+    .any(|k| has(k))
     {
         st.shell_quoting_collision += 1;
     }
-    let low = txt.to_ascii_lowercase();
-    if (txt.contains("Target") && (txt.contains("not found") || txt.contains("match")))
-        || txt.contains("Failed to find expected lines")
-        || (low.contains("apply_patch") && low.contains("error"))
+    if (has("Target") && (has("not found") || has("match")))
+        || has("Failed to find expected lines")
+        || (has_ci("apply_patch") && has_ci("error"))
     {
         st.patch_target_mismatch += 1;
     }
@@ -218,14 +264,11 @@ fn classify_err(txt: &str, st: &mut Counters) {
         "'charmap' codec",
     ]
     .iter()
-    .any(|k| txt.contains(k))
+    .any(|k| has(k))
     {
         st.encoding_utf8_crash += 1;
     }
-    if txt.contains("ModuleNotFoundError")
-        || txt.contains("ImportError")
-        || txt.contains("No module named pytest")
-    {
+    if has("ModuleNotFoundError") || has("ImportError") || has("No module named pytest") {
         st.import_syspath_error += 1;
     }
     if [
@@ -234,27 +277,49 @@ fn classify_err(txt: &str, st: &mut Counters) {
         "chars truncated",
     ]
     .iter()
-    .any(|k| txt.contains(k))
+    .any(|k| has(k))
     {
         st.output_truncation_spill += 1;
     }
-    if low.contains("timed out") || low.contains("etimedout") || low.contains("deadline exceeded") {
+    if has_ci("timed out") || has_ci("etimedout") || has_ci("deadline exceeded") {
         st.shell_timeouts += 1;
     }
-    if ((low.contains("no such file")
-        || low.contains("cannot find the path")
-        || low.contains("filenotfounderror"))
-        && (low.contains("/mnt/") || low.contains("unicodeescape")))
-        || txt.contains("Program Files/Git/")
-        || txt.contains("Program Files\\Git\\")
+    if ((has_ci("no such file") || has_ci("cannot find the path") || has_ci("filenotfounderror"))
+        && (has_ci("/mnt/") || has_ci("unicodeescape")))
+        || has("Program Files/Git/")
+        || has("Program Files\\Git\\")
     {
         st.path_translation_errors += 1;
     }
 }
 
-fn for_each_bounded_line(file: File, max_parse_bytes: usize, mut cb: impl FnMut(&str, usize)) {
+fn for_each_bounded_line(file: File, max_parse_bytes: usize, cb: impl FnMut(&str, usize)) {
+    for_each_bounded_line_with_cap(file, max_parse_bytes, MAX_FILE_TAIL_BYTES, cb);
+}
+
+fn for_each_bounded_line_with_cap(
+    mut file: File,
+    max_parse_bytes: usize,
+    max_file_tail_bytes: u64,
+    mut cb: impl FnMut(&str, usize),
+) {
+    let mut skipped_partial_head = false;
+    if max_file_tail_bytes > 0 {
+        if let Ok(meta) = file.metadata() {
+            let len = meta.len();
+            if len > max_file_tail_bytes {
+                let offset = len - max_file_tail_bytes;
+                if file.seek(SeekFrom::Start(offset)).is_ok() {
+                    skipped_partial_head = true;
+                }
+            }
+        }
+    }
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut buf = Vec::with_capacity(16 * 1024);
+    if skipped_partial_head {
+        let _ = reader.read_until(b'\n', &mut buf);
+    }
     loop {
         buf.clear();
         let Ok(n) = reader.read_until(b'\n', &mut buf) else {
@@ -382,6 +447,12 @@ fn scan_agy(f: &Path) -> SessionScan {
         if raw_len > MAX_LINE_PARSE_BYTES {
             st.outputs_over_8kb += 1;
             classify_err(line, &mut st);
+            return;
+        }
+        if !line.contains("\"tool_calls\"")
+            && !line.contains("\"model\"")
+            && !line.contains("\"content\"")
+        {
             return;
         }
         let Ok(o) = serde_json::from_str::<Value>(line) else {
@@ -1637,5 +1708,34 @@ mod tests {
         assert!(!serialized.contains("payroll_2026"));
         assert!(!serialized.contains("SECRET_TOKEN_XYZ_999"));
         assert!(!serialized.contains("corp-secret-endpoint-999"));
+    }
+
+    #[test]
+    fn contains_ascii_ci_and_tail_seeking_skip_old_prefix_cleanly() {
+        assert!(contains_ascii_ci("Error: TIMED OUT waiting", "timed out"));
+        assert!(contains_ascii_ci("Apply_Patch failed ERROR", "error"));
+        assert!(!contains_ascii_ci("short", "longer needle"));
+        assert!(contains_ascii_ci("abc", ""));
+
+        let tmp = std::env::temp_dir().join(format!("ap_audit_tail_{}.jsonl", std::process::id()));
+        let old_line = format!("{{\"old\":\"{}\"}}\n", "x".repeat(400));
+        let new_line = "{\"tail_marker\":\"hit\"}\n";
+        let payload = format!("{old_line}{old_line}{new_line}");
+        fs::write(&tmp, &payload).unwrap();
+
+        let f = File::open(&tmp).unwrap();
+        let mut seen = Vec::new();
+        for_each_bounded_line_with_cap(f, MAX_LINE_PARSE_BYTES, 128, |line, _| {
+            seen.push(line.to_string());
+        });
+        let _ = fs::remove_file(&tmp);
+        assert!(
+            seen.iter().any(|l| l.contains("tail_marker")),
+            "expected tail line preserved: {seen:?}"
+        );
+        assert!(
+            seen.len() <= 2,
+            "expected early lines before tail cap skipped: {seen:?}"
+        );
     }
 }

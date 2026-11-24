@@ -846,6 +846,122 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
     ))
 }
 
+/// Rewrite bounded `find [path] [-maxdepth N] [-type f|d] [-name "*.ext"] [2>/dev/null] [| head -n M]`
+/// (with optional leading `cd <dir> &&`) to bounded `ap ls`. Passes through complex predicates (`-exec`, `-o`, `!`, `(`, `-size`, etc.).
+pub fn try_accelerate_find_files(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    static HEAD_PIPE_RE: OnceLock<Regex> = OnceLock::new();
+    static STDERR_NULL_RE: OnceLock<Regex> = OnceLock::new();
+    static EXT_RE: OnceLock<Regex> = OnceLock::new();
+    let head_pipe_re = HEAD_PIPE_RE
+        .get_or_init(|| Regex::new(r"^(?s)(.+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$").unwrap());
+    let stderr_null_re =
+        STDERR_NULL_RE.get_or_init(|| Regex::new(r"\s*2>\s*/dev/null\s*$").unwrap());
+    let ext_re = EXT_RE.get_or_init(|| Regex::new(r"^\*\.([A-Za-z0-9_]+)$").unwrap());
+
+    let mut limit: Option<usize> = None;
+    let mut core = body;
+    if let Some(hcap) = head_pipe_re.captures(body) {
+        let n: usize = hcap.get(2).or_else(|| hcap.get(3))?.as_str().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        limit = Some(n);
+        core = hcap.get(1)?.as_str();
+    }
+    let clean_owned = stderr_null_re.replace(core.trim(), "").into_owned();
+    let find_body = clean_owned.trim();
+    if has_unsafe_shell_meta(find_body) {
+        return None;
+    }
+    let toks = split_ps_args(find_body)?;
+    if toks.first()?.as_str() != "find" {
+        return None;
+    }
+    let mut idx = 1usize;
+    let target = if let Some(first_arg) = toks.get(idx) {
+        if !first_arg.starts_with('-')
+            && !matches!(first_arg.as_str(), "(" | ")" | "!" | "\\(" | "\\)")
+        {
+            if first_arg.contains('*') || first_arg.contains('?') || first_arg.contains(',') {
+                return None;
+            }
+            idx += 1;
+            first_arg.as_str()
+        } else {
+            "."
+        }
+    } else {
+        "."
+    };
+
+    let mut depth: usize = 3;
+    let mut files_only = false;
+    let mut dirs_only = false;
+    let mut ext: Option<String> = None;
+    while idx < toks.len() {
+        match toks[idx].as_str() {
+            "-maxdepth" => {
+                let d: usize = toks.get(idx + 1)?.parse().ok()?;
+                if d == 0 || d > 5 {
+                    return None;
+                }
+                depth = d;
+                idx += 2;
+            }
+            "-type" => {
+                match toks.get(idx + 1)?.as_str() {
+                    "f" => files_only = true,
+                    "d" => dirs_only = true,
+                    _ => return None,
+                }
+                if files_only && dirs_only {
+                    return None;
+                }
+                idx += 2;
+            }
+            "-name" => {
+                if ext.is_some() {
+                    return None;
+                }
+                let pat = toks.get(idx + 1)?;
+                let ecap = ext_re.captures(pat)?;
+                ext = Some(ecap.get(1)?.as_str().to_string());
+                idx += 2;
+            }
+            _ => return None,
+        }
+    }
+
+    let ap_bin = std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string());
+    let tgt_esc = target.replace('"', "\\\"");
+    let mut flags = format!(" --depth {depth}");
+    if files_only {
+        flags.push_str(" --files-only");
+    } else if dirs_only {
+        flags.push_str(" --dirs-only");
+    }
+    if let Some(e) = ext {
+        flags.push_str(&format!(" --ext {e}"));
+    }
+    if let Some(m) = limit {
+        flags.push_str(&format!(" --limit {m}"));
+    }
+    Some(format!(
+        "{}\"{ap_bin}\" ls \"{tgt_esc}\"{flags}",
+        cd_pfx.unwrap_or("")
+    ))
+}
+
 /// Rewrite bare PowerShell `Get-ChildItem` / `gci` calls cleanly to bounded `ap ls`
 /// (with `--depth`), while safely passing through pipes, `-Filter`/`-Include`, or globs.
 pub fn try_accelerate_get_child_item(raw: &str) -> Option<String> {
@@ -1233,6 +1349,11 @@ pub fn heal_windows_command(
     if let Some(fast_cat) = try_accelerate_cat_slice(raw) {
         heals.push("cat-slice->ap-read");
         let (kind, cmd_out) = route_accelerated_cmd(fast_cat, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_find) = try_accelerate_find_files(raw) {
+        heals.push("find->ap-ls");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_find, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -2153,5 +2274,30 @@ mod tests {
         assert!(try_accelerate_cat_slice("cat *.js | head -n 10").is_none());
         assert!(try_accelerate_cat_slice("cat a.txt b.txt | head -n 10").is_none());
         assert!(try_accelerate_slow_grep("grep -rn foo . | sort").is_none());
+
+        // Bounded `find` -> `ap ls` accelerator
+        let (_, h34, tags34) = heal_windows_command(
+            "find src -maxdepth 2 -type f -name '*.rs' 2>/dev/null | head -n 25",
+            true,
+            true,
+        );
+        assert!(
+            h34.contains("ls \"src\" --depth 2 --files-only --ext rs --limit 25"),
+            "{h34}"
+        );
+        assert!(tags34.contains(&"find->ap-ls"));
+
+        let (k35, h35, tags35) =
+            heal_windows_command("cd sub && find . -type d -maxdepth 1", true, true);
+        assert_eq!(k35, ShellKind::GitBash);
+        assert!(
+            h35.starts_with("cd sub && ") && h35.contains("ls \".\" --depth 1 --dirs-only"),
+            "{h35}"
+        );
+        assert!(tags35.contains(&"find->ap-ls"));
+
+        assert!(try_accelerate_find_files("find . -name '*.rs' -exec rm {} +").is_none());
+        assert!(try_accelerate_find_files("find src tests -type f").is_none());
+        assert!(try_accelerate_find_files("find . -maxdepth 8 -type f").is_none());
     }
 }

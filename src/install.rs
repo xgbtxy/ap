@@ -3209,6 +3209,73 @@ export function healCommand(
 		}}
 	}}
 
+	// 1e. Rewrite bounded POSIX `find [path] [-maxdepth N] [-type f|d] [-name "*.ext"] [2>/dev/null] [| head -n M]` -> bounded `ap ls`
+	if (toolName === "bash" && !/[;&><{{}}`]|\$\(/.test(cmdTailBody)) {{
+		let findCore = cmdTailBody.trim();
+		let findLimit = 0;
+		const headPipeM = findCore.match(/^([\s\S]+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$/);
+		if (headPipeM) {{
+			findLimit = Number(headPipeM[2] || headPipeM[3]);
+			findCore = headPipeM[1].trim();
+		}}
+		if (findLimit >= 0 && !findCore.includes("|")) {{
+			findCore = findCore.replace(/\s*2>\s*\/dev\/null\s*$/, "").trim();
+			const fToks = (findCore.match(/"[^"]*"|'[^']*'|\S+/g) || []).map((t) =>
+				t.replace(/^(['"])(.*)\1$/, "$2"),
+			);
+			if (fToks.length >= 1 && fToks[0] === "find") {{
+				let fIdx = 1;
+				let fTarget = ".";
+				let findOk = true;
+				if (fIdx < fToks.length && !fToks[fIdx].startsWith("-") && !["(", ")", "!"].includes(fToks[fIdx])) {{
+					if (/[*?,]/.test(fToks[fIdx])) findOk = false;
+					fTarget = fToks[fIdx];
+					fIdx += 1;
+				}}
+				let fDepth = 3;
+				let fFilesOnly = false;
+				let fDirsOnly = false;
+				let fExt = "";
+				while (findOk && fIdx < fToks.length) {{
+					const flag = fToks[fIdx];
+					if (flag === "-maxdepth" && fIdx + 1 < fToks.length) {{
+						const d = Number(fToks[fIdx + 1]);
+						if (!Number.isInteger(d) || d < 1 || d > 5) {{
+							findOk = false;
+							break;
+						}}
+						fDepth = d;
+						fIdx += 2;
+					}} else if (flag === "-type" && fIdx + 1 < fToks.length) {{
+						const t = fToks[fIdx + 1];
+						if (t === "f") fFilesOnly = true;
+						else if (t === "d") fDirsOnly = true;
+						else findOk = false;
+						fIdx += 2;
+					}} else if (flag === "-name" && fIdx + 1 < fToks.length && !fExt) {{
+						const em = fToks[fIdx + 1].match(/^\*\.([A-Za-z0-9_]+)$/);
+						if (!em) {{
+							findOk = false;
+							break;
+						}}
+						fExt = em[1];
+						fIdx += 2;
+					}} else {{
+						findOk = false;
+						break;
+					}}
+				}}
+				if (findOk && !(fFilesOnly && fDirsOnly)) {{
+					const escTgt = fTarget.replace(/"/g, '\\"');
+					const typeFlag = fFilesOnly ? " --files-only" : fDirsOnly ? " --dirs-only" : "";
+					const extFlag = fExt ? ` --ext ${{fExt}}` : "";
+					const limFlag = findLimit > 0 ? ` --limit ${{findLimit}}` : "";
+					return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{escTgt}}" --depth ${{fDepth}}${{typeFlag}}${{extFlag}}${{limFlag}}`;
+				}}
+			}}
+		}}
+	}}
+
 	// 2. Prevent accidental literal `NUL` file creation in Git Bash (always safe)
 	if (toolName === "bash" && REDIR_NUL.test(cmd)) {{
 		cmd = cmd.replace(REDIR_NUL, "$1 /dev/null");

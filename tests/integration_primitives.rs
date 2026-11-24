@@ -9322,3 +9322,124 @@ fn test_v257_piped_grep_cat_slice_and_pi_hook_parity() {
         "Pi hook missing v2.57 parity"
     );
 }
+
+#[test]
+fn test_v258_fast_audit_tab_space_patch_and_find_accel() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 1. Tab-vs-space fuzzy patch rescue preserves target file indent style
+    fs::write(
+        root.join("src/tabbed.go"),
+        "package main\n\nfunc run() int {\n\tif true {\n\t\treturn 1\n\t}\n\treturn 0\n}\n",
+    )
+    .unwrap();
+    let tab_patch = r#"[{"op":"replace","path":"src/tabbed.go","old":"    if true {\n        return 1\n    }","new":"    if true {\n        return 7\n    }"}]"#;
+    let p_tabs = run_ap(
+        root,
+        &["splice", "apply", "--cwd", ".", "--stdin", "--json"],
+        Some(tab_patch),
+        &[],
+    );
+    assert!(
+        p_tabs.status.success(),
+        "tab rescue failed: {} {}",
+        String::from_utf8_lossy(&p_tabs.stdout),
+        String::from_utf8_lossy(&p_tabs.stderr)
+    );
+    let after_tabs = fs::read_to_string(root.join("src/tabbed.go")).unwrap();
+    assert!(
+        after_tabs.contains("\tif true {\n\t\treturn 7\n\t}"),
+        "{after_tabs}"
+    );
+
+    // 2. Bounded `find ... -> ap ls` accelerator in both Layer 1 (`ap exec`) and Layer 3 (Pi hook)
+    fs::write(root.join("src/extra.ts"), "export const x = 1;\n").unwrap();
+    let f_out = run_ap(
+        root,
+        &[
+            "exec",
+            "--cwd",
+            ".",
+            "-c",
+            "find src -maxdepth 2 -type f -name '*.go' 2>/dev/null | head -n 5",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        f_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&f_out.stderr)
+    );
+    let f_s = String::from_utf8_lossy(&f_out.stdout);
+    assert!(
+        f_s.contains("tabbed.go") && !f_s.contains("extra.ts"),
+        "{f_s}"
+    );
+
+    // 3. `ap audit` zero-alloc error classifier & >128KB line cap on synthetic session home
+    let fake_home = root.join("audit_home");
+    let pi_dir = fake_home.join(".pi/agent/sessions");
+    fs::create_dir_all(&pi_dir).unwrap();
+    let huge_blob = "a".repeat(160 * 1024);
+    let audit_lines = [
+        r#"{"type":"model_change","provider":"deepseek","modelId":"deepseek-chat"}"#.to_string(),
+        format!(r#"{{"type":"message","message":{{"role":"toolResult","content":[{{"type":"text","text":"{huge_blob} TIMED OUT"}}]}}"#),
+        r#"{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"bash","arguments":{"command":"find src -type f"}}]}}"#.to_string(),
+    ]
+    .join("\n");
+    fs::write(pi_dir.join("sess.jsonl"), audit_lines).unwrap();
+    let au = run_ap(
+        root,
+        &[
+            "audit",
+            "--home",
+            &fake_home.to_string_lossy(),
+            "--max-sessions",
+            "5",
+            "--maintainer",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        au.status.success(),
+        "{}",
+        String::from_utf8_lossy(&au.stderr)
+    );
+    let au_v: serde_json::Value = serde_json::from_slice(&au.stdout).unwrap();
+    assert!(
+        au_v["aggregate_friction_counts"]["outputs_over_8kb"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+            && au_v["aggregate_friction_counts"]["shell_timeouts"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1,
+        "{au_v}"
+    );
+
+    // 4. Pi hook parity includes `1e.` find -> ap ls section
+    fs::create_dir_all(fake_home.join(".pi/agent")).unwrap();
+    let init_p = run_ap(
+        root,
+        &["init", "-a", "pi", "--with-hooks", "--no-rules"],
+        None,
+        &[
+            ("HOME", &fake_home),
+            ("USERPROFILE", &fake_home),
+            ("AP_HOME", &fake_home),
+        ],
+    );
+    assert!(init_p.status.success());
+    let ts_src =
+        fs::read_to_string(fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
+    assert!(
+        ts_src.contains("1e. Rewrite bounded POSIX") && ts_src.contains("--files-only"),
+        "Pi hook missing v2.58 find->ap ls parity"
+    );
+}

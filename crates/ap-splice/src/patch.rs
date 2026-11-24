@@ -794,6 +794,110 @@ fn replace_crlf_inner(
             ));
         }
 
+        // Tier 3.5: Mixed tab/space indentation normalization (rescues tab-vs-space mismatch while preserving target indent style)
+        let old_has_tab = old_stripped.iter().any(|l| l.starts_with('\t'));
+        let measure_ws = |l: &str, tab_w: usize| -> usize {
+            l.bytes()
+                .take_while(|b| *b == b' ' || *b == b'\t')
+                .map(|b| if b == b'\t' { tab_w } else { 1 })
+                .sum()
+        };
+        let min_ws_cols = |lines: &[&str], tab_w: usize| -> usize {
+            lines
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| measure_ws(l, tab_w))
+                .min()
+                .unwrap_or(0)
+        };
+        let old_trim: Vec<&str> = old_stripped
+            .iter()
+            .map(|l| l.trim_start_matches([' ', '\t']))
+            .collect();
+        // Store `(idx, src_tw, old_tw, win_min, old_min, win_uses_tabs)`
+        let mut tab_hits: Vec<(usize, usize, usize, usize, usize, bool)> = Vec::new();
+        for i in 0..=(src_stripped.len() - n_old) {
+            let win = &src_stripped[i..i + n_old];
+            let win_has_tab = win.iter().any(|l| l.starts_with('\t'));
+            if !win_has_tab && !old_has_tab {
+                continue;
+            }
+            if !win
+                .iter()
+                .zip(&old_trim)
+                .all(|(w, o)| w.trim_start_matches([' ', '\t']) == *o)
+            {
+                continue;
+            }
+            let win_tw_candidates: &[usize] = if win_has_tab { &[4, 2, 8] } else { &[1] };
+            let old_tw_candidates: &[usize] = if old_has_tab { &[4, 2, 8] } else { &[1] };
+            'cand: for &stw in win_tw_candidates {
+                let win_min = min_ws_cols(win, stw);
+                for &otw in old_tw_candidates {
+                    let old_min = min_ws_cols(&old_stripped, otw);
+                    let rel_match = win.iter().zip(&old_stripped).all(|(w, o)| {
+                        let wc = w.trim().is_empty();
+                        let oc = o.trim().is_empty();
+                        if wc && oc {
+                            true
+                        } else if wc != oc {
+                            false
+                        } else {
+                            (measure_ws(w, stw) - win_min) == (measure_ws(o, otw) - old_min)
+                        }
+                    });
+                    if rel_match {
+                        tab_hits.push((i, stw, otw, win_min, old_min, win_has_tab));
+                        break 'cand;
+                    }
+                }
+            }
+        }
+        if !tab_hits.is_empty() {
+            let line_idxs: Vec<usize> = tab_hits.iter().map(|h| h.0).collect();
+            if let Some(chosen_idx) = pick_disambiguated(&line_idxs) {
+                if let Some(&(_, stw, otw, win_min, old_min, win_tabs)) =
+                    tab_hits.iter().find(|h| h.0 == chosen_idx)
+                {
+                    let delta = (win_min as isize) - (old_min as isize);
+                    let shifted_new: Vec<String> = new_lf
+                        .split('\n')
+                        .map(|l| {
+                            if l.trim().is_empty() {
+                                String::new()
+                            } else {
+                                let cur = measure_ws(l, otw);
+                                let next_cols = ((cur as isize) + delta).max(0) as usize;
+                                let rest = l.trim_start_matches([' ', '\t']);
+                                if win_tabs && stw > 0 {
+                                    let tabs = next_cols / stw;
+                                    let spaces = next_cols % stw;
+                                    format!("{}{}{}", "\t".repeat(tabs), " ".repeat(spaces), rest)
+                                } else {
+                                    format!("{}{}", " ".repeat(next_cols), rest)
+                                }
+                            }
+                        })
+                        .collect();
+                    let mut updated: Vec<String> =
+                        Vec::with_capacity(src_lines.len() + shifted_new.len());
+                    updated.extend(src_lines[..chosen_idx].iter().map(|s| (*s).to_string()));
+                    updated.extend(shifted_new);
+                    updated.extend(
+                        src_lines[chosen_idx + n_old..]
+                            .iter()
+                            .map(|s| (*s).to_string()),
+                    );
+                    return Ok((updated.join("\n"), 1));
+                }
+            }
+            return Err(format_ambiguous_err(
+                "tab/space indentation normalization",
+                &src_lines,
+                &line_idxs,
+            ));
+        }
+
         // Tier 4: Blank-line-insensitive unique match (rescues LLM blank-line elision/insertion)
         let old_nonempty: Vec<&str> = old_stripped
             .iter()
@@ -1122,5 +1226,44 @@ mod tests {
         assert_eq!(cnt, 1);
         assert!(out.starts_with("fn first() {\n    return 1;\n}"));
         assert!(out.ends_with("fn second() {\n    return 99;\n}"));
+    }
+
+    #[test]
+    fn tier_35_rescues_tab_vs_space_indent_and_preserves_target_style() {
+        let tab_src = "func demo() {\n\tif ready {\n\t\treturn 1\n\t}\n}\n";
+        let sp_old = "    if ready {\n        return 1\n    }";
+        let sp_new = "    if ready {\n        return 42\n    }";
+        let (out_tabs, cnt1) =
+            replace_crlf_tolerant_with_hint(tab_src, sp_old, sp_new, false, None)
+                .expect("space patch onto tab file");
+        assert_eq!(cnt1, 1);
+        assert_eq!(
+            out_tabs,
+            "func demo() {\n\tif ready {\n\t\treturn 42\n\t}\n}\n"
+        );
+
+        let sp_src = "func demo() {\n    if ready {\n        return 1\n    }\n}\n";
+        let tab_old = "\tif ready {\n\t\treturn 1\n\t}";
+        let tab_new = "\tif ready {\n\t\treturn 99\n\t}";
+        let (out_spaces, cnt2) =
+            replace_crlf_tolerant_with_hint(sp_src, tab_old, tab_new, false, None)
+                .expect("tab patch onto space file");
+        assert_eq!(cnt2, 1);
+        assert_eq!(
+            out_spaces,
+            "func demo() {\n    if ready {\n        return 99\n    }\n}\n"
+        );
+
+        let dup_tab_src =
+            "func a() {\n\treturn defaultValue\n}\nfunc b() {\n\treturn defaultValue\n}\n";
+        let err = replace_crlf_tolerant_with_hint(
+            dup_tab_src,
+            "    return defaultValue",
+            "    return nextValue",
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("L2:") && err.contains("L5:"), "{err}");
     }
 }
