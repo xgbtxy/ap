@@ -1514,30 +1514,41 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (next.includes("tools.mcp__agent-primitives__")) {{
 		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
 	}}
+	if (next.includes("String.raw`")) {{
+		next = next.replace(
+			/(\bString\.raw`[^`\r\n]*?)(\\+)`([ \t]*(?:[;,)\]]|$))/gm,
+			(m, head: string, bs: string, tail: string) =>
+				bs.length % 2 === 1 ? `${{head}}${{bs.slice(0, -1)}}\` + "\\\\"${{tail}}` : m,
+		);
+	}}
 	const healedNewlines = healJsStringRawNewlines(next);
 	if (healedNewlines) {{
 		next = healedNewlines;
 	}}
-	// Strip accidental TypeScript variable type annotations (`const x: string = ...`), function param types & `as <Type>` casts in QuickJS scripts
+	// Strip accidental TypeScript variable type annotations (`const x: string = ...`), catch/param types & `as <Type>` casts in QuickJS scripts
 	if (/\b(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:/.test(next)) {{
 		next = next.replace(
-			/(^|[;\n]\s*)(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:string|number|boolean|any|unknown|object|Record<[^>\n]+>|Array<[^>\n]+>|(?:string|number|boolean|any|unknown)\[\])\s*=/gm,
-			"$1$2 $3 =",
+			/(^|[;\n])([ \t]*)(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:(?:string|number|boolean|any|unknown)\[\]|Record<[^>\n]+>|Array<[^>\n]+>|string|number|boolean|any|unknown|object)\s*=/gm,
+			"$1$2$3 $4 =",
 		);
 	}}
 	const cleanTsParamList = (params: string): string =>
 		params.replace(
-			/(\b[A-Za-z_$][A-Za-z0-9_$]*)\s*\??\s*:\s*(?:string|number|boolean|any|unknown|void|object|Record<[^>\n,)]+>|Array<[^>\n,)]+>|(?:string|number|boolean|any|unknown)\[\])/g,
+			/(\b[A-Za-z_$][A-Za-z0-9_$]*)\s*\??\s*:\s*(?:(?:string|number|boolean|any|unknown)\[\]|Record<[^>\n,)]+>|Array<[^>\n,)]+>|string|number|boolean|any|unknown|void|object)/g,
 			"$1",
 		);
 	if (/:/.test(next)) {{
+		next = next.replace(
+			/\bcatch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:any|unknown|Error|string|object)\s*\)/g,
+			"catch ($1)",
+		);
 		next = next.replace(
 			/(^|[^.\w$])((?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*|(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?:async\s*)?)\(([^()\n]*)\)/gm,
 			(m, pre: string, head: string, params: string) =>
 				params.includes(":") ? `${{pre}}${{head}}(${{cleanTsParamList(params)}})` : m,
 		);
 		next = next.replace(
-			/(\(\s*|(?:map|filter|forEach|find|some|every|reduce|sort|flatMap)\s*\(\s*)\(([^()\n]+)\)(\s*=>)/g,
+			/(\(\s*|(?:map|filter|forEach|find|some|every|reduce|sort|flatMap|flat|catch|then|finally)\s*\(\s*)\(([^()\n]+)\)(\s*=>)/g,
 			(m, pre: string, params: string, arrow: string) =>
 				params.includes(":") ? `${{pre}}(${{cleanTsParamList(params)}})${{arrow}}` : m,
 		);
@@ -1548,7 +1559,7 @@ export function healCodemodeSource(code: string): string | undefined {{
 	}}
 	if (/\bas\s+(?:any|unknown|string|number|boolean|object|const)\b/.test(next)) {{
 		next = next.replace(
-			/(\)|\]|\b[A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+(?:any|unknown|string|number|boolean|object|const)\b(?=\s*[;,)\]\r\n.?:&|])/g,
+			/(\)|\]|\}}|\b[A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+(?:any|unknown|string|number|boolean|object|const)\b(?=\s*[;,)\]\r\n.?:&|])/g,
 			"$1",
 		);
 	}}
@@ -2807,7 +2818,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 
 	// Trailing `-l` / `-c` or AppData / backtick-safe recursive grep -> fast bounded `rg`
 	const complexRec = withoutIncludes.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[rRnwiEHhlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))([\s\S]*?)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[rRnwiEHhlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))([\s\S]*?)((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?$/,
 	);
 	if (complexRec && /[rR]/.test(complexRec[2])) {{
 		const cdPrefix = complexRec[1] || "";
@@ -2837,7 +2848,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	}}
 
 	const m = withoutIncludes.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHhlcIsFo]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHhlcIsFo]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
 	);
 	if (!m || !/[rR]/.test(m[2])) return undefined;
 	const cdPrefix = m[1] || "";
@@ -3045,49 +3056,103 @@ export function healMsysPathConv(raw: string, toolName = "bash"): string | undef
 export function healCmdForLoop(raw: string, toolName = "bash"): string | undefined {{
 	if (!raw || toolName !== "bash") return undefined;
 	if (/\bfor\s+\/[frld]\b/i.test(raw)) return undefined;
-	const m = raw.trim().match(
-		/^(?:(cd(?:\s+\/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(([^)\r\n]+)\)\s+do\s+([\s\S]+?)\s*$/i,
+	const trimmed = raw.trim();
+	const headM = trimmed.match(
+		/^(?:(cd(?:\s+\/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(/i,
 	);
-	if (!m) return undefined;
-	const cdRaw = m[1] ? `${{m[1].trim().replace(/^cd\s+\/d\s+/i, "cd ").replace(/\\/g, "/")}} && ` : "";
-	const v = m[2];
-	const items = m[3].trim();
-	if (!items) return undefined;
-	let body = m[4].trim();
+	if (!headM || headM.index === undefined) return undefined;
+	const listStart = headM[0].length;
+	let quote: string | null = null;
+	let listEnd = -1;
+	for (let i = listStart; i < trimmed.length; i++) {{
+		const ch = trimmed[i];
+		if (quote) {{
+			if (ch === quote) quote = null;
+		}} else if (ch === '"' || ch === "'") {{
+			quote = ch;
+		}} else if (ch === ")") {{
+			listEnd = i;
+			break;
+		}} else if (ch === "\n" || ch === "\r") {{
+			break;
+		}}
+	}}
+	if (listEnd <= listStart) return undefined;
+	const itemsRaw = trimmed.slice(listStart, listEnd).trim();
+	if (!itemsRaw) return undefined;
+	const doM = trimmed.slice(listEnd + 1).match(/^\s*do\s+([\s\S]+?)\s*$/i);
+	if (!doM) return undefined;
+	const cdRaw = headM[1] ? `${{headM[1].trim().replace(/^cd\s+\/d\s+/i, "cd ").replace(/\\/g, "/")}} && ` : "";
+	const v = headM[2];
+	const items = itemsRaw.replace(/([A-Za-z]:)\\([^"'\r\n]*)/g, (_m, d: string, rest: string) => `${{d}}/${{rest.replace(/\\/g, "/")}}`);
+	let body = doM[1].trim();
 	if (body.startsWith("@")) body = body.slice(1).trim();
 	if (body.startsWith("(") && body.endsWith(")") && body.length >= 2) {{
 		body = body.slice(1, -1).trim();
 	}}
-	body = body.replace(new RegExp(`%%?${{v}}(?!\\w)`, "g"), () => "${{" + v + "}}");
+	body = body.replace(new RegExp(`%%?(?:~[fdpnxsatz]*)?${{v}}(?!\\w)`, "gi"), () => "${{" + v + "}}");
+	body = body.replace(/\s+2>\s*nul\b/gi, " 2>/dev/null");
+	body = body.replace(/\bdir\s+\/b\s+\/s\s+("[^"]+"|'[^']+'|\S+)/gi, `"${{AP_BIN}}" ls $1 --depth 3`);
+	body = body.replace(/\bdir\s+\/s\s+\/b\s+("[^"]+"|'[^']+'|\S+)/gi, `"${{AP_BIN}}" ls $1 --depth 3`);
+	body = body.replace(/\bdir\s+\/b\s+("[^"]+"|'[^']+'|\S+)/gi, `"${{AP_BIN}}" ls $1`);
+	body = body.replace(/\bfindstr\s+\/I\s+\/C:("[^"]+"|\S+)/gi, "grep -iF $1");
 	body = body.replace(/(?<![&>])(?:\s+&\s*|\s*&\s+)(?![&>])/g, "; ");
 	return `${{cdRaw}}for ${{v}} in ${{items}}; do ${{body.trim()}}; done`;
 }}
 
-export function healCommand(
-	raw: string,
-	toolName: string,
-	kvSleepOverrideSec?: number,
-): string | undefined {{
-	if (!raw) return undefined;
-	let cmd = raw;
-	let changed = false;
-	if (cmd.includes("\0")) {{
-		cmd = cmd.replace(/\0/g, "");
-		changed = true;
-	}}
-	const isDestructive = DESTRUCTIVE_OR_WRITE.test(cmd);
-	if (isDestructive) {{
-		return changed ? cmd : undefined;
-	}}
+const BARE_PS_CMDLET_PREFIX_RE =
+	/^(?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection)\b/;
 
-	// 1. Recursive GNU `grep`, minified `grep -oE`, `for ... grep`, `cat | grep -oE` -> `<50ms` `ap search` / `rg` (supports leading `cd <dir> &&`)
-	const fastGrep = rewriteSlowRecursiveGrep(cmd, toolName);
-	if (fastGrep) {{
-		return fastGrep;
+function normalizeUnquotedBashDrivePaths(raw: string): string {{
+	let out = "";
+	let quote: string | null = null;
+	let i = 0;
+	while (i < raw.length) {{
+		const ch = raw[i];
+		if (quote) {{
+			out += ch;
+			if (ch === "\\" && quote === '"' && i + 1 < raw.length) {{
+				out += raw[i + 1];
+				i += 2;
+				continue;
+			}}
+			if (ch === quote) quote = null;
+			i++;
+			continue;
+		}}
+		if (ch === "'" || ch === '"') {{
+			quote = ch;
+			out += ch;
+			i++;
+			continue;
+		}}
+		if (
+			/[A-Za-z]/.test(ch) &&
+			raw[i + 1] === ":" &&
+			raw[i + 2] === "\\" &&
+			(i === 0 || /[\s=;]/.test(raw[i - 1]))
+		) {{
+			let j = i + 2;
+			while (j < raw.length && !/[\s'"`;|&<>()]/.test(raw[j])) {{
+				j++;
+			}}
+			out += `${{ch}}:${{raw.slice(i + 2, j).replace(/\\/g, "/")}}`;
+			i = j;
+			continue;
+		}}
+		out += ch;
+		i++;
 	}}
-	const cdLeadM = cmd.match(/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$/);
+	return out;
+}}
+
+function accelerateSingleBashSegment(seg: string, toolName: string): string | undefined {{
+	const fastGrep = rewriteSlowRecursiveGrep(seg, toolName);
+	if (fastGrep) return fastGrep;
+
+	const cdLeadM = seg.match(/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$/);
 	const cdLeadPfx = cdLeadM ? cdLeadM[1] : "";
-	const cmdTailBody = cdLeadM ? cdLeadM[2] : cmd;
+	const cmdTailBody = cdLeadM ? cdLeadM[2] : seg;
 	if (!/[|;&>]/.test(cmdTailBody)) {{
 		const gm = cmdTailBody.match(BARE_SLOW_GREP);
 		if (gm && /[rR]/.test(gm[1])) {{
@@ -3107,7 +3172,7 @@ export function healCommand(
 
 	// 1b. Rewrite `cmd //c "where /R <dir> <pat>"` -> fast `.gitignore`-aware `rg --files`
 	if (toolName === "bash") {{
-		const whereM = cmd.match(
+		const whereM = seg.match(
 			/^cmd\s+\/\/?c\s+"where\s+\/R\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s+([^"]+)"(\s*2>&1)?(\s*\|[\s\S]*)?$/i,
 		);
 		if (whereM) {{
@@ -3118,9 +3183,10 @@ export function healCommand(
 		}}
 	}}
 
-	// 1c. Rewrite MS-DOS `dir /b [flags] [path]` (incl. `/a-d`, `/o:n`, `/s`, leading `cd <dir> &&`) in Git Bash -> bounded `ap ls`
-	if (toolName === "bash" && !/[|;&>]/.test(cmdTailBody) && /\bdir\b/i.test(cmdTailBody)) {{
-		const toks = cmdTailBody.trim().match(/"[^"]*"|'[^']*'|\S+/g) || [];
+	// 1c. Rewrite MS-DOS `dir /b [flags] [path]` (incl. `/a-d`, `/o:n`, `/s`, `2>/dev/null`) in Git Bash -> bounded `ap ls`
+	const dirTail = cmdTailBody.replace(/\s+2>\s*\/dev\/null\s*$/i, "").trim();
+	if (toolName === "bash" && !/[|;&>]/.test(dirTail) && /\bdir\b/i.test(dirTail)) {{
+		const toks = dirTail.match(/"[^"]*"|'[^']*'|\S+/g) || [];
 		if (toks.length >= 2 && toks[0].toLowerCase() === "dir") {{
 			let hasBare = false;
 			let recursive = false;
@@ -3276,21 +3342,182 @@ export function healCommand(
 		}}
 	}}
 
-	// 2. Prevent accidental literal `NUL` file creation in Git Bash (always safe)
-	if (toolName === "bash" && REDIR_NUL.test(cmd)) {{
-		cmd = cmd.replace(REDIR_NUL, "$1 /dev/null");
+	// Accelerate slow recursive `powershell -NoProfile -Command "Get-ChildItem -Path ... -Recurse -Filter '*.ext'"` -> bounded `rg --files`
+	if (toolName === "bash" && /\bGet-ChildItem\b/i.test(seg) && /-Recurse\b/i.test(seg) && /-Filter\b/i.test(seg)) {{
+		const psGci = seg.match(
+			/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+(['"])([\s\S]+?)\2(?:\s*2>&1)?\s*$/i,
+		);
+		if (psGci) {{
+			const psBody = psGci[3]
+				.replace(/^\s*\[Console\]::OutputEncoding\s*=[^;]+;\s*/i, "")
+				.trim();
+			if (
+				!PS_MUTATING_CMDLET_RE.test(psBody) &&
+				!/\b(?:Where-Object|ForEach-Object|Format-Table|Sort-Object|-Include|-Exclude)\b/i.test(psBody)
+			) {{
+				let gciPart = psBody;
+				let firstN = -1;
+				const selM = psBody.match(/^([\s\S]+?)\|\s*Select-Object\s+[^|;]*?-First\s+(\d+)\b[^|;]*$/i);
+				if (selM) {{
+					gciPart = selM[1].trim();
+					firstN = Number(selM[2]);
+				}}
+				if (!gciPart.includes("|") && !gciPart.includes(";")) {{
+					const gm = gciPart.match(
+						/^(?:Get-ChildItem|gci)\s+[\s\S]*?-Path\s+([^;\n]+?)(?=\s+-(?:Recurse|Filter|ErrorAction|File|Directory)\b|$)/i,
+					);
+					const fm = gciPart.match(/-Filter\s+(?:'([^']+)'|"([^"]+)"|([^\s;|]+))/i);
+					const glob = fm ? fm[1] || fm[2] || fm[3] || "" : "";
+					if (gm && glob && !/\$/.test(gm[1]) && !/\$/.test(glob)) {{
+						const rawPaths = gm[1]
+							.split(",")
+							.map((p) => p.trim().replace(/^(['"])(.*)\1$/, "$2").replace(/\\/g, "/"))
+							.filter(Boolean);
+						if (rawPaths.length > 0 && rawPaths.every((p) => !/[*?`$;|<>]/.test(p))) {{
+							const quotedRoots = rawPaths.map((p) => `"${{p.replace(/"/g, '\\"')}}"`).join(" ");
+							const headPipe = firstN > 0 ? ` | head -n ${{firstN}}` : "";
+							return `${{psGci[1] || ""}}rg --files --no-ignore --max-depth 6 -g '${{glob.replace(/'/g, "")}}' ${{quotedRoots}} 2>/dev/null${{headPipe}}`;
+						}}
+					}}
+				}}
+			}}
+		}}
+	}}
+
+	return undefined;
+}}
+
+function accelerateCompoundSegments(cmd: string, toolName: string): string | undefined {{
+	if (toolName !== "bash" || !/(?:&&|;|\n)/.test(cmd)) return undefined;
+	if (/<<|\b(?:for|while|if)\s+/.test(cmd)) return undefined;
+	const parts: Array<{{ text: string; sep: string }}> = [];
+	let cur = "";
+	let quote: string | null = null;
+	let i = 0;
+	while (i < cmd.length) {{
+		const ch = cmd[i];
+		if (quote) {{
+			cur += ch;
+			if (ch === "\\" && quote === '"' && i + 1 < cmd.length) {{
+				cur += cmd[i + 1];
+				i += 2;
+				continue;
+			}}
+			if (ch === quote) quote = null;
+			i++;
+			continue;
+		}}
+		if (ch === "'" || ch === '"') {{
+			quote = ch;
+			cur += ch;
+			i++;
+			continue;
+		}}
+		if (ch === "&" && cmd[i + 1] === "&") {{
+			parts.push({{ text: cur, sep: "&&" }});
+			cur = "";
+			i += 2;
+			continue;
+		}}
+		if (ch === ";" || ch === "\n") {{
+			parts.push({{ text: cur, sep: ch }});
+			cur = "";
+			i++;
+			continue;
+		}}
+		cur += ch;
+		i++;
+	}}
+	parts.push({{ text: cur, sep: "" }});
+	if (parts.length < 2) return undefined;
+
+	let anyChanged = false;
+	const out: string[] = [];
+	for (const part of parts) {{
+		const leadWs = part.text.match(/^\s*/)?.[0] ?? "";
+		const trailWs = part.text.match(/\s*$/)?.[0] ?? "";
+		const core = part.text.trim();
+		let nextCore = core;
+		if (core) {{
+			const accel = accelerateSingleBashSegment(core, toolName);
+			if (accel) {{
+				nextCore = accel;
+				anyChanged = true;
+			}} else if (BARE_PS_CMDLET_PREFIX_RE.test(core) && !/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(core)) {{
+				const body = core.replace(/'/g, `'"'"'`);
+				nextCore = `powershell.exe -NoProfile -Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${{body}}'`;
+				anyChanged = true;
+			}}
+		}}
+		out.push(`${{leadWs}}${{nextCore}}${{trailWs}}${{part.sep}}`);
+	}}
+	return anyChanged ? out.join("") : undefined;
+}}
+
+export function healCommand(
+	raw: string,
+	toolName: string,
+	kvSleepOverrideSec?: number,
+): string | undefined {{
+	if (!raw) return undefined;
+	let cmd = raw;
+	let changed = false;
+	if (cmd.includes("\0")) {{
+		cmd = cmd.replace(/\0/g, "");
+		changed = true;
+	}}
+	const isDestructive = DESTRUCTIVE_OR_WRITE.test(cmd);
+	if (isDestructive) {{
+		return changed ? cmd : undefined;
+	}}
+
+	// 0. Pre-normalize safe Git Bash Windowsisms BEFORE accelerators so `cd /d`, `2>NUL`, `&`, unquoted backslashes & `| more` accelerate too
+	if (toolName === "bash") {{
+		if (REDIR_NUL.test(cmd)) {{
+			cmd = cmd.replace(REDIR_NUL, "$1 /dev/null");
+			changed = true;
+		}}
+		if (/(?:^|[;&|]\s*)cd\s+\/d\s+/i.test(cmd)) {{
+			cmd = cmd.replace(/(^|[;&|]\s*)cd\s+\/d\s+/gi, "$1cd ");
+			changed = true;
+		}}
+		const cdAmp = cmd.match(/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)(?:\s+2>\s*\/dev\/null)?)\s*&\s*(?![&>])([\s\S]+)$/);
+		if (cdAmp) {{
+			cmd = `${{cdAmp[1]}} && ${{cdAmp[2]}}`;
+			changed = true;
+		}}
+		if (/\|\s*more\b/i.test(cmd)) {{
+			const noMore = cmd.replace(/\s*\|\s*more(?:\s+\+\d+)?(?=\s*(?:$|[;&]))/gi, "");
+			if (noMore !== cmd) {{
+				cmd = noMore;
+				changed = true;
+			}}
+		}}
+		if (!/(?:<<|\b(?:python3?|py|node|powershell|pwsh)\b)/i.test(cmd) && /(?:^|[\s=;])[A-Za-z]:\\/.test(cmd)) {{
+			const normDrv = normalizeUnquotedBashDrivePaths(cmd);
+			if (normDrv !== cmd) {{
+				cmd = normDrv;
+				changed = true;
+			}}
+		}}
+	}}
+
+	// 1. Accelerate single-command slow patterns (`grep -rn`, `dir /b`, `sed`/`head`/`tail`/`cat`, `find`, slow PS `Get-ChildItem -Recurse -Filter`)
+	const singleAccel = accelerateSingleBashSegment(cmd, toolName);
+	if (singleAccel) {{
+		return singleAccel;
+	}}
+
+	// 1f. Accelerate top-level `;` / `&&` compound Bash probes (and wrap mid-command bare PowerShell cmdlets)
+	const compoundAccel = accelerateCompoundSegments(cmd, toolName);
+	if (compoundAccel) {{
+		cmd = compoundAccel;
 		changed = true;
 	}}
 
 	// 2a. Strip stray `2>/dev/null` placed inside `for x in *.py 2>/dev/null; do` word lists
 	if (toolName === "bash" && /\bfor\s+\w+\s+in\b[^;]*\s2>\s*\/dev\/null\s*;/.test(cmd)) {{
 		cmd = cmd.replace(/(\bfor\s+\w+\s+in\b[^;]*?)\s+2>\s*\/dev\/null(\s*;)/g, "$1$2");
-		changed = true;
-	}}
-
-	// 2b. Strip Windows cmd `cd /d <path>` flag inside Git Bash -> `cd <path>`
-	if (toolName === "bash" && /(?:^|[;&|]\s*)cd\s+\/d\s+/i.test(cmd)) {{
-		cmd = cmd.replace(/(^|[;&|]\s*)cd\s+\/d\s+/gi, "$1cd ");
 		changed = true;
 	}}
 
@@ -3377,7 +3604,7 @@ export function healCommand(
 	// 6b. Wrap bare read-only PowerShell cmdlets accidentally sent to Git Bash (fixes syntax error near unexpected token)
 	if (toolName === "bash" && !/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd)) {{
 		const psBare = cmd.match(
-			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String)\b[\s\S]*)$/,
+			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection)\b[\s\S]*)$/,
 		);
 		if (psBare) {{
 			const body = psBare[2].trim().replace(/'/g, `'"'"'`);

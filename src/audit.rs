@@ -245,6 +245,9 @@ fn classify_err(txt: &str, st: &mut Counters) {
         "The '<' operator",
         "unterminated triple-quoted",
         "Script sandbox failed",
+        "more: command not found",
+        "dir: cannot access '/b'",
+        "Get-NetTCPConnection: command not found",
     ]
     .iter()
     .any(|k| has(k))

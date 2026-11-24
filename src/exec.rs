@@ -254,14 +254,20 @@ pub fn try_cap_long_sleep(raw: &str, max_sec: u64) -> Option<String> {
     }
 }
 
-fn split_leading_cd_prefix(raw: &str) -> (Option<&str>, &str) {
+fn split_leading_cd_prefix(raw: &str) -> (Option<String>, &str) {
     static CD_PFX_RE: OnceLock<Regex> = OnceLock::new();
     let re = CD_PFX_RE.get_or_init(|| {
-        Regex::new(r#"^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$"#).unwrap()
+        Regex::new(
+            r#"(?i)^(\s*cd)(\s+\/d)?(\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$"#,
+        )
+        .unwrap()
     });
     if let Some(caps) = re.captures(raw) {
-        if let (Some(p), Some(rest)) = (caps.get(1), caps.get(2)) {
-            return (Some(p.as_str()), rest.as_str());
+        if let (Some(cd_kw), Some(rest_pfx), Some(body)) = (caps.get(1), caps.get(3), caps.get(4)) {
+            return (
+                Some(format!("{}{}", cd_kw.as_str(), rest_pfx.as_str())),
+                body.as_str(),
+            );
         }
     }
     (None, raw)
@@ -341,7 +347,7 @@ pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
     }
     Some(format!(
         "{}\"{ap_bin}\" search{args_out} \"{pat_esc}\" \"{target}\"",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -349,10 +355,15 @@ pub fn try_accelerate_slow_grep(raw: &str) -> Option<String> {
 /// cleanly to bounded `ap ls` with `--depth 3` when `/s` is present. Passes through pipes and globs safely.
 pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    if has_unsafe_shell_meta(body) {
+    static DIR_STDERR_NULL_RE: OnceLock<Regex> = OnceLock::new();
+    let stderr_null_re = DIR_STDERR_NULL_RE
+        .get_or_init(|| Regex::new(r"(?i)\s+2>\s*(?:/dev/null|NUL)\s*$").unwrap());
+    let clean_owned = stderr_null_re.replace(body.trim(), "").into_owned();
+    let clean_body = clean_owned.trim();
+    if has_unsafe_shell_meta(clean_body) {
         return None;
     }
-    let toks = split_ps_args(body.trim())?;
+    let toks = split_ps_args(clean_body)?;
     let head = toks.first()?;
     if !head.eq_ignore_ascii_case("dir") {
         return None;
@@ -394,7 +405,7 @@ pub fn try_heal_windows_dir_cmd(raw: &str) -> Option<String> {
     let tgt_esc = tgt_arg.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" ls \"{tgt_esc}\"{depth_flag}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -526,7 +537,7 @@ pub fn try_accelerate_select_string(raw: &str) -> Option<String> {
     let tgt_esc = tgt.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" search{flags} \"{pat_esc}\" \"{tgt_esc}\"",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -610,7 +621,7 @@ pub fn try_accelerate_get_content(raw: &str) -> Option<String> {
     let tgt_esc = tgt.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" read \"{tgt_esc}\"{limit_flag}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -665,7 +676,7 @@ pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
     let file_esc = file.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" read \"{file_esc}\" --lines {start}-{end}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -709,7 +720,7 @@ pub fn try_accelerate_head_slice(raw: &str) -> Option<String> {
     let file_esc = file.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" read \"{file_esc}\" --lines 1-{n}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -753,7 +764,7 @@ pub fn try_accelerate_tail_slice(raw: &str) -> Option<String> {
     let file_esc = file.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" read \"{file_esc}\" --tail {n}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -842,7 +853,7 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
     let file_esc = file.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" read \"{file_esc}\" {slice_flag}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -958,7 +969,7 @@ pub fn try_accelerate_find_files(raw: &str) -> Option<String> {
     }
     Some(format!(
         "{}\"{ap_bin}\" ls \"{tgt_esc}\"{flags}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -1028,7 +1039,7 @@ pub fn try_accelerate_get_child_item(raw: &str) -> Option<String> {
     let tgt_esc = tgt.replace('"', "\\\"");
     Some(format!(
         "{}\"{ap_bin}\" ls \"{tgt_esc}\"{depth_flag}",
-        cd_pfx.unwrap_or("")
+        cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
@@ -1056,7 +1067,7 @@ pub fn try_build_rg_fixed_retry(raw: &str) -> Option<String> {
     }
     Some(format!(
         "{}{} -F{tail}",
-        cd_pfx.unwrap_or(""),
+        cd_pfx.as_deref().unwrap_or(""),
         &trimmed[..prefix_len]
     ))
 }
@@ -1185,17 +1196,19 @@ fn heal_py_win_backslashes(cmd: &str) -> (String, bool) {
 }
 
 /// Convert simple Windows CMD `for %x in (a b c) do ...` (without `/f`, `/r`, `/l`, `/d`) into Bash `for x in a b c; do ...; done`,
-/// optionally preserving a leading `cd [/d] <dir> &/&&` prefix.
+/// optionally preserving a leading `cd [/d] <dir> &/&&` prefix, quote-aware `in (...)` parens, and `%~x` tilde modifiers.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn try_heal_cmd_for_loop(raw: &str) -> Option<String> {
-    static RE: OnceLock<(Regex, Regex)> = OnceLock::new();
-    let (for_re, var_re) = RE.get_or_init(|| {
+    static RE: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
+    let (head_re, do_re, var_re, items_bs_re) = RE.get_or_init(|| {
         (
             Regex::new(
-                r#"(?is)^\s*(?:(cd(?:\s+/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(([^)\r\n]+)\)\s+do\s+(.+?)\s*$"#,
+                r#"(?is)^\s*(?:(cd(?:\s+/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\("#,
             )
             .unwrap(),
-            Regex::new(r"%%?([A-Za-z_]\w*)").unwrap(),
+            Regex::new(r#"(?is)^\s*do\s+(.+?)\s*$"#).unwrap(),
+            Regex::new(r"%%?(?:~[fdpnxsatz]*)?([A-Za-z_]\w*)").unwrap(),
+            Regex::new(r#"([A-Za-z]:)\\([^"'\r\n]*)"#).unwrap(),
         )
     });
     let trimmed = raw.trim();
@@ -1205,13 +1218,37 @@ pub fn try_heal_cmd_for_loop(raw: &str) -> Option<String> {
     {
         return None;
     }
-    let caps = for_re.captures(trimmed)?;
-    let var = caps.get(2)?.as_str();
-    let items = caps.get(3)?.as_str().trim();
-    if items.is_empty() {
+    let caps = head_re.captures(trimmed)?;
+    let list_start = caps.get(0)?.end();
+    let mut quote: Option<char> = None;
+    let mut list_end: Option<usize> = None;
+    for (rel_idx, ch) in trimmed[list_start..].char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == ')' {
+            list_end = Some(list_start + rel_idx);
+            break;
+        } else if ch == '\n' || ch == '\r' {
+            break;
+        }
+    }
+    let list_end = list_end?;
+    let items_raw = trimmed[list_start..list_end].trim();
+    if items_raw.is_empty() {
         return None;
     }
-    let mut body = caps.get(4)?.as_str().trim().to_string();
+    let do_caps = do_re.captures(&trimmed[list_end + 1..])?;
+    let var = caps.get(2)?.as_str();
+    let items = items_bs_re
+        .replace_all(items_raw, |c: &regex::Captures| {
+            format!("{}/{}", &c[1], c[2].replace('\\', "/"))
+        })
+        .into_owned();
+    let mut body = do_caps.get(1)?.as_str().trim().to_string();
     if let Some(stripped) = body.strip_prefix('@') {
         body = stripped.trim().to_string();
     }
@@ -2299,5 +2336,24 @@ mod tests {
         assert!(try_accelerate_find_files("find . -name '*.rs' -exec rm {} +").is_none());
         assert!(try_accelerate_find_files("find src tests -type f").is_none());
         assert!(try_accelerate_find_files("find . -maxdepth 8 -type f").is_none());
+
+        // `cd /d` leading prefix, `dir /b 2>nul`, and quote-aware `for %d in ("... (x86)")` + `%~d` tilde modifiers
+        let (_, h36, tags36) =
+            heal_windows_command(r#"cd /d "C:/proj" && dir /b /s 2>nul"#, true, true);
+        assert!(
+            h36.starts_with(r#"cd "C:/proj" && "#) && h36.contains(r#"ls "." --depth 3"#),
+            "{h36}"
+        );
+        assert!(tags36.contains(&"dir-/b->ap-ls"));
+
+        assert_eq!(
+            try_heal_cmd_for_loop(
+                r#"for %d in ("C:\Program Files\App" "C:\Program Files (x86)\App") do @echo "%~d""#
+            )
+            .as_deref(),
+            Some(
+                r#"for d in "C:/Program Files/App" "C:/Program Files (x86)/App"; do echo "${d}"; done"#
+            )
+        );
     }
 }

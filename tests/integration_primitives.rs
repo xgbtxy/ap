@@ -9444,4 +9444,120 @@ fn test_v258_fast_audit_tab_space_patch_and_find_accel() {
             && ts_src.contains("replace(/\\s*2>\\s*\\/dev\\/null\\s*$/, \"\")"),
         "Pi hook missing v2.58 find->ap ls parity"
     );
+
+    // 5. v2.59 live Node.js verification of healed codemode TS/String.raw, CMD for-loop & compound/PS-in-Bash accelerators
+    let ts_file = fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    let strip_ok = Command::new("node")
+        .args(["--experimental-strip-types", "-e", "process.exit(0)"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if strip_ok {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCodemodeSource, healCmdForLoop, healCommand } = mod;
+
+// 1) String.raw trailing backslash & TypeScript syntax stripping in QuickJS codemode
+const rawBs = "const base = String.raw`C:\\demo\\sub\\`;\nconsole.log(base);";
+const healedBs = healCodemodeSource(rawBs);
+assert.ok(healedBs && healedBs.includes('String.raw`C:\\demo\\sub` + "\\\\"'), healedBs);
+new Function(healedBs);
+
+const validRaw = "const ok = String.raw`C:\\demo\\sub`;\nconst ok2 = String.raw`C:\\demo\\\\`;";
+assert.equal(healCodemodeSource(validRaw), undefined);
+
+const tsScript = [
+  "const items: any[] = [];",
+  "for (const q of ['a']) {",
+  "  try {",
+  "    const r: any = await Promise.resolve(q);",
+  "    const m = (r.hits || []).map((x: any) => x);",
+  "    items.push({ q, m } as any);",
+  "  } catch (e: any) { items.push(e.message); }",
+  "}",
+].join("\n");
+const healedTs = healCodemodeSource(tsScript);
+assert.ok(healedTs, "expected TS codemode healing");
+new Function(`return async () => {\n${healedTs}\n};`);
+
+// 2) CMD for-loop with quoted `(x86)` parens & `%~d` tilde modifier
+const forOut = healCmdForLoop(
+  'for %d in ("C:\\Program Files\\App" "C:\\Program Files (x86)\\App") do @dir /b /s "%~d" 2>nul | findstr /I /C:"foo"',
+  "bash",
+);
+assert.ok(
+  forOut
+    && forOut.includes('"C:/Program Files/App" "C:/Program Files (x86)/App"')
+    && forOut.includes('ls "${d}" --depth 3')
+    && forOut.includes('2>/dev/null')
+    && forOut.includes('grep -iF "foo"'),
+  forOut,
+);
+
+// 3) Shell pre-normalization + multi-stage pipes + compound segments + slow PS Get-ChildItem + PS-in-Bash
+const dirHealed = healCommand('cd /d "C:\\proj" 2>nul & dir /b', "bash");
+assert.ok(dirHealed && dirHealed.includes('cd "C:/proj"') && dirHealed.includes('&& ') && dirHealed.includes(' ls "."'), dirHealed);
+
+const drvHealed = healCommand('cd C:\\Users\\demo\\proj && ls', "bash");
+assert.equal(drvHealed, 'cd C:/Users/demo/proj && ls');
+
+const moreHealed = healCommand('cat app.log | more +0', "bash");
+assert.equal(moreHealed, 'cat app.log');
+
+const compoundHealed = healCommand(
+  'cd src && find . -maxdepth 3 -name "*.rs" 2>/dev/null | head -10; echo ---; grep -rho "fn " --include=*.rs . 2>/dev/null | sort | uniq -c | head -10',
+  "bash",
+);
+assert.ok(
+  compoundHealed
+    && compoundHealed.includes(' ls "." --depth 3 --ext rs --limit 10')
+    && compoundHealed.includes(' search -o --no-filename -e rs \'fn \' "." | sort | uniq -c | head -10'),
+  compoundHealed,
+);
+
+const midPsHealed = healCommand(
+  'ls src | head; echo ---; Get-NetTCPConnection -State Listen | Select-Object LocalPort',
+  "bash",
+);
+assert.ok(
+  midPsHealed
+    && midPsHealed.includes("powershell.exe -NoProfile -Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-NetTCPConnection -State Listen | Select-Object LocalPort'"),
+  midPsHealed,
+);
+
+const slowGciHealed = healCommand(
+  `powershell -NoProfile -Command "Get-ChildItem -Path 'C:\\App1','C:\\App2' -Recurse -Filter '*.dll' -ErrorAction SilentlyContinue | Select-Object -First 5 FullName"`,
+  "bash",
+);
+assert.ok(
+  slowGciHealed
+    && slowGciHealed.includes("rg --files --no-ignore --max-depth 6 -g '*.dll'")
+    && slowGciHealed.includes('"C:/App1" "C:/App2"')
+    && slowGciHealed.includes("| head -n 5"),
+  slowGciHealed,
+);
+
+// Destructive commands remain untouched
+assert.equal(healCommand('rm -rf build && grep -rn foo .', "bash"), undefined);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.59 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 }
