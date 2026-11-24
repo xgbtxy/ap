@@ -171,6 +171,9 @@ struct HttpArgs {
     /// Synchronized Barrier concurrency/TOCTOU race burst count (2..=32 parallel threads firing simultaneously)
     #[arg(long, default_value_t = 0)]
     race: usize,
+    /// Optional sensitive sentinel token(s) to flag immediately if leaked in any auth-matrix candidate response body
+    #[arg(long = "sentinel")]
+    sentinels: Vec<String>,
     #[arg(long)]
     json: bool,
 }
@@ -661,6 +664,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 select,
                 audit_headers,
                 race,
+                sentinels,
                 json,
             } = *boxed;
             if race >= 2 {
@@ -690,6 +694,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     cors_origin.as_deref(),
                     select.as_deref(),
                     audit_headers,
+                    &sentinels,
                     timeout,
                     insecure,
                     follow,

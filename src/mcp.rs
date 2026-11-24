@@ -6,117 +6,93 @@ fn mcp_tools_schema() -> Value {
     let mut tools = json!([
         {
             "name": "ap_read",
-            "description": "Universal zero-dependency reader: parses code with AST `--symbol`/`--outline` (Py/TS/JS/Go/Rust/C) & batch multi-file `targets`, .docx/.xlsx/.pptx/.pdf/.sqlite/.gz, Electron .asar & .zip/.vsix/.jar/.whl virtual archives, PE/ELF/Mach-O headers + strings, minified JS bundles (--offset/--chars/--pretty), GBK files, and JS-rendered URLs.",
+            "description": "AST/universal reader: Py/TS/JS/Go/Rust/C/C++ --symbol/--outline & batch `targets`, .docx/.xlsx/.pptx/.pdf/.sqlite/.gz, .asar/.zip/.vsix/.jar/.whl archives, PE/ELF/Mach-O headers/RVA/VA/XREF/find_bytes, minified JS (--offset/--chars/--pretty), SourceMaps, GBK, routes, JWT, secrets, structural --diff, and JS-rendered URLs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Local file/folder path or http(s):// URL" },
-                    "targets": {
-                        "type": "array",
-                        "description": "Optional batch list of up to 12 file paths to read in a single call",
-                        "items": { "type": "string" }
-                    },
-                    "symbol": { "type": "string", "description": "Optional Tree-sitter AST symbol name(s) to extract cleanly (comma-separated, e.g. 'Engine.commit,parse_spec')" },
-                    "outline": { "type": "boolean", "description": "Emit ONLY the compact Tree-sitter AST symbol outline (for code), C/C++ outline, JSON/JSONC/HAR/XML/PLIST/YAML/TOML/INI schema, or heading outline (for Markdown)" },
-                    "section": { "type": "string", "description": "Optional Markdown heading substring to extract ONLY that `# Heading` section cleanly" },
-                    "lines": { "type": "string", "description": "Optional line window or comma-separated multi-ranges, e.g. '1-30,120-160'" },
-                    "width": { "type": "integer", "description": "Optional max characters per output line (UTF-8 safe, like `cut -c1-N` without splitting CJK)" },
-                    "query": { "type": "string", "description": "Optional keyword/regex filter for rows, minified slices, archive entries, or binary strings" },
-                    "around": { "type": "integer", "description": "Optional `--query` context window (bytes each side for minified bundles, lines for normal files)" },
-                    "max_hits": { "type": "integer", "description": "Optional max `--query` match windows/blocks to return" },
-                    "sheet": { "type": "string", "description": "Optional worksheet filter for .xlsx" },
-                    "entry": { "type": "string", "description": "Optional archive entry path inside .asar/.zip/.vsix/.jar/.apk/.whl" },
-                    "offset": { "type": "string", "description": "Optional byte offset or comma-separated multi-offsets (e.g. '18000,95000') for slicing minified bundles in 1 call" },
-                    "chars": { "type": "integer", "description": "Optional slice window length with offset (default: 2400)" },
-                    "pretty": { "type": "boolean", "description": "Pretty-format minified JS/JSON snippets" },
-                    "json_path": { "type": "string", "description": "Zero-jq JSON/JSONC/JSONL or structured config (XML/PLIST/YAML/TOML/INI) path query (e.g. 'items[*].name' or '..token')" },
-                    "map_pos": { "type": "string", "description": "SourceMap v3 generated 'line:col' to resolve back to original source via VLQ" },
-                    "decode": { "type": "boolean", "description": "Auto-decode embedded JWT tokens, Base64 blobs, and URL-encoded strings" },
-                    "render": { "type": "boolean", "description": "Render JS-driven URLs in real Headless Edge/Chrome" },
-                    "hex": { "type": "boolean", "description": "Emit canonical hex+ASCII dump with SHA-256 & entropy (supports hex/decimal offset)" },
-                    "rva": { "type": "string", "description": "Map a PE RVA (or ELF offset) to file offset, section, enclosing x64 function & nearby call/hex preview" },
-                    "va": { "type": "string", "description": "Map a PE/ELF virtual address (`VA`) to file offset, section & nearby XREFs" },
-                    "find_bytes": { "type": "string", "description": "Wildcard hex byte pattern search across binary (e.g. '48 8D ?? ?? ?? ?? ?? E8'), mapping hits to RVA/VA/func" },
-                    "xref": { "type": "boolean", "description": "Resolve PE64 (x64 LEA/CALL) & ELF64 (x64 LEA / AArch64 ADRP+ADD) string & IAT XREFs + enclosing function RVAs" },
-                    "cert": { "type": "boolean", "description": "Pure-Rust X.509 PEM/DER certificate inspector (Subject, Issuer, Validity, SANs, SHA-256)" },
-                    "proto": { "type": "boolean", "description": "Schema-less raw Protocol Buffers wire decoder (no protoc required)" },
-                    "routes": { "type": "boolean", "description": "Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins" },
-                    "jwt": { "type": "boolean", "description": "Decode JWT header/claims/UTC timestamps & defensive security posture flags (accepts file or inline eyJ... token)" },
-                    "secrets": { "type": "boolean", "description": "Scan file or archive entry for hardcoded keys/tokens/URI credentials (all values auto-redacted)" },
-                    "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) or structured JSON/JSONC/XML/PLIST/YAML/TOML/INI file for structural/patch diffing" },
-                    "scrub": { "type": "boolean", "description": "Scrub leaked secrets (API keys/tokens/PEM/URI creds) and defang indirect prompt-injection payloads before returning output" }
+                    "target": { "type": "string", "description": "File/dir path or URL" },
+                    "targets": { "type": "array", "description": "Up to 12 paths to read in 1 call", "items": { "type": "string" } },
+                    "symbol": { "type": "string", "description": "Comma-separated AST symbol names" },
+                    "outline": { "type": "boolean", "description": "Emit AST/config/heading outline only" },
+                    "section": { "type": "string", "description": "Markdown heading substring" },
+                    "lines": { "type": "string", "description": "Line range(s), e.g. '1-30,120-160'" },
+                    "width": { "type": "integer", "description": "Max chars per line (UTF-8 safe)" },
+                    "query": { "type": "string", "description": "Keyword/regex filter" },
+                    "around": { "type": "integer", "description": "Context bytes/lines around query hits" },
+                    "max_hits": { "type": "integer", "description": "Max query match windows" },
+                    "sheet": { "type": "string", "description": ".xlsx sheet filter" },
+                    "entry": { "type": "string", "description": "Archive entry path" },
+                    "offset": { "type": "string", "description": "Byte offset(s) for minified bundles" },
+                    "chars": { "type": "integer", "description": "Slice window length (default: 2400)" },
+                    "pretty": { "type": "boolean", "description": "Pretty-format JS/JSON" },
+                    "json_path": { "type": "string", "description": "JSON/XML/PLIST/YAML/TOML path query" },
+                    "map_pos": { "type": "string", "description": "SourceMap v3 'line:col'" },
+                    "decode": { "type": "boolean", "description": "Auto-decode JWT/Base64/URL strings" },
+                    "render": { "type": "boolean", "description": "Render JS URL via headless browser" },
+                    "hex": { "type": "boolean", "description": "Hex+ASCII dump with SHA-256 & entropy" },
+                    "rva": { "type": "string", "description": "PE RVA / ELF offset to function/preview" },
+                    "va": { "type": "string", "description": "PE/ELF virtual address to offset/XREFs" },
+                    "find_bytes": { "type": "string", "description": "Wildcard hex pattern e.g. '48 8D ?? E8'" },
+                    "xref": { "type": "boolean", "description": "PE64/ELF64 string & IAT XREFs" },
+                    "cert": { "type": "boolean", "description": "X.509 PEM/DER inspector" },
+                    "proto": { "type": "boolean", "description": "Raw protobuf wire decoder" },
+                    "routes": { "type": "boolean", "description": "Extract JS/TS/HTML routes, sinks & origins" },
+                    "jwt": { "type": "boolean", "description": "Decode JWT header/claims & posture" },
+                    "secrets": { "type": "boolean", "description": "Scan redacted hardcoded keys/tokens" },
+                    "diff": { "type": "string", "description": "Older binary/archive/config path to diff" },
+                    "scrub": { "type": "boolean", "description": "Redact secrets & defang prompt injection" }
                 }
             }
         },
         {
             "name": "ap_query",
-            "description": "Execute exact SQLite 3.46+ SQL (`JOIN`, `GROUP BY`, `SUM`, `ROUND`, `CTE`, Window Functions) directly across `.xlsx` Excel workbooks, `GBK`/`UTF-8` `.csv`/`.tsv` tables, and `.json`/`.jsonl` files in <20ms with zero Python/DuckDB and zero numerical hallucination.",
+            "description": "Execute SQLite SQL (`JOIN`, `GROUP BY`, `SUM`, `CTE`, window fns) across `.xlsx`, `.csv`/`.tsv` (GBK/UTF-8), and `.json`/`.jsonl` in <20ms.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "files": {
-                        "type": "array",
-                        "description": "Table bindings like ['orders=sales.xlsx', 'bank=statement.csv']",
-                        "items": { "type": "string" }
-                    },
-                    "sql": { "type": "string", "description": "SQL query to execute (omit or set schema=true to inspect table columns first)" },
-                    "schema": { "type": "boolean", "description": "If true, list loaded table names, row counts & columns" },
-                    "format": { "type": "string", "description": "Output format: 'md' (default) or 'json' (populates structuredContent.records with named column objects)" },
-                    "out": { "type": "string", "description": "Optional output CSV file path" }
+                    "files": { "type": "array", "description": "Bindings like ['orders=sales.xlsx']", "items": { "type": "string" } },
+                    "sql": { "type": "string", "description": "SQL query (omit or schema=true to inspect columns)" },
+                    "schema": { "type": "boolean", "description": "List table names, counts & columns" },
+                    "format": { "type": "string", "description": "'md' (default) or 'json' (structuredContent.records)" },
+                    "out": { "type": "string", "description": "Optional output CSV path" }
                 },
                 "required": ["files"]
             }
         },
         {
             "name": "ap_search",
-            "description": "Fast single-pass .gitignore-aware regex & Tree-sitter AST structural search (`ast`: e.g. `kind:call`, `fetch($URL, $$$)`, `$X == $X`, `Command::new($BIN)`) across codebases, minified JS bundles, SourceMaps (`.map`), Electron `.asar`/`.vsix`/`.zip`, Office/PDF docs, and binary ASCII/UTF-16LE strings.",
+            "description": "Fast .gitignore-aware regex & Tree-sitter AST search (`ast`: `kind:call`, `fetch($URL, $$$)`) across code, minified bundles, SourceMaps, .asar/.zip, docs & binary strings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "Primary regex or literal search pattern (optional when `ast` is specified)" },
-                    "ast": { "type": "string", "description": "Structural Tree-sitter AST query across Py/TS/JS/Go/Rust/C: node kinds (`kind:call`, `kind:fn`, `kind:import`) or metavariable patterns (`fetch($URL, $$$)`, `Command::new($BIN)`, `$X == $X`) ignoring comments & strings" },
-                    "patterns": {
-                        "type": "array",
-                        "description": "Optional batch of extra regex patterns evaluated in the same single filesystem walk",
-                        "items": { "type": "string" }
-                    },
-                    "path": { "type": "string", "description": "Directory or file to search (default: '.')" },
-                    "paths": {
-                        "type": "array",
-                        "description": "Optional additional files or directories to search in the same pass",
-                        "items": { "type": "string" }
-                    },
-                    "ext": { "type": "string", "description": "Optional comma-separated extensions, e.g. 'ts,js' or 'asar,vsix,map'" },
-                    "pretty": { "type": "boolean", "description": "Pretty-format matches inside minified single-line bundles" },
-                    "multiline": { "type": "boolean", "description": "Enable cross-line multiline regex matching" },
-                    "block": { "type": "boolean", "description": "Emit full enclosing Tree-sitter AST function/class block around each hit" },
-                    "context": { "type": "integer", "description": "Show N surrounding lines before & after each match (like `rg -C N`)" },
-                    "before_context": { "type": "integer", "description": "Show N lines BEFORE each match (like `rg -B N`)" },
-                    "after_context": { "type": "integer", "description": "Show N lines AFTER each match (like `rg -A N`)" },
-                    "invert_match": { "type": "boolean", "description": "Return non-matching lines instead of matching lines (like `rg -v`)" },
-                    "files_only": { "type": "boolean", "description": "Return only unique matching file paths (like `rg -l`)" },
-                    "count": { "type": "boolean", "description": "Return per-file match counts (like `rg -c`)" },
-                    "only_matching": { "type": "boolean", "description": "Emit ONLY matched substrings from each line (like `grep -o` / `rg -o`)" },
-                    "unique": { "type": "boolean", "description": "Deduplicate matched snippets/tokens and rank by descending frequency" },
-                    "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal fixed string instead of regex (like `rg -F`)" },
-                    "ignore_case": { "type": "boolean", "description": "Force case-insensitive matching even with uppercase chars (like `rg -i`)" },
-                    "include": {
-                        "type": "array",
-                        "description": "Include only matching glob/path filters (e.g. ['*.rs', 'src/*'])",
-                        "items": { "type": "string" }
-                    },
-                    "code_only": { "type": "boolean", "description": "Skip non-code doc/config files AND skip matches inside Tree-sitter comments & string literals" },
-                    "no_tests": { "type": "boolean", "description": "Skip test/fixture paths AND inline Rust #[cfg(test)]/Python test_* blocks" },
-                    "exclude": {
-                        "type": "array",
-                        "description": "Relative-path substring or suffix filters to skip (e.g. ['fixtures', '*.gen.ts'])",
-                        "items": { "type": "string" }
-                    },
-                    "around": { "type": "integer", "description": "Context characters on each side when slicing matches inside minified single-line bundles (default: 160)" },
-                    "max_hits": { "type": "integer", "description": "Maximum total matches to return across files (default: 50)" },
-                    "per_pattern": { "type": "integer", "description": "Max hits per pattern in multi-pattern (`patterns`) mode (0 = fair auto quota across all patterns)" },
-                    "width": { "type": "integer", "description": "Optional max characters per output snippet (UTF-8 safe, like `cut -c1-N` without splitting CJK)" },
-                    "json": { "type": "boolean", "description": "Emit structured JSON populated into structuredContent (matches/files/counts) for zero-parse codemode pipelines" }
+                    "pattern": { "type": "string", "description": "Regex or literal pattern" },
+                    "ast": { "type": "string", "description": "AST query (`kind:call` or metavars like `fetch($URL, $$$)`)" },
+                    "patterns": { "type": "array", "description": "Extra regex patterns in same walk", "items": { "type": "string" } },
+                    "path": { "type": "string", "description": "Target path (default: '.')" },
+                    "paths": { "type": "array", "description": "Additional paths in same walk", "items": { "type": "string" } },
+                    "ext": { "type": "string", "description": "Comma-separated extensions" },
+                    "pretty": { "type": "boolean", "description": "Format minified bundle hits" },
+                    "multiline": { "type": "boolean", "description": "Cross-line regex" },
+                    "block": { "type": "boolean", "description": "Return enclosing AST fn/class block" },
+                    "context": { "type": "integer", "description": "Lines before & after hit (-C)" },
+                    "before_context": { "type": "integer", "description": "Lines before hit (-B)" },
+                    "after_context": { "type": "integer", "description": "Lines after hit (-A)" },
+                    "invert_match": { "type": "boolean", "description": "Non-matching lines (-v)" },
+                    "files_only": { "type": "boolean", "description": "Unique file paths only (-l)" },
+                    "count": { "type": "boolean", "description": "Per-file hit counts (-c)" },
+                    "only_matching": { "type": "boolean", "description": "Matched substrings only (-o)" },
+                    "unique": { "type": "boolean", "description": "Deduplicate & frequency-rank hits" },
+                    "fixed_strings": { "type": "boolean", "description": "Literal string mode (-F)" },
+                    "ignore_case": { "type": "boolean", "description": "Case-insensitive (-i)" },
+                    "include": { "type": "array", "description": "Include globs", "items": { "type": "string" } },
+                    "code_only": { "type": "boolean", "description": "Code files only, skip comments/strings" },
+                    "no_tests": { "type": "boolean", "description": "Skip test paths & test blocks" },
+                    "exclude": { "type": "array", "description": "Exclude path filters", "items": { "type": "string" } },
+                    "around": { "type": "integer", "description": "Minified slice context chars (default: 160)" },
+                    "max_hits": { "type": "integer", "description": "Max total hits (default: 50)" },
+                    "per_pattern": { "type": "integer", "description": "Max hits per pattern (0=auto)" },
+                    "width": { "type": "integer", "description": "Max snippet chars (UTF-8 safe)" },
+                    "json": { "type": "boolean", "description": "Emit structured JSON in structuredContent" }
                 }
             }
         },
@@ -298,13 +274,15 @@ fn mcp_tools_schema() -> Value {
     },
     {
         "name": "ap_trace",
-        "description": "Multi-hop Tree-sitter call-chain tracer (<30ms): maps upstream callers (1..depth hops), downstream callees & notable I/O/exec/DOM/SQL sinks for any function across Py/TS/JS/Go/Rust/C.",
+        "description": "Multi-hop Tree-sitter call-chain, source-to-sink reachability & guard-placement tracer (<30ms) across Py/TS/JS/Go/Rust/C/C++.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": { "type": "string", "description": "Function or method symbol name to trace" },
-                "path": { "type": "string", "description": "Workspace root directory (default: '.')" },
-                "depth": { "type": "integer", "description": "Max upstream caller hops (default: 3)" }
+                "symbol": { "type": "string", "description": "Source/target function or method name" },
+                "path": { "type": "string", "description": "Workspace root (default: '.')" },
+                "depth": { "type": "integer", "description": "Max traversal hops (default: 3)" },
+                "to": { "type": "string", "description": "Optional sink/callee name for shortest-path reachability + GUARD_BEFORE/GUARD_AFTER/UNGUARDED check" },
+                "sinks": { "type": "boolean", "description": "Find shortest paths to all notable I/O/exec/DOM/SQL sinks" }
             },
             "required": ["symbol"]
         }
@@ -330,47 +308,32 @@ fn mcp_tools_schema() -> Value {
     },
     {
         "name": "ap_http",
-        "description": "Zero-dependency HTTP/API diagnostic probe: execute single, batch (`batch_requests`), or single-field boundary variation (`vary_field`) requests with outlier clustering, headers, body, timeout, and loopback proxy bypass.",
+        "description": "HTTP/API diagnostic probe: single, batch, single-field boundary (`vary_field`), AuthZ/IDOR matrix with deep JSON diff & sentinel checks (`principals`/`principal_cdps`/`sentinels`), CORS audit, header security audit, and barrier TOCTOU race.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "Target HTTP(S) URL for single request" },
+                "url": { "type": "string", "description": "Target HTTP(S) URL" },
                 "method": { "type": "string", "description": "HTTP method (default: 'GET')" },
-                "headers": {
-                    "type": "array",
-                    "description": "Optional headers like ['Authorization: Bearer ...']",
-                    "items": { "type": "string" }
-                },
-                "body": { "type": "string", "description": "Optional raw request body" },
-                "batch_requests": {
-                    "type": "array",
-                    "description": "Optional list of 'METHOD URL [BODY]' lines to run in one batch call",
-                    "items": { "type": "string" }
-                },
-                "vary_request": { "type": "string", "description": "Optional path to saved JSON/raw HTTP request file for `vary_field`" },
-                "vary_field": { "type": "string", "description": "Single JSON/query/header field name to vary across boundary variants" },
-                "alt_value": { "type": "string", "description": "Optional alternate value for `vary_field`" },
-                "rate_ms": { "type": "integer", "description": "Delay in ms between serial `vary_field` requests (default: 0, max: 5000)" },
-                "max_variants": { "type": "integer", "description": "Max variants for `vary_field` (default: 20, max: 100)" },
-                "dry_run": { "type": "boolean", "description": "Generate `vary_field` variants without sending requests" },
-                "principals": {
-                    "type": "array",
-                    "description": "Multi-principal AuthZ/IDOR matrix specs like ['owner=Authorization: Bearer A', 'other=Authorization: Bearer B', 'anon=']",
-                    "items": { "type": "string" }
-                },
-                "cdp_cookies": { "type": "integer", "description": "Reuse live cookies in-memory from a local 127.0.0.1 CDP browser port (values never printed)" },
-                "principal_cdps": {
-                    "type": "array",
-                    "description": "Multi-principal AuthZ matrix reusing live local CDP browser sessions like ['owner=9451', 'other=9470']",
-                    "items": { "type": "string" }
-                },
-                "cors_origin": { "type": "string", "description": "Send a cross-origin Origin header and audit ACAO/Allow-Credentials/Vary reflection" },
-                "select": { "type": "string", "description": "Optional dot-path JSON selector (e.g. 'data.items[*].id') to extract from JSON responses" },
-                "audit_headers": { "type": "boolean", "description": "Audit response headers for security & two-phase storage/CORS/CSP/cookie gaps" },
-                "race": { "type": "integer", "description": "Synchronized Barrier concurrency/TOCTOU race burst thread count (2..=32)" },
-                "timeout": { "type": "integer", "description": "Per-request timeout in seconds (default: 15)" },
-                "insecure": { "type": "boolean", "description": "Skip TLS verification (-k)" },
-                "follow": { "type": "boolean", "description": "Follow HTTP redirects (-L)" }
+                "headers": { "type": "array", "description": "Request headers", "items": { "type": "string" } },
+                "body": { "type": "string", "description": "Raw request body" },
+                "batch_requests": { "type": "array", "description": "'METHOD URL [BODY]' lines", "items": { "type": "string" } },
+                "vary_request": { "type": "string", "description": "Saved request file for vary_field" },
+                "vary_field": { "type": "string", "description": "JSON/query/header field to vary" },
+                "alt_value": { "type": "string", "description": "Alternate vary_field value" },
+                "rate_ms": { "type": "integer", "description": "Serial vary_field delay ms" },
+                "max_variants": { "type": "integer", "description": "Max vary_field variants (default: 20)" },
+                "dry_run": { "type": "boolean", "description": "Preview vary_field without sending" },
+                "principals": { "type": "array", "description": "AuthZ matrix specs e.g. ['owner=Authorization: Bearer A','anon=']", "items": { "type": "string" } },
+                "cdp_cookies": { "type": "integer", "description": "In-memory cookies from 127.0.0.1 CDP port" },
+                "principal_cdps": { "type": "array", "description": "AuthZ matrix via CDP ports e.g. ['owner=9451','other=9470']", "items": { "type": "string" } },
+                "cors_origin": { "type": "string", "description": "Origin header for CORS reflection audit" },
+                "select": { "type": "string", "description": "Dot-path JSON extractor e.g. 'data.items[*].id'" },
+                "audit_headers": { "type": "boolean", "description": "Audit security/CORS/CSP/cookie headers" },
+                "race": { "type": "integer", "description": "Barrier TOCTOU burst threads (2..=32)" },
+                "sentinels": { "type": "array", "description": "Sentinel strings flagged if leaked", "items": { "type": "string" } },
+                "timeout": { "type": "integer", "description": "Timeout sec (default: 15)" },
+                "insecure": { "type": "boolean", "description": "Skip TLS verify (-k)" },
+                "follow": { "type": "boolean", "description": "Follow redirects (-L)" }
             }
         }
     },
@@ -2097,7 +2060,14 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 return (false, format!("[atlas] path not found: {path}"));
             }
             let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(3) as usize;
-            let rep = ap_atlas::trace::trace_symbol_chain(root_p, sym, depth);
+            let to_sink = args
+                .get("to")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let include_sinks = args.get("sinks").and_then(Value::as_bool).unwrap_or(false);
+            let rep =
+                ap_atlas::trace::trace_symbol_chain_to(root_p, sym, to_sink, include_sinks, depth);
             let out = ap_atlas::trace::render_trace_md(&rep);
             crate::stats::record_event("trace", 0, out.len() as u64, 0, 1, "mcp-trace");
             (true, out)
@@ -2299,6 +2269,14 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 if rc >= 2 {
                     cli.push("--race".into());
                     cli.push(rc.to_string());
+                }
+            }
+            if let Some(ss) = args.get("sentinels").and_then(Value::as_array) {
+                for s in ss.iter().filter_map(Value::as_str) {
+                    if !s.trim().is_empty() {
+                        cli.push("--sentinel".into());
+                        cli.push(s.trim().to_string());
+                    }
                 }
             }
             let batch_lines: Vec<&str> = args

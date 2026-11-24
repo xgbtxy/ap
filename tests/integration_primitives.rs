@@ -11930,3 +11930,287 @@ assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log', offse
         );
     }
 }
+
+#[test]
+fn test_v272_trace_reachability_probe_deep_diff_ws_and_mcp_compact() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // 1. Source-to-sink reachability + guard placement + C++ support via `ap atlas trace`
+    fs::write(
+        root.join("service.ts"),
+        "export function openRoute(req: any) {\n\
+           return callSink(req.cmd);\n\
+         }\n\
+         export function guardedRoute(req: any) {\n\
+           if (!authorize(req.user)) return 403;\n\
+           return callSink(req.cmd);\n\
+         }\n\
+         export function callSink(cmd: string) {\n\
+           return execSync(cmd);\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("native.cpp"),
+        "int Controller::runTask(const char* c) {\n\
+           return Controller::spawnChild(c);\n\
+         }\n\
+         int Controller::spawnChild(const char* c) {\n\
+           return system(c);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let tr_open = run_ap(
+        root,
+        &[
+            "atlas",
+            "trace",
+            "openRoute",
+            root.to_str().unwrap(),
+            "--to",
+            "execSync",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(tr_open.status.success());
+    let tr_open_v: Value = serde_json::from_slice(&tr_open.stdout).unwrap();
+    assert_eq!(tr_open_v["reachability_paths"].as_array().unwrap().len(), 1);
+    assert_eq!(tr_open_v["reachability_paths"][0]["guarded"], false);
+    assert_eq!(
+        tr_open_v["reachability_paths"][0]["hops"][0]["guard_placement"],
+        "UNGUARDED"
+    );
+
+    let tr_guard = run_ap(
+        root,
+        &[
+            "atlas",
+            "trace",
+            "guardedRoute",
+            root.to_str().unwrap(),
+            "--sinks",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(tr_guard.status.success());
+    let tr_guard_v: Value = serde_json::from_slice(&tr_guard.stdout).unwrap();
+    assert_eq!(tr_guard_v["reachability_paths"][0]["guarded"], true);
+    assert_eq!(
+        tr_guard_v["reachability_paths"][0]["hops"][0]["guard_placement"],
+        "GUARD_BEFORE"
+    );
+
+    let tr_cpp = run_ap(
+        root,
+        &[
+            "atlas",
+            "trace",
+            "Controller::runTask",
+            root.to_str().unwrap(),
+            "--to",
+            "system",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(tr_cpp.status.success());
+    let tr_cpp_v: Value = serde_json::from_slice(&tr_cpp.stdout).unwrap();
+    assert!(
+        !tr_cpp_v["reachability_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{tr_cpp_v}"
+    );
+
+    // 2. HTTP deep JSON structural diff + sentinel leak + non-JSON HTML diagnostic via local TcpListener
+    let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let http_handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut sock, _) = http_listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            let resp = if req.contains("authorization: bearer owner-tok") {
+                let body =
+                    r#"{"ok":true,"data":{"user":{"email":"owner@example.org","role":"admin"}}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else if req.contains("authorization: bearer other-tok") {
+                let body =
+                    r#"{"ok":true,"data":{"user":{"email":"owner@example.org","role":"viewer"}}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                let body = "<html><title>403 Forbidden</title><body>sentinel_leak_42</body></html>";
+                format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+
+    let http_out = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            &format!("http://127.0.0.1:{http_port}/api/profile"),
+            "--principal",
+            "owner=Authorization: Bearer owner-tok",
+            "--principal",
+            "other=Authorization: Bearer other-tok",
+            "--principal",
+            "anon=",
+            "--sentinel",
+            "sentinel_leak_42",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    http_handle.join().unwrap();
+    assert!(http_out.status.success());
+    let hv: Value = serde_json::from_slice(&http_out.stdout).unwrap();
+    assert_eq!(hv["results"][1]["verdict"], "LIKELY_BYPASS");
+    assert!(hv["results"][1]["diff"]["shared_nonempty_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "data.user.email"));
+    assert_eq!(hv["results"][2]["verdict"], "SENTINEL_LEAK");
+    assert_eq!(
+        hv["results"][2]["diff"]["sentinel_hits"][0],
+        "sentinel_leak_42"
+    );
+
+    // 3. WebSocket structured close frame diagnostics (`close_reason`, `close_code`, `close_message`)
+    let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    let ws_handle = std::thread::spawn(move || {
+        let (mut sock, _) = ws_listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf);
+        let hs = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+        let _ = sock.write_all(hs.as_bytes());
+        // Send text frame "hi" + close frame (1000 "bye")
+        let mut frames = vec![0x81u8, 0x02u8, b'h', b'i'];
+        frames.extend_from_slice(&[0x88u8, 0x05u8, 0x03u8, 0xE8u8, b'b', b'y', b'e']);
+        let _ = sock.write_all(&frames);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    });
+    let ws_out = run_ap(
+        root,
+        &[
+            "probe",
+            "ws",
+            &format!("ws://127.0.0.1:{ws_port}/ws"),
+            "--wait-ms",
+            "600",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    ws_handle.join().unwrap();
+    assert!(ws_out.status.success());
+    let wv: Value = serde_json::from_slice(&ws_out.stdout).unwrap();
+    assert_eq!(wv["received_count"], 1);
+    assert_eq!(wv["messages"][0], "hi");
+    assert_eq!(wv["close_reason"], "close_frame_1000");
+    assert_eq!(wv["close_code"], 1000);
+    assert_eq!(wv["close_message"], "bye");
+
+    // 4. MCP `ap_trace(to=...)` + compact catalog still ranks `ap_http` #1 for `http authz cors`
+    let mcp_in = format!(
+        "{}\n{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ap_trace", "arguments": {"symbol": "openRoute", "path": root.to_str().unwrap(), "to": "execSync"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_discover", "arguments": {"query": "http authz cors", "include_schema": true, "limit": 3}}})
+    );
+    let mcp_out = run_ap(root, &["mcp", "--profile", "deferred"], Some(&mcp_in), &[]);
+    assert!(mcp_out.status.success());
+    let mcp_resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    let trace_txt = mcp_resps[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(trace_txt.contains("Reachability Paths") && trace_txt.contains("[UNGUARDED]"));
+    assert_eq!(
+        mcp_resps[1]["result"]["structuredContent"]["tools"][0]["name"],
+        "ap_http"
+    );
+
+    // 5. Verify DeepSeek continuation effort & idle cache warming in generated zz-ap-accelerator.ts
+    let fake_home = root.join("fake_home_v272");
+    fs::create_dir_all(fake_home.join(".pi/agent/extensions")).unwrap();
+    let init_out = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            fake_home.to_str().unwrap(),
+        ],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+        ],
+    );
+    assert!(init_out.status.success());
+    if Command::new("node").arg("--version").output().is_ok() {
+        let ts_file = fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+        let node_script = r#"
+import assert from "node:assert/strict";
+const mod = await import(new URL("file:///" + process.env.ACCEL_TS.replace(/\\/g, "/")));
+const { classifyDeepSeekEffort, decideDeepSeekCacheWarming } = mod;
+assert.equal(classifyDeepSeekEffort("hi"), "low");
+assert.equal(classifyDeepSeekEffort("continue"), "high");
+assert.equal(classifyDeepSeekEffort("fix the parser race"), "high");
+assert.deepEqual(decideDeepSeekCacheWarming({ provider: "deepseek", modelId: "deepseek-flash", warmCost: 0.0003, missCost: 0.006, isIdle: true }), { action: "warm" });
+assert.equal(decideDeepSeekCacheWarming({ provider: "deepseek", modelId: "deepseek-flash", warmCost: 0.0003, missCost: 0.006, isIdle: false }), undefined);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                node_script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.72 runtime check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

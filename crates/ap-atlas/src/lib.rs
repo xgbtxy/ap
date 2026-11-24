@@ -189,7 +189,7 @@ enum SubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Multi-hop Tree-sitter call-chain tracer (<30ms): maps upstream callers (1..depth hops), downstream callees & notable I/O/exec/DOM/SQL sinks
+    /// Multi-hop Tree-sitter call-chain tracer (<30ms): maps upstream callers (1..depth hops), downstream callees, source-to-sink reachability & guard placement
     Trace {
         /// Function or method symbol name to trace
         symbol: String,
@@ -197,6 +197,12 @@ enum SubCmd {
         root: String,
         #[arg(short = 'd', long, default_value_t = 3)]
         depth: usize,
+        /// Target sink or symbol name for shortest-path reachability + guard-placement classification
+        #[arg(long)]
+        to: Option<String>,
+        /// Also compute multi-hop reachability paths to all notable I/O/exec/DOM/SQL sinks
+        #[arg(long)]
+        sinks: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1507,6 +1513,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             symbol,
             root,
             depth,
+            to,
+            sinks,
             json,
         }) => {
             let root_p = PathBuf::from(&root);
@@ -1514,7 +1522,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 eprintln!("[atlas] path not found: {root}");
                 return 1;
             }
-            let rep = trace::trace_symbol_chain(&root_p, &symbol, depth);
+            let rep = trace::trace_symbol_chain_to(&root_p, &symbol, to.as_deref(), sinks, depth);
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
             } else {

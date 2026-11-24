@@ -508,7 +508,12 @@ pub fn run_http_cli(
         Vec::new()
     };
     if as_json {
-        let out_val = if do_audit || select_clean.is_some() {
+        let needs_extra = do_audit
+            || select_clean.is_some()
+            || results
+                .iter()
+                .any(|r| summarize_non_json_body(&r.content_type, &r.body_preview).is_some());
+        let out_val = if needs_extra {
             let enriched: Vec<Value> = results
                 .iter()
                 .enumerate()
@@ -530,6 +535,11 @@ pub fn run_http_cli(
                                     .flatten()
                                     .unwrap_or(Value::Null),
                             );
+                        }
+                        if let Some(diag) =
+                            summarize_non_json_body(&r.content_type, &r.body_preview)
+                        {
+                            m.insert("body_diagnostic".to_string(), json!(diag));
                         }
                     }
                     v
@@ -1182,25 +1192,232 @@ pub fn audit_response_headers(
     findings
 }
 
-fn json_top_keys(body: &str) -> Vec<String> {
-    if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(body.trim()) {
-        let mut keys: Vec<String> = m.keys().cloned().collect();
-        keys.sort();
-        keys
-    } else {
-        Vec::new()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpDiffReport {
+    pub verdict: String,
+    pub possible_bypass: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_nonempty_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sentinel_hits: Vec<String>,
+}
+
+fn json_is_nonempty_leaf(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(m) => !m.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
     }
 }
 
-/// Compare an unprivileged/cross-tenant candidate HTTP response against a privileged owner baseline.
-/// Returns `(possible_bypass, reason)`.
-pub fn classify_auth_matrix_diff(base: &HttpProbeResult, cand: &HttpProbeResult) -> (bool, String) {
+fn flatten_json_paths(
+    val: &Value,
+    prefix: &str,
+    depth: usize,
+    out: &mut std::collections::BTreeMap<String, Value>,
+) {
+    if out.len() >= 256 || depth > 8 {
+        return;
+    }
+    match val {
+        Value::Object(map) => {
+            if map.is_empty() && !prefix.is_empty() {
+                out.insert(prefix.to_string(), Value::Object(serde_json::Map::new()));
+                return;
+            }
+            for (k, v) in map {
+                let next = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_json_paths(v, &next, depth + 1, out);
+            }
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                if !prefix.is_empty() {
+                    out.insert(prefix.to_string(), Value::Array(Vec::new()));
+                }
+                return;
+            }
+            for (idx, item) in arr.iter().take(16).enumerate() {
+                let next = if prefix.is_empty() {
+                    format!("[{idx}]")
+                } else {
+                    format!("{prefix}[{idx}]")
+                };
+                flatten_json_paths(item, &next, depth + 1, out);
+            }
+        }
+        _ => {
+            let key = if prefix.is_empty() { "$" } else { prefix };
+            out.insert(key.to_string(), val.clone());
+        }
+    }
+}
+
+/// Produce a crisp diagnostic summary when an HTTP response body is empty or non-JSON (e.g. HTML error/login shell).
+pub fn summarize_non_json_body(content_type: &str, body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if !trimmed.is_empty() && serde_json::from_str::<Value>(trimmed).is_ok() {
+        return None;
+    }
+    let ct = if content_type.trim().is_empty() {
+        "unknown"
+    } else {
+        content_type.trim()
+    };
+    if trimmed.is_empty() {
+        return Some(format!("non-JSON empty body ({ct})"));
+    }
+    let low = trimmed.to_ascii_lowercase();
+    let html_title = if let Some(s) = low.find("<title") {
+        let rest_orig = &trimmed[s..];
+        let rest_low = &low[s..];
+        rest_low.find('>').and_then(|gt| {
+            let after_gt = gt + 1;
+            rest_low[after_gt..].find("</title>").map(|end| {
+                rest_orig[after_gt..after_gt + end]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            })
+        })
+    } else {
+        None
+    };
+    let preview: String = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(140)
+        .collect();
+    if let Some(title) = html_title.filter(|t| !t.is_empty()) {
+        Some(format!("non-JSON ({ct}): title=\"{title}\" | {preview}"))
+    } else {
+        Some(format!("non-JSON ({ct}): {preview}"))
+    }
+}
+
+/// Deep structural diff oracle comparing an unprivileged/cross-tenant candidate HTTP response against
+/// a privileged baseline, with recursive JSON path diffing, sentinel leak checks, and HTML/non-JSON summaries.
+pub fn classify_auth_matrix_diff_deep(
+    base: &HttpProbeResult,
+    cand: &HttpProbeResult,
+    sentinels: &[String],
+) -> HttpDiffReport {
     if cand.status == 0 || !cand.error.is_empty() {
-        return (false, format!("transport error: {}", cand.error));
+        return HttpDiffReport {
+            verdict: "TRANSPORT_ERROR".to_string(),
+            possible_bypass: false,
+            reason: format!("transport error: {}", cand.error),
+            shared_nonempty_paths: Vec::new(),
+            added_paths: Vec::new(),
+            removed_paths: Vec::new(),
+            changed_paths: Vec::new(),
+            sentinel_hits: Vec::new(),
+        };
     }
+
+    let sentinel_hits: Vec<String> = sentinels
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && cand.body_preview.contains(*s))
+        .map(str::to_string)
+        .collect();
+
+    let mut base_paths = std::collections::BTreeMap::new();
+    let mut cand_paths = std::collections::BTreeMap::new();
+    let base_json = serde_json::from_str::<Value>(base.body_preview.trim()).ok();
+    let cand_json = serde_json::from_str::<Value>(cand.body_preview.trim()).ok();
+    if let Some(ref bv) = base_json {
+        flatten_json_paths(bv, "", 0, &mut base_paths);
+    }
+    if let Some(ref cv) = cand_json {
+        flatten_json_paths(cv, "", 0, &mut cand_paths);
+    }
+
+    let mut shared_nonempty_paths = Vec::new();
+    let mut added_paths = Vec::new();
+    let mut removed_paths = Vec::new();
+    let mut changed_paths = Vec::new();
+    if !base_paths.is_empty() && !cand_paths.is_empty() {
+        for (k, bv) in &base_paths {
+            match cand_paths.get(k) {
+                Some(cv) => {
+                    if json_is_nonempty_leaf(bv) && json_is_nonempty_leaf(cv) {
+                        shared_nonempty_paths.push(k.clone());
+                    }
+                    if bv != cv {
+                        changed_paths.push(k.clone());
+                    }
+                }
+                None => removed_paths.push(k.clone()),
+            }
+        }
+        for k in cand_paths.keys() {
+            if !base_paths.contains_key(k) {
+                added_paths.push(k.clone());
+            }
+        }
+        shared_nonempty_paths.truncate(24);
+        added_paths.truncate(24);
+        removed_paths.truncate(24);
+        changed_paths.truncate(24);
+    }
+
+    if !sentinel_hits.is_empty() {
+        return HttpDiffReport {
+            verdict: "SENTINEL_LEAK".to_string(),
+            possible_bypass: true,
+            reason: format!(
+                "HTTP {} leaked sentinel(s): [{}]",
+                cand.status,
+                sentinel_hits.join(", ")
+            ),
+            shared_nonempty_paths,
+            added_paths,
+            removed_paths,
+            changed_paths,
+            sentinel_hits,
+        };
+    }
+
     if !(200..300).contains(&cand.status) {
-        return (false, format!("rejected with HTTP {}", cand.status));
+        let verdict = if matches!(cand.status, 401 | 403) {
+            "AUTH_DENIED_401_403"
+        } else {
+            "REJECTED_4XX_5XX"
+        };
+        let extra = summarize_non_json_body(&cand.content_type, &cand.body_preview)
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        return HttpDiffReport {
+            verdict: verdict.to_string(),
+            possible_bypass: false,
+            reason: format!("rejected with HTTP {}{}", cand.status, extra),
+            shared_nonempty_paths,
+            added_paths,
+            removed_paths,
+            changed_paths,
+            sentinel_hits,
+        };
     }
+
     let low_body = cand.body_preview.to_ascii_lowercase();
     for deny_kw in [
         "unauthorized",
@@ -1215,54 +1432,116 @@ pub fn classify_auth_matrix_diff(base: &HttpProbeResult, cand: &HttpProbeResult)
         "\"status\":403",
     ] {
         if low_body.contains(deny_kw) {
-            return (
-                false,
-                format!(
+            return HttpDiffReport {
+                verdict: "PSEUDO_DENIAL_200".to_string(),
+                possible_bypass: false,
+                reason: format!(
                     "HTTP {} but body contains auth denial marker `{deny_kw}`",
                     cand.status
                 ),
-            );
+                shared_nonempty_paths,
+                added_paths,
+                removed_paths,
+                changed_paths,
+                sentinel_hits,
+            };
         }
     }
-    let base_keys = json_top_keys(&base.body_preview);
-    let cand_keys = json_top_keys(&cand.body_preview);
-    if !base_keys.is_empty() && !cand_keys.is_empty() {
-        let shared = cand_keys.iter().filter(|k| base_keys.contains(k)).count();
-        let denom = base_keys.len().max(1);
-        let overlap = (shared * 100) / denom;
+
+    if !base_paths.is_empty() && !cand_paths.is_empty() {
+        let base_nonempty_cnt = base_paths
+            .values()
+            .filter(|v| json_is_nonempty_leaf(v))
+            .count()
+            .max(1);
+        let shared = shared_nonempty_paths.len();
+        let overlap = (shared * 100) / base_nonempty_cnt;
         if overlap >= 50 && cand.body_preview.len() >= 16 {
-            return (
-                true,
-                format!(
-                    "HTTP {} with {overlap}% JSON key overlap ({shared}/{denom}) and {}B body (baseline {}B)",
+            return HttpDiffReport {
+                verdict: "LIKELY_BYPASS".to_string(),
+                possible_bypass: true,
+                reason: format!(
+                    "HTTP {} with {overlap}% deep JSON path overlap ({shared}/{base_nonempty_cnt}), {} changed, {} removed",
                     cand.status,
-                    cand.body_preview.len(),
-                    base.body_preview.len()
+                    changed_paths.len(),
+                    removed_paths.len(),
                 ),
-            );
+                shared_nonempty_paths,
+                added_paths,
+                removed_paths,
+                changed_paths,
+                sentinel_hits,
+            };
         }
+        return HttpDiffReport {
+            verdict: "IDENTICAL_OR_SUBSET".to_string(),
+            possible_bypass: false,
+            reason: format!(
+                "HTTP {} with low deep JSON overlap ({shared}/{base_nonempty_cnt}, {} removed, {} added)",
+                cand.status,
+                removed_paths.len(),
+                added_paths.len(),
+            ),
+            shared_nonempty_paths,
+            added_paths,
+            removed_paths,
+            changed_paths,
+            sentinel_hits,
+        };
     }
+
     let base_len = base.body_preview.len();
     let cand_len = cand.body_preview.len();
     if (200..300).contains(&base.status) && base_len >= 16 && cand_len * 100 >= base_len * 40 {
-        return (
-            true,
-            format!(
-                "HTTP {} with non-denied {}B payload ({}% of baseline {}B)",
+        let extra = summarize_non_json_body(&cand.content_type, &cand.body_preview)
+            .map(|d| format!(" [{d}]"))
+            .unwrap_or_default();
+        return HttpDiffReport {
+            verdict: "LIKELY_BYPASS".to_string(),
+            possible_bypass: true,
+            reason: format!(
+                "HTTP {} with non-denied {}B payload ({}% of baseline {}B){}",
                 cand.status,
                 cand_len,
                 (cand_len * 100) / base_len.max(1),
-                base_len
+                base_len,
+                extra
             ),
-        );
+            shared_nonempty_paths,
+            added_paths,
+            removed_paths,
+            changed_paths,
+            sentinel_hits,
+        };
     }
-    (
-        false,
-        format!(
-            "HTTP {} with divergent/minimal payload ({cand_len}B vs baseline {base_len}B)",
-            cand.status
+    let verdict = if base_json.is_none() || cand_json.is_none() {
+        "NON_JSON_BODY"
+    } else {
+        "IDENTICAL_OR_SUBSET"
+    };
+    let extra = summarize_non_json_body(&cand.content_type, &cand.body_preview)
+        .map(|d| format!(" [{d}]"))
+        .unwrap_or_default();
+    HttpDiffReport {
+        verdict: verdict.to_string(),
+        possible_bypass: false,
+        reason: format!(
+            "HTTP {} with divergent/minimal payload ({cand_len}B vs baseline {base_len}B){}",
+            cand.status, extra
         ),
-    )
+        shared_nonempty_paths,
+        added_paths,
+        removed_paths,
+        changed_paths,
+        sentinel_hits,
+    }
+}
+
+/// Compare an unprivileged/cross-tenant candidate HTTP response against a privileged owner baseline.
+/// Returns `(possible_bypass, reason)`.
+pub fn classify_auth_matrix_diff(base: &HttpProbeResult, cand: &HttpProbeResult) -> (bool, String) {
+    let rep = classify_auth_matrix_diff_deep(base, cand, &[]);
+    (rep.possible_bypass, rep.reason)
 }
 
 fn parse_principal_spec(raw: &str) -> (String, Vec<String>) {
@@ -1349,6 +1628,7 @@ pub fn run_http_auth_matrix(
     cors_origin: Option<&str>,
     select_expr: Option<&str>,
     audit_headers: bool,
+    sentinels: &[String],
     timeout_sec: u64,
     insecure: bool,
     follow: bool,
@@ -1481,18 +1761,39 @@ pub fn run_http_auth_matrix(
         let gaps = &row.gaps;
         let cookie_cnt = row.cookie_count;
         let sel_val = &row.selected;
-        let (possible_bypass, reason) = if idx == 0 {
-            (false, "baseline principal".to_string())
+        let diff_rep = if idx == 0 {
+            HttpDiffReport {
+                verdict: "BASELINE".to_string(),
+                possible_bypass: false,
+                reason: "baseline principal".to_string(),
+                shared_nonempty_paths: Vec::new(),
+                added_paths: Vec::new(),
+                removed_paths: Vec::new(),
+                changed_paths: Vec::new(),
+                sentinel_hits: Vec::new(),
+            }
         } else if let Some(ref base) = baseline {
-            classify_auth_matrix_diff(base, r)
+            classify_auth_matrix_diff_deep(base, r, sentinels)
         } else {
-            (false, "no baseline".to_string())
+            HttpDiffReport {
+                verdict: "NO_BASELINE".to_string(),
+                possible_bypass: false,
+                reason: "no baseline".to_string(),
+                shared_nonempty_paths: Vec::new(),
+                added_paths: Vec::new(),
+                removed_paths: Vec::new(),
+                changed_paths: Vec::new(),
+                sentinel_hits: Vec::new(),
+            }
         };
-        if possible_bypass {
+        if diff_rep.possible_bypass {
             bypasses.push(json!({
                 "principal": label,
                 "status": r.status,
-                "reason": reason,
+                "verdict": diff_rep.verdict,
+                "reason": diff_rep.reason,
+                "sentinel_hits": diff_rep.sentinel_hits,
+                "shared_nonempty_paths": diff_rep.shared_nonempty_paths,
                 "body_preview": r.body_preview.chars().take(240).collect::<String>(),
             }));
         }
@@ -1502,8 +1803,10 @@ pub fn run_http_auth_matrix(
             "elapsed_ms": r.elapsed_ms,
             "content_type": r.content_type,
             "body_len": r.body_preview.len(),
-            "possible_bypass": possible_bypass,
-            "diff_reason": reason,
+            "verdict": diff_rep.verdict,
+            "possible_bypass": diff_rep.possible_bypass,
+            "diff_reason": diff_rep.reason,
+            "diff": diff_rep,
             "header_findings": gaps,
             "error": r.error,
             "body_preview": r.body_preview.chars().take(360).collect::<String>(),
@@ -1852,5 +2155,60 @@ mod tests {
             Some(json!("b"))
         );
         assert_eq!(extract_json_select(body, "ok"), Some(json!(true)));
+    }
+
+    #[test]
+    fn deep_diff_detects_nested_bypass_sentinel_leak_and_html_summary() {
+        let base = HttpProbeResult {
+            method: "GET".to_string(),
+            url: "https://api.example/v1/account".to_string(),
+            status: 200,
+            elapsed_ms: 8.0,
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body_preview: r#"{"ok":true,"data":{"user":{"email":"owner@example.org","role":"admin","tier":"pro"}}}"#.to_string(),
+            error: String::new(),
+        };
+        let leaked_nested = HttpProbeResult {
+            body_preview: r#"{"ok":true,"data":{"user":{"email":"owner@example.org","role":"guest","tier":"pro"}}}"#.to_string(),
+            ..base.clone()
+        };
+        let rep = classify_auth_matrix_diff_deep(&base, &leaked_nested, &[]);
+        assert!(rep.possible_bypass);
+        assert_eq!(rep.verdict, "LIKELY_BYPASS");
+        assert!(rep
+            .shared_nonempty_paths
+            .contains(&"data.user.email".to_string()));
+        assert!(rep.changed_paths.contains(&"data.user.role".to_string()));
+
+        let err_sentinel = HttpProbeResult {
+            status: 500,
+            content_type: "text/html".to_string(),
+            body_preview: "<html><title>Debug Error</title><body>leaked_tok_XYZ</body></html>"
+                .to_string(),
+            ..base.clone()
+        };
+        let srep =
+            classify_auth_matrix_diff_deep(&base, &err_sentinel, &["leaked_tok_XYZ".to_string()]);
+        assert!(srep.possible_bypass);
+        assert_eq!(srep.verdict, "SENTINEL_LEAK");
+        assert_eq!(srep.sentinel_hits, vec!["leaked_tok_XYZ".to_string()]);
+
+        let html_denied = HttpProbeResult {
+            status: 403,
+            content_type: "text/html".to_string(),
+            body_preview:
+                "<html><head><title>403 Access Blocked</title></head><body>Sign in</body></html>"
+                    .to_string(),
+            ..base.clone()
+        };
+        let hrep = classify_auth_matrix_diff_deep(&base, &html_denied, &[]);
+        assert!(!hrep.possible_bypass);
+        assert_eq!(hrep.verdict, "AUTH_DENIED_401_403");
+        assert!(
+            hrep.reason.contains("403 Access Blocked"),
+            "{}",
+            hrep.reason
+        );
     }
 }

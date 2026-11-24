@@ -2362,6 +2362,7 @@ export function decideDeepSeekCacheWarming(input: {{
 	warmCost?: number;
 	missCost?: number;
 	action?: string;
+	isIdle?: boolean;
 }}): {{ action: "warm" }} | undefined {{
 	const prov = String(input.provider ?? "").toLowerCase();
 	const mid = String(input.modelId ?? "").toLowerCase();
@@ -2369,7 +2370,7 @@ export function decideDeepSeekCacheWarming(input: {{
 	if (!isDs) return undefined;
 	const warm = typeof input.warmCost === "number" ? input.warmCost : 0;
 	const miss = typeof input.missCost === "number" ? input.missCost : 0;
-	if (warm > 0 && miss >= 0.015 && miss / warm >= 20) {{
+	if (warm > 0 && ((miss >= 0.015 && miss / warm >= 20) || (input.isIdle && miss >= 0.005 && miss / warm >= 15))) {{
 		return {{ action: "warm" }};
 	}}
 	return undefined;
@@ -5356,7 +5357,9 @@ export type DeepSeekEffort = "low" | "high" | "max";
 const COMPLEX_PROMPT_RE =
 	/\b(?:architect|architecture|refactor|redesign|concurrency|deadlock|race\s+condition|root\s+cause|debug|diagnose|profil|optimiz|benchmark|migrat|multi[- ]file|security|audit|algorithm|compil|memory\s+leak)\b|架构|重构|并发|死锁|根因|排查|定位|性能|优化|基准|迁移|跨文件|深度|设计|算法|泄漏/i;
 const SIMPLE_PROMPT_RE =
-	/^(?:hi|hello|hey|ok|okay|thanks|thank you|yes|no|continue|go|lgtm|commit|push|status|git status|format|lint|run tests?|你好|继续|好的|谢谢|提交|推送|跑测试|看状态)\b[\s!.。？?]*$/i;
+	/^(?:hi|hello|hey|ok|okay|thanks|thank you|yes|no|lgtm|commit|push|status|git status|format|lint|run tests?|你好|好的|谢谢|提交|推送|跑测试|看状态)\b[\s!.。？?]*$/i;
+const CONTINUATION_PROMPT_RE =
+	/^(?:continue|proceed|resume|go(?:\s+ahead)?|keep\s+going|fix\s+(?:it|this|that)|继续|接着做)\b/i;
 const BLOCKER_DIFF_KINDS = new Set([
 	"SECRET-ADDED",
 	"TEST-SKIPPED",
@@ -5377,6 +5380,7 @@ export function classifyDeepSeekEffort(
 	const trimmed = (userText || "").trim();
 	if (!trimmed) return "low";
 	if (trimmed.length <= 80 && SIMPLE_PROMPT_RE.test(trimmed)) return "low";
+	if (CONTINUATION_PROMPT_RE.test(trimmed)) return "high";
 	const hasCodeBlock = trimmed.includes("```") || trimmed.includes("Error:") || trimmed.includes("Traceback");
 	const lineCount = trimmed.split("\n").length;
 	if (
@@ -5387,7 +5391,6 @@ export function classifyDeepSeekEffort(
 	) {{
 		return ceiling === "max" ? "max" : "high";
 	}}
-	if (trimmed.length <= 45 && !/[?？]/.test(trimmed)) return "low";
 	return "high";
 }}
 
@@ -5771,6 +5774,7 @@ export default function (pi: ExtensionAPI) {{
 			warmCost: event?.warmCost,
 			missCost: event?.missCost,
 			action: event?.action,
+			isIdle: typeof ctx?.isIdle === "function" ? Boolean(ctx.isIdle()) : false,
 		}});
 		if (override) {{
 			cacheWarmsCount += 1;

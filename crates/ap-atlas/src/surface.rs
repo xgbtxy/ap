@@ -58,7 +58,7 @@ pub struct SurfaceMap {
     pub items: Vec<SurfaceItem>,
 }
 
-fn guard_re() -> &'static Regex {
+pub(crate) fn guard_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(

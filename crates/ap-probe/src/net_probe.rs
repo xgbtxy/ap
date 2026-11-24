@@ -551,7 +551,29 @@ pub fn run_ws_cli(
     let htxt = String::from_utf8_lossy(&hbuf).to_string();
     let status_line = htxt.lines().next().unwrap_or("").trim().to_string();
     if !status_line.contains("101") {
-        eprintln!("[probe ws] Handshake rejected: `{status_line}`");
+        let rej_preview: String = htxt
+            .lines()
+            .take(6)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": false,
+                    "url": url,
+                    "handshake": status_line,
+                    "close_reason": "handshake_rejected",
+                    "headers_preview": rej_preview,
+                    "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("[probe ws] Handshake rejected: `{status_line}` ({rej_preview})");
+        }
         return 1;
     }
 
@@ -562,24 +584,58 @@ pub fn run_ws_cli(
         }
     }
 
-    let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(100, 12_000));
+    let clamped_wait = wait_ms.clamp(100, 12_000);
+    let deadline = Instant::now() + Duration::from_millis(clamped_wait);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(60)));
     let mut messages: Vec<String> = Vec::new();
-    while Instant::now() < deadline && messages.len() < 40 {
+    let mut close_reason = "idle_timeout".to_string();
+    let mut close_code: Option<u16> = None;
+    let mut close_message: Option<String> = None;
+
+    while Instant::now() < deadline {
+        if messages.len() >= 40 {
+            close_reason = "max_messages".to_string();
+            break;
+        }
         let mut peek_b = [0u8; 1];
         match stream.peek(&mut peek_b) {
-            Ok(0) => break,
+            Ok(0) => {
+                close_reason = "eof".to_string();
+                break;
+            }
             Ok(_) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
                 let fr = ws_read_one_frame(&mut stream);
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(60)));
                 match fr {
-                    Ok((8, _)) => break, // Close frame
+                    Ok((8, data)) => {
+                        if data.len() >= 2 {
+                            close_code = Some(u16::from_be_bytes([data[0], data[1]]));
+                            if data.len() > 2 {
+                                let msg = String::from_utf8_lossy(&data[2..])
+                                    .trim()
+                                    .chars()
+                                    .take(240)
+                                    .collect::<String>();
+                                if !msg.is_empty() {
+                                    close_message = Some(msg);
+                                }
+                            }
+                        }
+                        close_reason = match close_code {
+                            Some(c) => format!("close_frame_{c}"),
+                            None => "close_frame".to_string(),
+                        };
+                        break;
+                    }
                     Ok((1 | 2, data)) => {
                         messages.push(String::from_utf8_lossy(&data).chars().take(2000).collect());
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(e) => {
+                        close_reason = format!("read_error: {e}");
+                        break;
+                    }
                 }
             }
             Err(e)
@@ -590,7 +646,10 @@ pub fn run_ws_cli(
             {
                 continue;
             }
-            Err(_) => break,
+            Err(e) => {
+                close_reason = format!("io_error: {e}");
+                break;
+            }
         }
     }
 
@@ -603,6 +662,10 @@ pub fn run_ws_cli(
                 "url": url,
                 "handshake": status_line,
                 "elapsed_ms": elapsed_ms,
+                "wait_ms": clamped_wait,
+                "close_reason": close_reason,
+                "close_code": close_code,
+                "close_message": close_message,
                 "received_count": messages.len(),
                 "messages": messages,
             }))
@@ -610,7 +673,7 @@ pub fn run_ws_cli(
         );
     } else {
         println!(
-            "[probe ws] CONNECTED `{url}` ({status_line} | {elapsed_ms}ms | {} msg(s)):",
+            "[probe ws] CONNECTED `{url}` ({status_line} | {elapsed_ms}ms | close={close_reason} | {} msg(s)):",
             messages.len()
         );
         for (i, m) in messages.iter().enumerate() {
