@@ -10489,3 +10489,331 @@ assert.equal(repairHallucinatedToolName("ap_xead", new Set(["ap_read", "ap_head"
         );
     }
 }
+
+#[test]
+fn test_v265_structured_config_xml_plist_toml_ini_outline_query_diff_max_count_and_minified_read_sieve(
+) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    let pom = root.join("pom.xml");
+    let pom_old = root.join("pom_old.xml");
+    let plist = root.join("Info.plist");
+    let toml_new = root.join("config.toml");
+    let toml_old = root.join("config_old.toml");
+    let ini = root.join("app.ini");
+
+    fs::write(
+        &pom,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <artifactId>svc-core</artifactId>
+  <dependencies>
+    <dependency scope="compile"><artifactId>serde</artifactId></dependency>
+    <dependency scope="test"><artifactId>tokio</artifactId></dependency>
+  </dependencies>
+</project>"#,
+    )
+    .unwrap();
+    fs::write(
+        &pom_old,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <artifactId>svc-core</artifactId>
+  <dependencies>
+    <dependency scope="compile"><artifactId>serde</artifactId></dependency>
+  </dependencies>
+</project>"#,
+    )
+    .unwrap();
+    fs::write(
+        &plist,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.example.desktop</string>
+  <key>Port</key>
+  <integer>9222</integer>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+    fs::write(
+        &toml_old,
+        "[package]\nname = \"app\"\n\n[server]\nhost = \"127.0.0.1\"\nport = 8080\n",
+    )
+    .unwrap();
+    fs::write(
+        &toml_new,
+        "[package]\nname = \"app\"\n\n[server]\nhost = \"0.0.0.0\"\nport = 9090\ntls = true\n",
+    )
+    .unwrap();
+    fs::write(
+        &ini,
+        "; config\n[database]\nhost = \"db.internal\"\nport = 5432\n",
+    )
+    .unwrap();
+
+    // 1. CLI outline / json-path / diff across XML, PLIST, TOML, INI
+    let x_ol = run_ap(
+        root,
+        &["read", pom.to_str().unwrap(), "--outline"],
+        None,
+        &[],
+    );
+    assert!(
+        x_ol.status.success(),
+        "{}",
+        String::from_utf8_lossy(&x_ol.stderr)
+    );
+    let x_ol_s = String::from_utf8_lossy(&x_ol.stdout);
+    assert!(
+        x_ol_s.contains("XML schema") && x_ol_s.contains("dependencies"),
+        "{x_ol_s}"
+    );
+
+    let x_jp = run_ap(
+        root,
+        &[
+            "read",
+            pom.to_str().unwrap(),
+            "--json-path",
+            "$.project.dependencies.dependency[*].artifactId",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        x_jp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&x_jp.stderr)
+    );
+    let x_jp_s = String::from_utf8_lossy(&x_jp.stdout);
+    assert!(
+        x_jp_s.contains("\"serde\"") && x_jp_s.contains("\"tokio\""),
+        "{x_jp_s}"
+    );
+
+    let p_jp = run_ap(
+        root,
+        &[
+            "read",
+            plist.to_str().unwrap(),
+            "--json-path",
+            "$.CFBundleIdentifier",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        p_jp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p_jp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&p_jp.stdout).contains("com.example.desktop"),
+        "{}",
+        String::from_utf8_lossy(&p_jp.stdout)
+    );
+
+    let t_jp = run_ap(
+        root,
+        &[
+            "read",
+            toml_new.to_str().unwrap(),
+            "--json-path",
+            "$.server.port",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        t_jp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&t_jp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&t_jp.stdout).contains("9090"),
+        "{}",
+        String::from_utf8_lossy(&t_jp.stdout)
+    );
+
+    let t_diff = run_ap(
+        root,
+        &[
+            "read",
+            toml_new.to_str().unwrap(),
+            "--diff",
+            toml_old.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        t_diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&t_diff.stderr)
+    );
+    let tdv: Value = serde_json::from_slice(&t_diff.stdout).unwrap();
+    assert_eq!(tdv["format"], "config-diff");
+    assert_eq!(tdv["json_diff"]["counts"]["added"], 1);
+    assert_eq!(tdv["json_diff"]["counts"]["removed"], 0);
+    assert_eq!(tdv["json_diff"]["counts"]["changed"], 2);
+
+    let i_ol = run_ap(
+        root,
+        &["read", ini.to_str().unwrap(), "--outline"],
+        None,
+        &[],
+    );
+    assert!(
+        i_ol.status.success(),
+        "{}",
+        String::from_utf8_lossy(&i_ol.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&i_ol.stdout).contains("INI schema"),
+        "{}",
+        String::from_utf8_lossy(&i_ol.stdout)
+    );
+    let i_jp = run_ap(
+        root,
+        &[
+            "read",
+            ini.to_str().unwrap(),
+            "--json-path",
+            "$.database.host",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        i_jp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&i_jp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&i_jp.stdout).contains("db.internal"),
+        "{}",
+        String::from_utf8_lossy(&i_jp.stdout)
+    );
+
+    // 2. MCP `ap_read` parity for XML `json_path` & TOML `diff`
+    let mcp_req = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_read",
+                "arguments": {
+                    "target": pom.to_str().unwrap(),
+                    "json_path": "$.project.dependencies.dependency[*].artifactId"
+                }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_read",
+                "arguments": {
+                    "target": toml_new.to_str().unwrap(),
+                    "diff": toml_old.to_str().unwrap()
+                }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mcp_lines: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(mcp_lines.len(), 2);
+    assert!(mcp_lines[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("tokio"));
+    assert!(mcp_lines[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("$.server.tls"));
+
+    // 3. Live Node verification of `rg/grep -m` acceleration, curl `.py` false-match fix, and minified windowed read sieve
+    let home = root.join("home_v265");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand, guardUnboundedCurlTimeout, shouldAutoSieveUnboundedRead } = mod;
+
+const m1 = healCommand('rg --no-messages -m 6 "listen" main.log | head -20', "bash");
+assert.ok(m1 && m1.includes('search --max 6 \'listen\' "main.log"'), m1);
+
+const m2 = healCommand('grep -m 10 "err" app.log | cut -c1-120', "bash");
+assert.ok(m2 && m2.includes('search --width 120 --max 10 \'err\' "app.log"'), m2);
+
+assert.equal(
+  guardUnboundedCurlTimeout("curl -s https://example.com/script.py"),
+  "curl --max-time 30 -s https://example.com/script.py",
+);
+
+assert.equal(shouldAutoSieveUnboundedRead("a".repeat(18000), { offset: 1, limit: 200 }, true), false);
+assert.equal(shouldAutoSieveUnboundedRead("x".repeat(35000), { offset: 1, limit: 50 }, true), true);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.65 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

@@ -2525,6 +2525,859 @@ pub fn diff_json_structural_md(
     (lines.join("\n"), jv)
 }
 
+#[derive(Debug, Clone)]
+struct RawXmlNode {
+    name: String,
+    attrs: serde_json::Map<String, Value>,
+    children: Vec<RawXmlNode>,
+    text_buf: String,
+}
+
+fn decode_xml_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let bytes = raw.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if let Some(semi_rel) = raw[i..].find(';') {
+                if semi_rel <= 12 {
+                    let ent = &raw[i + 1..i + semi_rel];
+                    let decoded = match ent {
+                        "lt" => Some('<'),
+                        "gt" => Some('>'),
+                        "amp" => Some('&'),
+                        "quot" => Some('"'),
+                        "apos" => Some('\''),
+                        _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                            u32::from_str_radix(&ent[2..], 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                        }
+                        _ if ent.starts_with('#') => {
+                            ent[1..].parse::<u32>().ok().and_then(char::from_u32)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ch) = decoded {
+                        out.push(ch);
+                        i += semi_rel + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn parse_xml_attributes(raw_attrs: &str) -> serde_json::Map<String, Value> {
+    let mut attrs = serde_json::Map::new();
+    let bytes = raw_attrs.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let k_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let key = raw_attrs[k_start..i].trim();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let q = bytes[i];
+                i += 1;
+                let v_start = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                let val = decode_xml_entities(&raw_attrs[v_start..i]);
+                if i < bytes.len() {
+                    i += 1;
+                }
+                if !key.is_empty() {
+                    attrs.insert(format!("@{key}"), Value::String(val));
+                }
+            } else {
+                let v_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let val = decode_xml_entities(&raw_attrs[v_start..i]);
+                if !key.is_empty() {
+                    attrs.insert(format!("@{key}"), Value::String(val));
+                }
+            }
+        } else if !key.is_empty() {
+            attrs.insert(format!("@{key}"), Value::Bool(true));
+        }
+    }
+    attrs
+}
+
+fn plist_node_to_json(node: &RawXmlNode) -> Value {
+    match node.name.as_str() {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        "integer" => {
+            let t = node.text_buf.trim();
+            if let Ok(n) = t.parse::<i64>() {
+                Value::Number(n.into())
+            } else {
+                Value::String(t.to_string())
+            }
+        }
+        "real" => {
+            let t = node.text_buf.trim();
+            if let Some(num) = t.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                Value::Number(num)
+            } else {
+                Value::String(t.to_string())
+            }
+        }
+        "array" => Value::Array(node.children.iter().map(plist_node_to_json).collect()),
+        "dict" => {
+            let mut map = serde_json::Map::new();
+            let mut idx = 0usize;
+            while idx < node.children.len() {
+                if node.children[idx].name == "key" {
+                    let k = decode_xml_entities(node.children[idx].text_buf.trim());
+                    if let Some(v_node) = node.children.get(idx + 1) {
+                        map.insert(k, plist_node_to_json(v_node));
+                        idx += 2;
+                        continue;
+                    }
+                }
+                idx += 1;
+            }
+            Value::Object(map)
+        }
+        _ => Value::String(decode_xml_entities(node.text_buf.trim())),
+    }
+}
+
+fn xml_node_to_json(node: &RawXmlNode) -> Value {
+    let trimmed_text = decode_xml_entities(node.text_buf.trim());
+    if node.attrs.is_empty() && node.children.is_empty() {
+        return Value::String(trimmed_text);
+    }
+    let mut map = node.attrs.clone();
+    for ch in &node.children {
+        let child_val = xml_node_to_json(ch);
+        match map.get_mut(&ch.name) {
+            Some(Value::Array(arr)) => arr.push(child_val),
+            Some(existing) => {
+                let prev = std::mem::replace(existing, Value::Null);
+                *existing = Value::Array(vec![prev, child_val]);
+            }
+            None => {
+                map.insert(ch.name.clone(), child_val);
+            }
+        }
+    }
+    if !trimmed_text.is_empty() {
+        map.insert("#text".to_string(), Value::String(trimmed_text));
+    }
+    Value::Object(map)
+}
+
+/// Pure-Rust iterative XML parser supporting attributes (`@attr`), CDATA, entities, and Apple `.plist`.
+pub fn parse_xml_to_json(text: &str) -> Option<Value> {
+    let src = text.trim_start_matches('\u{FEFF}').trim();
+    if !src.starts_with('<') {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut stack: Vec<RawXmlNode> = Vec::new();
+    let mut root: Option<RawXmlNode> = None;
+
+    while i < len {
+        if bytes[i] == b'<' {
+            if src[i..].starts_with("<!--") {
+                let end = src[i + 4..].find("-->")?;
+                i += 4 + end + 3;
+                continue;
+            }
+            if src[i..].starts_with("<![CDATA[") {
+                let end = src[i + 9..].find("]]>")?;
+                let inner = &src[i + 9..i + 9 + end];
+                if let Some(top) = stack.last_mut() {
+                    top.text_buf.push_str(inner);
+                }
+                i += 9 + end + 3;
+                continue;
+            }
+            if src[i..].starts_with("<?") {
+                let end = src[i + 2..].find("?>")?;
+                i += 2 + end + 2;
+                continue;
+            }
+            if src[i..].starts_with("<!") {
+                // Scan <!DOCTYPE ... [ ... ]> cleanly
+                let mut j = i + 2;
+                let mut quote: Option<u8> = None;
+                let mut bracket_depth = 0usize;
+                while j < len {
+                    let b = bytes[j];
+                    if let Some(q) = quote {
+                        if b == q {
+                            quote = None;
+                        }
+                    } else if b == b'"' || b == b'\'' {
+                        quote = Some(b);
+                    } else if b == b'[' {
+                        bracket_depth += 1;
+                    } else if b == b']' && bracket_depth > 0 {
+                        bracket_depth -= 1;
+                    } else if b == b'>' && bracket_depth == 0 {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j >= len {
+                    return None;
+                }
+                i = j + 1;
+                continue;
+            }
+            if src[i..].starts_with("</") {
+                let close_end = src[i + 2..].find('>')?;
+                let close_name = src[i + 2..i + 2 + close_end].trim();
+                let popped = stack.pop()?;
+                if popped.name != close_name {
+                    return None;
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(popped);
+                } else {
+                    root = Some(popped);
+                }
+                i += 2 + close_end + 1;
+                continue;
+            }
+
+            // Opening or self-closing tag: locate closing `>` outside attribute quotes
+            let mut j = i + 1;
+            let mut quote: Option<u8> = None;
+            while j < len {
+                let b = bytes[j];
+                if let Some(q) = quote {
+                    if b == q {
+                        quote = None;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= len {
+                return None;
+            }
+            let raw_tag = src[i + 1..j].trim();
+            let self_closing = raw_tag.ends_with('/');
+            let tag_inner = if self_closing {
+                raw_tag[..raw_tag.len() - 1].trim_end()
+            } else {
+                raw_tag
+            };
+            let (name, attr_str) = match tag_inner.find(|c: char| c.is_ascii_whitespace()) {
+                Some(pos) => (&tag_inner[..pos], tag_inner[pos..].trim()),
+                None => (tag_inner, ""),
+            };
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':')
+            {
+                return None;
+            }
+            let node = RawXmlNode {
+                name: name.to_string(),
+                attrs: if attr_str.is_empty() {
+                    serde_json::Map::new()
+                } else {
+                    parse_xml_attributes(attr_str)
+                },
+                children: Vec::new(),
+                text_buf: String::new(),
+            };
+            if self_closing {
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(node);
+                } else {
+                    root = Some(node);
+                }
+            } else {
+                stack.push(node);
+            }
+            i = j + 1;
+        } else {
+            let next_lt = src[i..].find('<').map_or(len, |rel| i + rel);
+            if let Some(top) = stack.last_mut() {
+                top.text_buf.push_str(&src[i..next_lt]);
+            } else if !src[i..next_lt].trim().is_empty() {
+                return None;
+            }
+            i = next_lt;
+        }
+    }
+
+    if !stack.is_empty() {
+        return None;
+    }
+    let r = root?;
+    if r.name == "plist" {
+        if let Some(first_child) = r.children.first() {
+            if matches!(first_child.name.as_str(), "dict" | "array") {
+                return Some(plist_node_to_json(first_child));
+            }
+        }
+    }
+    let mut wrapper = serde_json::Map::new();
+    let val = xml_node_to_json(&r);
+    wrapper.insert(r.name, val);
+    Some(Value::Object(wrapper))
+}
+
+fn split_toml_key_path(raw: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for ch in raw.chars() {
+        if let Some(q) = quote {
+            if esc {
+                cur.push(ch);
+                esc = false;
+            } else if q == '"' && ch == '\\' {
+                esc = true;
+            } else if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == '.' {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                parts.push(t);
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let tail = cur.trim().to_string();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+fn ensure_toml_table_mut<'a>(
+    root: &'a mut serde_json::Map<String, Value>,
+    path: &[String],
+) -> &'a mut serde_json::Map<String, Value> {
+    let mut cur = root;
+    for seg in path {
+        let entry = cur
+            .entry(seg.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Value::Array(arr) = entry {
+            if !arr.last().is_some_and(|v| v.is_object()) {
+                arr.push(Value::Object(serde_json::Map::new()));
+            }
+            cur = arr.last_mut().unwrap().as_object_mut().unwrap();
+        } else {
+            if !entry.is_object() {
+                *entry = Value::Object(serde_json::Map::new());
+            }
+            cur = entry.as_object_mut().unwrap();
+        }
+    }
+    cur
+}
+
+fn push_toml_array_table(root: &mut serde_json::Map<String, Value>, path: &[String]) {
+    if path.is_empty() {
+        return;
+    }
+    let parent = ensure_toml_table_mut(root, &path[..path.len() - 1]);
+    let leaf = &path[path.len() - 1];
+    let entry = parent
+        .entry(leaf.clone())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !entry.is_array() {
+        *entry = Value::Array(Vec::new());
+    }
+    if let Value::Array(arr) = entry {
+        arr.push(Value::Object(serde_json::Map::new()));
+    }
+}
+
+fn unescape_toml_basic(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('\n') | Some('\r') => {
+                    while let Some(peek) = chars.clone().next() {
+                        if peek.is_whitespace() {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn split_toml_items(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    let mut start = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut esc = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if esc {
+                esc = false;
+            } else if q == b'"' && b == b'\\' {
+                esc = true;
+            } else if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        } else if b == b'[' {
+            bracket += 1;
+        } else if b == b']' && bracket > 0 {
+            bracket -= 1;
+        } else if b == b'{' {
+            brace += 1;
+        } else if b == b'}' && brace > 0 {
+            brace -= 1;
+        } else if b == b',' && bracket == 0 && brace == 0 {
+            let s = inner[start..i].trim();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn strip_toml_line_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut esc = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if esc {
+                esc = false;
+            } else if q == b'"' && b == b'\\' {
+                esc = true;
+            } else if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'#' {
+            return &s[..i];
+        }
+        i += 1;
+    }
+    s
+}
+
+fn parse_toml_value(raw: &str) -> Value {
+    let t = raw.trim();
+    if let Some(inner) = t
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+    {
+        let trimmed = inner
+            .strip_prefix("\r\n")
+            .or_else(|| inner.strip_prefix('\n'))
+            .unwrap_or(inner);
+        return Value::String(unescape_toml_basic(trimmed));
+    }
+    if let Some(inner) = t.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")) {
+        let trimmed = inner
+            .strip_prefix("\r\n")
+            .or_else(|| inner.strip_prefix('\n'))
+            .unwrap_or(inner);
+        return Value::String(trimmed.to_string());
+    }
+    if let Some(inner) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Value::String(unescape_toml_basic(inner));
+    }
+    if let Some(inner) = t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return Value::String(inner.to_string());
+    }
+    if t == "true" {
+        return Value::Bool(true);
+    }
+    if t == "false" {
+        return Value::Bool(false);
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let items = split_toml_items(inner)
+            .into_iter()
+            .filter_map(|it| {
+                let c = strip_toml_line_comment(it).trim();
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(parse_toml_value(c))
+                }
+            })
+            .collect();
+        return Value::Array(items);
+    }
+    if let Some(inner) = t.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        let mut map = serde_json::Map::new();
+        for item in split_toml_items(inner) {
+            if let Some((k_raw, v_raw)) = split_unquoted_kv(item, b'=') {
+                let kpath = split_toml_key_path(k_raw);
+                if !kpath.is_empty() {
+                    let tgt = ensure_toml_table_mut(&mut map, &kpath[..kpath.len() - 1]);
+                    tgt.insert(kpath.last().unwrap().clone(), parse_toml_value(v_raw));
+                }
+            }
+        }
+        return Value::Object(map);
+    }
+    let clean_num = t.replace('_', "");
+    if let Some(hex) = clean_num.strip_prefix("0x") {
+        if let Ok(n) = i64::from_str_radix(hex, 16) {
+            return Value::Number(n.into());
+        }
+    } else if let Some(oct) = clean_num.strip_prefix("0o") {
+        if let Ok(n) = i64::from_str_radix(oct, 8) {
+            return Value::Number(n.into());
+        }
+    } else if let Some(bin) = clean_num.strip_prefix("0b") {
+        if let Ok(n) = i64::from_str_radix(bin, 2) {
+            return Value::Number(n.into());
+        }
+    } else if let Ok(n) = clean_num.parse::<i64>() {
+        return Value::Number(n.into());
+    } else if let Ok(f) = clean_num.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(f) {
+            return Value::Number(num);
+        }
+    }
+    Value::String(t.to_string())
+}
+
+fn split_unquoted_kv(s: &str, delim: u8) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = quote {
+            if esc {
+                esc = false;
+            } else if q == b'"' && b == b'\\' {
+                esc = true;
+            } else if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == delim {
+            return Some((&s[..i], &s[i + 1..]));
+        }
+    }
+    None
+}
+
+fn toml_balance_open(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut quote: Option<&[u8]> = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if q == b"\"" && bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i..].starts_with(q) {
+                i += q.len();
+                quote = None;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'#' {
+            break;
+        }
+        if bytes[i..].starts_with(b"\"\"\"") {
+            quote = Some(b"\"\"\"");
+            i += 3;
+            continue;
+        }
+        if bytes[i..].starts_with(b"'''") {
+            quote = Some(b"'''");
+            i += 3;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            quote = Some(b"\"");
+        } else if bytes[i] == b'\'' {
+            quote = Some(b"'");
+        } else if bytes[i] == b'[' {
+            bracket += 1;
+        } else if bytes[i] == b']' {
+            bracket -= 1;
+        } else if bytes[i] == b'{' {
+            brace += 1;
+        } else if bytes[i] == b'}' {
+            brace -= 1;
+        }
+        i += 1;
+    }
+    quote.is_some() || bracket > 0 || brace > 0
+}
+
+/// Pure-Rust TOML parser supporting tables, `[[array]]`, dotted keys, multiline strings/arrays, and inline tables.
+pub fn parse_toml_to_json(text: &str) -> Option<Value> {
+    let clean = text.trim_start_matches('\u{FEFF}');
+    let mut root = serde_json::Map::new();
+    let mut cur_path: Vec<String> = Vec::new();
+    let lines: Vec<&str> = clean.lines().collect();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let stripped = strip_toml_line_comment(lines[idx]).trim();
+        if stripped.is_empty() {
+            idx += 1;
+            continue;
+        }
+        if let Some(arr_tbl) = stripped
+            .strip_prefix("[[")
+            .and_then(|s| s.strip_suffix("]]"))
+        {
+            let path = split_toml_key_path(arr_tbl);
+            if !path.is_empty() {
+                push_toml_array_table(&mut root, &path);
+                cur_path = path;
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(tbl) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let path = split_toml_key_path(tbl);
+            if !path.is_empty() {
+                ensure_toml_table_mut(&mut root, &path);
+                cur_path = path;
+            }
+            idx += 1;
+            continue;
+        }
+
+        let mut stmt = stripped.to_string();
+        while toml_balance_open(&stmt) && idx + 1 < lines.len() {
+            idx += 1;
+            stmt.push('\n');
+            stmt.push_str(lines[idx]);
+        }
+        let stmt_clean = strip_toml_line_comment(stmt.trim()).trim();
+        if let Some((k_raw, v_raw)) = split_unquoted_kv(stmt_clean, b'=') {
+            let kpath = split_toml_key_path(k_raw);
+            if !kpath.is_empty() {
+                let mut full_prefix = cur_path.clone();
+                full_prefix.extend_from_slice(&kpath[..kpath.len() - 1]);
+                let tgt = ensure_toml_table_mut(&mut root, &full_prefix);
+                tgt.insert(kpath.last().unwrap().clone(), parse_toml_value(v_raw));
+            }
+        }
+        idx += 1;
+    }
+
+    if root.is_empty() {
+        None
+    } else {
+        Some(Value::Object(root))
+    }
+}
+
+/// Pure-Rust INI / `.cfg` / `.conf` / `.properties` parser supporting `[section]` headers and `key=value`.
+pub fn parse_ini_to_json(text: &str, ext: &str) -> Option<Value> {
+    let clean = text.trim_start_matches('\u{FEFF}');
+    let mut root = serde_json::Map::new();
+    let mut cur_sec: Option<String> = None;
+    let is_props = ext.eq_ignore_ascii_case("properties");
+
+    for line in clean.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            let sec = trimmed[1..trimmed.len() - 1].trim().to_string();
+            if !sec.is_empty() {
+                root.entry(sec.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                cur_sec = Some(sec);
+            }
+            continue;
+        }
+        let split_pos = if is_props {
+            let eq = trimmed.find('=');
+            let col = trimmed.find(':');
+            match (eq, col) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        } else {
+            trimmed.find('=')
+        };
+        if let Some(pos) = split_pos {
+            let k = trimmed[..pos].trim();
+            let v_raw = trimmed[pos + 1..].trim();
+            let v = v_raw
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v_raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v_raw);
+            if !k.is_empty() {
+                if let Some(ref sec) = cur_sec {
+                    if let Some(Value::Object(map)) = root.get_mut(sec) {
+                        map.insert(k.to_string(), Value::String(v.to_string()));
+                    }
+                } else {
+                    root.insert(k.to_string(), Value::String(v.to_string()));
+                }
+            }
+        }
+    }
+
+    if root.is_empty() {
+        None
+    } else {
+        Some(Value::Object(root))
+    }
+}
+
+/// Dispatch structured configuration parsing (XML, Apple PLIST, TOML, INI) into normalized JSON.
+pub fn parse_structured_config_to_json(text: &str, ext: &str) -> Option<(&'static str, Value)> {
+    let low = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    match low.as_str() {
+        "plist" => parse_xml_to_json(text).map(|v| ("PLIST", v)),
+        "xml" | "csproj" | "vbproj" | "fsproj" | "props" | "targets" | "config" | "manifest"
+        | "svg" | "xaml" | "nuspec" | "wsdl" | "xsd" | "pom" => {
+            parse_xml_to_json(text).map(|v| ("XML", v))
+        }
+        "toml" => parse_toml_to_json(text).map(|v| ("TOML", v)),
+        "ini" | "cfg" | "conf" | "inf" | "properties" | "editorconfig" => {
+            parse_ini_to_json(text, &low).map(|v| ("INI", v))
+        }
+        _ => {
+            let trimmed = text.trim_start_matches('\u{FEFF}').trim_start();
+            if trimmed.starts_with("<?xml") {
+                parse_xml_to_json(text).map(|v| ("XML", v))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Compact schema outline for structured configuration formats (XML, PLIST, TOML, INI).
+pub fn outline_structured_config(text: &str, ext: &str) -> Option<(&'static str, String)> {
+    let (kind, val) = parse_structured_config_to_json(text, ext)?;
+    let mut lines_out = Vec::new();
+    summarize_json_node(&val, "", 0, &mut lines_out);
+    if lines_out.is_empty() {
+        None
+    } else {
+        Some((kind, lines_out.join("\n")))
+    }
+}
+
+/// Evaluate `--json-path` against JSON/JSONL first, then seamlessly against XML/PLIST/TOML/INI configs.
+pub fn query_json_or_structured(text: &str, ext: &str, expr: &str) -> Result<String, String> {
+    if serde_json::from_str::<Value>(text).is_ok() {
+        return query_json_or_jsonl(text, expr);
+    }
+    if let Some((_, val)) = parse_structured_config_to_json(text, ext) {
+        let results = eval_json_path_owned(&val, expr);
+        if results.is_empty() {
+            return Ok(format!("## JSON Path `{expr}` (0 matches)"));
+        }
+        let body = if results.len() == 1 {
+            serde_json::to_string_pretty(&results[0]).unwrap_or_default()
+        } else {
+            serde_json::to_string_pretty(&results).unwrap_or_default()
+        };
+        return Ok(format!(
+            "## JSON Path `{expr}` ({} match(es))\n{body}",
+            results.len()
+        ));
+    }
+    query_json_or_jsonl(text, expr)
+}
+
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
@@ -2830,5 +3683,89 @@ mod inspect_tests {
         assert_eq!(diff_jv["counts"]["added"], 2);
         assert_eq!(diff_jv["counts"]["removed"], 1);
         assert_eq!(diff_jv["counts"]["changed"], 2);
+    }
+
+    #[test]
+    fn parses_xml_plist_toml_ini_for_outline_query_and_structural_diff() {
+        // 1. XML with attributes, repeated tags, CDATA & entities
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <artifactId>demo-svc</artifactId>
+  <notes><![CDATA[raw <tag> & text]]></notes>
+  <desc>Fast &amp; safe</desc>
+  <dependencies>
+    <dependency scope="compile"><artifactId>serde</artifactId></dependency>
+    <dependency scope="test"><artifactId>tempfile</artifactId></dependency>
+  </dependencies>
+</project>"#;
+        let (x_kind, x_out) = outline_structured_config(xml, "xml").unwrap();
+        assert_eq!(x_kind, "XML");
+        assert!(x_out.contains("project: object"), "{x_out}");
+        let x_q = query_json_or_structured(
+            xml,
+            "xml",
+            "$.project.dependencies.dependency[*].artifactId",
+        )
+        .unwrap();
+        assert!(
+            x_q.contains("\"serde\"") && x_q.contains("\"tempfile\""),
+            "{x_q}"
+        );
+        let x_notes = query_json_or_structured(xml, "xml", "$.project.notes").unwrap();
+        assert!(x_notes.contains("raw <tag> & text"), "{x_notes}");
+
+        // 2. Apple XML .plist
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.example.demo</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>Port</key>
+  <integer>8443</integer>
+</dict>
+</plist>"#;
+        let p_id = query_json_or_structured(plist, "plist", "$.CFBundleIdentifier").unwrap();
+        assert!(p_id.contains("com.example.demo"), "{p_id}");
+        let p_flag = query_json_or_structured(plist, "plist", "$.LSUIElement").unwrap();
+        assert!(p_flag.contains("true"), "{p_flag}");
+
+        // 3. TOML (reordered parity + structural diff)
+        let toml_a = r#"
+[package]
+name = "demo"
+version = "1.0.0"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[[bin]]
+name = "cli"
+"#;
+        let toml_b = r#"
+[[bin]]
+name = "cli"
+
+[dependencies]
+serde = { features = ["derive"], version = "1.0" }
+
+[package]
+version = "1.0.0"
+name = "demo"
+"#;
+        let (_, va) = parse_structured_config_to_json(toml_a, "toml").unwrap();
+        let (_, vb) = parse_structured_config_to_json(toml_b, "toml").unwrap();
+        let (same_md, _) = diff_json_structural_md(&vb, &va, "b.toml", "a.toml");
+        assert!(same_md.contains("0 semantic differences"), "{same_md}");
+
+        // 4. INI
+        let ini = "; sample config\n[database]\nhost = \"127.0.0.1\"\nport = 5432\n";
+        let (i_kind, i_out) = outline_structured_config(ini, "ini").unwrap();
+        assert_eq!(i_kind, "INI");
+        assert!(i_out.contains("database: object"), "{i_out}");
+        let i_q = query_json_or_structured(ini, "ini", "$.database.host").unwrap();
+        assert!(i_q.contains("127.0.0.1"), "{i_q}");
     }
 }

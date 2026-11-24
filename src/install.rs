@@ -2970,7 +2970,7 @@ export function shouldAutoSieveUnboundedRead(
 	if (!outText || outText.includes("[sieve id=")) return false;
 	const rec = input && typeof input === "object" ? (input as {{ offset?: unknown; limit?: unknown }}) : undefined;
 	if ((rec?.offset !== undefined && rec?.offset !== null) || (rec?.limit !== undefined && rec?.limit !== null)) {{
-		return false;
+		return outText.length >= 32_000 && outText.split("\n").some((l) => l.length > SIEVE_GIANT_LINE_CHARS);
 	}}
 	const thr =
 		hardLimitOverride && hardLimitOverride > 0
@@ -2986,7 +2986,7 @@ export function shouldAutoSieveUnboundedRead(
  * instead of hanging into DeepSeek's KV-cache eviction window or stalling turns.
  */
 export function guardUnboundedCurlTimeout(cmd: string): string | undefined {{
-	if (!cmd || /<<|\b(?:python3?|py|node)\b/i.test(cmd)) return undefined;
+	if (!cmd || /<<|(?:^|[\s;&|(=])(?:python3?|py|node)(?:\.exe)?(?=\s|$|[;&|)])/i.test(cmd)) return undefined;
 	if (!/(?:^|[;&|]\s*)curl(?:\.exe)?\s+/.test(cmd)) return undefined;
 	if (/\s(?:-m|--max-time|--connect-timeout)\b/.test(cmd)) return undefined;
 	const next = cmd.replace(/(^|[;&|]\s*)(curl(?:\.exe)?)(?=\s)/g, "$1$2 --max-time 30");
@@ -3350,6 +3350,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	let onlyMatch = false;
 	let invertMatch = false;
 	let noFilename = false;
+	let optMaxCount = 0;
 	const exts: string[] = [];
 	const includes: string[] = [];
 	const addGlob = (g: string): boolean => {{
@@ -3373,6 +3374,19 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		if (!endOpts && gt.startsWith("--")) {{
 			if (gt === "--invert-match") {{
 				invertMatch = true;
+				continue;
+			}}
+			if (gt.startsWith("--max-count=")) {{
+				const m = Number(gt.slice(12));
+				if (!Number.isInteger(m) || m < 1) return undefined;
+				optMaxCount = optMaxCount > 0 ? Math.min(optMaxCount, m) : m;
+				continue;
+			}}
+			if (gt === "--max-count") {{
+				gi += 1;
+				const m = gi < gToks.length ? Number(gToks[gi]) : NaN;
+				if (!Number.isInteger(m) || m < 1) return undefined;
+				optMaxCount = optMaxCount > 0 ? Math.min(optMaxCount, m) : m;
 				continue;
 			}}
 			if (!isRg) return undefined;
@@ -3404,6 +3418,21 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		}}
 		if (!endOpts && gt.startsWith("-") && gt.length > 1) {{
 			const sh = gt.slice(1);
+			if (sh === "m") {{
+				gi += 1;
+				const m = gi < gToks.length ? Number(gToks[gi]) : NaN;
+				if (!Number.isInteger(m) || m < 1) return undefined;
+				optMaxCount = optMaxCount > 0 ? Math.min(optMaxCount, m) : m;
+				continue;
+			}}
+			if (sh.startsWith("m")) {{
+				const tail = sh.slice(1);
+				if (!/^\d+$/.test(tail)) return undefined;
+				const m = Number(tail);
+				if (m < 1) return undefined;
+				optMaxCount = optMaxCount > 0 ? Math.min(optMaxCount, m) : m;
+				continue;
+			}}
 			if (isRg && sh === "g") {{
 				gi += 1;
 				if (gi >= gToks.length || !addGlob(gToks[gi])) return undefined;
@@ -3435,7 +3464,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		return undefined;
 	}}
 	let cutWidth = 0;
-	let maxHits = 0;
+	let maxHits = optMaxCount;
 	let unique = false;
 	let sawBareSort = false;
 	let sawUniqC = false;

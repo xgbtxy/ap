@@ -1303,6 +1303,45 @@ fn read_single_target(
                     return Ok((rendered, jv));
                 }
             }
+            let old_ext = old_p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let (new_txt, _, _) = decode_any_bytes(&raw_bytes);
+            let (old_txt, _, _) = decode_any_bytes(&old_bytes);
+            if let (Some((_, new_v)), Some((_, old_v))) = (
+                crate::inspect::parse_structured_config_to_json(&new_txt, &ext),
+                crate::inspect::parse_structured_config_to_json(&old_txt, &old_ext),
+            ) {
+                if matches!(
+                    new_v,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ) && matches!(
+                    old_v,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ) {
+                    let (rendered, json_diff) =
+                        crate::inspect::diff_json_structural_md(&new_v, &old_v, &label, &norm_old);
+                    record_event(
+                        "read",
+                        (raw_bytes.len() + old_bytes.len()) as u64,
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        "config-diff",
+                    );
+                    let jv = json!({
+                        "ok": true,
+                        "target": label,
+                        "old_target": norm_old,
+                        "format": "config-diff",
+                        "json_diff": json_diff,
+                        "content": rendered,
+                    });
+                    return Ok((rendered, jv));
+                }
+            }
         }
         let rendered = crate::binary::diff_binaries_or_archives_md(
             &raw_bytes, &old_bytes, &label, &norm_old, &ext,
@@ -1853,6 +1892,12 @@ fn read_single_target(
             format!(
                 "# OUTLINE `{label}` [JSON/HAR/JSONL schema across {total_lines} lines | {format_tag}]\n{json_outline}"
             )
+        } else if let Some((cfg_kind, cfg_outline)) =
+            crate::inspect::outline_structured_config(&converted, &ext)
+        {
+            format!(
+                "# OUTLINE `{label}` [{cfg_kind} schema across {total_lines} lines | {format_tag}]\n{cfg_outline}"
+            )
         } else {
             let headings: Vec<String> = all_lines
                 .iter()
@@ -1953,7 +1998,7 @@ fn read_single_target(
             blocks.join("\n\n")
         )
     } else if let Some(ref jp) = cli.json_path {
-        match crate::inspect::query_json_or_jsonl(&converted, jp) {
+        match crate::inspect::query_json_or_structured(&converted, &ext, jp) {
             Ok(out) => format!("# READ `{label}` [json-path='{jp}' | {format_tag}]\n{out}"),
             Err(e) => return Err((1, format!("[ap read] {e}"))),
         }

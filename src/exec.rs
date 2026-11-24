@@ -983,6 +983,7 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
     let mut invert_match = false;
     let mut no_filename = false;
     let mut word_regex = false;
+    let mut opt_max_count: Option<usize> = None;
     let mut exts: Vec<String> = Vec::new();
     let mut includes: Vec<String> = Vec::new();
     let mut end_opts = false;
@@ -998,6 +999,25 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
         if !end_opts && tok.starts_with("--") {
             if tok == "--invert-match" {
                 invert_match = true;
+                idx += 1;
+                continue;
+            }
+            if let Some(mc_str) = tok.strip_prefix("--max-count=") {
+                let mc: usize = mc_str.parse().ok()?;
+                if mc == 0 {
+                    return None;
+                }
+                opt_max_count = Some(opt_max_count.map_or(mc, |prev| prev.min(mc)));
+                idx += 1;
+                continue;
+            }
+            if tok == "--max-count" {
+                idx += 1;
+                let mc: usize = toks.get(idx)?.parse().ok()?;
+                if mc == 0 {
+                    return None;
+                }
+                opt_max_count = Some(opt_max_count.map_or(mc, |prev| prev.min(mc)));
                 idx += 1;
                 continue;
             }
@@ -1052,6 +1072,25 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
         }
         if !end_opts && tok.starts_with('-') && tok.len() > 1 {
             let short = &tok[1..];
+            if short == "m" {
+                idx += 1;
+                let mc: usize = toks.get(idx)?.parse().ok()?;
+                if mc == 0 {
+                    return None;
+                }
+                opt_max_count = Some(opt_max_count.map_or(mc, |prev| prev.min(mc)));
+                idx += 1;
+                continue;
+            }
+            if let Some(mc_rest) = short.strip_prefix('m') {
+                let mc: usize = mc_rest.parse().ok()?;
+                if mc == 0 {
+                    return None;
+                }
+                opt_max_count = Some(opt_max_count.map_or(mc, |prev| prev.min(mc)));
+                idx += 1;
+                continue;
+            }
             if is_rg && short == "g" {
                 idx += 1;
                 let g = toks.get(idx)?;
@@ -1120,7 +1159,7 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
         HEAD_STAGE_RE.get_or_init(|| Regex::new(r#"^head\s+(?:-n\s*(\d+)|-(\d+))$"#).unwrap());
 
     let mut width: Option<usize> = None;
-    let mut max_hits: Option<usize> = None;
+    let mut max_hits: Option<usize> = opt_max_count;
     let mut unique = false;
     let mut saw_bare_sort = false;
     let mut saw_uniq_c = false;
@@ -3071,6 +3110,24 @@ mod tests {
         assert!(
             fast_iname.contains("ls \"src\" --depth 3 --ext log --limit 20"),
             "{fast_iname}"
+        );
+
+        // `-m` / `--max-count` in grep/rg pipelines
+        let (_, h56, _) = heal_windows_command(
+            "rg --no-messages -m 6 \"listen\" main.log | head -20",
+            true,
+            true,
+        );
+        assert!(
+            h56.contains("search --max 6 \"listen\" \"main.log\""),
+            "{h56}"
+        );
+
+        let (_, h57, _) =
+            heal_windows_command("grep -m 10 \"err\" app.log | cut -c1-120", true, true);
+        assert!(
+            h57.contains("search --width 120 --max 10 \"err\" \"app.log\""),
+            "{h57}"
         );
     }
 }
