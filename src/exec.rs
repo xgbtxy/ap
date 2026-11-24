@@ -980,6 +980,7 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
     let mut files_only = false;
     let mut count_only = false;
     let mut only_matching = false;
+    let mut invert_match = false;
     let mut no_filename = false;
     let mut word_regex = false;
     let mut exts: Vec<String> = Vec::new();
@@ -995,6 +996,11 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
             continue;
         }
         if !end_opts && tok.starts_with("--") {
+            if tok == "--invert-match" {
+                invert_match = true;
+                idx += 1;
+                continue;
+            }
             if !is_rg {
                 return None;
             }
@@ -1076,6 +1082,7 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
                     'l' => files_only = true,
                     'c' => count_only = true,
                     'o' => only_matching = true,
+                    'v' => invert_match = true,
                     'w' => word_regex = true,
                     _ => return None,
                 }
@@ -1085,6 +1092,9 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
         }
         positional.push(tok.clone());
         idx += 1;
+    }
+    if invert_match && only_matching {
+        return None;
     }
     let (pat, target) = if is_rg && positional.len() == 1 {
         (positional[0].as_str(), ".")
@@ -1177,6 +1187,9 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
     }
     if only_matching {
         flags.push_str(" -o");
+    }
+    if invert_match {
+        flags.push_str(" -v");
     }
     if no_filename {
         flags.push_str(" --no-filename");
@@ -1442,7 +1455,7 @@ pub fn try_accelerate_find_files(raw: &str) -> Option<String> {
                 }
                 idx += 2;
             }
-            "-name" => {
+            "-name" | "-iname" => {
                 if ext.is_some() {
                     return None;
                 }
@@ -2959,7 +2972,7 @@ mod tests {
         );
 
         assert!(try_accelerate_grep_pipeline("grep -n 'foo' app.js | sort").is_none());
-        assert!(try_accelerate_grep_pipeline("grep -v 'foo' app.js | head -10").is_none());
+        assert!(try_accelerate_grep_pipeline("grep -ov 'foo' app.js | head -10").is_none());
         assert!(try_accelerate_grep_pipeline("grep -n 'foo' *.js | head -10").is_none());
 
         // `ls | head`, `cat 2>/dev/null | head/head -c/tail|cut`, and `head -c` accelerators
@@ -3031,5 +3044,33 @@ mod tests {
 
         assert!(try_accelerate_grep_pipeline("rg -a -b -o 'foo' app.exe | head -10").is_none());
         assert!(try_accelerate_grep_pipeline("rg -o 'foo' -g '!*.test.js' | head -10").is_none());
+
+        // `grep -v` / `rg --invert-match` & `find -iname` accelerators
+        let (_, h54, _) = heal_windows_command("grep -v \"debug\" app.log | head -25", true, true);
+        assert!(
+            h54.contains("search --max 25 -v \"debug\" \"app.log\""),
+            "{h54}"
+        );
+
+        let (_, h55, _) = heal_windows_command(
+            "rg --invert-match \"noise\" src | cut -c1-120 | head -15",
+            true,
+            true,
+        );
+        assert!(
+            h55.contains("search --width 120 --max 15 -v \"noise\" \"src\""),
+            "{h55}"
+        );
+
+        assert!(try_accelerate_grep_pipeline("grep -ov \"foo\" app.log | head -10").is_none());
+
+        let fast_iname = try_accelerate_find_files(
+            "find src -maxdepth 3 -iname \"*.log\" 2>/dev/null | head -20",
+        )
+        .expect("should accelerate find -iname");
+        assert!(
+            fast_iname.contains("ls \"src\" --depth 3 --ext log --limit 20"),
+            "{fast_iname}"
+        );
     }
 }

@@ -1483,6 +1483,48 @@ export function healJsStringRawNewlines(code: string): string | undefined {{
 	return out;
 }}
 
+const AP_MCP_TOOL_NAMES: ReadonlySet<string> = new Set([
+	"ap_read",
+	"ap_query",
+	"ap_search",
+	"ap_undo",
+	"ap_orient",
+	"ap_impact",
+	"ap_edit",
+	"ap_smoke",
+	"ap_fuzz",
+	"ap_mutate",
+	"ap_ui",
+	"ap_locate",
+	"ap_trace",
+	"ap_cdp",
+	"ap_http",
+	"ap_ports",
+	"ap_ps",
+	"ap_win",
+	"ap_fs_diff",
+	"ap_tcp",
+	"ap_listen",
+	"ap_ws",
+	"ap_tls",
+	"ap_baton_claim",
+	"ap_baton_dedup",
+	"ap_guard_pack",
+	"ap_diff_audit",
+	"ap_verify",
+	"ap_exec",
+	"ap_probe",
+	"ap_rename",
+	"ap_sieve",
+	"ap_baton",
+	"ap_recall",
+	"ap_changes",
+	"ap_surface",
+	"ap_frontier",
+	"ap_discover",
+	"ap_call",
+]);
+
 /**
  * Lossless pre-execution auto-heal for Pi `codemode` JS scripts:
  * 1) Strips outer markdown code fences (```js ... ```) that break QuickJS parsing / `// @options:` line 1.
@@ -1513,6 +1555,11 @@ export function healCodemodeSource(code: string): string | undefined {{
 	}}
 	if (next.includes("tools.mcp__agent-primitives__")) {{
 		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
+	}}
+	if (/\btools\.ap_[a-z_]+\b/.test(next)) {{
+		next = next.replace(/\btools\.(ap_[a-z_]+)\b/g, (m, name: string) =>
+			AP_MCP_TOOL_NAMES.has(name) ? `tools.mcp__agent_primitives__${{name}}` : m,
+		);
 	}}
 	if (next.includes("String.raw`")) {{
 		next = next.replace(
@@ -3049,7 +3096,12 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {{
 }}
 
 export function clampKvSafeSleep(cmd: string, toolName: string, maxSec = 45): string | undefined {{
-	if (!cmd || /\bnohup\b|<<|\b(?:python3?|py|node)\b/i.test(cmd) || /&\s*$/.test(cmd.trim()) || /\(\s*[^)]*\bsleep\b[^)]*\)\s*&/i.test(cmd)) {{
+	if (
+		!cmd ||
+		/\bnohup\b|<<|(?:^|[\s;&|(=])(?:python3?|py|node)(?:\.exe)?(?=\s|$|[;&|)])/i.test(cmd) ||
+		/&\s*$/.test(cmd.trim()) ||
+		/\(\s*[^)]*\bsleep\b[^)]*\)\s*&/i.test(cmd)
+	) {{
 		return undefined;
 	}}
 	if (toolName === "bash") {{
@@ -3138,7 +3190,7 @@ export function healCmdForLoop(raw: string, toolName = "bash"): string | undefin
 	if (/\bfor\s+\/[frld]\b/i.test(raw)) return undefined;
 	const trimmed = raw.trim();
 	const headM = trimmed.match(
-		/^(?:(cd(?:\s+\/d)?\s+(?:"[^"]+"|'[^']+'|\S+))\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(/i,
+		/^(?:(cd(?:\s+\/d)?\s+(?:"[^"]+"|'[^']+'|\S+)(?:\s+2>\s*(?:\/dev\/null|NUL))?)\s*(?:&&|&)\s*)?for\s+%%?([A-Za-z_]\w*)\s+in\s+\(/i,
 	);
 	if (!headM || headM.index === undefined) return undefined;
 	const listStart = headM[0].length;
@@ -3162,15 +3214,26 @@ export function healCmdForLoop(raw: string, toolName = "bash"): string | undefin
 	if (!itemsRaw) return undefined;
 	const doM = trimmed.slice(listEnd + 1).match(/^\s*do\s+([\s\S]+?)\s*$/i);
 	if (!doM) return undefined;
-	const cdRaw = headM[1] ? `${{headM[1].trim().replace(/^cd\s+\/d\s+/i, "cd ").replace(/\\/g, "/")}} && ` : "";
+	const normWinTmpEnv = (s: string): string =>
+		s.replace(/"([^"]*)"|'([^']*)'|%(?:TEMP|TMP)%/gi, (m, dq?: string, sq?: string) => {{
+			if (dq !== undefined) return `"${{dq.replace(/%(?:TEMP|TMP)%/gi, "$TEMP")}}"`;
+			if (sq !== undefined) return `'${{sq}}'`;
+			return '"$TEMP"';
+		}});
+	const cdRaw = headM[1]
+		? `${{normWinTmpEnv(headM[1].trim().replace(/^cd\s+\/d\s+/i, "cd ").replace(/\\/g, "/"))}} && `
+		: "";
 	const v = headM[2];
-	const items = itemsRaw.replace(/([A-Za-z]:)\\([^"'\r\n]*)/g, (_m, d: string, rest: string) => `${{d}}/${{rest.replace(/\\/g, "/")}}`);
+	const items = normWinTmpEnv(
+		itemsRaw.replace(/([A-Za-z]:)\\([^"'\r\n]*)/g, (_m, d: string, rest: string) => `${{d}}/${{rest.replace(/\\/g, "/")}}`),
+	);
 	let body = doM[1].trim();
 	if (body.startsWith("@")) body = body.slice(1).trim();
 	if (body.startsWith("(") && body.endsWith(")") && body.length >= 2) {{
 		body = body.slice(1, -1).trim();
 	}}
 	body = body.replace(new RegExp(`%%?(?:~[fdpnxsatz]*)?${{v}}(?!\\w)`, "gi"), () => "${{" + v + "}}");
+	body = normWinTmpEnv(body);
 	body = body.replace(/\s+2>\s*nul\b/gi, " 2>/dev/null");
 	body = body.replace(/\bdir\s+\/b\s+\/s\s+("[^"]+"|'[^']+'|\S+)/gi, `"${{AP_BIN}}" ls $1 --depth 3`);
 	body = body.replace(/\bdir\s+\/s\s+\/b\s+("[^"]+"|'[^']+'|\S+)/gi, `"${{AP_BIN}}" ls $1 --depth 3`);
@@ -3285,6 +3348,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	let countOnly = false;
 	let wordRe = false;
 	let onlyMatch = false;
+	let invertMatch = false;
 	let noFilename = false;
 	const exts: string[] = [];
 	const includes: string[] = [];
@@ -3307,6 +3371,10 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 			continue;
 		}}
 		if (!endOpts && gt.startsWith("--")) {{
+			if (gt === "--invert-match") {{
+				invertMatch = true;
+				continue;
+			}}
 			if (!isRg) return undefined;
 			if (gt.startsWith("--glob=")) {{
 				if (!addGlob(gt.slice(7))) return undefined;
@@ -3353,12 +3421,14 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 				else if (ch === "c") countOnly = true;
 				else if (ch === "w") wordRe = true;
 				else if (ch === "o") onlyMatch = true;
+				else if (ch === "v") invertMatch = true;
 				else return undefined;
 			}}
 			continue;
 		}}
 		gPos.push(gt);
 	}}
+	if (invertMatch && onlyMatch) return undefined;
 	const patPos = gPos[0];
 	const tgtPos = isRg && gPos.length === 1 ? "." : gPos.length === 2 ? gPos[1] : "";
 	if (!patPos || !tgtPos || tgtPos === "-" || /[*?,]/.test(tgtPos) || (gPos.length !== 2 && !(isRg && gPos.length === 1))) {{
@@ -3412,6 +3482,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		unique ? " --unique" : "",
 		filesOnly ? " --files-only" : countOnly ? " --count" : "",
 		onlyMatch ? " -o" : "",
+		invertMatch ? " -v" : "",
 		noFilename ? " --no-filename" : "",
 		ignoreCase ? " -i" : "",
 		fixed ? " --fixed-strings" : "",
@@ -3657,7 +3728,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 						else if (t === "d") fDirsOnly = true;
 						else findOk = false;
 						fIdx += 2;
-					}} else if (flag === "-name" && fIdx + 1 < fToks.length && !fExt) {{
+					}} else if ((flag === "-name" || flag === "-iname") && fIdx + 1 < fToks.length && !fExt) {{
 						const em = fToks[fIdx + 1].match(/^\*\.([A-Za-z0-9_]+)$/);
 						if (!em) {{
 							findOk = false;
@@ -3822,7 +3893,7 @@ export function healCommand(
 		return changed ? cmd : undefined;
 	}}
 
-	// 0. Pre-normalize safe Git Bash Windowsisms BEFORE accelerators so `cd /d`, `2>NUL`, `&`, unquoted backslashes & `| more` accelerate too
+	// 0. Pre-normalize safe Git Bash Windowsisms BEFORE accelerators so `cd /d`, `2>NUL`, `&`, unquoted/quoted backslashes, `| more` & `| Select-Object` accelerate too
 	if (toolName === "bash") {{
 		if (REDIR_NUL.test(cmd)) {{
 			cmd = cmd.replace(REDIR_NUL, "$1 /dev/null");
@@ -3838,16 +3909,40 @@ export function healCommand(
 			changed = true;
 		}}
 		if (/\|\s*more\b/i.test(cmd)) {{
-			const noMore = cmd.replace(/\s*\|\s*more(?:\s+\+\d+)?(?=\s*(?:$|[;&]))/gi, "");
+			const noMore = cmd.replace(/\s*\|\s*more(?:\s+\+\d+)?(?=\s*(?:$|[;&|]))/gi, "");
 			if (noMore !== cmd) {{
 				cmd = noMore;
 				changed = true;
 			}}
 		}}
-		if (!/(?:<<|\b(?:python3?|py|node|powershell|pwsh)\b)/i.test(cmd) && /(?:^|[\s=;])[A-Za-z]:\\/.test(cmd)) {{
-			const normDrv = normalizeUnquotedBashDrivePaths(cmd);
-			if (normDrv !== cmd) {{
-				cmd = normDrv;
+		const hasScriptRuntime = /<<|(?:^|[\s;&|(=])(?:python3?|py|node|powershell|pwsh)(?:\.exe)?(?=\s|$|[;&|)])/i.test(cmd);
+		if (!/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd) && !cmd.includes("<<")) {{
+			const normSelect = cmd
+				.replace(/\|\s*Select-Object\s+-First\s+(\d+)\b/gi, "| head -n $1")
+				.replace(/\|\s*Select-Object\s+-Last\s+(\d+)\b/gi, "| tail -n $1");
+			if (normSelect !== cmd) {{
+				cmd = normSelect;
+				changed = true;
+			}}
+		}}
+		if (!hasScriptRuntime) {{
+			const moreToCat = cmd.replace(/(^|[;&|]\s*|\bdo\s+)more(?:\s+\+\d+)?(?=\s+[^-|;&])/gi, "$1cat");
+			if (moreToCat !== cmd) {{
+				cmd = moreToCat;
+				changed = true;
+			}}
+			if (/(?:^|[\s=;])[A-Za-z]:\\/.test(cmd)) {{
+				const normDrv = normalizeUnquotedBashDrivePaths(cmd);
+				if (normDrv !== cmd) {{
+					cmd = normDrv;
+					changed = true;
+				}}
+			}}
+		}}
+		if (!cmd.includes("<<")) {{
+			const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
+			if (fixedBs !== cmd) {{
+				cmd = fixedBs;
 				changed = true;
 			}}
 		}}
@@ -3880,15 +3975,6 @@ export function healCommand(
 		}});
 		if (fixedFind !== cmd) {{
 			cmd = fixedFind;
-			changed = true;
-		}}
-	}}
-
-	// 2d. Fix Windows trailing backslash inside quotes (`"C:\"` -> `"C:/"` or `"C:\App\"*.dll` -> `"C:/App/"*.dll`) while preserving nested `\"C:\\...\"`
-	if (toolName === "bash") {{
-		const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
-		if (fixedBs !== cmd) {{
-			cmd = fixedBs;
 			changed = true;
 		}}
 	}}
@@ -4033,6 +4119,8 @@ const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{
 	codemake: "codemode",
 	code_mode: "codemode",
 	"code-mode": "codemode",
+	cdemode: "codemode",
+	codemao: "codemode",
 	codemodep: "codemode",
 	codemod: "codemode",
 	codemodocode: "codemode",
@@ -4059,9 +4147,31 @@ const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{
 	exec_command: "bash",
 }};
 
+function damerauLevenshtein(a: string, b: string): number {{
+	const n = a.length;
+	const m = b.length;
+	if (n === 0) return m;
+	if (m === 0) return n;
+	const dp: number[][] = Array.from({{ length: n + 1 }}, () => new Array<number>(m + 1).fill(0));
+	for (let i = 0; i <= n; i++) dp[i][0] = i;
+	for (let j = 0; j <= m; j++) dp[0][j] = j;
+	for (let i = 1; i <= n; i++) {{
+		for (let j = 1; j <= m; j++) {{
+			const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+			let v = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+			if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {{
+				v = Math.min(v, dp[i - 2][j - 2] + 1);
+			}}
+			dp[i][j] = v;
+		}}
+	}}
+	return dp[n][m];
+}}
+
 /**
  * Deterministically repair high-frequency hallucinated tool names (e.g. `codemake` -> `codemode`,
- * `read_file` -> `read`, `run_command` -> `bash`) strictly when the target tool is active.
+ * `read_file` -> `read`, `run_command` -> `bash`) and unique bounded typos via Damerau-Levenshtein
+ * strictly when the target tool is active.
  */
 export function repairHallucinatedToolName(
 	rawName: string,
@@ -4073,6 +4183,31 @@ export function repairHallucinatedToolName(
 	const mapped = HALLUCINATED_TOOL_ALIASES[key];
 	if (mapped && activeTools.has(mapped)) return mapped;
 	if (activeTools.has(key)) return key;
+	if (key.length >= 5) {{
+		const maxDist = key.length >= 7 ? 2 : 1;
+		let bestCand: string | undefined = undefined;
+		let bestDist = maxDist + 1;
+		let bestCount = 0;
+		for (const cand of activeTools) {{
+			const candLow = cand.toLowerCase();
+			if (candLow.length < 4 || Math.abs(key.length - candLow.length) > maxDist) continue;
+			const firstOk =
+				key[0] === candLow[0] ||
+				(key.length >= 2 && key[1] === candLow[0] && key[0] === candLow[1]);
+			if (!firstOk) continue;
+			const d = damerauLevenshtein(key, candLow);
+			if (d <= maxDist) {{
+				if (d < bestDist) {{
+					bestDist = d;
+					bestCand = cand;
+					bestCount = 1;
+				}} else if (d === bestDist) {{
+					bestCount += 1;
+				}}
+			}}
+		}}
+		if (bestCand !== undefined && bestCount === 1) return bestCand;
+	}}
 	return undefined;
 }}
 

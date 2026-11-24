@@ -10344,3 +10344,148 @@ assert.equal(guardUnboundedCurlTimeout("curl -s -m 10 https://example.com"), und
         );
     }
 }
+
+#[test]
+fn test_v264_bash_py_drive_path_healing_invert_grep_find_iname_codemode_ap_alias_and_fuzzy_tool_repair(
+) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // 1. CLI `ap search -v` & case-insensitive `ap ls --ext`
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(src_dir.join("mod.TS"), "export const v = 1;\n").unwrap();
+    let log_p = root.join("app.log");
+    fs::write(&log_p, "ok init\nnoise debug\nok ready\n").unwrap();
+
+    let sv = run_ap(
+        root,
+        &["search", "-v", "noise", log_p.to_str().unwrap()],
+        None,
+        &[],
+    );
+    assert!(
+        sv.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sv.stderr)
+    );
+    let sv_out = String::from_utf8_lossy(&sv.stdout);
+    assert!(
+        sv_out.contains("ok init")
+            && sv_out.contains("ok ready")
+            && !sv_out.contains("noise debug"),
+        "{sv_out}"
+    );
+
+    let lsi = run_ap(root, &["ls", "src", "--ext", "ts"], None, &[]);
+    assert!(
+        lsi.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lsi.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&lsi.stdout).contains("mod.TS"),
+        "{}",
+        String::from_utf8_lossy(&lsi.stdout)
+    );
+
+    // 2. Live Node verification of v2.64 zz-ap-accelerator.ts improvements
+    let home = root.join("home_v264");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand, healCodemodeSource, repairHallucinatedToolName } = mod;
+
+// 1) .py filename no longer blocks drive-path healing or compound acceleration
+const p1 = healCommand("cd /d D:\\proj\\dir && ls -la *.py | head -20 && head -40 app.py", "bash");
+assert.ok(p1 && p1.includes("cd D:/proj/dir && ") && p1.includes('read "app.py" --lines 1-40'), p1);
+
+// 2) Trailing backslash inside quotes fixed in Step 0 -> downstream grep pipeline still accelerates
+const p2 = healCommand('ls "D:\\proj\\dir\\" 2>/dev/null; echo "=== (ok)"; grep -n -i "foo" "D:\\proj\\dir\\a.txt" | cut -c1-70 | head -20', "bash");
+assert.ok(p2 && p2.includes('"D:/proj/dir/"') && p2.includes('search --width 70 --max 20 -i \'foo\' "D:/proj/dir/a.txt"'), p2);
+
+// 3) CMD `for` loop with `cd /d %TEMP% 2>nul & ...`
+const p3 = healCommand('cd /d %TEMP% 2>nul & for %P in ("/" "/a") do @echo %~P', "bash");
+assert.ok(p3 && p3.includes('"$TEMP"') && p3.includes("for P in ") && p3.includes("done"), p3);
+
+// 4) `| Select-Object -First/-Last N` cascades cleanly to `ap search --max N` / `ap read --tail N`
+const p4 = healCommand('grep -n "foo" src/a.txt | Select-Object -First 15', "bash");
+assert.ok(p4 && p4.includes('search --max 15 \'foo\' "src/a.txt"'), p4);
+const p4r = healCommand('grep -rn "foo" src | Select-Object -First 15', "bash");
+assert.ok(p4r && !p4r.includes("Select-Object") && p4r.includes('search \'foo\' "src" | head -n 15'), p4r);
+const p4t = healCommand('cat app.log | Select-Object -Last 20', "bash");
+assert.ok(p4t && p4t.includes('read "app.log" --tail 20'), p4t);
+
+// 5) Standalone `more` inside Git Bash loop rewrites to `cat`
+const p5 = healCommand('for f in a.log b.log; do more "$f"; done', "bash");
+assert.equal(p5, 'for f in a.log b.log; do cat "$f"; done');
+
+// 6) `grep -v | head` accelerates, while `-ov` stays untouched
+const p6 = healCommand('grep -v "noise" app.log | head -25', "bash");
+assert.ok(p6 && p6.includes('search --max 25 -v \'noise\' "app.log"'), p6);
+assert.equal(healCommand('grep -ov "noise" app.log | head -25', "bash"), undefined);
+
+// 7) `find -iname "*.ts"` accelerates to `ap ls --ext ts`
+const p7 = healCommand('find src -maxdepth 3 -iname "*.ts" 2>/dev/null | head -20', "bash");
+assert.ok(p7 && p7.includes('ls "src" --depth 3 --ext ts --limit 20'), p7);
+
+// 8) Codemode bare `tools.ap_<known>` auto-prefix (leaves custom/unknown unchanged)
+const cm = healCodemodeSource('const s = await tools.ap_search({ pattern: "foo", path: "." }); const x = tools.ap_custom_local();');
+assert.ok(cm && cm.includes("tools.mcp__agent_primitives__ap_search(") && cm.includes("tools.ap_custom_local()"), cm);
+
+// 9) Damerau-Levenshtein & alias tool name repair
+const active = new Set(["bash", "read", "edit", "write", "codemode"]);
+assert.equal(repairHallucinatedToolName("cdemode", active), "codemode");
+assert.equal(repairHallucinatedToolName("codemao", active), "codemode");
+assert.equal(repairHallucinatedToolName("codemoed", active), "codemode");
+assert.equal(repairHallucinatedToolName("bashx", active), "bash");
+assert.equal(repairHallucinatedToolName("xyzzy", active), undefined);
+assert.equal(repairHallucinatedToolName("ap_xead", new Set(["ap_read", "ap_head"])), undefined);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.64 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
