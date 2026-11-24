@@ -11798,3 +11798,135 @@ assert.equal(healCommand("du -sh * | sort -h", "bash"), undefined);
         );
     }
 }
+
+#[test]
+fn test_v271_codemode_bash_kv_heals() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let home = root.join("home_v271");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    let strip_ok = Command::new("node")
+        .args(["--experimental-strip-types", "-e", "process.exit(0)"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if strip_ok {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const {
+  healCodemodeSource,
+  classifyCodemodeFailureTip,
+  healCommand,
+  shouldAutoSieveShellOutput,
+  shouldAutoSieveUnboundedRead,
+} = mod;
+
+// 1. Codemode trailing backslash before closing quote/backtick + valid escaped quotes preserved
+const q1 = healCodemodeSource('await tools.ap_search({ pattern: "serviceType=\\" })');
+assert.ok(q1 && q1.includes('serviceType=\\\\"'), q1);
+new Function(`return async () => {\n${q1}\n};`);
+
+const q2 = healCodemodeSource('const a = "C:\\\\dir\\";\nconst b = "ok";');
+assert.ok(q2, "expected trailing backslash quote heal");
+new Function(q2);
+
+assert.equal(healCodemodeSource('const s = "say \\"hi\\"";'), undefined);
+
+const t1 = healCodemodeSource('const p = `C:\\\\demo\\`;');
+assert.ok(t1, "expected plain template trailing backslash heal");
+new Function(t1);
+
+const t2 = healCodemodeSource('const r = String.raw`${`a`}\\`;');
+assert.ok(t2, "expected nested-backtick String.raw heal");
+new Function(t2);
+
+// 2. Codemode TS annotation stripping inside blocks, nested generics, arrow returns, and object URL safety
+const tsBlock = [
+  'try { const out: any[] = []; const r: Promise<Record<string, any>> = Promise.resolve({}); let err: Error | null; } catch (e: unknown) {}',
+  'const fn = async (id: string, opts?: { k: number }): Promise<Record<string, any>> => { return { id, opts }; };',
+].join("\n");
+const healedTs = healCodemodeSource(tsBlock);
+assert.ok(healedTs, "expected TS annotation heal");
+new Function(`return async () => {\n${healedTs}\n};`);
+
+assert.equal(healCodemodeSource('const u = { a: "http://example.com:8080/v1", b: 1 };'), undefined);
+
+// 3. Codemode TypeError Promise.allSettled guidance
+const tip = classifyCodemodeFailureTip("TypeError: cannot read property 'slice' of undefined");
+assert.ok(tip.includes("Promise.allSettled") && tip.includes('r.status === "fulfilled"'), tip);
+
+// 4. Bash dir /b pipes & globs, (x86) quoting, quote-safe grep, find depth bound, Get-ChildItem -Recurse
+const dPipe = healCommand('cd /d C:\\proj && dir /b | head -10', 'bash');
+assert.ok(dPipe && dPipe.includes('ls "."') && dPipe.includes('| head -10'), dPipe);
+
+const dGlob = healCommand('dir /b *.rs', 'bash');
+assert.ok(dGlob && dGlob.includes('ls "." --ext rs'), dGlob);
+
+const x86 = healCommand('ls C:\\Program Files (x86)\\Vendor\\app.exe', 'bash');
+assert.ok(x86 && x86.includes('"C:/Program Files (x86)/Vendor/app.exe"'), x86);
+
+const gQuote = healCommand('grep -rn "key=\\"val\\"" src | head -5', 'bash');
+assert.ok(gQuote && gQuote.includes('\'key="val"\'') && gQuote.includes('"src" | head -5'), gQuote);
+
+const gPipe = healCommand('grep -rn "foo" src | grep -v test | head -10', 'bash');
+assert.ok(gPipe && gPipe.includes('rg ') && gPipe.includes('--max-depth 8') && gPipe.includes('| grep -v test | head -10'), gPipe);
+
+const fBound = healCommand('find /c/demo -name "*token*" | grep -v test', 'bash');
+assert.ok(fBound && fBound.includes('-maxdepth 6'), fBound);
+
+const gciNoFilter = healCommand('powershell -NoProfile -Command "Get-ChildItem \'C:\\App\' -Recurse"', 'bash');
+assert.ok(gciNoFilter && gciNoFilter.includes('rg --files --no-ignore --max-depth 6 "C:/App"'), gciNoFilter);
+
+const psGci = healCommand('Get-ChildItem -Recurse | Where-Object { $_.Name -like "*.ts" }', 'powershell');
+assert.ok(psGci && psGci.includes('-Recurse -Depth 5'), psGci);
+
+// 5. Context-size-adaptive auto-sieve for KV-cache tail protection (<45k tok)
+const multiline9k = ("a".repeat(100) + "\n").repeat(90);
+const multiline11k = ("a".repeat(100) + "\n").repeat(110);
+assert.equal(shouldAutoSieveShellOutput(multiline9k, false, 16000, 32000), true);
+assert.equal(shouldAutoSieveShellOutput(multiline9k, false, 16000, 80000), false);
+assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log' }, false, 16000, 30000), true);
+assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log', offset: 1, limit: 100 }, false, 16000, 30000), false);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.71 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

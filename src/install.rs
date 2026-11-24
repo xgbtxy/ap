@@ -1325,7 +1325,7 @@ export function loadApProfile(profilePath?: string): ApProfileOverrides | undefi
  * comments, regex literals, and multiline backtick template literals untouched (prevents QuickJS EOS errors).
  */
 export function healJsStringRawNewlines(code: string): string | undefined {{
-	if (!code || (!code.includes("\n") && !code.includes("\r"))) return undefined;
+	if (!code || (!code.includes("\n") && !code.includes("\r") && !code.includes("\\"))) return undefined;
 	const n = code.length;
 	let out = "";
 	let lastFlush = 0;
@@ -1378,7 +1378,41 @@ export function healJsStringRawNewlines(code: string): string | undefined {{
 		while (i < n) {{
 			const ch = code[i];
 			if (ch === "\\") {{
-				i += i + 1 < n ? 2 : 1;
+				let bs = 0;
+				while (i + bs < n && code[i + bs] === "\\") bs++;
+				if (bs % 2 === 1 && i + bs < n && code[i + bs] === quote) {{
+					let k = i + bs + 1;
+					while (k < n && (code[k] === " " || code[k] === "\t")) k++;
+					const nextCh = k < n ? code[k] : "";
+					if (nextCh === "" || ",;}}]):\r\n".includes(nextCh)) {{
+						let hasLaterClose = false;
+						let s = i + bs + 1;
+						while (s < n && code[s] !== "\n" && code[s] !== "\r") {{
+							if (code[s] === "\\") {{
+								let sbs = 0;
+								while (s + sbs < n && code[s + sbs] === "\\") sbs++;
+								s +=
+									sbs % 2 === 1 && s + sbs < n && code[s + sbs] !== "\n" && code[s + sbs] !== "\r"
+										? sbs + 1
+										: sbs;
+								continue;
+							}}
+							if (code[s] === quote) {{
+								hasLaterClose = true;
+								break;
+							}}
+							s++;
+						}}
+						if (!hasLaterClose) {{
+							out += code.slice(lastFlush, i + bs) + "\\";
+							lastFlush = i + bs;
+							changed = true;
+							i += bs + 1;
+							break;
+						}}
+					}}
+				}}
+				i += bs % 2 === 1 && i + bs < n ? bs + 1 : bs;
 				continue;
 			}}
 			if (ch === "\r") {{
@@ -1409,12 +1443,48 @@ export function healJsStringRawNewlines(code: string): string | undefined {{
 		}}
 	}};
 
-	const scanTemplate = () => {{
+	const scanTemplate = (isRawTag: boolean) => {{
 		i++;
 		while (i < n) {{
 			const ch = code[i];
 			if (ch === "\\") {{
-				i += i + 1 < n ? 2 : 1;
+				let bs = 0;
+				while (i + bs < n && code[i + bs] === "\\") bs++;
+				if (bs % 2 === 1 && i + bs < n && code[i + bs] === "`") {{
+					let k = i + bs + 1;
+					while (k < n && (code[k] === " " || code[k] === "\t")) k++;
+					const nextCh = k < n ? code[k] : "";
+					if (nextCh === "" || ",;}}]):\r\n".includes(nextCh)) {{
+						let hasLaterBacktick = false;
+						let s = i + bs + 1;
+						while (s < n) {{
+							if (code[s] === "\\") {{
+								let sbs = 0;
+								while (s + sbs < n && code[s + sbs] === "\\") sbs++;
+								s += sbs % 2 === 1 && s + sbs < n ? sbs + 1 : sbs;
+								continue;
+							}}
+							if (code[s] === "`") {{
+								hasLaterBacktick = true;
+								break;
+							}}
+							s++;
+						}}
+						if (!hasLaterBacktick) {{
+							if (isRawTag) {{
+								out += code.slice(lastFlush, i + bs - 1) + '` + "\\\\"';
+								lastFlush = i + bs + 1;
+							}} else {{
+								out += code.slice(lastFlush, i + bs) + "\\";
+								lastFlush = i + bs;
+							}}
+							changed = true;
+							i += bs + 1;
+							break;
+						}}
+					}}
+				}}
+				i += bs % 2 === 1 && i + bs < n ? bs + 1 : bs;
 				continue;
 			}}
 			if (ch === "$" && code[i + 1] === "{{") {{
@@ -1470,7 +1540,8 @@ export function healJsStringRawNewlines(code: string): string | undefined {{
 				continue;
 			}}
 			if (ch === "`") {{
-				scanTemplate();
+				const isRawTag = /\bString\.raw[ \t]*$/.test(code.slice(Math.max(0, i - 16), i));
+				scanTemplate(isRawTag);
 				continue;
 			}}
 			i++;
@@ -1525,12 +1596,488 @@ const AP_MCP_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"ap_call",
 ]);
 
+function stripTsTypesInCodemode(code: string): string {{
+	if (!code || (!code.includes(":") && !/\bas\s+/.test(code))) return code;
+	const tokens: string[] = [];
+	let masked = "";
+	let last = 0;
+	let i = 0;
+	const n = code.length;
+	const maskSpan = (start: number, end: number) => {{
+		masked += code.slice(last, start);
+		const idx = tokens.length;
+		tokens.push(code.slice(start, end));
+		masked += `\u0001T${{idx}}\u0001`;
+		last = end;
+	}};
+	const scanRegexLit = (startSlash: number): number => {{
+		let prev = startSlash - 1;
+		while (prev >= 0 && (code[prev] === " " || code[prev] === "\t")) prev--;
+		let allow = prev < 0 || "([,=;:!&|?{{}}~+-*%^<>\n\r".includes(code[prev]);
+		if (!allow && prev >= 0 && /[A-Za-z_$0-9]/.test(code[prev])) {{
+			let ws = prev;
+			while (ws > 0 && /[A-Za-z_$0-9]/.test(code[ws - 1])) ws--;
+			allow = /^(?:return|throw|case|typeof|void|delete|await|yield|in|of|new)$/.test(code.slice(ws, prev + 1));
+		}}
+		if (!allow) return -1;
+		let j = startSlash + 1;
+		let inClass = false;
+		while (j < n) {{
+			const rc = code[j];
+			if (rc === "\n" || rc === "\r") return -1;
+			if (rc === "\\") {{
+				if (j + 1 >= n || code[j + 1] === "\n" || code[j + 1] === "\r") return -1;
+				j += 2;
+				continue;
+			}}
+			if (rc === "[") inClass = true;
+			else if (rc === "]" && inClass) inClass = false;
+			else if (rc === "/" && !inClass) {{
+				j++;
+				while (j < n && /[a-z]/i.test(code[j])) j++;
+				return j;
+			}}
+			j++;
+		}}
+		return -1;
+	}};
+	const scanTpl = () => {{
+		let spanStart = i;
+		i++;
+		while (i < n) {{
+			const ch = code[i];
+			if (ch === "\\") {{
+				i += i + 1 < n ? 2 : 1;
+				continue;
+			}}
+			if (ch === "$" && code[i + 1] === "{{") {{
+				i += 2;
+				maskSpan(spanStart, i);
+				scanCode(true);
+				spanStart = i;
+				continue;
+			}}
+			if (ch === "`") {{
+				i++;
+				maskSpan(spanStart, i);
+				return;
+			}}
+			i++;
+		}}
+		maskSpan(spanStart, n);
+	}};
+	const scanCode = (stopOnBrace: boolean) => {{
+		let braceDepth = 0;
+		while (i < n) {{
+			const ch = code[i];
+			if (ch === "{{" && stopOnBrace) {{
+				braceDepth++;
+				i++;
+				continue;
+			}}
+			if (ch === "}}" && stopOnBrace) {{
+				if (braceDepth === 0) {{
+					i++;
+					return;
+				}}
+				braceDepth--;
+				i++;
+				continue;
+			}}
+			if (ch === "/" && code[i + 1] === "/") {{
+				const s = i;
+				const nl = code.indexOf("\n", i + 2);
+				i = nl < 0 ? n : nl;
+				maskSpan(s, i);
+				continue;
+			}}
+			if (ch === "/" && code[i + 1] === "*") {{
+				const s = i;
+				const end = code.indexOf("*/", i + 2);
+				i = end < 0 ? n : end + 2;
+				maskSpan(s, i);
+				continue;
+			}}
+			if (ch === "/" && code[i + 1] !== "/" && code[i + 1] !== "*") {{
+				const reEnd = scanRegexLit(i);
+				if (reEnd > i) {{
+					maskSpan(i, reEnd);
+					i = reEnd;
+					continue;
+				}}
+			}}
+			if (ch === "'" || ch === '"') {{
+				const s = i;
+				const q = ch;
+				i++;
+				while (i < n) {{
+					if (code[i] === "\\") {{
+						i += i + 1 < n ? 2 : 1;
+						continue;
+					}}
+					if (code[i] === q) {{
+						i++;
+						break;
+					}}
+					if (code[i] === "\n" || code[i] === "\r") break;
+					i++;
+				}}
+				maskSpan(s, i);
+				continue;
+			}}
+			if (ch === "`") {{
+				scanTpl();
+				continue;
+			}}
+			i++;
+		}}
+	}};
+	if (code.includes("\u0001")) return code;
+	scanCode(false);
+	masked += code.slice(last);
+
+	const consumeBalancedType = (s: string, start: number, allowFnArrow: boolean): number => {{
+		let p = start;
+		while (p < s.length && (s[p] === " " || s[p] === "\t")) p++;
+		let angle = 0;
+		let paren = 0;
+		let bracket = 0;
+		let brace = 0;
+		let sawToken = false;
+		let expectMore = true;
+		while (p < s.length) {{
+			const ch = s[p];
+			const depth = angle + paren + bracket + brace;
+			if (ch === "<") {{
+				if (depth > 0 || sawToken) {{
+					angle++;
+					p++;
+					expectMore = true;
+					continue;
+				}}
+				break;
+			}}
+			if (ch === ">") {{
+				if (angle > 0) {{
+					angle--;
+					p++;
+					sawToken = true;
+					expectMore = false;
+					continue;
+				}}
+				break;
+			}}
+			if (ch === "(") {{
+				if (depth > 0 || expectMore) {{
+					paren++;
+					p++;
+					expectMore = true;
+					continue;
+				}}
+				break;
+			}}
+			if (ch === ")") {{
+				if (paren > 0) {{
+					paren--;
+					p++;
+					sawToken = true;
+					expectMore = false;
+					continue;
+				}}
+				break;
+			}}
+			if (ch === "[") {{
+				bracket++;
+				p++;
+				expectMore = true;
+				continue;
+			}}
+			if (ch === "]") {{
+				if (bracket > 0) {{
+					bracket--;
+					p++;
+					sawToken = true;
+					expectMore = false;
+					continue;
+				}}
+				break;
+			}}
+			if (ch === "{{") {{
+				if (depth > 0 || expectMore) {{
+					brace++;
+					p++;
+					expectMore = true;
+					continue;
+				}}
+				break;
+			}}
+			if (ch === "}}") {{
+				if (brace > 0) {{
+					brace--;
+					p++;
+					sawToken = true;
+					expectMore = false;
+					continue;
+				}}
+				break;
+			}}
+			if (depth === 0) {{
+				if (ch === "=" && s[p + 1] === ">") {{
+					if (!allowFnArrow) break;
+					p += 2;
+					expectMore = true;
+					continue;
+				}}
+				if (";,=\r\n?:".includes(ch)) break;
+				if (ch === "|" || ch === "&") {{
+					p++;
+					expectMore = true;
+					continue;
+				}}
+				if (ch === " " || ch === "\t") {{
+					let q = p;
+					while (q < s.length && (s[q] === " " || s[q] === "\t")) q++;
+					if (s[q] === "=" && s[q + 1] === ">" && allowFnArrow) {{
+						p = q + 2;
+						expectMore = true;
+						continue;
+					}}
+					if (s[q] === "|" || s[q] === "&" || s[q] === "[" || s[q] === "<") {{
+						p = q;
+						continue;
+					}}
+					const kw = s.slice(q).match(/^(?:in|of|as)\b/);
+					if (kw) break;
+					if (!expectMore) break;
+					p = q;
+					continue;
+				}}
+				if (ch === "\u0001") {{
+					const endM = s.indexOf("\u0001", p + 1);
+					if (endM < 0) break;
+					p = endM + 1;
+					sawToken = true;
+					expectMore = false;
+					continue;
+				}}
+				if (/[A-Za-z0-9_$.]/.test(ch)) {{
+					p++;
+					sawToken = true;
+					expectMore = false;
+					continue;
+				}}
+				break;
+			}}
+			p++;
+		}}
+		if (angle !== 0 || paren !== 0 || bracket !== 0 || brace !== 0 || !sawToken) return -1;
+		while (p > start && (s[p - 1] === " " || s[p - 1] === "\t")) p--;
+		return p > start ? p : -1;
+	}};
+
+	const stripParamList = (params: string): string => {{
+		let outP = "";
+		let idx = 0;
+		let dp = 0;
+		let db = 0;
+		let da = 0;
+		while (idx < params.length) {{
+			const ch = params[idx];
+			if (ch === "(") dp++;
+			else if (ch === ")" && dp > 0) dp--;
+			else if (ch === "[") db++;
+			else if (ch === "]" && db > 0) db--;
+			else if (ch === "<") da++;
+			else if (ch === ">" && da > 0) da--;
+			else if (ch === "{{") {{
+				let bDepth = 1;
+				let j = idx + 1;
+				while (j < params.length && bDepth > 0) {{
+					if (params[j] === "{{") bDepth++;
+					else if (params[j] === "}}") bDepth--;
+					j++;
+				}}
+				outP += params.slice(idx, j);
+				idx = j;
+				if (dp === 0 && db === 0 && da === 0) {{
+					const rest = params.slice(idx).match(/^[ \t]*\??[ \t]*:/);
+					if (rest) {{
+						const tEnd = consumeBalancedType(params, idx + rest[0].length, true);
+						if (tEnd > 0) idx = tEnd;
+					}}
+				}}
+				continue;
+			}}
+			if (dp === 0 && db === 0 && da === 0 && (ch === "?" || ch === ":")) {{
+				const colonM = params.slice(idx).match(/^\??[ \t]*:/);
+				if (colonM) {{
+					const tEnd = consumeBalancedType(params, idx + colonM[0].length, true);
+					if (tEnd > 0) {{
+						idx = tEnd;
+						continue;
+					}}
+				}}
+			}}
+			outP += ch;
+			idx++;
+		}}
+		return outP;
+	}};
+
+	let res = masked;
+	// 1. Variable declarations: `const x: Type = ...` or `let x: Type;`
+	if (/\b(?:const|let|var)[ \t]+[A-Za-z_$]/.test(res)) {{
+		let nextRes = "";
+		let cur = 0;
+		const declRe = /\b(const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*:/g;
+		let dm: RegExpExecArray | null;
+		while ((dm = declRe.exec(res)) !== null) {{
+			const colonPos = dm.index + dm[0].length;
+			const tEnd = consumeBalancedType(res, colonPos, true);
+			if (tEnd > colonPos) {{
+				let k = tEnd;
+				while (k < res.length && (res[k] === " " || res[k] === "\t")) k++;
+				const tail = res.slice(k);
+				if (
+					k >= res.length ||
+					"=;,\r\n)".includes(res[k]) ||
+					/^(?:in|of)\b/.test(tail)
+				) {{
+					nextRes += res.slice(cur, dm.index) + res.slice(dm.index, colonPos - 1).replace(/[ \t]*$/, "");
+					cur = tEnd;
+					declRe.lastIndex = tEnd;
+				}}
+			}}
+		}}
+		if (cur > 0) res = nextRes + res.slice(cur);
+	}}
+
+	// 2. `catch (e: unknown)` -> `catch (e)`
+	res = res.replace(
+		/\bcatch[ \t]*\([ \t]*([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*:[^()\n]+\)/g,
+		"catch ($1)",
+	);
+
+	// 3. Function declarations/expressions & arrow functions (params + return types)
+	if (res.includes(":")) {{
+		const fnHeadRe = /\b((?:async[ \t]+)?function(?:[ \t]+[A-Za-z_$][A-Za-z0-9_$]*)?[ \t]*)(?:<[^>\n;{{]+>[ \t]*)?\(/g;
+		let fnOut = "";
+		let fnCur = 0;
+		let fm: RegExpExecArray | null;
+		while ((fm = fnHeadRe.exec(res)) !== null) {{
+			const openParen = fm.index + fm[0].length - 1;
+			let depth = 1;
+			let p = openParen + 1;
+			while (p < res.length && depth > 0) {{
+				if (res[p] === "(") depth++;
+				else if (res[p] === ")") depth--;
+				p++;
+			}}
+			if (depth !== 0) continue;
+			const closeParen = p - 1;
+			const rawParams = res.slice(openParen + 1, closeParen);
+			const cleanParams = rawParams.includes(":") ? stripParamList(rawParams) : rawParams;
+			let afterClose = closeParen + 1;
+			const retColon = res.slice(afterClose).match(/^[ \t]*:/);
+			if (retColon) {{
+				const tEnd = consumeBalancedType(res, afterClose + retColon[0].length, false);
+				if (tEnd > 0) {{
+					let k = tEnd;
+					while (k < res.length && (res[k] === " " || res[k] === "\t")) k++;
+					if (res[k] === "{{") {{
+						afterClose = tEnd;
+					}}
+				}}
+			}}
+			fnOut += res.slice(fnCur, fm.index) + fm[1] + "(" + cleanParams + ")" + (afterClose > closeParen + 1 ? " " : "");
+			fnCur = afterClose;
+			fnHeadRe.lastIndex = afterClose;
+		}}
+		if (fnCur > 0) res = fnOut + res.slice(fnCur);
+
+		// Arrow functions: `(params)[: ReturnType] =>`
+		let arrOut = "";
+		let arrCur = 0;
+		for (let p = 0; p < res.length; p++) {{
+			if (res[p] !== "(") continue;
+			let depth = 1;
+			let q = p + 1;
+			while (q < res.length && depth > 0) {{
+				if (res[q] === "(") depth++;
+				else if (res[q] === ")") depth--;
+				q++;
+			}}
+			if (depth !== 0) continue;
+			const closeP = q - 1;
+			let k = closeP + 1;
+			while (k < res.length && (res[k] === " " || res[k] === "\t")) k++;
+			let arrowStart = -1;
+			let retEnd = closeP + 1;
+			if (res[k] === "=" && res[k + 1] === ">") {{
+				arrowStart = k;
+			}} else if (res[k] === ":") {{
+				const tEnd = consumeBalancedType(res, k + 1, false);
+				if (tEnd > 0) {{
+					let k2 = tEnd;
+					while (k2 < res.length && (res[k2] === " " || res[k2] === "\t")) k2++;
+					if (res[k2] === "=" && res[k2 + 1] === ">") {{
+						arrowStart = k2;
+						retEnd = tEnd;
+					}}
+				}}
+			}}
+			if (arrowStart >= 0) {{
+				const rawParams = res.slice(p + 1, closeP);
+				if (rawParams.includes(":") || retEnd > closeP + 1) {{
+					const cleanParams = rawParams.includes(":") ? stripParamList(rawParams) : rawParams;
+					arrOut += res.slice(arrCur, p) + "(" + cleanParams + ")" + (retEnd > closeP + 1 ? " " : "");
+					arrCur = retEnd;
+					p = arrowStart + 1;
+				}}
+			}}
+		}}
+		if (arrCur > 0) res = arrOut + res.slice(arrCur);
+	}}
+
+	// 4. `as <Type>` casts (supports nested generics like `as unknown as Record<string, any>`)
+	if (/\bas[ \t]+/.test(res)) {{
+		for (let pass = 0; pass < 3; pass++) {{
+			let asOut = "";
+			let asCur = 0;
+			const asRe = /(\)|\]|\}}|\b[A-Za-z_$][A-Za-z0-9_$]*)[ \t]+\bas[ \t]+/g;
+			let am: RegExpExecArray | null;
+			while ((am = asRe.exec(res)) !== null) {{
+				const typeStart = am.index + am[0].length;
+				const tEnd = consumeBalancedType(res, typeStart, true);
+				if (tEnd > typeStart) {{
+					let k = tEnd;
+					while (k < res.length && (res[k] === " " || res[k] === "\t")) k++;
+					const nextCh = k < res.length ? res[k] : "";
+					if (
+						nextCh === "" ||
+						";,)]\r\n.?:&|".includes(nextCh) ||
+						/^as\b/.test(res.slice(k))
+					) {{
+						asOut += res.slice(asCur, am.index + am[1].length);
+						asCur = tEnd;
+						asRe.lastIndex = tEnd;
+					}}
+				}}
+			}}
+			if (asCur === 0) break;
+			res = asOut + res.slice(asCur);
+		}}
+	}}
+
+	return res.replace(/\u0001T(\d+)\u0001/g, (_m, idx: string) => tokens[Number(idx)] ?? "");
+}}
+
 /**
  * Lossless pre-execution auto-heal for Pi `codemode` JS scripts:
  * 1) Strips outer markdown code fences (```js ... ```) that break QuickJS parsing / `// @options:` line 1.
  * 2) Repairs `tools.mcp__agent-primitives__` -> `tools.mcp__agent_primitives__` (avoids JS subtraction ReferenceError).
- * 3) Escapes raw newlines inside single/double-quoted strings (`healJsStringRawNewlines`).
- * 4) Strips accidental TypeScript variable/parameter/return annotations and `as <Type>` casts.
+ * 3) Escapes raw newlines inside single/double-quoted strings & heals trailing escaped quotes (`healJsStringRawNewlines`).
+ * 4) Strips accidental TypeScript variable/parameter/return annotations and `as <Type>` casts (`stripTsTypesInCodemode`).
  * 5) Auto-shims `setTimeout(...)` via host `sleep(ms)` (eliminating 100% of QuickJS timer ReferenceErrors while keeping `// @options:` on line 1).
  */
 export function healCodemodeSource(code: string): string | undefined {{
@@ -1572,48 +2119,7 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (healedNewlines) {{
 		next = healedNewlines;
 	}}
-	// Strip accidental TypeScript variable type annotations (`const x: string = ...`), catch/param types & `as <Type>` casts in QuickJS scripts
-	if (/\b(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:/.test(next)) {{
-		next = next.replace(
-			/(^|[;\n])([ \t]*)(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:(?:string|number|boolean|any|unknown)\[\]|Record<[^>\n]+>|Array<[^>\n]+>|string|number|boolean|any|unknown|object)\s*=/gm,
-			"$1$2$3 $4 =",
-		);
-	}}
-	const cleanTsParamList = (params: string): string =>
-		params.replace(
-			/(\b[A-Za-z_$][A-Za-z0-9_$]*)\s*\??\s*:\s*(?:(?:string|number|boolean|any|unknown)\[\]|Record<[^>\n,)]+>|Array<[^>\n,)]+>|string|number|boolean|any|unknown|void|object)/g,
-			"$1",
-		);
-	if (/:/.test(next)) {{
-		next = next.replace(
-			/\bcatch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:any|unknown|Error|string|object)\s*\)/g,
-			"catch ($1)",
-		);
-		next = next.replace(
-			/(^|[^.\w$])((?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*|(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?:async\s*)?)\(([^()\n]*)\)/gm,
-			(m, pre: string, head: string, params: string) =>
-				params.includes(":") ? `${{pre}}${{head}}(${{cleanTsParamList(params)}})` : m,
-		);
-		next = next.replace(
-			/(\(\s*|(?:map|filter|forEach|find|some|every|reduce|sort|flatMap|flat|catch|then|finally)\s*\(\s*)\(([^()\n]+)\)(\s*=>)/g,
-			(m, pre: string, params: string, arrow: string) =>
-				params.includes(":") ? `${{pre}}(${{cleanTsParamList(params)}})${{arrow}}` : m,
-		);
-		next = next.replace(
-			/\)\s*:\s*(?:void|string|number|boolean|any|unknown|Promise<[^>\n]+>)\s*(?=\{{|=>)/g,
-			") ",
-		);
-	}}
-	if (/\bas\s+/.test(next)) {{
-		for (let pass = 0; pass < 3; pass++) {{
-			const prevNext = next;
-			next = next.replace(
-				/(\)|\]|\}}|\b[A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+(?:any|unknown|string|number|boolean|object|const|never|Record<[^>\n;{{}}]+>|Array<[^>\n;{{}}]+>|[A-Z][A-Za-z0-9_]*(?:<[^>\n;{{}}]+>)?)(?:\[\])*(?=\s*(?:[;,)\]\r\n.?:&|]|\bas\b))/g,
-				"$1",
-			);
-			if (next === prevNext) break;
-		}}
-	}}
+	next = stripTsTypesInCodemode(next);
 	if (/\bsetTimeout\s*\(/.test(next) && !/\b(?:const|let|var|function)\s+setTimeout\b/.test(next)) {{
 		const optLine = next.match(/^([ \t]*\/\/[ \t]*@options:[^\r\n]*\r?\n)([\s\S]*)$/);
 		if (optLine) {{
@@ -1650,6 +2156,7 @@ export function sieveCodemodeContentBlocks(
 	sieveFn: (rawBody: string) => string | undefined,
 	isFastModel = false,
 	hardLimitOverride?: number,
+	contextTokens?: number,
 ): Array<{{ type?: string; text?: string; [k: string]: unknown }}> | undefined {{
 	if (!Array.isArray(content) || content.length === 0) return undefined;
 	const first = content[0];
@@ -1672,7 +2179,7 @@ export function sieveCodemodeContentBlocks(
 	if (
 		!combinedBody ||
 		combinedBody.includes("[sieve id=") ||
-		!shouldAutoSieveShellOutput(combinedBody, isFastModel, hardLimitOverride)
+		!shouldAutoSieveShellOutput(combinedBody, isFastModel, hardLimitOverride, contextTokens)
 	) {{
 		return undefined;
 	}}
@@ -1686,7 +2193,7 @@ export function sieveCodemodeContentBlocks(
 	}} else if (combinedBody.startsWith("Script error:\n")) {{
 		return undefined;
 	}}
-	if (!shouldAutoSieveShellOutput(sieveInput, isFastModel, hardLimitOverride)) {{
+	if (!shouldAutoSieveShellOutput(sieveInput, isFastModel, hardLimitOverride, contextTokens)) {{
 		return undefined;
 	}}
 	const digested = sieveFn(sieveInput);
@@ -1731,6 +2238,7 @@ export function sieveShellContentBlocks(
 	sieveFn: (rawBody: string) => string | undefined,
 	isFastModel = false,
 	hardLimitOverride?: number,
+	contextTokens?: number,
 ): Array<{{ type?: string; text?: string; [k: string]: unknown }}> | undefined {{
 	if (!Array.isArray(content) || content.length === 0) return undefined;
 	let changed = false;
@@ -1739,7 +2247,7 @@ export function sieveShellContentBlocks(
 			blk?.type === "text" &&
 			typeof blk.text === "string" &&
 			!blk.text.includes("[sieve id=") &&
-			shouldAutoSieveShellOutput(blk.text, isFastModel, hardLimitOverride)
+			shouldAutoSieveShellOutput(blk.text, isFastModel, hardLimitOverride, contextTokens)
 		) {{
 			const digested = sieveFn(blk.text);
 			if (digested && digested.length > 40 && digested.length < blk.text.length * 0.78) {{
@@ -1794,7 +2302,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 			outText,
 		)
 	) {{
-		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (read (res.output ?? "")), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined, or use (JSON.stringify(val) ?? "").slice(...)). Run await describeTool("<name>") to verify exact fields.`;
+		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (read (res.output ?? "")), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined, or use (JSON.stringify(val) ?? "").slice(...)). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
 	}}
 	if (/Unexpected end of JSON input/i.test(outText)) {{
 		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on non-JSON wrappers.`;
@@ -1934,11 +2442,16 @@ export function shouldAutoSieveShellOutput(
 	text: string,
 	isFastModel = false,
 	hardLimitOverride?: number,
+	contextTokens?: number,
 ): boolean {{
 	if (!text) return false;
 	let hardLimit = isFastModel ? 12000 : SIEVE_HARD_CHARS;
 	if (typeof hardLimitOverride === "number" && hardLimitOverride > 0) {{
 		hardLimit = hardLimitOverride;
+	}}
+	// Protect KV-cache tail (p05/p01) on small/medium post-rotation contexts (<45k tok)
+	if (typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 45000) {{
+		hardLimit = Math.min(hardLimit, 8500);
 	}}
 	if (text.length >= hardLimit) return true;
 	const lines = text.split("\n");
@@ -2916,8 +3429,9 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		return `${{cdPrefix}}rg -a --no-ignore -o${{noFile}} ${{multiGrep[3]}} ${{multiGrep[4].trim()}}${{multiGrep[5] || ""}}`;
 	}}
 
-	// Collect one or more `--include=*.ext` flags anywhere in the grep command
+	// Collect one or more `--include=*.ext` / `--include=<glob>` flags anywhere in the grep command
 	const exts: string[] = [];
+	const extraIncludes: string[] = [];
 	const globs: string[] = [];
 	const withoutIncludes = cleaned.replace(
 		/\s+--include=(?:'([^']+)'|"([^"]+)"|([^\s|&;]+))/g,
@@ -2925,28 +3439,38 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 			const glob = g1 || g2 || g3 || "";
 			const em = glob.match(/^\*\.([A-Za-z0-9]+)$/);
 			if (em) exts.push(em[1]);
+			else if (glob) extraIncludes.push(glob);
 			if (glob) globs.push(`-g '${{glob}}'`);
 			return "";
 		}},
 	);
 
-	// Trailing `-l` / `-c` or AppData / backtick-safe recursive grep -> fast bounded `rg`
+	// Trailing `-l` / `-c`, multi-target, AppData, arbitrary-pipe, or backtick-safe recursive grep -> fast bounded `rg`
 	const complexRec = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRnwiEHhlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRnwiEHhlcIFso]+\s+)+)(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|[^;&<>]+)+)?$/,
 	);
 	if (complexRec && /[rR]/.test(complexRec[2])) {{
 		const cdPrefix = complexRec[1] || "";
 		const rawFlags = complexRec[2];
-		const patRaw = complexRec[3] !== undefined ? `'${{complexRec[3]}}'` : complexRec[4] !== undefined ? `"${{complexRec[4]}}"` : complexRec[5];
+		const patRaw =
+			complexRec[3] !== undefined
+				? `'${{complexRec[3]}}'`
+				: complexRec[4] !== undefined
+					? `"${{complexRec[4]}}"`
+					: complexRec[5];
 		const restArgs = (complexRec[6] || "").trim();
 		const pipeSuffix = complexRec[7] || "";
 		const hasBacktickPat = complexRec[3]?.includes("`") || complexRec[4]?.includes("`");
 		const hasTrailingFlag = /(?:^|\s)-[lch](?:\s|$)/.test(restArgs);
 		const isAppData = /AppData[/\\]Roaming/i.test(restArgs);
 		const multiTarget = restArgs.split(/\s+/).filter(Boolean).length > 1;
-		if (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget) {{
+		const hasArbitraryPipe =
+			Boolean(pipeSuffix) &&
+			!/^(?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+$/.test(pipeSuffix);
+		if (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget || hasArbitraryPipe) {{
 			const rFlags = [
 				/[a]/.test(rawFlags) ? "-a" : "",
+				/[n]/.test(rawFlags) ? "-n --no-heading" : "",
 				/[l]/.test(rawFlags) ? "-l" : "",
 				/[c]/.test(rawFlags) ? "-c" : "",
 				/[o]/.test(rawFlags) ? "-o" : "",
@@ -2954,38 +3478,41 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 				/[w]/.test(rawFlags) ? "-w" : "",
 				/[i]/.test(rawFlags) ? "-i" : "",
 				/[F]/.test(rawFlags) ? "-F" : "",
-				isAppData ? "--max-depth 4" : "",
+				isAppData ? "--max-depth 4" : "--max-depth 8",
 				"-g '!node_modules'",
 				"-g '!target'",
 				...globs,
 			]
 				.filter(Boolean)
 				.join(" ");
-			return `${{cdPrefix}}rg ${{rFlags}} ${{patRaw}} ${{restArgs}}${{pipeSuffix}}`;
+			const tgtStr = restArgs || ".";
+			return `${{cdPrefix}}rg ${{rFlags}} ${{patRaw}} ${{tgtStr}}${{pipeSuffix}}`;
 		}}
 	}}
 
 	const m = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aArRnwiEHhlcIsFo]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"([^"]+)"|((?!-)[^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aArRnwiEHhlcIFso]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
 	);
 	if (!m) return undefined;
 	const flags = m[2].replace(/[\s-]+/g, "");
 	if (!/[rR]/.test(flags)) return undefined;
 	const cdPrefix = m[1] || "";
-	const rawPat = m[3] || m[4] || m[5] || "";
+	const rawPat = m[3] || (m[4] ? m[4].replace(/\\"/g, '"') : "") || m[5] || "";
 	if (!rawPat) return undefined;
 	const target = m[6] || m[7] || m[8] || ".";
 	const pipeSuffix = m[9] || "";
 	const extFlag = exts.length > 0 ? ` -e ${{[...new Set(exts)].join(",")}}` : "";
+	const incFlags = extraIncludes.map((inc) => ` --include "${{inc.replace(/"/g, '\\"')}}"`).join("");
 	const prefix = toolName === "powershell" ? "& " : "";
 	const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${{rawPat.replace(/"/g, '\\"')}}"`;
 	const extra = [
 		flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
 		flags.includes("o") ? " -o" : "",
 		flags.includes("i") ? " -i" : "",
+		flags.includes("F") ? " -F" : "",
 		flags.includes("h") ? " --no-filename" : "",
 	].join("");
-	return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}} ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
+	return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}}${{incFlags}} ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
 }}
 
 /**
@@ -3024,18 +3551,22 @@ export function shouldAutoSieveUnboundedRead(
 	input: unknown,
 	isFastModel = false,
 	hardLimitOverride?: number,
+	contextTokens?: number,
 ): boolean {{
 	if (!outText || outText.includes("[sieve id=")) return false;
 	const rec = input && typeof input === "object" ? (input as {{ offset?: unknown; limit?: unknown }}) : undefined;
 	if ((rec?.offset !== undefined && rec?.offset !== null) || (rec?.limit !== undefined && rec?.limit !== null)) {{
 		return outText.length >= 32_000 && outText.split("\n").some((l) => l.length > SIEVE_GIANT_LINE_CHARS);
 	}}
-	const thr =
+	let thr =
 		hardLimitOverride && hardLimitOverride > 0
 			? Math.max(hardLimitOverride, 12_000)
 			: isFastModel
 				? SIEVE_STRUCTURED_CHARS
 				: 24_000;
+	if (typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 45_000) {{
+		thr = Math.min(thr, 10_000);
+	}}
 	return outText.length >= thr;
 }}
 
@@ -3315,7 +3846,7 @@ export function healCmdForLoop(raw: string, toolName = "bash"): string | undefin
 }}
 
 const BARE_PS_CMDLET_PREFIX_RE =
-	/^(?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection)\b/;
+	/^(?:\(\s*)?(?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Item|Get-FileHash|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection|Test-Path|Resolve-Path)\b/;
 
 function normalizeUnquotedBashDrivePaths(raw: string): string {{
 	let out = "";
@@ -3343,16 +3874,27 @@ function normalizeUnquotedBashDrivePaths(raw: string): string {{
 		if (
 			/[A-Za-z]/.test(ch) &&
 			raw[i + 1] === ":" &&
-			raw[i + 2] === "\\" &&
+			(raw[i + 2] === "\\" || raw[i + 2] === "/") &&
 			(i === 0 || /[\s=;]/.test(raw[i - 1]))
 		) {{
-			let j = i + 2;
-			while (j < raw.length && !/[\s'"`;|&<>()]/.test(raw[j])) {{
-				j++;
+			const pfM = raw
+				.slice(i)
+				.match(/^([A-Za-z]:)[\\/](Program Files(?: \(x86\))?(?:[\\/][^\s'"`;|&<>()]*)?)/i);
+			if (pfM) {{
+				const normPf = `${{pfM[1]}}/${{pfM[2].replace(/\\/g, "/")}}`;
+				out += `"${{normPf}}"`;
+				i += pfM[0].length;
+				continue;
 			}}
-			out += `${{ch}}:${{raw.slice(i + 2, j).replace(/\\/g, "/")}}`;
-			i = j;
-			continue;
+			if (raw[i + 2] === "\\") {{
+				let j = i + 2;
+				while (j < raw.length && !/[\s'"`;|&<>()]/.test(raw[j])) {{
+					j++;
+				}}
+				out += `${{ch}}:${{raw.slice(i + 2, j).replace(/\\/g, "/")}}`;
+				i = j;
+				continue;
+			}}
 		}}
 		out += ch;
 		i++;
@@ -3685,35 +4227,61 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		}}
 	}}
 
-	// 1c. Rewrite MS-DOS `dir /b [flags] [path]` (incl. `/a-d`, `/o:n`, `/s`, `2>/dev/null`) in Git Bash -> bounded `ap ls`
-	const dirTail = cmdTailBody.replace(/\s+2>\s*\/dev\/null\s*$/i, "").trim();
-	if (toolName === "bash" && !/[|;&>]/.test(dirTail) && /\bdir\b/i.test(dirTail)) {{
-		const toks = dirTail.match(/"[^"]*"|'[^']*'|\S+/g) || [];
-		if (toks.length >= 2 && toks[0].toLowerCase() === "dir") {{
-			let hasBare = false;
-			let recursive = false;
-			let tgt: string | undefined = undefined;
-			let ok = true;
-			for (let i = 1; i < toks.length; i += 1) {{
-				const rawTok = toks[i];
-				const unq = rawTok.replace(/^(['"])(.*)\1$/, "$2");
-				const low = unq.toLowerCase();
-				if (low === "/b") {{
-					hasBare = true;
-				}} else if (low === "/s") {{
-					recursive = true;
-				}} else if (unq.startsWith("/") && unq.length >= 2) {{
-					continue;
-				}} else if (tgt === undefined && !/[*?,]/.test(unq)) {{
-					tgt = unq;
-				}} else {{
-					ok = false;
-					break;
+	// 1c. Rewrite MS-DOS `dir /b [flags] [path|glob] [2>/dev/null|2>&1] [| pipe]` in Git Bash -> bounded `ap ls` / `rg --files`
+	if (toolName === "bash" && /\bdir\b/i.test(cmdTailBody)) {{
+		const dStages = splitUnquotedPipes(cmdTailBody.trim());
+		if (dStages && dStages.length >= 1) {{
+			const dirTail = dStages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+			const pipeTail = dStages.length > 1 ? ` | ${{dStages.slice(1).join(" | ")}}` : "";
+			if (!/[;&><]/.test(dirTail)) {{
+				const toks = dirTail.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+				if (toks.length >= 2 && toks[0].toLowerCase() === "dir") {{
+					let hasBare = false;
+					let recursive = false;
+					const tgts: string[] = [];
+					let ok = true;
+					for (let i = 1; i < toks.length; i += 1) {{
+						const rawTok = toks[i];
+						const unq = rawTok.replace(/^(['"])(.*)\1$/, "$2");
+						const low = unq.toLowerCase();
+						if (low === "/b") {{
+							hasBare = true;
+						}} else if (low === "/s") {{
+							recursive = true;
+						}} else if (unq.startsWith("/") && unq.length >= 2) {{
+							continue;
+						}} else if (!/[?,]/.test(unq)) {{
+							tgts.push(unq);
+						}} else {{
+							ok = false;
+							break;
+						}}
+					}}
+					if (ok && hasBare) {{
+						const depthVal = recursive ? 3 : 1;
+						const depthFlag = recursive ? " --depth 3" : "";
+						if (tgts.length <= 1) {{
+							const rawT = tgts[0] || ".";
+							if (rawT.includes("*")) {{
+								const normT = rawT.replace(/\\/g, "/");
+								const slashIdx = normT.lastIndexOf("/");
+								const dirPart = slashIdx >= 0 ? normT.slice(0, slashIdx) || "." : ".";
+								const globPart = slashIdx >= 0 ? normT.slice(slashIdx + 1) : normT;
+								const extM = globPart.match(/^\*\.([A-Za-z0-9_]+)$/);
+								if (extM) {{
+									return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{dirPart.replace(/"/g, '\\"')}}"${{depthFlag}} --ext ${{extM[1]}}${{pipeTail}}`;
+								}}
+								return `${{cdLeadPfx}}rg --files --no-ignore --max-depth ${{depthVal}} -g '${{globPart.replace(/'/g, "")}}' "${{dirPart.replace(/"/g, '\\"')}}" 2>/dev/null${{pipeTail}}`;
+							}}
+							return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{rawT.replace(/"/g, '\\"')}}"${{depthFlag}}${{pipeTail}}`;
+						}} else if (tgts.every((t) => !t.includes("*"))) {{
+							const quotedDirs = tgts
+								.map((t) => `"${{t.replace(/\\/g, "/").replace(/"/g, '\\"')}}"`)
+								.join(" ");
+							return `${{cdLeadPfx}}rg --files --no-ignore --max-depth ${{depthVal}} ${{quotedDirs}} 2>/dev/null${{pipeTail}}`;
+						}}
+					}}
 				}}
-			}}
-			if (ok && hasBare) {{
-				const depthFlag = recursive ? " --depth 3" : "";
-				return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{tgt || "."}}"${{depthFlag}}`;
 			}}
 		}}
 	}}
@@ -3831,7 +4399,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		}}
 	}}
 
-	// 1e. Rewrite bounded POSIX `find [path] [-maxdepth N] [-type f|d] [-name "*.ext"] [2>/dev/null] [| head -n M]` -> bounded `ap ls`
+	// 1e. Rewrite bounded POSIX `find [path] [-maxdepth N] [-type f|d] [-name "<glob>"] [2>/dev/null] [| head -n M]` -> bounded `ap ls` / `rg --files`, and depth-bound any unbounded `find`
 	if (toolName === "bash" && /^\s*find(?:\s|$)/.test(cmdTailBody)) {{
 		let findCore = cmdTailBody.trim();
 		let findLimit = -1;
@@ -3858,6 +4426,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				let fFilesOnly = false;
 				let fDirsOnly = false;
 				let fExt = "";
+				let fGlob = "";
 				while (findOk && fIdx < fToks.length) {{
 					const flag = fToks[fIdx];
 					if (flag === "-maxdepth" && fIdx + 1 < fToks.length) {{
@@ -3874,13 +4443,17 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 						else if (t === "d") fDirsOnly = true;
 						else findOk = false;
 						fIdx += 2;
-					}} else if ((flag === "-name" || flag === "-iname") && fIdx + 1 < fToks.length && !fExt) {{
-						const em = fToks[fIdx + 1].match(/^\*\.([A-Za-z0-9_]+)$/);
-						if (!em) {{
+					}} else if ((flag === "-name" || flag === "-iname") && fIdx + 1 < fToks.length && !fExt && !fGlob) {{
+						const rawGlob = fToks[fIdx + 1];
+						const em = rawGlob.match(/^\*\.([A-Za-z0-9_]+)$/);
+						if (em) {{
+							fExt = em[1];
+						}} else if (rawGlob && !/[`$]/.test(rawGlob)) {{
+							fGlob = rawGlob;
+						}} else {{
 							findOk = false;
 							break;
 						}}
-						fExt = em[1];
 						fIdx += 2;
 					}} else {{
 						findOk = false;
@@ -3889,6 +4462,10 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				}}
 				if (findOk && !(fFilesOnly && fDirsOnly)) {{
 					const escTgt = fTarget.replace(/"/g, '\\"');
+					if (fGlob && !fDirsOnly) {{
+						const headTail = findLimit > 0 ? ` | head -n ${{findLimit}}` : "";
+						return `${{cdLeadPfx}}rg --files --no-ignore --max-depth ${{fDepth}} -g '${{fGlob.replace(/'/g, "")}}' "${{escTgt}}" 2>/dev/null${{headTail}}`;
+					}}
 					const typeFlag = fFilesOnly ? " --files-only" : fDirsOnly ? " --dirs-only" : "";
 					const extFlag = fExt ? ` --ext ${{fExt}}` : "";
 					const limFlag = findLimit > 0 ? ` --limit ${{findLimit}}` : "";
@@ -3896,20 +4473,35 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				}}
 			}}
 		}}
+		// Safety net: inject `-maxdepth 6` into unbounded `find` pipelines that could not be rewritten
+		const rawTrimmedFind = cmdTailBody.trim();
+		if (
+			!/\s-(?:maxdepth|prune|delete|exec|execdir|ok)\b/.test(rawTrimmedFind) &&
+			!/[;&><`]|&&|\|\|/.test(rawTrimmedFind.replace(/'[^']*'|"[^"]*"/g, ""))
+		) {{
+			const inj = rawTrimmedFind.replace(
+				/^(find(?:\s+(?:'[^']+'|"[^"]+"|[^\s-|;&><()!]+))*)(?=\s+(?:-|!|\())/,
+				"$1 -maxdepth 6",
+			);
+			if (inj !== rawTrimmedFind) {{
+				return `${{cdLeadPfx}}${{inj}}`;
+			}}
+		}}
 	}}
 
-	// Accelerate slow recursive `powershell -NoProfile -Command "Get-ChildItem -Path ... -Recurse -Filter '*.ext'"` -> bounded `rg --files`
-	if (toolName === "bash" && /\bGet-ChildItem\b/i.test(seg) && /-Recurse\b/i.test(seg) && /-Filter\b/i.test(seg)) {{
+	// Accelerate slow recursive PowerShell `Get-ChildItem ... -Recurse` (both PS-in-Bash and native PowerShell tool)
+	if (toolName === "bash" && /\b(?:Get-ChildItem|gci)\b/i.test(seg) && /-Recurse\b/i.test(seg)) {{
 		const psGci = seg.match(
 			/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+(['"])([\s\S]+?)\2(?:\s*2>&1)?\s*$/i,
 		);
 		if (psGci) {{
+			const qWrap = psGci[2];
 			const psBody = psGci[3]
 				.replace(/^\s*\[Console\]::OutputEncoding\s*=[^;]+;\s*/i, "")
 				.trim();
 			if (
 				!PS_MUTATING_CMDLET_RE.test(psBody) &&
-				!/\b(?:Where-Object|ForEach-Object|Format-Table|Sort-Object|-Include|-Exclude)\b/i.test(psBody)
+				!/\b(?:Where-Object|ForEach-Object|Format-Table|Sort-Object|-Include|-Exclude|-Directory)\b/i.test(psBody)
 			) {{
 				let gciPart = psBody;
 				let firstN = -1;
@@ -3920,24 +4512,45 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				}}
 				if (!gciPart.includes("|") && !gciPart.includes(";")) {{
 					const gm = gciPart.match(
-						/^(?:Get-ChildItem|gci)\s+[\s\S]*?-Path\s+([^;\n]+?)(?=\s+-(?:Recurse|Filter|ErrorAction|File|Directory)\b|$)/i,
+						/^(?:Get-ChildItem|gci)\s+[\s\S]*?-(?:Literal)?Path\s+([^;\n]+?)(?=\s+-(?:Recurse|Filter|ErrorAction|File|Directory|Depth)\b|$)/i,
 					);
+					const posM = !gm
+						? gciPart.match(
+								/^(?:Get-ChildItem|gci)\s+(?!-)(?:'([^']+)'|"([^"]+)"|([^\s;|]+))(?:\s|$)/i,
+							)
+						: null;
+					const pathExpr = gm ? gm[1] : posM ? posM[1] || posM[2] || posM[3] || "." : ".";
 					const fm = gciPart.match(/-Filter\s+(?:'([^']+)'|"([^"]+)"|([^\s;|]+))/i);
 					const glob = fm ? fm[1] || fm[2] || fm[3] || "" : "";
-					if (gm && glob && !/\$/.test(gm[1]) && !/\$/.test(glob)) {{
-						const rawPaths = gm[1]
+					if (!/\$/.test(pathExpr) && !/\$/.test(glob)) {{
+						const rawPaths = pathExpr
 							.split(",")
 							.map((p) => p.trim().replace(/^(['"])(.*)\1$/, "$2").replace(/\\/g, "/"))
 							.filter(Boolean);
 						if (rawPaths.length > 0 && rawPaths.every((p) => !/[*?`$;|<>]/.test(p))) {{
 							const quotedRoots = rawPaths.map((p) => `"${{p.replace(/"/g, '\\"')}}"`).join(" ");
+							const globFlag = glob ? ` -g '${{glob.replace(/'/g, "")}}'` : "";
 							const headPipe = firstN > 0 ? ` | head -n ${{firstN}}` : "";
-							return `${{psGci[1] || ""}}rg --files --no-ignore --max-depth 6 -g '${{glob.replace(/'/g, "")}}' ${{quotedRoots}} 2>/dev/null${{headPipe}}`;
+							return `${{psGci[1] || ""}}rg --files --no-ignore --max-depth 6${{globFlag}} ${{quotedRoots}} 2>/dev/null${{headPipe}}`;
 						}}
 					}}
 				}}
 			}}
+			if (!/-Depth\b/i.test(psBody) && !PS_MUTATING_CMDLET_RE.test(psBody)) {{
+				const bounded = seg.replace(/(-Recurse\b)/i, "$1 -Depth 5");
+				if (bounded !== seg && bounded.includes(qWrap)) return bounded;
+			}}
 		}}
+	}}
+	if (
+		toolName === "powershell" &&
+		/\b(?:Get-ChildItem|gci)\b/i.test(seg) &&
+		/-Recurse\b/i.test(seg) &&
+		!/-Depth\b/i.test(seg) &&
+		!PS_MUTATING_CMDLET_RE.test(seg)
+	) {{
+		const boundedPs = seg.replace(/(-Recurse\b)/i, "$1 -Depth 5");
+		if (boundedPs !== seg) return boundedPs;
 	}}
 
 	return undefined;
@@ -4079,17 +4692,19 @@ export function healCommand(
 			}}
 		}}
 		if (!cmd.includes("<<")) {{
-			if (/(?:^|[\s=;])[A-Za-z]:\\/.test(cmd)) {{
+			if (/(?:^|[\s=;])[A-Za-z]:\\|[A-Za-z]:[\\/]Program Files/i.test(cmd)) {{
 				const normDrv = normalizeUnquotedBashDrivePaths(cmd);
 				if (normDrv !== cmd) {{
 					cmd = normDrv;
 					changed = true;
 				}}
 			}}
-			const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
-			if (fixedBs !== cmd) {{
-				cmd = fixedBs;
-				changed = true;
+			if (!PY_INVOKE.test(cmd)) {{
+				const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
+				if (fixedBs !== cmd) {{
+					cmd = fixedBs;
+					changed = true;
+				}}
 			}}
 		}}
 	}}
@@ -4187,7 +4802,7 @@ export function healCommand(
 	// 6b. Wrap bare read-only PowerShell cmdlets accidentally sent to Git Bash (fixes syntax error near unexpected token)
 	if (toolName === "bash" && !/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd)) {{
 		const psBare = cmd.match(
-			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection)\b[\s\S]*)$/,
+			/^(\s*(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?)((?:\(\s*)?(?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Item|Get-FileHash|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection|Test-Path|Resolve-Path)\b[\s\S]*)$/,
 		);
 		if (psBare) {{
 			const body = psBare[2].trim().replace(/'/g, `'"'"'`);
@@ -6182,6 +6797,8 @@ export default function (pi: ExtensionAPI) {{
 		let mutated = false;
 
 		const isFast = isDeepCacheDiscountModel((ctx as {{ model?: {{ id?: string; api?: string }} }} | undefined)?.model);
+		const usageTokRaw = (ctx as {{ getContextUsage?: () => {{ tokens?: number | null }} }} | undefined)?.getContextUsage?.()?.tokens;
+		const effContextTokens = typeof usageTokRaw === "number" && usageTokRaw > 0 ? usageTokRaw : lastKnownPromptTokens;
 
 		// 0. Lossless multi-block auto-sieve for oversized `codemode` dumps (content[1..N]; preserves header, Script error & images)
 		if (event.toolName === "codemode") {{
@@ -6199,6 +6816,7 @@ export default function (pi: ExtensionAPI) {{
 				}},
 				isFast,
 				apProfileOverrides?.sieveHardChars,
+				effContextTokens,
 			);
 			if (sieved) {{
 				workingContent = sieved;
@@ -6292,7 +6910,7 @@ export default function (pi: ExtensionAPI) {{
 							}}
 						}}
 					}}
-				}} else if (shouldAutoSieveUnboundedRead(readText, event.input, isFast, apProfileOverrides?.sieveHardChars)) {{
+				}} else if (shouldAutoSieveUnboundedRead(readText, event.input, isFast, apProfileOverrides?.sieveHardChars, effContextTokens)) {{
 					const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-read"], {{
 						input: readText,
 						encoding: "utf8",
@@ -6468,7 +7086,8 @@ export default function (pi: ExtensionAPI) {{
 					}}
 				}}
 			}}
-			const skipSieve = isSieveSelf || (isBoundedApCmd && maxShellBlockLen < 24000 && !hasGiantShellLine);
+			const boundedApMax = effContextTokens > 0 && effContextTokens < 45000 ? 12000 : 24000;
+			const skipSieve = isSieveSelf || (isBoundedApCmd && maxShellBlockLen < boundedApMax && !hasGiantShellLine);
 			if (!skipSieve) {{
 				const sievedShell = sieveShellContentBlocks(
 					workingContent,
@@ -6484,6 +7103,7 @@ export default function (pi: ExtensionAPI) {{
 					}},
 					isFast,
 					apProfileOverrides?.sieveHardChars,
+					effContextTokens,
 				);
 				if (sievedShell) {{
 					workingContent = sievedShell;
