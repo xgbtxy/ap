@@ -23,7 +23,7 @@ enum PiSubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Idempotently apply all 15 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
+    /// Idempotently apply all 16 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
     Patch {
         #[arg(long)]
         pi_dir: Option<String>,
@@ -393,6 +393,26 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: "\tfunction caller(kind, name, spread) {\n\t\treturn (...args) =>\n\t\t\tnew Promise((resolve, reject) => {\n\t\t\t\tlet json;\n\t\t\t\ttry {\n\t\t\t\t\tjson = serialize(spread ? args : args[0]);",
                 alt_olds: &[],
                 new: "\tfunction caller(kind, name, spread) {\n\t\treturn (...args) =>\n\t\t\tnew Promise((resolve, reject) => {\n\t\t\t\tlet json;\n\t\t\t\ttry {\n\t\t\t\t\tlet _arg = spread ? args : args[0];\n\t\t\t\t\tif (kind === \"call\" && !spread && _arg && typeof _arg === \"object\" && !Array.isArray(_arg)) { const _clean = {}; for (const _k of Object.keys(_arg)) { if (_arg[_k] !== null) _clean[_k] = _arg[_k]; } _arg = _clean; }\n\t\t\t\t\tjson = serialize(_arg);",
+            },
+        ],
+    },
+    PatchSpec {
+        id: "codemode_global_log_helper",
+        summary: "Expose writable/configurable globalThis.log(...args) alias to console.log inside QuickJS codemode scripts to eliminate ReferenceError: log is not defined (template-literal-safe)",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_codemode_global_log",
+                rel_hint: None,
+                old: "\tObject.defineProperty(globalThis, \"console\", { value: console, enumerable: true });\n\tObject.defineProperty(globalThis, \"text\", { value: text, enumerable: true });",
+                alt_olds: &[],
+                new: "\tObject.defineProperty(globalThis, \"console\", { value: console, enumerable: true });\n\tObject.defineProperty(globalThis, \"log\", { value: (...args) => { console.log(...args); }, writable: true, enumerable: true, configurable: true });\n\tObject.defineProperty(globalThis, \"text\", { value: text, enumerable: true });",
+            },
+            PatchHunk {
+                id: "prelude_codemode_global_log",
+                rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
+                old: "\tObject.defineProperty(globalThis, \"console\", { value: console, enumerable: true });\n\tObject.defineProperty(globalThis, \"text\", { value: text, enumerable: true });",
+                alt_olds: &[],
+                new: "\tObject.defineProperty(globalThis, \"console\", { value: console, enumerable: true });\n\tObject.defineProperty(globalThis, \"log\", { value: (...args) => { console.log(...args); }, writable: true, enumerable: true, configurable: true });\n\tObject.defineProperty(globalThis, \"text\", { value: text, enumerable: true });",
             },
         ],
     },
@@ -963,22 +983,24 @@ mod tests {
         fs::write(
             chunks.join("codemode-worker.js"),
             format!(
-                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
+                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
                 CODEMODE_BUILTINS_OLD.replace('\n', "\r\n"),
                 CODEMODE_WRAPPER_OLD,
                 PATCH_SPECS[10].hunks[0].old.replace('\n', "\r\n"),
                 PATCH_SPECS[11].hunks[0].old.replace('\n', "\r\n"),
                 PATCH_SPECS[14].hunks[0].old.replace('\n', "\r\n"),
+                PATCH_SPECS[15].hunks[0].old.replace('\n', "\r\n"),
             ),
         )
         .unwrap();
         fs::write(
             prelude_dir.join("prelude-source.js"),
             format!(
-                "{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n",
                 PATCH_SPECS[10].hunks[1].old,
                 PATCH_SPECS[11].hunks[1].old,
                 PATCH_SPECS[14].hunks[1].old,
+                PATCH_SPECS[15].hunks[1].old,
             ),
         )
         .unwrap();
@@ -1009,7 +1031,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 15);
+        assert_eq!(applied["report"]["applied_count"], 16);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));
@@ -1061,6 +1083,19 @@ mod tests {
             .unwrap();
         assert_eq!(strip_spec.hunks.len(), 2);
         for h in strip_spec.hunks {
+            assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
+            assert!(
+                !h.new.contains("${"),
+                "unsafe template interpolation in {}",
+                h.id
+            );
+        }
+        let log_spec = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "codemode_global_log_helper")
+            .unwrap();
+        assert_eq!(log_spec.hunks.len(), 2);
+        for h in log_spec.hunks {
             assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
             assert!(
                 !h.new.contains("${"),

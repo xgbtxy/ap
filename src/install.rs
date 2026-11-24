@@ -1557,11 +1557,15 @@ export function healCodemodeSource(code: string): string | undefined {{
 			") ",
 		);
 	}}
-	if (/\bas\s+(?:any|unknown|string|number|boolean|object|const)\b/.test(next)) {{
-		next = next.replace(
-			/(\)|\]|\}}|\b[A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+(?:any|unknown|string|number|boolean|object|const)\b(?=\s*[;,)\]\r\n.?:&|])/g,
-			"$1",
-		);
+	if (/\bas\s+/.test(next)) {{
+		for (let pass = 0; pass < 3; pass++) {{
+			const prevNext = next;
+			next = next.replace(
+				/(\)|\]|\}}|\b[A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+(?:any|unknown|string|number|boolean|object|const|never|Record<[^>\n;{{}}]+>|Array<[^>\n;{{}}]+>|[A-Z][A-Za-z0-9_]*(?:<[^>\n;{{}}]+>)?)(?:\[\])*(?=\s*(?:[;,)\]\r\n.?:&|]|\bas\b))/g,
+				"$1",
+			);
+			if (next === prevNext) break;
+		}}
 	}}
 	if (/\bsetTimeout\s*\(/.test(next) && !/\b(?:const|let|var|function)\s+setTimeout\b/.test(next)) {{
 		const optLine = next.match(/^([ \t]*\/\/[ \t]*@options:[^\r\n]*\r?\n)([\s\S]*)$/);
@@ -2800,7 +2804,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 
 	// Fast-path A4: multi-file `grep -ohE <pat> <2+ targets>` -> `rg -a --no-ignore -o`
 	const multiGrep = cleaned.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+-([ohEia]+)\s+('[^']+'|"[^"]+"|\S+)\s+(\S+\s+\S+[\s\S]*?)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+-([ohEia]+)\s+('[^']+'|"[^"]+"|(?!-)\S+)\s+([^\s|;&]+\s+[^\s|;&]+(?:\s+[^\s|;&]+)*)(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?$/,
 	);
 	if (multiGrep && !/[rR]/.test(multiGrep[2]) && multiGrep[2].includes("o")) {{
 		const cdPrefix = multiGrep[1] || "";
@@ -2903,6 +2907,47 @@ export function classifyOversizedDocRead(filePath: string, byteLen: number): str
 }}
 
 /**
+ * Lossless auto-sieve trigger for unbounded giant `read` responses (offset/limit both unset).
+ * Windowed `read(offset, limit)` calls ALWAYS return false so exact edit lines are never altered.
+ */
+export function shouldAutoSieveUnboundedRead(
+	outText: string,
+	input: unknown,
+	isFastModel = false,
+	hardLimitOverride?: number,
+): boolean {{
+	if (!outText || outText.includes("[sieve id=")) return false;
+	const rec = input && typeof input === "object" ? (input as {{ offset?: unknown; limit?: unknown }}) : undefined;
+	if ((rec?.offset !== undefined && rec?.offset !== null) || (rec?.limit !== undefined && rec?.limit !== null)) {{
+		return false;
+	}}
+	const thr =
+		hardLimitOverride && hardLimitOverride > 0
+			? Math.max(hardLimitOverride, 12_000)
+			: isFastModel
+				? SIEVE_STRUCTURED_CHARS
+				: 24_000;
+	return outText.length >= thr;
+}}
+
+/**
+ * Strip explicit top-level `null` optional fields so strict tool schemas (e.g. read, mcp_*)
+ * never reject DeepSeek or other models sending `{{ offset: null, limit: null }}`.
+ */
+export function stripNullOptionalArgs(input: unknown): boolean {{
+	if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+	const rec = input as Record<string, unknown>;
+	let stripped = false;
+	for (const k of Object.keys(rec)) {{
+		if (rec[k] === null) {{
+			delete rec[k];
+			stripped = true;
+		}}
+	}}
+	return stripped;
+}}
+
+/**
  * Track consecutive read-only single bash probes and nudge toward batched `codemode` (`Promise.allSettled`).
  */
 export function trackReadOnlyBashStreak(
@@ -2926,10 +2971,16 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {{
 	if (!/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd) || /-EncodedCommand\b|-enc\b/i.test(cmd)) {{
 		return undefined;
 	}}
-	const hm = cmd.match(/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&"']*?\s-(?:Command|c)\s+)"/i);
-	if (hm && hm.index !== undefined) {{
-		const prefix = cmd.slice(0, hm.index) + hm[1];
-		const bodyStart = hm.index + hm[0].length;
+	const psHeadRe = /\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&"']*?\s-(?:Command|c)\s+)"/gi;
+	let out = "";
+	let cursor = 0;
+	let matchedAny = false;
+	while (true) {{
+		psHeadRe.lastIndex = cursor;
+		const hm = psHeadRe.exec(cmd);
+		if (!hm) break;
+		const prefixStart = hm.index;
+		const bodyStart = prefixStart + hm[0].length;
 		let bodyEnd = -1;
 		for (let i = bodyStart; i < cmd.length; i++) {{
 			const ch = cmd[i];
@@ -2942,31 +2993,34 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {{
 				break;
 			}}
 		}}
-		if (bodyEnd > bodyStart) {{
-			const inner = cmd.slice(bodyStart, bodyEnd);
-			const suffix = cmd.slice(bodyEnd + 1);
-			const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(inner);
-			const utf8Prefix = hasUtf8 ? "" : "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
-			const hasPsVar = /\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*|\?|\()/i.test(inner);
-			const hasPsBacktick = /(?<!\\)`/.test(inner);
-			if (!inner.includes("'") && !/\$\(/.test(inner) && (hasPsVar || hasPsBacktick)) {{
-				const sqInner = inner.replace(/\\"/g, '"').replace(/\\\$/g, "$").replace(/\\`/g, "`");
-				const out = `${{prefix}}'${{utf8Prefix}}${{sqInner}}'${{suffix}}`;
-				return out !== cmd ? out : undefined;
-			}}
-			if (hasPsVar || hasPsBacktick || !hasUtf8) {{
-				const innerEsc = inner
-					.replace(/(?<!\\)\$(?=[A-Za-z_?(])/g, "\\$")
-					.replace(/(?<!\\)`/g, "\\`");
-				const out = `${{prefix}}"${{utf8Prefix}}${{innerEsc}}"${{suffix}}`;
-				return out !== cmd ? out : undefined;
-			}}
-			return undefined;
+		if (bodyEnd <= bodyStart) break;
+		matchedAny = true;
+		out += cmd.slice(cursor, prefixStart) + hm[1];
+		const inner = cmd.slice(bodyStart, bodyEnd);
+		const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(inner);
+		const utf8Prefix = hasUtf8 ? "" : "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
+		const hasPsVar = /\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*|\?|\()/i.test(inner);
+		const hasPsBacktick = /(?<!\\)`/.test(inner);
+		if (!inner.includes("'") && !/\$\(/.test(inner) && (hasPsVar || hasPsBacktick)) {{
+			const sqInner = inner.replace(/\\"/g, '"').replace(/\\\$/g, "$").replace(/\\`/g, "`");
+			out += `'${{utf8Prefix}}${{sqInner}}'`;
+		}} else if (hasPsVar || hasPsBacktick || !hasUtf8) {{
+			const innerEsc = inner
+				.replace(/(?<!\\)\$(?=[A-Za-z_?(])/g, "\\$")
+				.replace(/(?<!\\)`/g, "\\`");
+			out += `"${{utf8Prefix}}${{innerEsc}}"`;
+		}} else {{
+			out += `"${{inner}}"`;
 		}}
+		cursor = bodyEnd + 1;
+	}}
+	if (matchedAny) {{
+		out += cmd.slice(cursor);
+		return out !== cmd ? out : undefined;
 	}}
 	if (!/OutputEncoding|UTF8Encoding/i.test(cmd)) {{
 		const psFixed = cmd.replace(
-			/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/i,
+			/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/gi,
 			"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
 		);
 		return psFixed !== cmd ? psFixed : undefined;
@@ -3152,6 +3206,148 @@ function normalizeUnquotedBashDrivePaths(raw: string): string {{
 	return out;
 }}
 
+function splitUnquotedPipes(s: string): string[] | undefined {{
+	const parts: string[] = [];
+	let cur = "";
+	let quote: string | null = null;
+	for (let i = 0; i < s.length; i++) {{
+		const ch = s[i];
+		if (quote) {{
+			cur += ch;
+			if (ch === quote) {{
+				quote = null;
+			}} else if (quote === '"' && ch === "\\" && i + 1 < s.length) {{
+				cur += s[i + 1];
+				i += 1;
+			}}
+			continue;
+		}}
+		if (ch === "'" || ch === '"') {{
+			quote = ch;
+			cur += ch;
+		}} else if (ch === "|") {{
+			if (s[i + 1] === "|") return undefined;
+			const t = cur.trim();
+			if (!t) return undefined;
+			parts.push(t);
+			cur = "";
+		}} else if (ch === "&" || (ch === "$" && s[i + 1] === "(")) {{
+			return undefined;
+		}} else {{
+			cur += ch;
+		}}
+	}}
+	if (quote !== null) return undefined;
+	const tail = cur.trim();
+	if (!tail) return undefined;
+	parts.push(tail);
+	return parts;
+}}
+
+function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
+	const stages = splitUnquotedPipes(cmdTailBody.trim());
+	if (!stages || stages.length < 2) return undefined;
+	const grepRaw = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
+	const stripQuotes = (s: string) => s.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
+	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(grepRaw))) return undefined;
+	if (!/^grep(?:\s|$)/.test(grepRaw)) return undefined;
+	const gToks = (grepRaw.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) => {{
+		if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {{
+			return t.slice(1, -1).replace(/\\"/g, '"');
+		}}
+		return t;
+	}});
+	if (gToks[0] !== "grep") return undefined;
+	let ignoreCase = false;
+	let fixed = false;
+	let filesOnly = false;
+	let countOnly = false;
+	let wordRe = false;
+	let onlyMatch = false;
+	let noFilename = false;
+	let endOpts = false;
+	const gPos: string[] = [];
+	for (let gi = 1; gi < gToks.length; gi += 1) {{
+		const gt = gToks[gi];
+		if (!endOpts && gt === "--") {{
+			endOpts = true;
+			continue;
+		}}
+		if (!endOpts && gt.startsWith("-") && gt.length > 1) {{
+			for (const ch of gt.slice(1)) {{
+				if (ch === "n" || ch === "E" || ch === "H" || ch === "s" || ch === "r" || ch === "R") continue;
+				else if (ch === "h") noFilename = true;
+				else if (ch === "i") ignoreCase = true;
+				else if (ch === "F") fixed = true;
+				else if (ch === "l") filesOnly = true;
+				else if (ch === "c") countOnly = true;
+				else if (ch === "w") wordRe = true;
+				else if (ch === "o") onlyMatch = true;
+				else return undefined;
+			}}
+			continue;
+		}}
+		gPos.push(gt);
+	}}
+	if (gPos.length !== 2 || !gPos[0] || !gPos[1] || gPos[1] === "-" || /[*?,]/.test(gPos[1])) {{
+		return undefined;
+	}}
+	let cutWidth = 0;
+	let maxHits = 0;
+	let unique = false;
+	let sawBareSort = false;
+	let sawUniqC = false;
+	for (let si = 1; si < stages.length; si += 1) {{
+		const norm = stages[si].replace(/\s+/g, " ").trim();
+		if (/[;&><{{}}`]|\$\(/.test(norm)) return undefined;
+		if (norm === "sort") {{
+			if (sawBareSort) return undefined;
+			sawBareSort = true;
+			continue;
+		}}
+		if (norm === "uniq -c" || norm === "uniq") {{
+			if (!sawBareSort) return undefined;
+			sawBareSort = false;
+			sawUniqC = true;
+			unique = true;
+			continue;
+		}}
+		if (sawBareSort) return undefined;
+		if (norm === "sort -u") {{
+			unique = true;
+		}} else if ((norm === "sort -rn" || norm === "sort -nr" || norm === "sort -r") && sawUniqC) {{
+			// `ap search --unique` already ranks descending by frequency
+		}} else {{
+			const cutM = norm.match(/^cut\s+-c\s*1-(\d+)$/);
+			const headM = norm.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
+			if (cutM) {{
+				const w = Number(cutM[1]);
+				if (w < 1) return undefined;
+				cutWidth = cutWidth > 0 ? Math.min(cutWidth, w) : w;
+			}} else if (headM) {{
+				const m = Number(headM[1] || headM[2]);
+				if (m < 1) return undefined;
+				maxHits = maxHits > 0 ? Math.min(maxHits, m) : m;
+			}} else {{
+				return undefined;
+			}}
+		}}
+	}}
+	if (sawBareSort || (cutWidth === 0 && maxHits === 0 && !unique)) return undefined;
+	const flags = [
+		cutWidth > 0 ? ` --width ${{cutWidth}}` : "",
+		maxHits > 0 ? ` --max ${{maxHits}}` : "",
+		unique ? " --unique" : "",
+		filesOnly ? " --files-only" : countOnly ? " --count" : "",
+		onlyMatch ? " -o" : "",
+		noFilename ? " --no-filename" : "",
+		ignoreCase ? " -i" : "",
+		fixed ? " --fixed-strings" : "",
+		wordRe ? " -w" : "",
+	].join("");
+	return `${{cdLeadPfx}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(gPos[0])}} "${{gPos[1].replace(/"/g, '\\"')}}"`;
+}}
+
 function accelerateSingleBashSegment(seg: string, toolName: string): string | undefined {{
 	const fastGrep = rewriteSlowRecursiveGrep(seg, toolName);
 	if (fastGrep) return fastGrep;
@@ -3223,33 +3419,16 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 	}}
 
 	// 1d. Rewrite bare `sed -n '<A>,<B>p'`, `head -n <N>`, `tail -n <N>`, `cat <file> | head|tail|sed`,
-	// or single-file `grep ... | cut -c1-<W> [| head -n <M>]` (with optional trailing `| cut -c1-<W>`) -> bounded `ap read` / `ap search`
-	if (toolName === "bash" && !/[;&><{{}}`]|\$\(/.test(cmdTailBody)) {{
+	// or unified `grep ... | cut/sort/uniq/head` pipelines -> bounded `ap read` / `ap search`
+	if (toolName === "bash") {{
 		const trimmedTail = cmdTailBody.trim();
 		const qPathOk = (f: string) => Boolean(f) && f !== "-" && !/[*?,]/.test(f);
-		let headCap = 0;
-		const headCapM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$/);
-		let cutWidth = 0;
-		let baseTail = trimmedTail;
-		if (headCapM) {{
-			const m = Number(headCapM[2] || headCapM[3]);
-			const cutBeforeHead = headCapM[1].trim().match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
-			if (m >= 1 && cutBeforeHead && Number(cutBeforeHead[2]) >= 1) {{
-				headCap = m;
-				cutWidth = Number(cutBeforeHead[2]);
-				baseTail = cutBeforeHead[1].trim();
-			}}
-		}} else {{
-			const cutTailM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
-			if (cutTailM && Number(cutTailM[2]) >= 1) {{
-				cutWidth = Number(cutTailM[2]);
-				baseTail = cutTailM[1].trim();
-			}}
-		}}
-		const widthFlag = cutWidth > 0 ? ` --width ${{cutWidth}}` : "";
-		const baseHasPipe = baseTail.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "").includes("|");
-		if (!baseHasPipe && headCap === 0) {{
-			const sedM = baseTail.match(
+		const cutOnlyM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
+		const sliceCore = cutOnlyM ? cutOnlyM[1].trim() : trimmedTail;
+		const sliceWidth = cutOnlyM && Number(cutOnlyM[2]) >= 1 ? Number(cutOnlyM[2]) : 0;
+		const sliceWidthFlag = sliceWidth > 0 ? ` --width ${{sliceWidth}}` : "";
+		if (!/[|;&><{{}}`]|\$\(/.test(sliceCore)) {{
+			const sedM = sliceCore.match(
 				/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
 			);
 			if (sedM) {{
@@ -3257,71 +3436,29 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				const e = Number(sedM[2] || sedM[4] || sedM[6]);
 				const f = sedM[7] || sedM[8] || sedM[9] || "";
 				if (s >= 1 && e >= s && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}${{widthFlag}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
 				}}
 			}}
-			const headM = baseTail.match(/^head\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			const headM = sliceCore.match(/^head\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
 			if (headM) {{
 				const n = Number(headM[1] || headM[2]);
 				const f = headM[3] || headM[4] || headM[5] || "";
 				if (n >= 1 && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{widthFlag}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{sliceWidthFlag}}`;
 				}}
 			}}
-			const tailM = baseTail.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			const tailM = sliceCore.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
 			if (tailM) {{
 				const n = Number(tailM[1] || tailM[2]);
 				const f = tailM[3] || tailM[4] || tailM[5] || "";
 				if (n >= 1 && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}${{widthFlag}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}${{sliceWidthFlag}}`;
 				}}
 			}}
 		}}
-		if (cutWidth > 0 && !baseHasPipe && /^grep(?:\s|$)/.test(baseTail)) {{
-			const gToks = (baseTail.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) => {{
-				if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {{
-					return t.slice(1, -1).replace(/\\"/g, '"');
-				}}
-				return t;
-			}});
-			if (gToks[0] === "grep") {{
-				let ignoreCase = false;
-				let fixed = false;
-				let wordRe = false;
-				let onlyMatch = false;
-				let endOpts = false;
-				let gOk = true;
-				const gPos: string[] = [];
-				for (let gi = 1; gi < gToks.length; gi += 1) {{
-					const gt = gToks[gi];
-					if (!endOpts && gt === "--") {{
-						endOpts = true;
-						continue;
-					}}
-					if (!endOpts && gt.startsWith("-") && gt.length > 1) {{
-						for (const ch of gt.slice(1)) {{
-							if (ch === "n" || ch === "E" || ch === "H" || ch === "h" || ch === "s") continue;
-							else if (ch === "i") ignoreCase = true;
-							else if (ch === "F") fixed = true;
-							else if (ch === "w") wordRe = true;
-							else if (ch === "o") onlyMatch = true;
-							else {{
-								gOk = false;
-								break;
-							}}
-						}}
-						if (!gOk) break;
-						continue;
-					}}
-					gPos.push(gt);
-				}}
-				if (gOk && gPos.length === 2 && gPos[0] && qPathOk(gPos[1])) {{
-					const maxFlag = headCap > 0 ? ` --max ${{headCap}}` : "";
-					const fFlags = `${{onlyMatch ? " -o" : ""}}${{ignoreCase ? " -i" : ""}}${{fixed ? " --fixed-strings" : ""}}${{wordRe ? " -w" : ""}}`;
-					return `${{cdLeadPfx}}"${{AP_BIN}}" search${{widthFlag}}${{maxFlag}}${{fFlags}} ${{shellQuoteBashPat(gPos[0])}} "${{gPos[1].replace(/"/g, '\\"')}}"`;
-				}}
-			}}
-		}} else if (cutWidth === 0 && headCap === 0 && trimmedTail.includes("|")) {{
+		const grepPipeOut = accelerateGrepPipeline(trimmedTail, cdLeadPfx);
+		if (grepPipeOut) return grepPipeOut;
+		if (!/[;&><{{}}`]|\$\(/.test(trimmedTail) && trimmedTail.includes("|")) {{
 			const parts = trimmedTail.split("|");
 			if (parts.length === 2) {{
 				const catM = parts[0].trim().match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
@@ -3541,6 +3678,18 @@ export function healCommand(
 	}}
 	const isDestructive = DESTRUCTIVE_OR_WRITE.test(cmd);
 	if (isDestructive) {{
+		if (toolName === "bash") {{
+			const psDestr = healBashPowerShellCommand(cmd);
+			if (psDestr) {{
+				cmd = psDestr;
+				changed = true;
+			}}
+			const msysDestr = process.platform === "win32" ? healMsysPathConv(cmd, toolName) : undefined;
+			if (msysDestr) {{
+				cmd = msysDestr;
+				changed = true;
+			}}
+		}}
 		return changed ? cmd : undefined;
 	}}
 
@@ -5447,6 +5596,9 @@ export default function (pi: ExtensionAPI) {{
 	}});
 
 	pi.on("tool_call", (event, ctx) => {{
+		if (event.input && typeof event.input === "object") {{
+			stripNullOptionalArgs(event.input);
+		}}
 		if (process.platform === "win32" && event.input && typeof event.input === "object") {{
 			const piInp = event.input as {{ path?: unknown; file_path?: unknown }};
 			const normP = typeof piInp.path === "string" ? normalizeWindowsToolPath(piInp.path) : undefined;
@@ -5723,6 +5875,20 @@ export default function (pi: ExtensionAPI) {{
 								// ignore unreadable/binary files
 							}}
 						}}
+					}}
+				}} else if (shouldAutoSieveUnboundedRead(outText, event.input, isFast, apProfileOverrides?.sieveHardChars)) {{
+					const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-read"], {{
+						input: outText,
+						encoding: "utf8",
+						timeout: 4000,
+						windowsHide: true,
+						env: {{ ...process.env, SIEVE_HOME }},
+					}});
+					if (res.status === 0 && res.stdout && res.stdout.length > 40 && res.stdout.length < outText.length * 0.78) {{
+						outText = `${{res.stdout.trimEnd()}}\n[ap read-sieve] Unbounded full-file read archived losslessly; use read(offset, limit) for exact edit lines or ap sieve peek/search.`;
+						sievedCount += 1;
+						textMutated = true;
+						mutated = true;
 					}}
 				}} else if (!largeReadTipShown && outText.length >= LARGE_CODE_READ_CHARS && CODE_FILE_EXT.test(p)) {{
 					outText += `\n[ap read-tip] Large code file loaded; use ap_read(outline=true) or ap_read(symbol="...") for AST-exact slices (~85% fewer tokens).`;

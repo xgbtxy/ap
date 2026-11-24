@@ -3817,10 +3817,13 @@ fn handle_rpc_request(req: &Value, profile: McpProfile) -> Option<Value> {
                 .pointer("/params/name")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let targs = req
+            let mut targs = req
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            if let Value::Object(ref mut map) = targs {
+                map.retain(|_, v| !v.is_null());
+            }
             let (ok, text) = dispatch_tool_call(tname, &targs);
             let mut result = json!({
                 "content": [{ "type": "text", "text": text }],

@@ -827,32 +827,118 @@ pub fn try_accelerate_tail_slice(raw: &str) -> Option<String> {
     ))
 }
 
-/// Rewrite bounded `grep [flags] <pattern> <file_or_dir> [2>/dev/null] | cut -c1-<W> [| head -n <M>]`
-/// cleanly to `ap search [--width <W>] [--max <M>] ... "<pattern>" "<target>"`.
-pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
-    let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    static HEAD_PIPE_RE: OnceLock<Regex> = OnceLock::new();
-    let head_re = HEAD_PIPE_RE.get_or_init(|| {
-        Regex::new(r#"^([\s\S]+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$"#).unwrap()
-    });
-    let (before_head, max_hits) = if let Some(cap) = head_re.captures(body.trim()) {
-        let m: usize = cap.get(2).or_else(|| cap.get(3))?.as_str().parse().ok()?;
-        if m == 0 {
-            return None;
+fn split_unquoted_pipes(s: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                } else if q == '"' && c == '\\' && i + 1 < chars.len() {
+                    cur.push(chars[i + 1]);
+                    i += 1;
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    cur.push(c);
+                } else if c == '|' {
+                    if i + 1 < chars.len() && chars[i + 1] == '|' {
+                        return None;
+                    }
+                    let t = cur.trim();
+                    if t.is_empty() {
+                        return None;
+                    }
+                    parts.push(t.to_string());
+                    cur.clear();
+                } else if c == '&' || (c == '$' && i + 1 < chars.len() && chars[i + 1] == '(') {
+                    return None;
+                } else {
+                    cur.push(c);
+                }
+            }
         }
-        (cap.get(1)?.as_str().trim(), Some(m))
-    } else {
-        (body.trim(), None)
-    };
-    let (grep_raw, cut_w) = strip_trailing_cut_width(before_head);
-    let width = cut_w?;
-    let grep_clean = grep_raw
+        i += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let tail = cur.trim();
+    if tail.is_empty() {
+        return None;
+    }
+    parts.push(tail.to_string());
+    Some(parts)
+}
+
+/// Rewrite bounded `grep [flags] <pattern> <file_or_dir> [2>/dev/null] | ...` pipelines cleanly
+/// to native `ap search` across ANY valid combination/order of `| cut -c1-<W>`, `| sort -u`,
+/// `| sort | uniq -c [| sort -rn|-nr]`, and `| head -n <M>`.
+pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    let stages = split_unquoted_pipes(body.trim())?;
+    if stages.len() < 2 {
+        return None;
+    }
+    let grep_clean = stages[0]
         .trim()
         .strip_suffix("2>/dev/null")
-        .unwrap_or(grep_raw)
+        .or_else(|| stages[0].trim().strip_suffix("2>nul"))
+        .unwrap_or(stages[0].as_str())
         .trim();
-    if has_unsafe_shell_meta(grep_clean) {
+    // Ensure no unquoted unsafe shell chars survived on the grep stage
+    if has_unsafe_shell_meta(
+        &split_shell_tokens(grep_clean)?
+            .into_iter()
+            .filter(|t| {
+                !t.chars()
+                    .any(|c| matches!(c, '|' | ';' | '>' | '<' | '{' | '}' | '`'))
+                    && !t.contains("$(")
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    ) {
         return None;
+    }
+    if grep_clean.contains(';') || grep_clean.contains('>') || grep_clean.contains('<') {
+        // Still allow `>` only inside quotes (checked below via stage tokens)
+        let mut q: Option<char> = None;
+        let mut esc = false;
+        for c in grep_clean.chars() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match q {
+                Some('"') => {
+                    if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        q = None;
+                    }
+                }
+                Some(qc) => {
+                    if c == qc {
+                        q = None;
+                    }
+                }
+                None => {
+                    if c == '\'' || c == '"' {
+                        q = Some(c);
+                    } else if matches!(c, ';' | '>' | '<' | '{' | '}' | '`') {
+                        return None;
+                    }
+                }
+            }
+        }
     }
     let toks = split_shell_tokens(grep_clean)?;
     if toks.first()?.as_str() != "grep" {
@@ -863,6 +949,7 @@ pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
     let mut files_only = false;
     let mut count_only = false;
     let mut only_matching = false;
+    let mut no_filename = false;
     let mut word_regex = false;
     let mut end_opts = false;
     let mut positional: Vec<String> = Vec::new();
@@ -874,10 +961,10 @@ pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
         if !end_opts && tok.starts_with('-') && tok.len() > 1 {
             for ch in tok.chars().skip(1) {
                 match ch {
-                    'n' | 'H' | 'h' | 's' | 'r' | 'R' => {}
+                    'n' | 'H' | 's' | 'r' | 'R' | 'E' => {}
+                    'h' => no_filename = true,
                     'i' => ignore_case = true,
                     'F' => fixed = true,
-                    'E' => {}
                     'l' => files_only = true,
                     'c' => count_only = true,
                     'o' => only_matching = true,
@@ -903,10 +990,73 @@ pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
     {
         return None;
     }
+
+    static CUT_STAGE_RE: OnceLock<Regex> = OnceLock::new();
+    static HEAD_STAGE_RE: OnceLock<Regex> = OnceLock::new();
+    let cut_re = CUT_STAGE_RE.get_or_init(|| Regex::new(r#"^cut\s+-c\s*1-(\d+)$"#).unwrap());
+    let head_re =
+        HEAD_STAGE_RE.get_or_init(|| Regex::new(r#"^head\s+(?:-n\s*(\d+)|-(\d+))$"#).unwrap());
+
+    let mut width: Option<usize> = None;
+    let mut max_hits: Option<usize> = None;
+    let mut unique = false;
+    let mut saw_bare_sort = false;
+    let mut saw_uniq_c = false;
+
+    for st in stages.iter().skip(1) {
+        let norm = st.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm == "sort" {
+            if saw_bare_sort {
+                return None;
+            }
+            saw_bare_sort = true;
+            continue;
+        }
+        if norm == "uniq -c" || norm == "uniq" {
+            if !saw_bare_sort {
+                return None;
+            }
+            saw_bare_sort = false;
+            saw_uniq_c = true;
+            unique = true;
+            continue;
+        }
+        if saw_bare_sort {
+            return None;
+        }
+        if norm == "sort -u" {
+            unique = true;
+        } else if (norm == "sort -rn" || norm == "sort -nr" || norm == "sort -r") && saw_uniq_c {
+            // `ap search --unique` already sorts by descending frequency
+        } else if let Some(cap) = cut_re.captures(&norm) {
+            let w: usize = cap[1].parse().ok()?;
+            if w == 0 {
+                return None;
+            }
+            width = Some(width.map_or(w, |prev| prev.min(w)));
+        } else {
+            let cap = head_re.captures(&norm)?;
+            let m: usize = cap.get(1).or_else(|| cap.get(2))?.as_str().parse().ok()?;
+            if m == 0 {
+                return None;
+            }
+            max_hits = Some(max_hits.map_or(m, |prev| prev.min(m)));
+        }
+    }
+    if saw_bare_sort || (width.is_none() && max_hits.is_none() && !unique) {
+        return None;
+    }
+
     let ap_bin = current_ap_bin();
-    let mut flags = format!(" --width {width}");
+    let mut flags = String::new();
+    if let Some(w) = width {
+        flags.push_str(&format!(" --width {w}"));
+    }
     if let Some(m) = max_hits {
         flags.push_str(&format!(" --max {m}"));
+    }
+    if unique {
+        flags.push_str(" --unique");
     }
     if files_only {
         flags.push_str(" --files-only");
@@ -915,6 +1065,9 @@ pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
     }
     if only_matching {
         flags.push_str(" -o");
+    }
+    if no_filename {
+        flags.push_str(" --no-filename");
     }
     if ignore_case {
         flags.push_str(" -i");
@@ -931,6 +1084,12 @@ pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
         "{}\"{ap_bin}\" search{flags} \"{pat_esc}\" \"{tgt_esc}\"",
         cd_pfx.as_deref().unwrap_or("")
     ))
+}
+
+/// Rewrite bounded `grep [flags] <pattern> <file_or_dir> [2>/dev/null] | cut -c1-<W> [| head -n <M>]`
+/// cleanly to `ap search [--width <W>] [--max <M>] ... "<pattern>" "<target>"`.
+pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
+    try_accelerate_grep_pipeline(raw)
 }
 
 /// Rewrite single-file `cat <file> | head -n <N>`, `cat <file> | tail -n <N>`, or `cat <file> | sed -n '<A>,<B>p'`
@@ -1558,9 +1717,13 @@ pub fn heal_windows_command(
         let (kind, cmd_out) = route_accelerated_cmd(fast_find, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
-    if let Some(fast_grep_cut) = try_accelerate_grep_cut_slice(raw) {
-        heals.push("grep-cut->ap-search");
-        let (kind, cmd_out) = route_accelerated_cmd(fast_grep_cut, has_pwsh7, has_git_bash);
+    if let Some(fast_grep_pipe) = try_accelerate_grep_pipeline(raw) {
+        if fast_grep_pipe.contains(" --width ") {
+            heals.push("grep-cut->ap-search");
+        } else {
+            heals.push("grep-pipe->ap-search");
+        }
+        let (kind, cmd_out) = route_accelerated_cmd(fast_grep_pipe, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -2563,5 +2726,48 @@ mod tests {
             "{h40}"
         );
         assert!(tags40.contains(&"grep-cut->ap-search"));
+
+        // Unified grep pipeline acceleration & negative controls
+        let (_, h41, tags41) = heal_windows_command(
+            "grep -o -E 'token=[a-z0-9]+' app.js | head -n 20",
+            true,
+            true,
+        );
+        assert!(
+            h41.contains("search --max 20 -o \"token=[a-z0-9]+\" \"app.js\""),
+            "{h41}"
+        );
+        assert!(tags41.contains(&"grep-pipe->ap-search"));
+
+        let (_, h42, _) =
+            heal_windows_command("grep -n 'auth' app.js | head -20 | cut -c1-140", true, true);
+        assert!(
+            h42.contains("search --width 140 --max 20 \"auth\" \"app.js\""),
+            "{h42}"
+        );
+
+        let (_, h43, _) = heal_windows_command(
+            "grep -oE 'https?://[^ ]+' app.js | sort -u | head -30",
+            true,
+            true,
+        );
+        assert!(
+            h43.contains("search --max 30 --unique -o \"https?://[^ ]+\" \"app.js\""),
+            "{h43}"
+        );
+
+        let (_, h44, _) = heal_windows_command(
+            "grep -oh 'err_[a-z]+' app.log | sort | uniq -c | sort -rn | head -15",
+            true,
+            true,
+        );
+        assert!(
+            h44.contains("search --max 15 --unique -o --no-filename \"err_[a-z]+\" \"app.log\""),
+            "{h44}"
+        );
+
+        assert!(try_accelerate_grep_pipeline("grep -n 'foo' app.js | sort").is_none());
+        assert!(try_accelerate_grep_pipeline("grep -v 'foo' app.js | head -10").is_none());
+        assert!(try_accelerate_grep_pipeline("grep -n 'foo' *.js | head -10").is_none());
     }
 }

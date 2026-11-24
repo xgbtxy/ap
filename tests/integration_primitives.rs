@@ -6393,7 +6393,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 15);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 16);
     }
 }
 
@@ -7157,7 +7157,7 @@ fn test_v244_pi_patch13_quote_safe_grep_ps_backtick_and_loop_sleep() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 15);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 16);
     }
 }
 
@@ -7216,7 +7216,7 @@ fn test_v245_windows_win_probe_msys_shield_tmp_path_and_pi_patch14() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 15);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 16);
     }
 
     // 3. Verify `ap mcp` discovers `ap_win` across 37 specialist tools
@@ -9791,6 +9791,162 @@ assert.ok(Array.isArray(sievedFast) && sievedFast.length === 2 && String(sievedF
         assert!(
             run.status.success(),
             "Node v2.60 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_v261_grep_pipeline_null_arg_strip_ps_multiblock_unbounded_read_sieve_and_pi_patch16() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Universal top-level `null` optional-arg stripping in `ap mcp` (`ap_read` & `ap_search`)
+    let sample = root.join("sample.js");
+    fs::write(
+        &sample,
+        "const tok_alpha = \"tok=12345\";\nconst second_line = \"ok\";\n",
+    )
+    .unwrap();
+    let mcp_req = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_read",
+                "arguments": { "target": sample.to_str().unwrap(), "lines": null, "width": null }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_search",
+                "arguments": { "pattern": "tok_alpha", "path": sample.to_str().unwrap(), "width": null, "max": null }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mcp_stdout = String::from_utf8_lossy(&mcp_out.stdout);
+    let mut seen_ids = 0usize;
+    for ln in mcp_stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let v: Value = serde_json::from_str(ln).unwrap();
+        assert_eq!(
+            v["result"]["isError"],
+            Value::Bool(false),
+            "MCP call with null optionals should succeed: {v}"
+        );
+        seen_ids += 1;
+    }
+    assert_eq!(seen_ids, 2, "{mcp_stdout}");
+
+    // 2. Init Pi accelerator + live Node.js verification of v2.61 helpers
+    let home = root.join("home_v261");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const {
+  stripNullOptionalArgs,
+  healCodemodeSource,
+  healBashPowerShellCommand,
+  healCommand,
+  shouldAutoSieveUnboundedRead,
+} = mod;
+
+// 2a. Null arg strip
+const args = { path: "a.md", offset: null, limit: null, extra: 0 };
+assert.equal(stripNullOptionalArgs(args), true);
+assert.equal("offset" in args, false);
+assert.equal("limit" in args, false);
+assert.equal(args.extra, 0);
+assert.equal(stripNullOptionalArgs(args), false);
+
+// 2b. Expanded TS `as` cast stripping
+const healedCm = healCodemodeSource("const x = (res as unknown as Record<string, any>).ok;");
+assert.ok(healedCm && !healedCm.includes(" as ") && healedCm.includes("(res).ok"), healedCm);
+
+// 2c. Multi-block & destructive PowerShell shield while preserving non-PS destructive pass-through
+const twoPs = 'powershell -NoProfile -Command "Write-Host $a"; powershell -NoProfile -Command "Write-Host $b"';
+const healedTwoPs = healBashPowerShellCommand(twoPs);
+assert.ok(healedTwoPs && (healedTwoPs.match(/OutputEncoding/g) || []).length === 2, healedTwoPs);
+
+const destrPs = healCommand('powershell -NoProfile -Command "$p=Get-ChildItem .; Remove-Item $p"', "bash");
+assert.ok(destrPs && destrPs.includes("OutputEncoding") && (destrPs.includes(" $p=") || destrPs.includes("\\$p")), destrPs);
+assert.equal(healCommand("rm -rf build && grep -rn foo .", "bash"), undefined);
+
+// 2d. Unified grep pipeline accelerators + negative control
+const g1 = healCommand("grep -o -E 'tok=[0-9]+' app.js | head -n 20", "bash");
+assert.ok(g1 && g1.includes('search --max 20 -o \'tok=[0-9]+\' "app.js"'), g1);
+
+const g2 = healCommand("grep -n 'auth' app.js | head -20 | cut -c1-140", "bash");
+assert.ok(g2 && g2.includes('search --width 140 --max 20 \'auth\' "app.js"'), g2);
+
+const g3 = healCommand("grep -oE 'https?://[^ ]+' app.js | sort -u | head -30", "bash");
+assert.ok(g3 && g3.includes('search --max 30 --unique -o \'https?://[^ ]+\' "app.js"'), g3);
+
+const g4 = healCommand("grep -oh 'err_[a-z]+' app.log | sort | uniq -c | sort -rn | head -15", "bash");
+assert.ok(g4 && g4.includes('search --max 15 --unique -o --no-filename \'err_[a-z]+\' "app.log"'), g4);
+
+assert.equal(healCommand("grep -n 'foo' app.js | sort", "bash"), undefined);
+
+// 2e. Unbounded read auto-sieve (threshold parity + windowed exemption)
+const txt15k = "L".repeat(15000);
+const txt30k = "L".repeat(30000);
+assert.equal(shouldAutoSieveUnboundedRead(txt15k, { path: "a.md" }, true), true);
+assert.equal(shouldAutoSieveUnboundedRead(txt15k, { path: "a.md" }, false), false);
+assert.equal(shouldAutoSieveUnboundedRead(txt30k, { path: "a.md", offset: 1, limit: 200 }, true), false);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.61 accelerator check failed:\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
