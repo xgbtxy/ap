@@ -2845,20 +2845,22 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 
 	// Fast-path A: slow minified-JS context regex `grep -oE '.{{0,N}}PAT.{{0,M}}' file [| head ...]` -> `<25ms` `ap search --around`
 	const aroundMatch = cleaned.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+(?:-[oEP]+\s+)+['"]\.\\?\{{0,(\d+)\\?\}}([^'"]+?)(\.\\?\{{0,(\d+)\\?\}})?['"]\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aAoEPirRhHn]+\s+)+)['"]\.\\?\{{0,(\d+)\\?\}}([^'"]+?)(\.\\?\{{0,(\d+)\\?\}})?['"]\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
 	);
-	if (aroundMatch) {{
+	if (aroundMatch && aroundMatch[2].includes("o")) {{
 		const cdPrefix = aroundMatch[1] || "";
-		const leftN = Math.min(800, Math.max(40, Number(aroundMatch[2]) || 160));
-		const rightN = Math.min(800, Math.max(40, Number(aroundMatch[5]) || leftN));
+		const rawFlags = aroundMatch[2] || "";
+		const leftN = Math.min(800, Math.max(40, Number(aroundMatch[3]) || 160));
+		const rightN = Math.min(800, Math.max(40, Number(aroundMatch[6]) || leftN));
 		const around = Math.max(leftN, rightN);
-		const rawPat = aroundMatch[3] || "";
-		const target = aroundMatch[6] || aroundMatch[7] || aroundMatch[8] || ".";
-		const pipeSuffix = aroundMatch[9] || "";
+		const rawPat = aroundMatch[4] || "";
+		const target = aroundMatch[7] || aroundMatch[8] || aroundMatch[9] || ".";
+		const pipeSuffix = aroundMatch[10] || "";
 		if (rawPat && !rawPat.includes("{{")) {{
 			const prefix = toolName === "powershell" ? "& " : "";
 			const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${{rawPat.replace(/"/g, '\\"')}}"`;
-			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search --around ${{around}} --pretty ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
+			const icFlag = rawFlags.includes("i") ? " -i" : "";
+			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{icFlag}} --around ${{around}} --pretty ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
 		}}
 	}}
 
@@ -2930,7 +2932,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 
 	// Trailing `-l` / `-c` or AppData / backtick-safe recursive grep -> fast bounded `rg`
 	const complexRec = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[rRnwiEHhlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))([\s\S]*?)((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRnwiEHhlcIsFo]+\s+)+)(?:'([^']+)'|"([^"]+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?$/,
 	);
 	if (complexRec && /[rR]/.test(complexRec[2])) {{
 		const cdPrefix = complexRec[1] || "";
@@ -2944,8 +2946,12 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const multiTarget = restArgs.split(/\s+/).filter(Boolean).length > 1;
 		if (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget) {{
 			const rFlags = [
+				/[a]/.test(rawFlags) ? "-a" : "",
 				/[l]/.test(rawFlags) ? "-l" : "",
 				/[c]/.test(rawFlags) ? "-c" : "",
+				/[o]/.test(rawFlags) ? "-o" : "",
+				/[h]/.test(rawFlags) ? "--no-filename" : "",
+				/[w]/.test(rawFlags) ? "-w" : "",
 				/[i]/.test(rawFlags) ? "-i" : "",
 				/[F]/.test(rawFlags) ? "-F" : "",
 				isAppData ? "--max-depth 4" : "",
@@ -2960,11 +2966,12 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	}}
 
 	const m = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+-([rRnwiEHhlcIsFo]+)(?:\s+-e)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aArRnwiEHhlcIsFo]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"([^"]+)"|((?!-)[^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
 	);
-	if (!m || !/[rR]/.test(m[2])) return undefined;
+	if (!m) return undefined;
+	const flags = m[2].replace(/[\s-]+/g, "");
+	if (!/[rR]/.test(flags)) return undefined;
 	const cdPrefix = m[1] || "";
-	const flags = m[2];
 	const rawPat = m[3] || m[4] || m[5] || "";
 	if (!rawPat) return undefined;
 	const target = m[6] || m[7] || m[8] || ".";
@@ -3084,6 +3091,19 @@ export function trackReadOnlyBashStreak(
 export function healBashPowerShellCommand(cmd: string): string | undefined {{
 	if (!/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd) || /-EncodedCommand\b|-enc\b/i.test(cmd)) {{
 		return undefined;
+	}}
+	const hereM = cmd.match(
+		/^([\s\S]*?\b(?:powershell|pwsh)(?:\.exe)?\b[^|;&"'\r\n]*?\s-(?:Command|c)\s+)@(['"])\r?\n([\s\S]*?)\r?\n\2@([ \t]*(?:2>&1)?(?:[ \t]*\|[^\r\n]*)?)\s*$/i,
+	);
+	if (hereM) {{
+		const head = hereM[1];
+		const body = hereM[3];
+		const tail = hereM[4] || "";
+		const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(body);
+		const utf8Line = hasUtf8 ? "" : "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n";
+		let delim = "AP_PS_HEREDOC";
+		while (body.includes(delim)) delim += "_X";
+		return `${{head}}- <<'${{delim}}'${{tail}}\n${{utf8Line}}${{body}}\n${{delim}}`;
 	}}
 	const psHeadRe = /\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&"']*?\s-(?:Command|c)\s+)"/gi;
 	let out = "";
@@ -3490,7 +3510,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 				continue;
 			}}
 			for (const ch of sh) {{
-				if (ch === "n" || ch === "H" || ch === "s") continue;
+				if (ch === "n" || ch === "H" || ch === "s" || ch === "a") continue;
 				else if (isRg && ch === "N") continue;
 				else if (isRg && ch === "I") noFilename = true;
 				else if (!isRg && (ch === "r" || ch === "R" || ch === "E")) continue;
@@ -3612,6 +3632,22 @@ function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | 
 	return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 --limit ${{limit}}`;
 }}
 
+function parseSedLineRanges(expr: string): string | undefined {{
+	const parts = expr.split(";");
+	if (parts.length === 0 || parts.length > 16) return undefined;
+	const out: string[] = [];
+	for (const rawPart of parts) {{
+		const p = rawPart.trim();
+		const m = p.match(/^(\d+)(?:,(\d+))?p$/);
+		if (!m) return undefined;
+		const s = Number(m[1]);
+		const e = m[2] ? Number(m[2]) : s;
+		if (!Number.isInteger(s) || !Number.isInteger(e) || s < 1 || e < s) return undefined;
+		out.push(`${{s}}-${{e}}`);
+	}}
+	return out.length > 0 ? out.join(",") : undefined;
+}}
+
 function accelerateSingleBashSegment(seg: string, toolName: string): string | undefined {{
 	const fastGrep = rewriteSlowRecursiveGrep(seg, toolName);
 	if (fastGrep) return fastGrep;
@@ -3692,38 +3728,39 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		const sliceCore = stripErr(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
 		const sliceWidth = cutOnlyM && Number(cutOnlyM[2]) >= 1 ? Number(cutOnlyM[2]) : 0;
 		const sliceWidthFlag = sliceWidth > 0 ? ` --width ${{sliceWidth}}` : "";
-		if (!/[|;&><{{}}`]|\$\(/.test(sliceCore)) {{
+		const hasUnsafeOutsideQuotes = (s: string) => /[|;&><{{}}`]|\$\(/.test(s.replace(/'[^']*'|"[^"]*"/g, ""));
+		if (!hasUnsafeOutsideQuotes(sliceCore)) {{
 			const sedM = sliceCore.match(
-				/^sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
+				/^sed\s+-n\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
 			);
-			if (sedM) {{
-				const s = Number(sedM[1] || sedM[3] || sedM[5]);
-				const eRaw = sedM[2] || sedM[4] || sedM[6];
-				const e = eRaw ? Number(eRaw) : s;
-				const f = sedM[7] || sedM[8] || sedM[9] || "";
-				if (s >= 1 && e >= s && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
+			const sedRanges = sedM ? parseSedLineRanges(sedM[1] || sedM[2] || sedM[3] || "") : undefined;
+			if (sedM && sedRanges) {{
+				const f = sedM[4] || sedM[5] || sedM[6] || "";
+				if (qPathOk(f)) {{
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{sedRanges}}${{sliceWidthFlag}}`;
 				}}
 			}}
-			const headM = sliceCore.match(
-				/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&>-]+))\s*$/,
-			);
-			if (headM) {{
-				const isBytes = Boolean(headM[1]);
-				const n = Number(headM[2] || headM[3] || headM[4]);
-				const f = headM[5] || headM[6] || headM[7] || "";
-				if (n >= 1 && qPathOk(f) && !(isBytes && sliceWidth > 0)) {{
-					return isBytes
-						? `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --offset 0 --chars ${{n}}`
-						: `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{sliceWidthFlag}}`;
+			if (!/[|;&><{{}}`]|\$\(/.test(sliceCore)) {{
+				const headM = sliceCore.match(
+					/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&>-]+))\s*$/,
+				);
+				if (headM) {{
+					const isBytes = Boolean(headM[1]);
+					const n = Number(headM[2] || headM[3] || headM[4]);
+					const f = headM[5] || headM[6] || headM[7] || "";
+					if (n >= 1 && qPathOk(f) && !(isBytes && sliceWidth > 0)) {{
+						return isBytes
+							? `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --offset 0 --chars ${{n}}`
+							: `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{sliceWidthFlag}}`;
+					}}
 				}}
-			}}
-			const tailM = sliceCore.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
-			if (tailM) {{
-				const n = Number(tailM[1] || tailM[2]);
-				const f = tailM[3] || tailM[4] || tailM[5] || "";
-				if (n >= 1 && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}${{sliceWidthFlag}}`;
+				const tailM = sliceCore.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+				if (tailM) {{
+					const n = Number(tailM[1] || tailM[2]);
+					const f = tailM[3] || tailM[4] || tailM[5] || "";
+					if (n >= 1 && qPathOk(f)) {{
+						return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}${{sliceWidthFlag}}`;
+					}}
 				}}
 			}}
 		}}
@@ -3735,13 +3772,14 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		if (catStages && catStages.length === 2) {{
 			const catLhs = stripErr(catStages[0]);
 			const rhs = catStages[1].trim();
-			if (!/[;&><{{}}`]|\$\(/.test(catLhs) && !/[;&><{{}}`]|\$\(/.test(rhs)) {{
+			if (!/[|;&><{{}}`]|\$\(/.test(catLhs) && !hasUnsafeOutsideQuotes(rhs)) {{
 				const catM = catLhs.match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
 				const f = catM ? catM[1] || catM[2] || catM[3] || "" : "";
 				if (qPathOk(f)) {{
 					const rHead = rhs.match(/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))$/);
 					const rTail = rhs.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
-					const rSed = rhs.match(/^sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)$/);
+					const rSed = rhs.match(/^sed\s+-n\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))$/);
+					const rSedRanges = rSed ? parseSedLineRanges(rSed[1] || rSed[2] || rSed[3] || "") : undefined;
 					const esc = f.replace(/"/g, '\\"');
 					if (rHead) {{
 						const isBytes = Boolean(rHead[1]);
@@ -3754,11 +3792,8 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 					}} else if (rTail) {{
 						const n = Number(rTail[1] || rTail[2]);
 						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --tail ${{n}}${{sliceWidthFlag}}`;
-					}} else if (rSed) {{
-						const s = Number(rSed[1] || rSed[3] || rSed[5]);
-						const eRaw = rSed[2] || rSed[4] || rSed[6];
-						const e = eRaw ? Number(eRaw) : s;
-						if (s >= 1 && e >= s) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
+					}} else if (rSed && rSedRanges) {{
+						return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{rSedRanges}}${{sliceWidthFlag}}`;
 					}}
 				}}
 			}}

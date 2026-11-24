@@ -11395,3 +11395,211 @@ assert.ok(psJsonTip && psJsonTip.includes("[ap json-tip]"), psJsonTip);
         );
     }
 }
+
+#[test]
+fn test_v268_grep_around_a_fix_ps_herestring_multirange_sed_and_ap_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Native `ap strings` / `ap read --strings` (`-a`, `-n`, `-e l|s`, `-el`, `-q`, `--json`)
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"\x00\x00hi\x00\x00API_ENDPOINT_V268\x00\x00");
+    for b in b"WIDE_PIPE_V268" {
+        blob.push(*b);
+        blob.push(0);
+    }
+    blob.extend_from_slice(b"\x00\x00");
+    let bin_path = root.join("sample.bin");
+    fs::write(&bin_path, &blob).unwrap();
+
+    let st1 = run_ap(
+        root,
+        &["strings", "-a", "-n", "8", bin_path.to_str().unwrap()],
+        None,
+        &[],
+    );
+    assert!(
+        st1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st1.stderr)
+    );
+    let st1_out = String::from_utf8_lossy(&st1.stdout);
+    assert!(
+        st1_out.contains("API_ENDPOINT_V268")
+            && st1_out.contains("WIDE_PIPE_V268")
+            && !st1_out.contains("] hi"),
+        "{st1_out}"
+    );
+
+    let st2 = run_ap(
+        root,
+        &["strings", "-el", "-n", "6", bin_path.to_str().unwrap()],
+        None,
+        &[],
+    );
+    assert!(
+        st2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st2.stderr)
+    );
+    let st2_out = String::from_utf8_lossy(&st2.stdout);
+    assert!(
+        st2_out.contains("WIDE_PIPE_V268") && !st2_out.contains("API_ENDPOINT_V268"),
+        "{st2_out}"
+    );
+
+    let st3 = run_ap(
+        root,
+        &[
+            "read",
+            bin_path.to_str().unwrap(),
+            "--strings",
+            "--min-len",
+            "8",
+            "-q",
+            "WIDE_PIPE",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        st3.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st3.stderr)
+    );
+    let st3_jv: Value = serde_json::from_slice(&st3.stdout).unwrap();
+    assert_eq!(st3_jv["ok"], Value::Bool(true));
+    assert_eq!(st3_jv["format"], "strings");
+    assert!(st3_jv["content"]
+        .as_str()
+        .unwrap()
+        .contains("WIDE_PIPE_V268"));
+
+    // 2. Layer 1 `ap exec` multi-range `sed -n` & `grep -ao` pipeline
+    let sample_txt = root.join("sample.txt");
+    fs::write(
+        &sample_txt,
+        "L1 first\nL2 second\nL3 skip\nL4 skip\nL5 TOK_101\nL6 TOK_202\n",
+    )
+    .unwrap();
+    let ex_sed = run_ap(
+        root,
+        &["exec", "-c", "sed -n '1,2p;5,6p' sample.txt"],
+        None,
+        &[],
+    );
+    assert!(
+        ex_sed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ex_sed.stderr)
+    );
+    let ex_sed_out = String::from_utf8_lossy(&ex_sed.stdout);
+    assert!(
+        ex_sed_out.contains("L1 first")
+            && ex_sed_out.contains("L5 TOK_101")
+            && !ex_sed_out.contains("L3 skip"),
+        "{ex_sed_out}"
+    );
+
+    let ex_grp = run_ap(
+        root,
+        &[
+            "exec",
+            "-c",
+            "grep -ao 'TOK_[0-9]+' sample.txt | sort -u | head -5",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        ex_grp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ex_grp.stderr)
+    );
+    let ex_grp_out = String::from_utf8_lossy(&ex_grp.stdout);
+    assert!(
+        ex_grp_out.contains("TOK_101") && ex_grp_out.contains("TOK_202"),
+        "{ex_grp_out}"
+    );
+
+    // 3. Layer 3 `zz-ap-accelerator.ts` live Node checks
+    let home = root.join("home_v268");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand } = mod;
+
+// 3a. `grep -rho -a -E` context regex must hit Fast-path A `ap search --around` (NOT broken `rg -a -E`)
+const ga = healCommand('cd "C:/work" && grep -rho -a -E \'.{0,200}X-Custom-Hdr.{0,200}\' . 2>/dev/null | head -20', "bash");
+assert.ok(ga && ga.includes("search --around 200 --pretty 'X-Custom-Hdr' \".\" | head -20") && !ga.includes("rg "), ga);
+
+// 3b. `grep -rl -a` must not misparse `-a` as pattern
+const grl = healCommand('cd "C:/work" && grep -rl -a \'needle\' . | head -5', "bash");
+assert.ok(grl && grl.includes("search -l 'needle' \".\" | head -5"), grl);
+
+// 3c. PowerShell @'...'@ here-string -> UTF-8-locked `- <<'AP_PS_HEREDOC'`
+const psh = healCommand("powershell -NoProfile -Command @'\n$x='(hello)'\nWrite-Output $x\n'@", "bash");
+assert.ok(
+  psh &&
+    psh.includes("- <<'AP_PS_HEREDOC'\n[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$x='(hello)'\nWrite-Output $x\nAP_PS_HEREDOC"),
+  psh,
+);
+
+// 3d. Multi-range `sed -n` & `cat | sed -n` & `grep -ao` pipeline
+const ms1 = healCommand("sed -n '1,20p;50,70p' app.rs", "bash");
+assert.ok(ms1 && ms1.includes('read "app.rs" --lines 1-20,50-70'), ms1);
+
+const ms2 = healCommand("cat app.rs | sed -n '2p;10,15p' | cut -c1-120", "bash");
+assert.ok(ms2 && ms2.includes('read "app.rs" --lines 2-2,10-15 --width 120'), ms2);
+
+const ga2 = healCommand("grep -ao 'err_[0-9]+' app.log | sort -u | head -10", "bash");
+assert.ok(ga2 && ga2.includes("search --max 10 --unique -o 'err_[0-9]+' \"app.log\""), ga2);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.68 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

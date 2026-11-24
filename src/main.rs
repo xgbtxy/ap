@@ -134,9 +134,30 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
     let code = match name {
         "read" => return Some(read::run_cli(&sub_argv)),
         "ls" => return Some(ls::run_cli(&sub_argv)),
-        "bin" | "pe_info" | "pe" | "strings" => {
+        "bin" | "pe_info" | "pe" => {
             sub_argv[0] = "read".to_string();
             return Some(read::run_cli(&sub_argv));
+        }
+        "strings" => {
+            let mut str_argv = Vec::with_capacity(tail_args.len() + 3);
+            str_argv.push("read".to_string());
+            if !is_help {
+                str_argv.push("--strings".to_string());
+            }
+            for a in tail_args {
+                match a.as_str() {
+                    "-el" | "-eL" => {
+                        str_argv.push("-e".to_string());
+                        str_argv.push("l".to_string());
+                    }
+                    "-es" | "-eS" => {
+                        str_argv.push("-e".to_string());
+                        str_argv.push("s".to_string());
+                    }
+                    _ => str_argv.push(a.clone()),
+                }
+            }
+            return Some(read::run_cli(&str_argv));
         }
         "cdp" | "http" | "ws" | "tls" | "tcp" | "listen" | "ports" | "ps" | "win" | "ui"
         | "smoke" | "fuzz" | "mutate" => {

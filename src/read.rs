@@ -71,6 +71,18 @@ struct ReadCli {
     /// Canonical hex + ASCII dump (`xxd`/`hexdump -C`) with SHA-256 & entropy (supports decimal or `0x` `--offset`)
     #[arg(long)]
     hex: bool,
+    /// Extract printable ASCII & UTF-16LE strings (`ap strings` compatible: supports `-n`, `-a`, `-e s|l`, `-q`)
+    #[arg(long)]
+    strings: bool,
+    /// Minimum printable string length for `--strings` / `ap strings` (default: 6 ASCII / 5 UTF-16LE)
+    #[arg(short = 'n', long = "min-len", alias = "bytes", default_value_t = 0)]
+    min_len: usize,
+    /// Accepted for GNU `strings -a` compatibility (always scans full bounded buffer)
+    #[arg(short = 'a', long = "all")]
+    _all_sections: bool,
+    /// String encoding filter for `--strings` / `ap strings` (`s`=ASCII, `l`=UTF-16LE, default=both)
+    #[arg(short = 'e', long = "encoding", default_value = "")]
+    str_encoding: String,
     /// Map a PE RVA (or ELF offset) to file offset, section, enclosing x64 function & hex/disasm preview
     #[arg(long)]
     rva: Option<String>,
@@ -1475,6 +1487,51 @@ fn read_single_target(
             "target": label,
             "format": "protobuf-raw",
             "size_bytes": raw_bytes.len(),
+            "content": rendered,
+        });
+        return Ok((rendered, jv));
+    }
+
+    if cli.strings {
+        let max_hits = if cli.max_hits > 0 { cli.max_hits } else { 200 };
+        let raw_rendered = crate::binary::extract_strings_md(
+            &raw_bytes,
+            cli.query.as_deref(),
+            cli.min_len,
+            max_hits,
+            &cli.str_encoding,
+        );
+        let rendered = if cli.width > 0 {
+            raw_rendered
+                .lines()
+                .map(|ln| {
+                    if ln.chars().count() > cli.width {
+                        let cut: String = ln.chars().take(cli.width).collect();
+                        format!("{cut}…")
+                    } else {
+                        ln.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            raw_rendered
+        };
+        record_event(
+            "read",
+            raw_bytes.len() as u64,
+            rendered.len() as u64,
+            0,
+            1,
+            "strings",
+        );
+        let jv = json!({
+            "ok": true,
+            "target": label,
+            "format": "strings",
+            "size_bytes": raw_bytes.len(),
+            "min_len": cli.min_len,
+            "encoding": cli.str_encoding,
             "content": rendered,
         });
         return Ok((rendered, jv));

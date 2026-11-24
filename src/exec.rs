@@ -702,52 +702,70 @@ fn split_shell_tokens(s: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Rewrite bare `sed -n '<start>[,<end>]p' <file>` (with optional leading `cd <dir> &&` and optional
-/// trailing `| cut -c1-<W>`) cleanly to bounded `ap read "<file>" --lines <start>-<end> [--width <W>]`.
-/// Passes through piped or complex sed expressions.
+fn parse_sed_line_ranges(expr: &str) -> Option<String> {
+    let mut out = Vec::new();
+    for raw_part in expr.split(';') {
+        let part = raw_part.trim();
+        if part.is_empty() || out.len() >= 16 {
+            return None;
+        }
+        let body = part.strip_suffix('p')?;
+        let (start, end) = if let Some((a, b)) = body.split_once(',') {
+            (
+                a.trim().parse::<usize>().ok()?,
+                b.trim().parse::<usize>().ok()?,
+            )
+        } else {
+            let n = body.trim().parse::<usize>().ok()?;
+            (n, n)
+        };
+        if start == 0 || end < start {
+            return None;
+        }
+        out.push(format!("{start}-{end}"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(","))
+    }
+}
+
+/// Rewrite bare `sed -n '<start>[,<end>]p[;...]' <file>` (with optional leading `cd <dir> &&`,
+/// optional `2>/dev/null`, and optional trailing `| cut -c1-<W>`) cleanly to bounded
+/// `ap read "<file>" --lines <start>-<end>[,...] [--width <W>]`. Passes through piped or complex sed expressions.
 pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    let (core, cut_w) = strip_trailing_cut_width(body);
-    if has_unsafe_shell_meta(core) {
-        return None;
-    }
+    let (core_raw, cut_w) = strip_trailing_cut_width(body);
+    let core = strip_trailing_stderr_null(core_raw);
     static SED_RE: OnceLock<Regex> = OnceLock::new();
     let re = SED_RE.get_or_init(|| {
         Regex::new(
-            r#"^\s*sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s*$"#,
+            r#"^\s*sed\s+-n\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$"#,
         )
         .unwrap()
     });
     let cap = re.captures(core)?;
-    let s_str = cap
+    let expr = cap
         .get(1)
-        .or_else(|| cap.get(3))
-        .or_else(|| cap.get(5))?
+        .or_else(|| cap.get(2))
+        .or_else(|| cap.get(3))?
         .as_str();
-    let e_str = cap
-        .get(2)
-        .or_else(|| cap.get(4))
-        .or_else(|| cap.get(6))
-        .map(|m| m.as_str())
-        .unwrap_or(s_str);
-    let start: usize = s_str.parse().ok()?;
-    let end: usize = e_str.parse().ok()?;
-    if start == 0 || end < start {
-        return None;
-    }
+    let ranges = parse_sed_line_ranges(expr)?;
     let file = cap
-        .get(7)
-        .or_else(|| cap.get(8))
-        .or_else(|| cap.get(9))?
+        .get(4)
+        .or_else(|| cap.get(5))
+        .or_else(|| cap.get(6))?
         .as_str();
-    if file.contains('*') || file.contains('?') || file.contains(',') {
+    if file.contains('*') || file.contains('?') || file.contains(',') || has_unsafe_shell_meta(file)
+    {
         return None;
     }
     let ap_bin = current_ap_bin();
     let file_esc = file.replace('"', "\\\"");
     let width_flag = cut_w.map(|w| format!(" --width {w}")).unwrap_or_default();
     Some(format!(
-        "{}\"{ap_bin}\" read \"{file_esc}\" --lines {start}-{end}{width_flag}",
+        "{}\"{ap_bin}\" read \"{file_esc}\" --lines {ranges}{width_flag}",
         cd_pfx.as_deref().unwrap_or("")
     ))
 }
@@ -1111,7 +1129,7 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
             }
             for ch in short.chars() {
                 match ch {
-                    'n' | 'H' | 's' => {}
+                    'n' | 'H' | 's' | 'a' => {}
                     'N' if is_rg => {}
                     'I' if is_rg => no_filename = true,
                     'r' | 'R' | 'E' if !is_rg => {}
@@ -1274,7 +1292,7 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
     }
     let lhs_clean = strip_trailing_stderr_null(&stages[0]);
     let rhs_clean = stages[1].trim();
-    if has_unsafe_shell_meta(lhs_clean) || has_unsafe_shell_meta(rhs_clean) {
+    if has_unsafe_shell_meta(lhs_clean) || rhs_clean.contains("$(") || rhs_clean.contains('`') {
         return None;
     }
     static CAT_RE: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
@@ -1283,10 +1301,7 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
             Regex::new(r#"^\s*cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$"#).unwrap(),
             Regex::new(r#"^\s*head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))\s*$"#).unwrap(),
             Regex::new(r#"^\s*tail\s+(?:-n\s*(\d+)|-(\d+))\s*$"#).unwrap(),
-            Regex::new(
-                r#"^\s*sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)\s*$"#,
-            )
-            .unwrap(),
+            Regex::new(r#"^\s*sed\s+-n\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s*$"#).unwrap(),
         )
     });
     let cat_cap = cat_re.captures(lhs_clean)?;
@@ -1326,23 +1341,13 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
         format!("--tail {n}")
     } else {
         let sc = sed_re.captures(rhs_clean)?;
-        let s_str = sc
+        let expr = sc
             .get(1)
-            .or_else(|| sc.get(3))
-            .or_else(|| sc.get(5))?
+            .or_else(|| sc.get(2))
+            .or_else(|| sc.get(3))?
             .as_str();
-        let e_str = sc
-            .get(2)
-            .or_else(|| sc.get(4))
-            .or_else(|| sc.get(6))
-            .map(|m| m.as_str())
-            .unwrap_or(s_str);
-        let s: usize = s_str.parse().ok()?;
-        let e: usize = e_str.parse().ok()?;
-        if s == 0 || e < s {
-            return None;
-        }
-        format!("--lines {s}-{e}")
+        let ranges = parse_sed_line_ranges(expr)?;
+        format!("--lines {ranges}")
     };
     let ap_bin = current_ap_bin();
     let file_esc = file.replace('"', "\\\"");

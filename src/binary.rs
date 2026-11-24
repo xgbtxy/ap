@@ -4074,6 +4074,98 @@ pub fn find_binary_bytes_md(
     ))
 }
 
+/// Extract printable ASCII and Windows UTF-16LE strings with GNU `strings`-compatible filters (`min_len`, `encoding`: `s`/`l`/both).
+pub fn extract_strings_md(
+    bytes: &[u8],
+    query: Option<&str>,
+    min_len: usize,
+    max_strings: usize,
+    encoding: &str,
+) -> String {
+    let enc_low = encoding.trim().to_ascii_lowercase();
+    let scan_ascii = !matches!(enc_low.as_str(), "l" | "utf16" | "utf-16le" | "wide");
+    let scan_wide = !matches!(enc_low.as_str(), "s" | "ascii");
+    let min_ascii = if min_len >= 2 { min_len } else { 6 };
+    let min_wide = if min_len >= 2 { min_len } else { 5 };
+    let q_re = query.and_then(|q| {
+        Regex::new(&format!("(?i){q}"))
+            .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
+            .ok()
+    });
+    let cap_hits = if max_strings == 0 { 200 } else { max_strings };
+    let scan_lim = bytes.len().min(if query.is_some() {
+        24 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    });
+    let data = &bytes[..scan_lim];
+    let mut hits: Vec<String> = Vec::new();
+
+    if scan_ascii {
+        let mut i = 0usize;
+        while i < data.len() && hits.len() < cap_hits {
+            if (0x20..=0x7E).contains(&data[i]) {
+                let st = i;
+                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 240 {
+                    i += 1;
+                }
+                if i - st >= min_ascii {
+                    let s = String::from_utf8_lossy(&data[st..i]);
+                    if q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
+                        hits.push(format!("[ascii @0x{st:x}] {s}"));
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if scan_wide {
+        let mut j = 0usize;
+        while j + 1 < data.len() && hits.len() < cap_hits {
+            if (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 {
+                let st = j;
+                let mut s = String::new();
+                while j + 1 < data.len()
+                    && (0x20..=0x7E).contains(&data[j])
+                    && data[j + 1] == 0
+                    && s.len() < 200
+                {
+                    s.push(data[j] as char);
+                    j += 2;
+                }
+                if s.len() >= min_wide && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
+                    hits.push(format!("[utf16le @0x{st:x}] {s}"));
+                }
+            } else {
+                j += 1;
+            }
+        }
+    }
+
+    let enc_label = if scan_ascii && scan_wide {
+        "ascii+utf16le"
+    } else if scan_wide {
+        "utf16le"
+    } else {
+        "ascii"
+    };
+    let mut lines = vec![format!(
+        "## Strings ({} B | min_len={} | encoding={} | {} hit(s))",
+        bytes.len(),
+        if scan_ascii { min_ascii } else { min_wide },
+        enc_label,
+        hits.len()
+    )];
+    if hits.is_empty() {
+        lines.push("*(no matching printable strings found)*".to_string());
+    } else {
+        lines.extend(hits);
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4734,6 +4826,38 @@ mod tests {
         assert!(
             ptxt.contains("Client.fetch_health:L14") && ptxt.contains("urllib_open"),
             "{ptxt}"
+        );
+    }
+
+    #[test]
+    fn extracts_strings_with_min_len_and_utf16le_filter() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x00\x00short\x00\x00");
+        blob.extend_from_slice(b"API_TOKEN_ASCII_V268\x00\x00");
+        for b in b"WIDE_SERVICE_V268" {
+            blob.push(*b);
+            blob.push(0);
+        }
+        blob.extend_from_slice(b"\x00\x00");
+
+        let both = extract_strings_md(&blob, None, 8, 50, "");
+        assert!(
+            both.contains("API_TOKEN_ASCII_V268")
+                && both.contains("WIDE_SERVICE_V268")
+                && !both.contains("short"),
+            "{both}"
+        );
+
+        let wide_only = extract_strings_md(&blob, None, 6, 50, "l");
+        assert!(
+            wide_only.contains("WIDE_SERVICE_V268") && !wide_only.contains("API_TOKEN_ASCII_V268"),
+            "{wide_only}"
+        );
+
+        let queried = extract_strings_md(&blob, Some("TOKEN"), 8, 50, "s");
+        assert!(
+            queried.contains("API_TOKEN_ASCII_V268") && !queried.contains("WIDE_SERVICE_V268"),
+            "{queried}"
         );
     }
 }
