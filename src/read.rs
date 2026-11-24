@@ -35,6 +35,9 @@ struct ReadCli {
     /// Read only the last N lines of a file (e.g. `ap read app.log --tail 50`)
     #[arg(long)]
     tail: Option<usize>,
+    /// Optional max characters per output line (UTF-8 safe, like `cut -c1-N` without splitting CJK)
+    #[arg(long, alias = "max-line-len", default_value_t = 0)]
+    width: usize,
     /// Filter or search rows/paragraphs matching keyword or regex
     #[arg(short = 'q', long)]
     query: Option<String>,
@@ -685,6 +688,9 @@ fn read_tar_or_entry(
         if crate::binary::is_java_class_magic(&eb) {
             *format_tag = "java-class";
             Ok(crate::binary::parse_java_class_md(&eb, query))
+        } else if crate::binary::is_pyc_magic(&eb) {
+            *format_tag = "pyc";
+            Ok(crate::binary::parse_pyc_md(&eb, query))
         } else if crate::binary::is_binary_magic(&eb) {
             *format_tag = "tar-entry-bin";
             Ok(crate::binary::inspect_binary_with_xref_md(
@@ -1547,6 +1553,9 @@ fn read_single_target(
                         if crate::binary::is_java_class_magic(&eb) {
                             format_tag = "java-class";
                             crate::binary::parse_java_class_md(&eb, cli.query.as_deref())
+                        } else if crate::binary::is_pyc_magic(&eb) {
+                            format_tag = "pyc";
+                            crate::binary::parse_pyc_md(&eb, cli.query.as_deref())
                         } else {
                             format_tag = "zip-entry";
                             let (dec, _, healed) = decode_any_bytes(&eb);
@@ -1625,6 +1634,7 @@ fn read_single_target(
                     | "wasm"
                     | "bin"
                     | "class"
+                    | "pyc"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
                 format_tag = "binary";
@@ -1762,8 +1772,19 @@ fn read_single_target(
         idx
     };
 
+    fn cap_line_width(s: &str, width: usize) -> std::borrow::Cow<'_, str> {
+        if width == 0 || s.chars().count() <= width {
+            std::borrow::Cow::Borrowed(s)
+        } else {
+            let cut: String = s.chars().take(width).collect();
+            std::borrow::Cow::Owned(format!("{cut}…"))
+        }
+    }
+
     let mut rendered = if cli.outline {
-        if ap_splice::ast::language_for_ext(&ext).is_some() {
+        if format_tag == "binary" {
+            converted.clone()
+        } else if ap_splice::ast::language_for_ext(&ext).is_some() {
             let syms = ap_splice::ast::scan_symbols(&converted, &ext);
             let lines_out: Vec<String> = syms
                 .iter()
@@ -1963,7 +1984,7 @@ fn read_single_target(
         if parts.len() <= 1 {
             if let Some((s, e)) = parse_line_window(lspec, total_lines) {
                 let slice = (s..=e)
-                    .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
+                    .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!("# READ `{label}` [L{s}-L{e} of {total_lines} | {format_tag}]\n{slice}")
@@ -1983,7 +2004,7 @@ fn read_single_target(
                     ));
                 };
                 let slice = (s..=e)
-                    .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
+                    .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
                     .collect::<Vec<_>>()
                     .join("\n");
                 blocks.push(format!("## L{s}-L{e}\n{slice}"));
@@ -2004,7 +2025,7 @@ fn read_single_target(
             let s = total_lines.saturating_sub(tail_n) + 1;
             let e = total_lines;
             let slice = (s..=e)
-                .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
+                .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
                 .collect::<Vec<_>>()
                 .join("\n");
             format!("# READ `{label}` [L{s}-L{e} of {total_lines} | {format_tag}]\n{slice}")
@@ -2066,7 +2087,9 @@ fn read_single_target(
                     let s = idx.saturating_sub(ctx_n);
                     let e = (idx + ctx_n).min(total_lines.saturating_sub(1));
                     let ctx = (s..=e)
-                        .map(|k| format!("  {}: {}", k + 1, all_lines[k]))
+                        .map(|k| {
+                            format!("  {}: {}", k + 1, cap_line_width(all_lines[k], cli.width))
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
                     hits.push(ctx);
@@ -2159,7 +2182,7 @@ fn read_single_target(
         };
         let head_n = 45.min(total_lines);
         let head_s = (1..=head_n)
-            .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
+            .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
             .collect::<Vec<_>>()
             .join("\n");
         let tip = if is_ast_code {
@@ -2179,6 +2202,13 @@ fn read_single_target(
             "# READ `{label}` [paged: {}B -> preview of L1-L{head_n} / {total_lines} total lines | {format_tag}]\n{outline}{head_s}\n\n{tip}",
             raw_len
         )
+    } else if cli.width > 0 {
+        let capped = all_lines
+            .iter()
+            .map(|l| cap_line_width(l, cli.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("# READ `{label}` [{total_lines} lines | {format_tag}]\n{capped}")
     } else {
         format!("# READ `{label}` [{total_lines} lines | {format_tag}]\n{converted}")
     };

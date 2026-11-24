@@ -20,6 +20,7 @@ fn mcp_tools_schema() -> Value {
                     "outline": { "type": "boolean", "description": "Emit ONLY the compact Tree-sitter AST symbol outline (for code), C/C++ outline, or heading outline (for Markdown)" },
                     "section": { "type": "string", "description": "Optional Markdown heading substring to extract ONLY that `# Heading` section cleanly" },
                     "lines": { "type": "string", "description": "Optional line window or comma-separated multi-ranges, e.g. '1-30,120-160'" },
+                    "width": { "type": "integer", "description": "Optional max characters per output line (UTF-8 safe, like `cut -c1-N` without splitting CJK)" },
                     "query": { "type": "string", "description": "Optional keyword/regex filter for rows, minified slices, archive entries, or binary strings" },
                     "around": { "type": "integer", "description": "Optional `--query` context window (bytes each side for minified bundles, lines for normal files)" },
                     "max_hits": { "type": "integer", "description": "Optional max `--query` match windows/blocks to return" },
@@ -106,6 +107,7 @@ fn mcp_tools_schema() -> Value {
                         "description": "Relative-path substring or suffix filters to skip (e.g. ['fixtures', '*.gen.ts'])",
                         "items": { "type": "string" }
                     },
+                    "width": { "type": "integer", "description": "Optional max characters per output snippet (UTF-8 safe, like `cut -c1-N` without splitting CJK)" },
                     "json": { "type": "boolean", "description": "Emit structured JSON populated into structuredContent (matches/files/counts) for zero-parse codemode pipelines" }
                 }
             }
@@ -1219,6 +1221,16 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push("--lines".to_string());
                 cli.push(l.to_string());
             }
+            if let Some(w) = args
+                .get("width")
+                .or_else(|| args.get("max_line_len"))
+                .and_then(Value::as_u64)
+            {
+                if w > 0 {
+                    cli.push("--width".to_string());
+                    cli.push(w.to_string());
+                }
+            }
             if let Some(q) = args
                 .get("query")
                 .and_then(Value::as_str)
@@ -1558,6 +1570,16 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         cli.push("--exclude".to_string());
                         cli.push(ex.to_string());
                     }
+                }
+            }
+            if let Some(w) = args
+                .get("width")
+                .or_else(|| args.get("max_line_len"))
+                .and_then(Value::as_u64)
+            {
+                if w > 0 {
+                    cli.push("--width".to_string());
+                    cli.push(w.to_string());
                 }
             }
             if args.get("json").and_then(Value::as_bool).unwrap_or(false) {

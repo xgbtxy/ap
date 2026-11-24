@@ -972,9 +972,499 @@ pub fn is_binary_magic(bytes: &[u8]) -> bool {
         || bytes.starts_with(b"\x7FELF")
         || bytes.starts_with(b"\x00asm")
         || is_java_class_magic(bytes)
+        || is_pyc_magic(bytes)
         || bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
         || bytes.starts_with(&[0xCE, 0xFA, 0xED, 0xFE])
         || bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])
+}
+
+/// Detect CPython 3.8–3.14 `.pyc` files (PEP-552 16-byte header followed by Marshal v4 `TYPE_CODE`).
+pub fn is_pyc_magic(bytes: &[u8]) -> bool {
+    if bytes.len() < 18 || bytes[2] != 0x0D || bytes[3] != 0x0A {
+        return false;
+    }
+    let magic = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if !(3400..=3650).contains(&magic) {
+        return false;
+    }
+    let Some(bitfield) = read_u32_le(bytes, 4) else {
+        return false;
+    };
+    bitfield <= 3 && (bytes[16] & 0x7F) == b'c'
+}
+
+fn pyc_python_version(magic: u16) -> &'static str {
+    match magic {
+        3400..=3419 => "3.8",
+        3420..=3429 => "3.9",
+        3430..=3449 => "3.10",
+        3450..=3509 => "3.11",
+        3510..=3549 => "3.12",
+        3550..=3599 => "3.13",
+        _ => "3.14+",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PycCodeObj {
+    argcount: i32,
+    firstlineno: i32,
+    name: String,
+    qualname: String,
+    filename: String,
+    consts: Vec<MarshalVal>,
+    names: Vec<String>,
+    varnames: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum MarshalVal {
+    Null,
+    Scalar,
+    Str(String),
+    Seq(Vec<MarshalVal>),
+    Code(Box<PycCodeObj>),
+}
+
+impl MarshalVal {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            MarshalVal::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_str_list(&self) -> Vec<String> {
+        match self {
+            MarshalVal::Seq(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+struct MarshalReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    magic: u16,
+    refs: Vec<MarshalVal>,
+    obj_count: usize,
+}
+
+impl<'a> MarshalReader<'a> {
+    fn new(data: &'a [u8], pos: usize, magic: u16) -> Self {
+        Self {
+            data,
+            pos,
+            magic,
+            refs: Vec::new(),
+            obj_count: 0,
+        }
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn read_i32(&mut self) -> Option<i32> {
+        let s = self.data.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        let s = self.data.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn read_i64(&mut self) -> Option<i64> {
+        let s = self.data.get(self.pos..self.pos + 8)?;
+        self.pos += 8;
+        Some(i64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    fn read_f64(&mut self) -> Option<f64> {
+        let s = self.data.get(self.pos..self.pos + 8)?;
+        self.pos += 8;
+        Some(f64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    fn read_bytes_slice(&mut self, len: usize) -> Option<&'a [u8]> {
+        if len > 16 * 1024 * 1024 || self.pos.saturating_add(len) > self.data.len() {
+            return None;
+        }
+        let s = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        Some(s)
+    }
+
+    fn read_obj(&mut self, depth: usize) -> Option<MarshalVal> {
+        if depth > 40 || self.obj_count > 60_000 {
+            return None;
+        }
+        self.obj_count += 1;
+        let raw_tag = self.read_u8()?;
+        let flag = (raw_tag & 0x80) != 0;
+        let tag = raw_tag & 0x7F;
+        let ref_idx = if flag {
+            let idx = self.refs.len();
+            self.refs.push(MarshalVal::Null);
+            Some(idx)
+        } else {
+            None
+        };
+
+        let val = match tag {
+            b'0' => MarshalVal::Null,
+            b'N' | b'S' | b'.' | b'F' | b'T' => MarshalVal::Scalar,
+            b'i' => {
+                let _ = self.read_i32()?;
+                MarshalVal::Scalar
+            }
+            b'I' => {
+                let _ = self.read_i64()?;
+                MarshalVal::Scalar
+            }
+            b'l' => {
+                let n = self.read_i32()?;
+                let digits = n.unsigned_abs() as usize;
+                let _ = self.read_bytes_slice(digits.saturating_mul(2))?;
+                MarshalVal::Scalar
+            }
+            b'g' => {
+                let _ = self.read_f64()?;
+                MarshalVal::Scalar
+            }
+            b'f' => {
+                let n = self.read_u8()? as usize;
+                let _ = self.read_bytes_slice(n)?;
+                MarshalVal::Scalar
+            }
+            b'y' => {
+                let _ = self.read_f64()?;
+                let _ = self.read_f64()?;
+                MarshalVal::Scalar
+            }
+            b'x' => {
+                let n1 = self.read_u8()? as usize;
+                let _ = self.read_bytes_slice(n1)?;
+                let n2 = self.read_u8()? as usize;
+                let _ = self.read_bytes_slice(n2)?;
+                MarshalVal::Scalar
+            }
+            b's' => {
+                let n = self.read_u32()? as usize;
+                let _ = self.read_bytes_slice(n)?;
+                MarshalVal::Scalar
+            }
+            b't' | b'u' | b'a' | b'A' => {
+                let n = self.read_u32()? as usize;
+                let b = self.read_bytes_slice(n)?;
+                MarshalVal::Str(String::from_utf8_lossy(b).into_owned())
+            }
+            b'z' | b'Z' => {
+                let n = self.read_u8()? as usize;
+                let b = self.read_bytes_slice(n)?;
+                MarshalVal::Str(String::from_utf8_lossy(b).into_owned())
+            }
+            b')' => {
+                let n = self.read_u8()? as usize;
+                let mut items = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    items.push(self.read_obj(depth + 1)?);
+                }
+                MarshalVal::Seq(items)
+            }
+            b'(' | b'[' | b'<' | b'>' => {
+                let n = (self.read_u32()? as usize).min(20_000);
+                let mut items = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    items.push(self.read_obj(depth + 1)?);
+                }
+                MarshalVal::Seq(items)
+            }
+            b'{' => {
+                let mut pairs = Vec::new();
+                for _ in 0..20_000 {
+                    let k = self.read_obj(depth + 1)?;
+                    if matches!(k, MarshalVal::Null) {
+                        break;
+                    }
+                    let v = self.read_obj(depth + 1)?;
+                    pairs.push(k);
+                    pairs.push(v);
+                }
+                MarshalVal::Seq(pairs)
+            }
+            b'r' => {
+                let idx = self.read_u32()? as usize;
+                self.refs.get(idx).cloned().unwrap_or(MarshalVal::Null)
+            }
+            b'c' => {
+                let argcount = self.read_i32()?;
+                let _posonly = if self.magic >= 3413 {
+                    self.read_i32()?
+                } else {
+                    0
+                };
+                let _kwonly = self.read_i32()?;
+                let _nlocals = self.read_i32()?;
+                let _stacksize = self.read_i32()?;
+                let _flags = self.read_i32()?;
+                let _code = self.read_obj(depth + 1)?;
+                let consts_val = self.read_obj(depth + 1)?;
+                let names_val = self.read_obj(depth + 1)?;
+
+                let varnames = if self.magic >= 3450 {
+                    let lp = self.read_obj(depth + 1)?;
+                    let _lpk = self.read_obj(depth + 1)?;
+                    lp.as_str_list()
+                } else {
+                    let vn = self.read_obj(depth + 1)?;
+                    let _fv = self.read_obj(depth + 1)?;
+                    let _cv = self.read_obj(depth + 1)?;
+                    vn.as_str_list()
+                };
+                let filename = self.read_obj(depth + 1)?.as_str().unwrap_or("").to_string();
+                let name = self
+                    .read_obj(depth + 1)?
+                    .as_str()
+                    .unwrap_or("<codeobj>")
+                    .to_string();
+                let qualname = if self.magic >= 3450 {
+                    self.read_obj(depth + 1)?
+                        .as_str()
+                        .unwrap_or(&name)
+                        .to_string()
+                } else {
+                    name.clone()
+                };
+                let firstlineno = self.read_i32()?;
+                let _linetable = self.read_obj(depth + 1)?;
+                if self.magic >= 3450 {
+                    let _exc = self.read_obj(depth + 1)?;
+                }
+                let consts = match consts_val {
+                    MarshalVal::Seq(v) => v,
+                    _ => Vec::new(),
+                };
+                MarshalVal::Code(Box::new(PycCodeObj {
+                    argcount,
+                    firstlineno,
+                    name,
+                    qualname,
+                    filename,
+                    consts,
+                    names: names_val.as_str_list(),
+                    varnames,
+                }))
+            }
+            _ => return None,
+        };
+
+        if let Some(idx) = ref_idx {
+            if let Some(slot) = self.refs.get_mut(idx) {
+                *slot = val.clone();
+            }
+        }
+        Some(val)
+    }
+}
+
+#[derive(Default)]
+struct PycWalkAcc {
+    code_lines: Vec<String>,
+    const_strs: Vec<String>,
+    seen_consts: std::collections::HashSet<String>,
+    sym_names: Vec<String>,
+    seen_syms: std::collections::HashSet<String>,
+}
+
+fn collect_pyc_walk(code: &PycCodeObj, depth: usize, q_re: Option<&Regex>, acc: &mut PycWalkAcc) {
+    if acc.code_lines.len() < 80 {
+        let indent = "  ".repeat(depth.min(4));
+        let label = if !code.qualname.is_empty() {
+            &code.qualname
+        } else {
+            &code.name
+        };
+        let locals_s = if code.varnames.is_empty() {
+            String::new()
+        } else {
+            let preview: Vec<&str> = code.varnames.iter().take(6).map(String::as_str).collect();
+            format!(" | locals=[{}]", preview.join(", "))
+        };
+        let refs_s = if code.names.is_empty() {
+            String::new()
+        } else {
+            let preview: Vec<&str> = code.names.iter().take(6).map(String::as_str).collect();
+            format!(" | refs=[{}]", preview.join(", "))
+        };
+        let row = format!(
+            "{indent}- `{label}` (args={}, L{}){locals_s}{refs_s}",
+            code.argcount, code.firstlineno
+        );
+        if q_re.map_or(true, |r| r.is_match(&row)) {
+            acc.code_lines.push(row);
+        }
+    }
+    for n in &code.names {
+        if acc.sym_names.len() < 80
+            && !n.is_empty()
+            && q_re.map_or(true, |r| r.is_match(n))
+            && acc.seen_syms.insert(n.clone())
+        {
+            acc.sym_names.push(n.clone());
+        }
+    }
+    fn push_const(acc: &mut PycWalkAcc, s: &str, q_re: Option<&Regex>) {
+        let clean = s.replace('\r', "").replace('\n', "\\n");
+        let trimmed = clean.trim();
+        if acc.const_strs.len() < 120
+            && trimmed.len() >= 2
+            && trimmed.chars().any(|ch| !ch.is_control())
+            && q_re.map_or(true, |r| r.is_match(trimmed))
+            && acc.seen_consts.insert(trimmed.to_string())
+        {
+            acc.const_strs.push(trimmed.chars().take(180).collect());
+        }
+    }
+    for c in &code.consts {
+        match c {
+            MarshalVal::Str(s) => push_const(acc, s, q_re),
+            MarshalVal::Code(sub) => collect_pyc_walk(sub, depth + 1, q_re, acc),
+            MarshalVal::Seq(items) => {
+                for item in items {
+                    if let MarshalVal::Str(s) = item {
+                        push_const(acc, s, q_re);
+                    } else if let MarshalVal::Code(sub) = item {
+                        collect_pyc_walk(sub, depth + 1, q_re, acc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pure-Rust CPython 3.8–3.14 `.pyc` Marshal v4 Bytecode, Code-Object & Constant-Pool Analyzer.
+pub fn parse_pyc_md(bytes: &[u8], query: Option<&str>) -> String {
+    if !is_pyc_magic(bytes) {
+        return "*(not a valid CPython .pyc file)*".to_string();
+    }
+    let magic = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let py_ver = pyc_python_version(magic);
+    let mut reader = MarshalReader::new(bytes, 16, magic);
+    let Some(MarshalVal::Code(root)) = reader.read_obj(0) else {
+        return format!(
+            "## Binary Header: Python Bytecode `.pyc` (Python {py_ver}, magic={magic}, {} B) | SHA-256: `{}`\n*(marshal stream truncated or unsupported opcodes)*",
+            bytes.len(),
+            sha256_hex(bytes)
+        );
+    };
+    let q_re = query.and_then(|q| {
+        Regex::new(&format!("(?i){q}"))
+            .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
+            .ok()
+    });
+    let mut acc = PycWalkAcc::default();
+    collect_pyc_walk(&root, 0, q_re.as_ref(), &mut acc);
+
+    let fname = if root.filename.is_empty() {
+        "<module>"
+    } else {
+        root.filename.as_str()
+    };
+    let mut out = vec![
+        format!(
+            "## Binary Header: Python Bytecode `.pyc` (Python {py_ver}, magic={magic}, {} B) | `{fname}` | SHA-256: `{}`",
+            bytes.len(),
+            sha256_hex(bytes)
+        ),
+    ];
+    if !acc.code_lines.is_empty() {
+        out.push(format!("### Code Objects ({})", acc.code_lines.len()));
+        out.extend(acc.code_lines);
+    }
+    if !acc.const_strs.is_empty() {
+        out.push(format!("### String Constants ({})", acc.const_strs.len()));
+        for s in acc.const_strs {
+            out.push(format!("- `{s}`"));
+        }
+    }
+    if !acc.sym_names.is_empty() {
+        out.push(format!(
+            "### Referenced Symbols (co_names, {})",
+            acc.sym_names.len()
+        ));
+        out.push(format!("- `{}`", acc.sym_names.join("`, `")));
+    }
+    out.join("\n")
+}
+
+/// Extract searchable text from a CPython `.pyc` bytecode file for `ap search` (incl. inside `.zip`/`.whl`/`.tar`).
+pub fn extract_pyc_searchable_text(bytes: &[u8]) -> String {
+    if !is_pyc_magic(bytes) {
+        return String::new();
+    }
+    let magic = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let mut reader = MarshalReader::new(bytes, 16, magic);
+    let Some(MarshalVal::Code(root)) = reader.read_obj(0) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    fn walk_text(c: &PycCodeObj, out: &mut String) {
+        if out.len() >= 192 * 1024 {
+            return;
+        }
+        let qn = if !c.qualname.is_empty() {
+            &c.qualname
+        } else {
+            &c.name
+        };
+        out.push_str(&format!("{}:{}:L{}\n", c.filename, qn, c.firstlineno));
+        if !c.names.is_empty() {
+            out.push_str(&c.names.join(" "));
+            out.push('\n');
+        }
+        if !c.varnames.is_empty() {
+            out.push_str(&c.varnames.join(" "));
+            out.push('\n');
+        }
+        for item in &c.consts {
+            match item {
+                MarshalVal::Str(s) if !s.is_empty() => {
+                    out.push_str(&s.replace('\r', "").replace('\n', "\\n"));
+                    out.push('\n');
+                }
+                MarshalVal::Code(sub) => walk_text(sub, out),
+                MarshalVal::Seq(seq) => {
+                    for x in seq {
+                        if let MarshalVal::Str(s) = x {
+                            if !s.is_empty() {
+                                out.push_str(&s.replace('\r', "").replace('\n', "\\n"));
+                                out.push('\n');
+                            }
+                        } else if let MarshalVal::Code(sub) = x {
+                            walk_text(sub, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk_text(&root, &mut out);
+    out
 }
 
 struct PeSection {
@@ -2985,6 +3475,8 @@ pub fn inspect_binary_with_xref_md(
         elf_ctx = Some(parse_elf_details(bytes, &mut out));
     } else if is_java_class_magic(bytes) {
         return parse_java_class_md(bytes, query);
+    } else if is_pyc_magic(bytes) {
+        return parse_pyc_md(bytes, query);
     } else if bytes.starts_with(b"\x00asm") {
         out.push(format!(
             "## Binary Header: WebAssembly ({} B) | SHA-256: `{}`",
@@ -4156,5 +4648,92 @@ mod tests {
         );
         let member = read_tar_member(&tar, "service_config_extra.json").unwrap();
         assert_eq!(member, payload);
+
+        // 4. Synthetic Python 3.11 .pyc (PEP-552 16B header + Marshal v4 TYPE_CODE + FLAG_REF/TYPE_REF)
+        fn push_short_ascii(buf: &mut Vec<u8>, s: &str, intern_ref: bool) {
+            let tag = if intern_ref { b'z' | 0x80 } else { b'z' };
+            buf.push(tag);
+            buf.push(s.len() as u8);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        fn push_bytes(buf: &mut Vec<u8>, raw: &[u8]) {
+            buf.push(b's');
+            buf.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            buf.extend_from_slice(raw);
+        }
+        let mut pyc = Vec::new();
+        pyc.extend_from_slice(&3495u16.to_le_bytes()); // Python 3.11 magic
+        pyc.extend_from_slice(&[0x0D, 0x0A]);
+        pyc.extend_from_slice(&0u32.to_le_bytes()); // PEP-552 bitfield=0
+        pyc.extend_from_slice(&0u32.to_le_bytes()); // mtime
+        pyc.extend_from_slice(&0u32.to_le_bytes()); // size
+                                                    // Root module code object
+        pyc.push(b'c');
+        for v in [0i32, 0, 0, 1, 2, 0] {
+            pyc.extend_from_slice(&v.to_le_bytes());
+        }
+        push_bytes(&mut pyc, b"\x97\x00"); // co_code
+                                           // co_consts: tuple of (String constant, nested Code object)
+        pyc.push(b')');
+        pyc.push(2);
+        push_short_ascii(&mut pyc, "https://api.example.test/v1/health", false);
+        // Nested function code object (Python 3.11 layout)
+        pyc.push(b'c');
+        for v in [2i32, 0, 0, 2, 3, 67] {
+            pyc.extend_from_slice(&v.to_le_bytes());
+        }
+        push_bytes(&mut pyc, b"\x97\x00");
+        pyc.push(b')');
+        pyc.push(1);
+        push_short_ascii(&mut pyc, "secret_const_token", false);
+        pyc.push(b')');
+        pyc.push(1);
+        push_short_ascii(&mut pyc, "urllib_open", false);
+        pyc.push(b')');
+        pyc.push(2);
+        push_short_ascii(&mut pyc, "endpoint", false);
+        push_short_ascii(&mut pyc, "timeout", false);
+        push_bytes(&mut pyc, b"\x00\x00"); // localspluskinds
+        push_short_ascii(&mut pyc, "client.py", true); // ref #0 (after root? wait: root hasn't pushed ref yet -> ref #0)
+        push_short_ascii(&mut pyc, "fetch_health", false);
+        push_short_ascii(&mut pyc, "Client.fetch_health", false);
+        pyc.extend_from_slice(&14i32.to_le_bytes()); // firstlineno
+        push_bytes(&mut pyc, b""); // linetable
+        push_bytes(&mut pyc, b""); // exceptiontable
+                                   // Root co_names, localsplusnames, localspluskinds, filename (TYPE_REF 0!), name, qualname, firstlineno, linetable, exceptiontable
+        pyc.push(b')');
+        pyc.push(1);
+        push_short_ascii(&mut pyc, "Client", false);
+        pyc.push(b')');
+        pyc.push(0); // localsplusnames
+        push_bytes(&mut pyc, b""); // localspluskinds
+        pyc.push(b'r');
+        pyc.extend_from_slice(&0u32.to_le_bytes()); // filename via TYPE_REF -> "client.py"
+        push_short_ascii(&mut pyc, "<module>", false);
+        push_short_ascii(&mut pyc, "<module>", false);
+        pyc.extend_from_slice(&1i32.to_le_bytes());
+        push_bytes(&mut pyc, b"");
+        push_bytes(&mut pyc, b"");
+
+        assert!(is_pyc_magic(&pyc));
+        let pmd = parse_pyc_md(&pyc, None);
+        assert!(
+            pmd.contains("Python 3.11")
+                && pmd.contains("client.py")
+                && pmd.contains("Client.fetch_health")
+                && pmd.contains("https://api.example.test/v1/health")
+                && pmd.contains("urllib_open"),
+            "{pmd}"
+        );
+        let pmd_q = parse_pyc_md(&pyc, Some("secret_const"));
+        assert!(
+            pmd_q.contains("secret_const_token") && !pmd_q.contains("health"),
+            "{pmd_q}"
+        );
+        let ptxt = extract_pyc_searchable_text(&pyc);
+        assert!(
+            ptxt.contains("Client.fetch_health:L14") && ptxt.contains("urllib_open"),
+            "{ptxt}"
+        );
     }
 }

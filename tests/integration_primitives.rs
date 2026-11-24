@@ -6393,7 +6393,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 14);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 15);
     }
 }
 
@@ -7157,7 +7157,7 @@ fn test_v244_pi_patch13_quote_safe_grep_ps_backtick_and_loop_sleep() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 14);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 15);
     }
 }
 
@@ -7216,7 +7216,7 @@ fn test_v245_windows_win_probe_msys_shield_tmp_path_and_pi_patch14() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 14);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 15);
     }
 
     // 3. Verify `ap mcp` discovers `ap_win` across 37 specialist tools
@@ -9556,6 +9556,241 @@ assert.equal(healCommand('rm -rf build && grep -rn foo .', "bash"), undefined);
         assert!(
             run.status.success(),
             "Node v2.59 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_v260_pyc_width_cut_accel_pi_patch15_and_codemode_fast_sieve() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. UTF-8 safe `--width` on `ap read` & `ap search`
+    let long_file = root.join("minified.js");
+    let long_line = format!(
+        "const payload_αβγ = \"{}\"; // NEEDLE_TOKEN\nshort_line\n",
+        "A".repeat(160)
+    );
+    fs::write(&long_file, &long_line).unwrap();
+
+    let rd = run_ap(
+        root,
+        &[
+            "read",
+            long_file.to_str().unwrap(),
+            "--lines",
+            "1-2",
+            "--width",
+            "32",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        rd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rd.stderr)
+    );
+    let rd_out = String::from_utf8_lossy(&rd.stdout);
+    assert!(
+        rd_out.contains("const payload_αβγ") && rd_out.contains('…'),
+        "{rd_out}"
+    );
+    assert!(
+        !rd_out.contains("NEEDLE_TOKEN"),
+        "Line should be capped at --width 32: {rd_out}"
+    );
+
+    let sr = run_ap(
+        root,
+        &[
+            "search",
+            "NEEDLE_TOKEN",
+            long_file.to_str().unwrap(),
+            "--width",
+            "36",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        sr.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sr.stderr)
+    );
+    let sr_out = String::from_utf8_lossy(&sr.stdout);
+    assert!(
+        sr_out.contains("1 hit(s)") && sr_out.contains('…'),
+        "{sr_out}"
+    );
+
+    // 2. Native CPython 3.11 `.pyc` Marshal v4 read + search (direct & inside .zip)
+    fn m_short_ascii(s: &str) -> Vec<u8> {
+        let mut v = vec![b'Z', s.len() as u8];
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+    fn m_bytes(b: &[u8]) -> Vec<u8> {
+        let mut v = vec![b's'];
+        v.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        v.extend_from_slice(b);
+        v
+    }
+    fn m_tuple(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = vec![b')', items.len() as u8];
+        for it in items {
+            v.extend_from_slice(it);
+        }
+        v
+    }
+    let mut pyc = vec![0xA7, 0x0D, 0x0D, 0x0A];
+    pyc.extend_from_slice(&[0u8; 12]);
+    pyc.push(b'c');
+    for n in [1u32, 0, 1, 1, 2, 0] {
+        pyc.extend_from_slice(&n.to_le_bytes());
+    }
+    pyc.extend_from_slice(&m_bytes(&[151, 0, 100, 0, 83, 0])); // RESUME, LOAD_CONST 0, RETURN_VALUE
+    pyc.extend_from_slice(&m_tuple(&[m_short_ascii("PYC_SECRET_TOKEN_987")]));
+    pyc.extend_from_slice(&m_tuple(&[m_short_ascii("verify_pyc_token")]));
+    pyc.extend_from_slice(&m_tuple(&[m_short_ascii("arg0")])); // co_localsplusnames
+    pyc.extend_from_slice(&m_bytes(&[0x20])); // co_localspluskinds (CO_FAST_LOCAL)
+    pyc.extend_from_slice(&m_short_ascii("app.py"));
+    pyc.extend_from_slice(&m_short_ascii("check_auth"));
+    pyc.extend_from_slice(&m_short_ascii("check_auth"));
+    pyc.extend_from_slice(&10u32.to_le_bytes());
+    pyc.extend_from_slice(&m_bytes(b""));
+    pyc.extend_from_slice(&m_bytes(b""));
+
+    let pyc_path = root.join("app.pyc");
+    fs::write(&pyc_path, &pyc).unwrap();
+
+    let pyc_rd = run_ap(root, &["read", pyc_path.to_str().unwrap()], None, &[]);
+    assert!(
+        pyc_rd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pyc_rd.stderr)
+    );
+    let pyc_rd_out = String::from_utf8_lossy(&pyc_rd.stdout);
+    assert!(
+        pyc_rd_out.contains("Python 3.11")
+            && pyc_rd_out.contains("PYC_SECRET_TOKEN_987")
+            && pyc_rd_out.contains("verify_pyc_token"),
+        "{pyc_rd_out}"
+    );
+
+    let pyc_sr = run_ap(
+        root,
+        &["search", "PYC_SECRET_TOKEN_987", pyc_path.to_str().unwrap()],
+        None,
+        &[],
+    );
+    assert!(
+        pyc_sr.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pyc_sr.stderr)
+    );
+    let pyc_sr_out = String::from_utf8_lossy(&pyc_sr.stdout);
+    assert!(
+        pyc_sr_out.contains("1 hit(s)") && pyc_sr_out.contains("PYC_SECRET_TOKEN_987"),
+        "{pyc_sr_out}"
+    );
+
+    // Zip containing app.pyc
+    let zip_path = root.join("bundle.zip");
+    {
+        let f = fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("pkg/app.pyc", opts).unwrap();
+        std::io::Write::write_all(&mut zw, &pyc).unwrap();
+        zw.finish().unwrap();
+    }
+    let zip_sr = run_ap(
+        root,
+        &["search", "verify_pyc_token", zip_path.to_str().unwrap()],
+        None,
+        &[],
+    );
+    assert!(
+        zip_sr.status.success(),
+        "{}",
+        String::from_utf8_lossy(&zip_sr.stderr)
+    );
+    let zip_sr_out = String::from_utf8_lossy(&zip_sr.stdout);
+    assert!(
+        zip_sr_out.contains("verify_pyc_token") && zip_sr_out.contains("pkg/app.pyc"),
+        "{zip_sr_out}"
+    );
+
+    // 3. Init Pi accelerator + live Node check (`| cut -c1-<W>` rewrites & fast-model codemode sieve)
+    let home = root.join("home_v260");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand, sieveCodemodeContentBlocks } = mod;
+
+const sedCut = healCommand("sed -n '1,80p' app.py | cut -c1-160", "bash");
+assert.ok(sedCut && sedCut.includes('read "app.py" --lines 1-80 --width 160'), sedCut);
+
+const headCut = healCommand("head -n 50 bundle.js | cut -c 1-200", "bash");
+assert.ok(headCut && headCut.includes('read "bundle.js" --lines 1-50 --width 200'), headCut);
+
+const tailCut = healCommand("tail -30 server.log | cut -c1-120", "bash");
+assert.ok(tailCut && tailCut.includes('read "server.log" --tail 30 --width 120'), tailCut);
+
+const grepCut = healCommand("grep -ni 'authToken' dist/app.js | cut -c1-140 | head -n 20", "bash");
+assert.ok(grepCut && grepCut.includes('search --width 140 --max 20 -i \'authToken\' "dist/app.js"'), grepCut);
+
+const body13k = "row=item_val\n".repeat(1050); // ~13.6KB (>12KB fast threshold, <14KB structured std threshold)
+const blocks = [{ type: "text", text: "Script completed in 12ms." }, { type: "text", text: body13k }];
+assert.equal(sieveCodemodeContentBlocks(blocks, (b) => "[sieve id=d] " + b.slice(0, 40), false), undefined);
+const sievedFast = sieveCodemodeContentBlocks(blocks, (b) => "[sieve id=d] " + b.slice(0, 40), true);
+assert.ok(Array.isArray(sievedFast) && sievedFast.length === 2 && String(sievedFast[1].text).includes("[sieve id=d]"));
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.60 accelerator check failed:\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );

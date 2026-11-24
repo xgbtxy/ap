@@ -23,7 +23,7 @@ enum PiSubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Idempotently apply all 14 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
+    /// Idempotently apply all 15 generic Pi v1.5+ runtime patches (saves pristine originals to ~/.ap/pi-backups/)
     Patch {
         #[arg(long)]
         pi_dir: Option<String>,
@@ -373,6 +373,26 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: "    return {\n        ...process.env,\n        [pathKey]: updatedPath,\n    };",
                 alt_olds: &[],
                 new: "    return {\n        ...process.env,\n        ...(process.platform === \"win32\" ? { PYTHONUTF8: process.env.PYTHONUTF8 ?? \"1\", PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? \"utf-8\", LANG: process.env.LANG ?? \"C.UTF-8\", LC_ALL: process.env.LC_ALL ?? \"C.UTF-8\" } : {}),\n        [pathKey]: updatedPath,\n    };",
+            },
+        ],
+    },
+    PatchSpec {
+        id: "codemode_strip_null_tool_args",
+        summary: "Strip top-level null optional properties on QuickJS codemode tools.* calls so strict schemas never reject explicit null fields (template-literal-safe)",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_codemode_strip_null_args",
+                rel_hint: None,
+                old: "\tfunction caller(kind, name, spread) {\n\t\treturn (...args) =>\n\t\t\tnew Promise((resolve, reject) => {\n\t\t\t\tlet json;\n\t\t\t\ttry {\n\t\t\t\t\tjson = serialize(spread ? args : args[0]);",
+                alt_olds: &[],
+                new: "\tfunction caller(kind, name, spread) {\n\t\treturn (...args) =>\n\t\t\tnew Promise((resolve, reject) => {\n\t\t\t\tlet json;\n\t\t\t\ttry {\n\t\t\t\t\tlet _arg = spread ? args : args[0];\n\t\t\t\t\tif (kind === \"call\" && !spread && _arg && typeof _arg === \"object\" && !Array.isArray(_arg)) { const _clean = {}; for (const _k of Object.keys(_arg)) { if (_arg[_k] !== null) _clean[_k] = _arg[_k]; } _arg = _clean; }\n\t\t\t\t\tjson = serialize(_arg);",
+            },
+            PatchHunk {
+                id: "prelude_codemode_strip_null_args",
+                rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
+                old: "\tfunction caller(kind, name, spread) {\n\t\treturn (...args) =>\n\t\t\tnew Promise((resolve, reject) => {\n\t\t\t\tlet json;\n\t\t\t\ttry {\n\t\t\t\t\tjson = serialize(spread ? args : args[0]);",
+                alt_olds: &[],
+                new: "\tfunction caller(kind, name, spread) {\n\t\treturn (...args) =>\n\t\t\tnew Promise((resolve, reject) => {\n\t\t\t\tlet json;\n\t\t\t\ttry {\n\t\t\t\t\tlet _arg = spread ? args : args[0];\n\t\t\t\t\tif (kind === \"call\" && !spread && _arg && typeof _arg === \"object\" && !Array.isArray(_arg)) { const _clean = {}; for (const _k of Object.keys(_arg)) { if (_arg[_k] !== null) _clean[_k] = _arg[_k]; } _arg = _clean; }\n\t\t\t\t\tjson = serialize(_arg);",
             },
         ],
     },
@@ -943,19 +963,22 @@ mod tests {
         fs::write(
             chunks.join("codemode-worker.js"),
             format!(
-                "{}\r\n{}\r\n{}\r\n{}\r\n",
+                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
                 CODEMODE_BUILTINS_OLD.replace('\n', "\r\n"),
                 CODEMODE_WRAPPER_OLD,
                 PATCH_SPECS[10].hunks[0].old.replace('\n', "\r\n"),
-                PATCH_SPECS[11].hunks[0].old.replace('\n', "\r\n")
+                PATCH_SPECS[11].hunks[0].old.replace('\n', "\r\n"),
+                PATCH_SPECS[14].hunks[0].old.replace('\n', "\r\n"),
             ),
         )
         .unwrap();
         fs::write(
             prelude_dir.join("prelude-source.js"),
             format!(
-                "{}\n{}\n",
-                PATCH_SPECS[10].hunks[1].old, PATCH_SPECS[11].hunks[1].old
+                "{}\n{}\n{}\n",
+                PATCH_SPECS[10].hunks[1].old,
+                PATCH_SPECS[11].hunks[1].old,
+                PATCH_SPECS[14].hunks[1].old,
             ),
         )
         .unwrap();
@@ -986,7 +1009,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 14);
+        assert_eq!(applied["report"]["applied_count"], 15);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));
@@ -1031,6 +1054,19 @@ mod tests {
                 .alt_olds
                 .iter()
                 .any(|a| a.contains("!(\"output\" in value)") && a.contains(r#""\n""#)));
+        }
+        let strip_spec = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "codemode_strip_null_tool_args")
+            .unwrap();
+        assert_eq!(strip_spec.hunks.len(), 2);
+        for h in strip_spec.hunks {
+            assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
+            assert!(
+                !h.new.contains("${"),
+                "unsafe template interpolation in {}",
+                h.id
+            );
         }
     }
 }

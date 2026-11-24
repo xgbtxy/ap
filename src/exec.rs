@@ -625,11 +625,90 @@ pub fn try_accelerate_get_content(raw: &str) -> Option<String> {
     ))
 }
 
-/// Rewrite bare `sed -n '<start>,<end>p' <file>` (with optional leading `cd <dir> &&`) cleanly
-/// to bounded `ap read "<file>" --lines <start>-<end>`. Passes through piped or complex sed expressions.
+fn current_ap_bin() -> String {
+    std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ap"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "ap".to_string())
+}
+
+fn strip_trailing_cut_width(s: &str) -> (&str, Option<usize>) {
+    static CUT_RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        CUT_RE.get_or_init(|| Regex::new(r#"^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$"#).unwrap());
+    if let Some(cap) = re.captures(s.trim()) {
+        if let (Some(core), Some(w_m)) = (cap.get(1), cap.get(2)) {
+            if let Ok(w) = w_m.as_str().parse::<usize>() {
+                if w > 0 {
+                    return (core.as_str().trim(), Some(w));
+                }
+            }
+        }
+    }
+    (s.trim(), None)
+}
+
+fn split_shell_tokens(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_tok = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if q == '"' && c == '\\' {
+                    if let Some(&nx) = chars.peek() {
+                        if nx == '"' || nx == '\\' {
+                            cur.push(chars.next().unwrap());
+                            continue;
+                        }
+                    }
+                    cur.push(c);
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => {
+                if c.is_whitespace() {
+                    if in_tok {
+                        out.push(std::mem::take(&mut cur));
+                        in_tok = false;
+                    }
+                } else if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    in_tok = true;
+                } else {
+                    cur.push(c);
+                    in_tok = true;
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_tok {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+/// Rewrite bare `sed -n '<start>,<end>p' <file>` (with optional leading `cd <dir> &&` and optional
+/// trailing `| cut -c1-<W>`) cleanly to bounded `ap read "<file>" --lines <start>-<end> [--width <W>]`.
+/// Passes through piped or complex sed expressions.
 pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    if has_unsafe_shell_meta(body) {
+    let (core, cut_w) = strip_trailing_cut_width(body);
+    if has_unsafe_shell_meta(core) {
         return None;
     }
     static SED_RE: OnceLock<Regex> = OnceLock::new();
@@ -639,7 +718,7 @@ pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
         )
         .unwrap()
     });
-    let cap = re.captures(body.trim())?;
+    let cap = re.captures(core)?;
     let s_str = cap
         .get(1)
         .or_else(|| cap.get(3))
@@ -663,28 +742,22 @@ pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
     if file.contains('*') || file.contains('?') || file.contains(',') {
         return None;
     }
-    let ap_bin = std::env::current_exe()
-        .ok()
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case("ap"))
-                .unwrap_or(false)
-        })
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|| "ap".to_string());
+    let ap_bin = current_ap_bin();
     let file_esc = file.replace('"', "\\\"");
+    let width_flag = cut_w.map(|w| format!(" --width {w}")).unwrap_or_default();
     Some(format!(
-        "{}\"{ap_bin}\" read \"{file_esc}\" --lines {start}-{end}",
+        "{}\"{ap_bin}\" read \"{file_esc}\" --lines {start}-{end}{width_flag}",
         cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
-/// Rewrite bare `head -n <N> <file>` or `head -<N> <file>` (with optional leading `cd <dir> &&`) cleanly
-/// to bounded `ap read "<file>" --lines 1-<N>`. Passes through piped `head` streams safely.
+/// Rewrite bare `head -n <N> <file>` or `head -<N> <file>` (with optional leading `cd <dir> &&` and optional
+/// trailing `| cut -c1-<W>`) cleanly to bounded `ap read "<file>" --lines 1-<N> [--width <W>]`.
+/// Passes through piped `head` streams safely.
 pub fn try_accelerate_head_slice(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    if has_unsafe_shell_meta(body) {
+    let (core, cut_w) = strip_trailing_cut_width(body);
+    if has_unsafe_shell_meta(core) {
         return None;
     }
     static HEAD_RE: OnceLock<Regex> = OnceLock::new();
@@ -694,7 +767,7 @@ pub fn try_accelerate_head_slice(raw: &str) -> Option<String> {
         )
         .unwrap()
     });
-    let cap = re.captures(body.trim())?;
+    let cap = re.captures(core)?;
     let n: usize = cap.get(1).or_else(|| cap.get(2))?.as_str().parse().ok()?;
     if n == 0 {
         return None;
@@ -707,28 +780,22 @@ pub fn try_accelerate_head_slice(raw: &str) -> Option<String> {
     if file.contains('*') || file.contains('?') || file.contains(',') {
         return None;
     }
-    let ap_bin = std::env::current_exe()
-        .ok()
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case("ap"))
-                .unwrap_or(false)
-        })
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|| "ap".to_string());
+    let ap_bin = current_ap_bin();
     let file_esc = file.replace('"', "\\\"");
+    let width_flag = cut_w.map(|w| format!(" --width {w}")).unwrap_or_default();
     Some(format!(
-        "{}\"{ap_bin}\" read \"{file_esc}\" --lines 1-{n}",
+        "{}\"{ap_bin}\" read \"{file_esc}\" --lines 1-{n}{width_flag}",
         cd_pfx.as_deref().unwrap_or("")
     ))
 }
 
-/// Rewrite bare `tail -n <N> <file>` or `tail -<N> <file>` (with optional leading `cd <dir> &&`) cleanly
-/// to bounded `ap read "<file>" --tail <N>`. Passes through `-f`, `--follow`, `+N`, pipes, and globs safely.
+/// Rewrite bare `tail -n <N> <file>` or `tail -<N> <file>` (with optional leading `cd <dir> &&` and optional
+/// trailing `| cut -c1-<W>`) cleanly to bounded `ap read "<file>" --tail <N> [--width <W>]`.
+/// Passes through `-f`, `--follow`, `+N`, pipes, and globs safely.
 pub fn try_accelerate_tail_slice(raw: &str) -> Option<String> {
     let (cd_pfx, body) = split_leading_cd_prefix(raw);
-    if has_unsafe_shell_meta(body) {
+    let (core, cut_w) = strip_trailing_cut_width(body);
+    if has_unsafe_shell_meta(core) {
         return None;
     }
     static TAIL_RE: OnceLock<Regex> = OnceLock::new();
@@ -738,7 +805,7 @@ pub fn try_accelerate_tail_slice(raw: &str) -> Option<String> {
         )
         .unwrap()
     });
-    let cap = re.captures(body.trim())?;
+    let cap = re.captures(core)?;
     let n: usize = cap.get(1).or_else(|| cap.get(2))?.as_str().parse().ok()?;
     if n == 0 {
         return None;
@@ -751,19 +818,117 @@ pub fn try_accelerate_tail_slice(raw: &str) -> Option<String> {
     if file.contains('*') || file.contains('?') || file.contains(',') {
         return None;
     }
-    let ap_bin = std::env::current_exe()
-        .ok()
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case("ap"))
-                .unwrap_or(false)
-        })
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|| "ap".to_string());
+    let ap_bin = current_ap_bin();
     let file_esc = file.replace('"', "\\\"");
+    let width_flag = cut_w.map(|w| format!(" --width {w}")).unwrap_or_default();
     Some(format!(
-        "{}\"{ap_bin}\" read \"{file_esc}\" --tail {n}",
+        "{}\"{ap_bin}\" read \"{file_esc}\" --tail {n}{width_flag}",
+        cd_pfx.as_deref().unwrap_or("")
+    ))
+}
+
+/// Rewrite bounded `grep [flags] <pattern> <file_or_dir> [2>/dev/null] | cut -c1-<W> [| head -n <M>]`
+/// cleanly to `ap search [--width <W>] [--max <M>] ... "<pattern>" "<target>"`.
+pub fn try_accelerate_grep_cut_slice(raw: &str) -> Option<String> {
+    let (cd_pfx, body) = split_leading_cd_prefix(raw);
+    static HEAD_PIPE_RE: OnceLock<Regex> = OnceLock::new();
+    let head_re = HEAD_PIPE_RE.get_or_init(|| {
+        Regex::new(r#"^([\s\S]+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$"#).unwrap()
+    });
+    let (before_head, max_hits) = if let Some(cap) = head_re.captures(body.trim()) {
+        let m: usize = cap.get(2).or_else(|| cap.get(3))?.as_str().parse().ok()?;
+        if m == 0 {
+            return None;
+        }
+        (cap.get(1)?.as_str().trim(), Some(m))
+    } else {
+        (body.trim(), None)
+    };
+    let (grep_raw, cut_w) = strip_trailing_cut_width(before_head);
+    let width = cut_w?;
+    let grep_clean = grep_raw
+        .trim()
+        .strip_suffix("2>/dev/null")
+        .unwrap_or(grep_raw)
+        .trim();
+    if has_unsafe_shell_meta(grep_clean) {
+        return None;
+    }
+    let toks = split_shell_tokens(grep_clean)?;
+    if toks.first()?.as_str() != "grep" {
+        return None;
+    }
+    let mut ignore_case = false;
+    let mut fixed = false;
+    let mut files_only = false;
+    let mut count_only = false;
+    let mut only_matching = false;
+    let mut word_regex = false;
+    let mut end_opts = false;
+    let mut positional: Vec<String> = Vec::new();
+    for tok in toks.iter().skip(1) {
+        if !end_opts && tok == "--" {
+            end_opts = true;
+            continue;
+        }
+        if !end_opts && tok.starts_with('-') && tok.len() > 1 {
+            for ch in tok.chars().skip(1) {
+                match ch {
+                    'n' | 'H' | 'h' | 's' | 'r' | 'R' => {}
+                    'i' => ignore_case = true,
+                    'F' => fixed = true,
+                    'E' => {}
+                    'l' => files_only = true,
+                    'c' => count_only = true,
+                    'o' => only_matching = true,
+                    'w' => word_regex = true,
+                    _ => return None,
+                }
+            }
+            continue;
+        }
+        positional.push(tok.clone());
+    }
+    if positional.len() != 2 {
+        return None;
+    }
+    let pat = &positional[0];
+    let target = &positional[1];
+    if pat.is_empty()
+        || target.is_empty()
+        || target == "-"
+        || target.contains('*')
+        || target.contains('?')
+        || target.contains(',')
+    {
+        return None;
+    }
+    let ap_bin = current_ap_bin();
+    let mut flags = format!(" --width {width}");
+    if let Some(m) = max_hits {
+        flags.push_str(&format!(" --max {m}"));
+    }
+    if files_only {
+        flags.push_str(" --files-only");
+    } else if count_only {
+        flags.push_str(" --count");
+    }
+    if only_matching {
+        flags.push_str(" -o");
+    }
+    if ignore_case {
+        flags.push_str(" -i");
+    }
+    if fixed {
+        flags.push_str(" --fixed-strings");
+    }
+    if word_regex {
+        flags.push_str(" -w");
+    }
+    let pat_esc = pat.replace('"', "\\\"");
+    let tgt_esc = target.replace('"', "\\\"");
+    Some(format!(
+        "{}\"{ap_bin}\" search{flags} \"{pat_esc}\" \"{tgt_esc}\"",
         cd_pfx.as_deref().unwrap_or("")
     ))
 }
@@ -1391,6 +1556,11 @@ pub fn heal_windows_command(
     if let Some(fast_find) = try_accelerate_find_files(raw) {
         heals.push("find->ap-ls");
         let (kind, cmd_out) = route_accelerated_cmd(fast_find, has_pwsh7, has_git_bash);
+        return (kind, cmd_out, heals);
+    }
+    if let Some(fast_grep_cut) = try_accelerate_grep_cut_slice(raw) {
+        heals.push("grep-cut->ap-search");
+        let (kind, cmd_out) = route_accelerated_cmd(fast_grep_cut, has_pwsh7, has_git_bash);
         return (kind, cmd_out, heals);
     }
     if has_git_bash {
@@ -2355,5 +2525,43 @@ mod tests {
                 r#"for d in "C:/Program Files/App" "C:/Program Files (x86)/App"; do echo "${d}"; done"#
             )
         );
+
+        // Trailing `| cut -c1-<W>` acceleration on sed/head/tail + grep-cut
+        let (_, h37, tags37) =
+            heal_windows_command("sed -n '1,80p' app.py | cut -c1-160", true, true);
+        assert!(
+            h37.contains("read \"app.py\" --lines 1-80 --width 160"),
+            "{h37}"
+        );
+        assert!(tags37.contains(&"sed-slice->ap-read"));
+
+        let (_, h38, tags38) =
+            heal_windows_command("head -n 50 bundle.js | cut -c 1-200", true, true);
+        assert!(
+            h38.contains("read \"bundle.js\" --lines 1-50 --width 200"),
+            "{h38}"
+        );
+        assert!(tags38.contains(&"head-slice->ap-read"));
+
+        let (k39, h39, tags39) =
+            heal_windows_command("cd sub && tail -30 server.log | cut -c1-120", true, true);
+        assert_eq!(k39, ShellKind::GitBash);
+        assert!(
+            h39.starts_with("cd sub && ")
+                && h39.contains("read \"server.log\" --tail 30 --width 120"),
+            "{h39}"
+        );
+        assert!(tags39.contains(&"tail-slice->ap-read"));
+
+        let (_, h40, tags40) = heal_windows_command(
+            "grep -ni 'authToken' dist/app.js | cut -c1-140 | head -n 20",
+            true,
+            true,
+        );
+        assert!(
+            h40.contains("search --width 140 --max 20 -i \"authToken\" \"dist/app.js\""),
+            "{h40}"
+        );
+        assert!(tags40.contains(&"grep-cut->ap-search"));
     }
 }

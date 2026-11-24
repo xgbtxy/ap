@@ -1597,6 +1597,8 @@ export function extractAllToolResultText(
 export function sieveCodemodeContentBlocks(
 	content: ReadonlyArray<{{ type?: string; text?: string; [k: string]: unknown }}>,
 	sieveFn: (rawBody: string) => string | undefined,
+	isFastModel = false,
+	hardLimitOverride?: number,
 ): Array<{{ type?: string; text?: string; [k: string]: unknown }}> | undefined {{
 	if (!Array.isArray(content) || content.length === 0) return undefined;
 	const first = content[0];
@@ -1616,7 +1618,11 @@ export function sieveCodemodeContentBlocks(
 		}}
 	}}
 	const combinedBody = bodyTexts.join("\n");
-	if (!combinedBody || combinedBody.includes("[sieve id=") || !shouldAutoSieveShellOutput(combinedBody)) {{
+	if (
+		!combinedBody ||
+		combinedBody.includes("[sieve id=") ||
+		!shouldAutoSieveShellOutput(combinedBody, isFastModel, hardLimitOverride)
+	) {{
 		return undefined;
 	}}
 	// Preserve any trailing `Script error:` block verbatim so error diagnostics + classifiers keep full fidelity
@@ -1629,7 +1635,7 @@ export function sieveCodemodeContentBlocks(
 	}} else if (combinedBody.startsWith("Script error:\n")) {{
 		return undefined;
 	}}
-	if (!shouldAutoSieveShellOutput(sieveInput)) {{
+	if (!shouldAutoSieveShellOutput(sieveInput, isFastModel, hardLimitOverride)) {{
 		return undefined;
 	}}
 	const digested = sieveFn(sieveInput);
@@ -3216,12 +3222,34 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		}}
 	}}
 
-	// 1d. Rewrite bare `sed -n '<A>,<B>p'`, `head -n <N>`, `tail -n <N>`, or `cat <file> | head|tail|sed` -> bounded `ap read`
+	// 1d. Rewrite bare `sed -n '<A>,<B>p'`, `head -n <N>`, `tail -n <N>`, `cat <file> | head|tail|sed`,
+	// or single-file `grep ... | cut -c1-<W> [| head -n <M>]` (with optional trailing `| cut -c1-<W>`) -> bounded `ap read` / `ap search`
 	if (toolName === "bash" && !/[;&><{{}}`]|\$\(/.test(cmdTailBody)) {{
 		const trimmedTail = cmdTailBody.trim();
 		const qPathOk = (f: string) => Boolean(f) && f !== "-" && !/[*?,]/.test(f);
-		if (!trimmedTail.includes("|")) {{
-			const sedM = trimmedTail.match(
+		let headCap = 0;
+		const headCapM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$/);
+		let cutWidth = 0;
+		let baseTail = trimmedTail;
+		if (headCapM) {{
+			const m = Number(headCapM[2] || headCapM[3]);
+			const cutBeforeHead = headCapM[1].trim().match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
+			if (m >= 1 && cutBeforeHead && Number(cutBeforeHead[2]) >= 1) {{
+				headCap = m;
+				cutWidth = Number(cutBeforeHead[2]);
+				baseTail = cutBeforeHead[1].trim();
+			}}
+		}} else {{
+			const cutTailM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
+			if (cutTailM && Number(cutTailM[2]) >= 1) {{
+				cutWidth = Number(cutTailM[2]);
+				baseTail = cutTailM[1].trim();
+			}}
+		}}
+		const widthFlag = cutWidth > 0 ? ` --width ${{cutWidth}}` : "";
+		const baseHasPipe = baseTail.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "").includes("|");
+		if (!baseHasPipe && headCap === 0) {{
+			const sedM = baseTail.match(
 				/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
 			);
 			if (sedM) {{
@@ -3229,26 +3257,71 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				const e = Number(sedM[2] || sedM[4] || sedM[6]);
 				const f = sedM[7] || sedM[8] || sedM[9] || "";
 				if (s >= 1 && e >= s && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}${{widthFlag}}`;
 				}}
 			}}
-			const headM = trimmedTail.match(/^head\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			const headM = baseTail.match(/^head\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
 			if (headM) {{
 				const n = Number(headM[1] || headM[2]);
 				const f = headM[3] || headM[4] || headM[5] || "";
 				if (n >= 1 && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{widthFlag}}`;
 				}}
 			}}
-			const tailM = trimmedTail.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			const tailM = baseTail.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
 			if (tailM) {{
 				const n = Number(tailM[1] || tailM[2]);
 				const f = tailM[3] || tailM[4] || tailM[5] || "";
 				if (n >= 1 && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --tail ${{n}}${{widthFlag}}`;
 				}}
 			}}
-		}} else {{
+		}}
+		if (cutWidth > 0 && !baseHasPipe && /^grep(?:\s|$)/.test(baseTail)) {{
+			const gToks = (baseTail.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) => {{
+				if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {{
+					return t.slice(1, -1).replace(/\\"/g, '"');
+				}}
+				return t;
+			}});
+			if (gToks[0] === "grep") {{
+				let ignoreCase = false;
+				let fixed = false;
+				let wordRe = false;
+				let onlyMatch = false;
+				let endOpts = false;
+				let gOk = true;
+				const gPos: string[] = [];
+				for (let gi = 1; gi < gToks.length; gi += 1) {{
+					const gt = gToks[gi];
+					if (!endOpts && gt === "--") {{
+						endOpts = true;
+						continue;
+					}}
+					if (!endOpts && gt.startsWith("-") && gt.length > 1) {{
+						for (const ch of gt.slice(1)) {{
+							if (ch === "n" || ch === "E" || ch === "H" || ch === "h" || ch === "s") continue;
+							else if (ch === "i") ignoreCase = true;
+							else if (ch === "F") fixed = true;
+							else if (ch === "w") wordRe = true;
+							else if (ch === "o") onlyMatch = true;
+							else {{
+								gOk = false;
+								break;
+							}}
+						}}
+						if (!gOk) break;
+						continue;
+					}}
+					gPos.push(gt);
+				}}
+				if (gOk && gPos.length === 2 && gPos[0] && qPathOk(gPos[1])) {{
+					const maxFlag = headCap > 0 ? ` --max ${{headCap}}` : "";
+					const fFlags = `${{onlyMatch ? " -o" : ""}}${{ignoreCase ? " -i" : ""}}${{fixed ? " --fixed-strings" : ""}}${{wordRe ? " -w" : ""}}`;
+					return `${{cdLeadPfx}}"${{AP_BIN}}" search${{widthFlag}}${{maxFlag}}${{fFlags}} ${{shellQuoteBashPat(gPos[0])}} "${{gPos[1].replace(/"/g, '\\"')}}"`;
+				}}
+			}}
+		}} else if (cutWidth === 0 && headCap === 0 && trimmedTail.includes("|")) {{
 			const parts = trimmedTail.split("|");
 			if (parts.length === 2) {{
 				const catM = parts[0].trim().match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
@@ -5537,18 +5610,25 @@ export default function (pi: ExtensionAPI) {{
 		}}>;
 		let mutated = false;
 
+		const isFast = isDeepCacheDiscountModel((ctx as {{ model?: {{ id?: string; api?: string }} }} | undefined)?.model);
+
 		// 0. Lossless multi-block auto-sieve for oversized `codemode` dumps (content[1..N]; preserves header, Script error & images)
 		if (event.toolName === "codemode") {{
-			const sieved = sieveCodemodeContentBlocks(workingContent, (rawBody) => {{
-				const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-codemode"], {{
-					input: rawBody,
-					encoding: "utf8",
-					timeout: 4000,
-					windowsHide: true,
-					env: {{ ...process.env, SIEVE_HOME }},
-				}});
-				return res.status === 0 && res.stdout ? res.stdout : undefined;
-			}});
+			const sieved = sieveCodemodeContentBlocks(
+				workingContent,
+				(rawBody) => {{
+					const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-codemode"], {{
+						input: rawBody,
+						encoding: "utf8",
+						timeout: 4000,
+						windowsHide: true,
+						env: {{ ...process.env, SIEVE_HOME }},
+					}});
+					return res.status === 0 && res.stdout ? res.stdout : undefined;
+				}},
+				isFast,
+				apProfileOverrides?.sieveHardChars,
+			);
 			if (sieved) {{
 				workingContent = sieved;
 				sievedCount += 1;
@@ -5778,10 +5858,11 @@ export default function (pi: ExtensionAPI) {{
 		// C. Dual-tier shell auto-sieve (>=24KB unconditional, >=14KB structured/noisy) + failure tips + loop-breaker
 		if (event.toolName === "bash" || event.toolName === "powershell") {{
 			const cmd = typeof event.input?.command === "string" ? event.input.command : "";
-			const skipSieve =
+			const isSieveSelf = /\bap(?:\.exe)?\s+sieve\b/.test(cmd);
+			const isBoundedApCmd =
 				cmd.includes("ap.exe") ||
 				/\bap\s+(?:read|search|query|atlas|probe|guard|sieve|baton|splice|recall)\b/.test(cmd);
-			const isFast = isDeepCacheDiscountModel((ctx as {{ model?: {{ id?: string; api?: string }} }} | undefined)?.model);
+			const skipSieve = isSieveSelf || (isBoundedApCmd && outText.length < 24000);
 			if (!skipSieve && shouldAutoSieveShellOutput(outText, isFast, apProfileOverrides?.sieveHardChars)) {{
 				const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-bash"], {{
 					input: outText,

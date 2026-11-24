@@ -133,6 +133,9 @@ struct SearchCli {
     /// Structural Tree-sitter AST query across Py/TS/JS/Go/Rust/C (`kind:call`, `kind:fn`, `fetch($URL, $$$)`, `$X == $X`, `Command::new($BIN)`)
     #[arg(long, default_value = "")]
     ast: String,
+    /// Maximum characters per returned snippet line (0 = keep default snippet)
+    #[arg(long, alias = "max-line-len", default_value_t = 0)]
+    width: usize,
     /// Emit structured JSON output
     #[arg(long)]
     json: bool,
@@ -966,12 +969,15 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 | "yaml"
                                 | "properties"
                                 | "class"
+                                | "pyc"
                         ) {
                             continue;
                         }
                         let mut eb = Vec::new();
                         if std::io::Read::read_to_end(&mut zf, &mut eb).is_ok() {
-                            let txt = if eext == "class" {
+                            let txt = if eext == "pyc" || crate::binary::is_pyc_magic(&eb) {
+                                crate::binary::extract_pyc_searchable_text(&eb)
+                            } else if eext == "class" {
                                 crate::binary::extract_java_class_searchable_text(&eb)
                             } else {
                                 decode_any_bytes(&eb).0
@@ -1025,7 +1031,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                 let Some(eb) = tar_buf.get(ent.offset..ent.offset + ent.size) else {
                     continue;
                 };
-                if crate::binary::is_binary_magic(eb) && !crate::binary::is_java_class_magic(eb) {
+                if crate::binary::is_binary_magic(eb)
+                    && !crate::binary::is_java_class_magic(eb)
+                    && !crate::binary::is_pyc_magic(eb)
+                {
                     continue;
                 }
                 let eext = Path::new(&ent.path)
@@ -1033,7 +1042,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                let txt = if crate::binary::is_java_class_magic(eb) {
+                let txt = if eext == "pyc" || crate::binary::is_pyc_magic(eb) {
+                    crate::binary::extract_pyc_searchable_text(eb)
+                } else if crate::binary::is_java_class_magic(eb) {
                     crate::binary::extract_java_class_searchable_text(eb)
                 } else {
                     decode_any_bytes(eb).0
@@ -1046,6 +1057,32 @@ pub fn run_cli(args: &[String]) -> i32 {
                         &txt,
                         &virt_rel,
                         &eext,
+                        false,
+                        r,
+                        s_opts,
+                        filtered_non_code,
+                        filtered_tests,
+                        &mut local_matches,
+                    );
+                    if local_matches.len() >= s_opts.max_hits {
+                        return local_matches;
+                    }
+                }
+            }
+            return local_matches;
+        }
+
+        // CPython .pyc Marshal v4 + bytecode search when explicitly targeted or --ext pyc
+        if ext == "pyc" || (explicit_file && crate::binary::is_pyc_magic(&bytes)) {
+            let txt = crate::binary::extract_pyc_searchable_text(&bytes);
+            if !txt.is_empty() {
+                for (pl, r) in compiled {
+                    let lbl = if multi_mode { pl.as_str() } else { "" };
+                    push_text_matches(
+                        lbl,
+                        &txt,
+                        &rel,
+                        "py",
                         false,
                         r,
                         s_opts,
@@ -1283,6 +1320,16 @@ pub fn run_cli(args: &[String]) -> i32 {
     });
     if !cli.count && !cli.files_only && !cli.unique && matches.len() > cli.max_hits {
         matches.truncate(cli.max_hits);
+    }
+    if cli.width > 0 {
+        for m in &mut matches {
+            let char_cnt = m.snippet.chars().count();
+            if char_cnt > cli.width {
+                let mut truncated: String = m.snippet.chars().take(cli.width).collect();
+                truncated.push('…');
+                m.snippet = truncated;
+            }
+        }
     }
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
