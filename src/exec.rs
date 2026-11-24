@@ -702,7 +702,7 @@ fn split_shell_tokens(s: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Rewrite bare `sed -n '<start>,<end>p' <file>` (with optional leading `cd <dir> &&` and optional
+/// Rewrite bare `sed -n '<start>[,<end>]p' <file>` (with optional leading `cd <dir> &&` and optional
 /// trailing `| cut -c1-<W>`) cleanly to bounded `ap read "<file>" --lines <start>-<end> [--width <W>]`.
 /// Passes through piped or complex sed expressions.
 pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
@@ -714,7 +714,7 @@ pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
     static SED_RE: OnceLock<Regex> = OnceLock::new();
     let re = SED_RE.get_or_init(|| {
         Regex::new(
-            r#"^\s*sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s*$"#,
+            r#"^\s*sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))\s*$"#,
         )
         .unwrap()
     });
@@ -727,8 +727,9 @@ pub fn try_accelerate_sed_slice(raw: &str) -> Option<String> {
     let e_str = cap
         .get(2)
         .or_else(|| cap.get(4))
-        .or_else(|| cap.get(6))?
-        .as_str();
+        .or_else(|| cap.get(6))
+        .map(|m| m.as_str())
+        .unwrap_or(s_str);
     let start: usize = s_str.parse().ok()?;
     let end: usize = e_str.parse().ok()?;
     if start == 0 || end < start {
@@ -969,9 +970,11 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
         }
     }
     let toks = split_shell_tokens(grep_clean)?;
-    if toks.first()?.as_str() != "grep" {
+    let cmd0 = toks.first()?.as_str();
+    if cmd0 != "grep" && cmd0 != "rg" {
         return None;
     }
+    let is_rg = cmd0 == "rg";
     let mut ignore_case = false;
     let mut fixed = false;
     let mut files_only = false;
@@ -979,17 +982,94 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
     let mut only_matching = false;
     let mut no_filename = false;
     let mut word_regex = false;
+    let mut exts: Vec<String> = Vec::new();
+    let mut includes: Vec<String> = Vec::new();
     let mut end_opts = false;
     let mut positional: Vec<String> = Vec::new();
-    for tok in toks.iter().skip(1) {
+    let mut idx = 1usize;
+    while idx < toks.len() {
+        let tok = &toks[idx];
         if !end_opts && tok == "--" {
             end_opts = true;
+            idx += 1;
+            continue;
+        }
+        if !end_opts && tok.starts_with("--") {
+            if !is_rg {
+                return None;
+            }
+            if let Some(g) = tok.strip_prefix("--glob=") {
+                if g.is_empty() || g.starts_with('!') {
+                    return None;
+                }
+                if let Some(ext) = g.strip_prefix("*.").filter(|s| {
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                }) {
+                    if !exts.iter().any(|x| x == ext) {
+                        exts.push(ext.to_string());
+                    }
+                } else {
+                    includes.push(g.to_string());
+                }
+            } else {
+                match tok.as_str() {
+                    "--glob" => {
+                        idx += 1;
+                        let g = toks.get(idx)?;
+                        if g.is_empty() || g.starts_with('!') {
+                            return None;
+                        }
+                        if let Some(ext) = g.strip_prefix("*.").filter(|s| {
+                            !s.is_empty()
+                                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        }) {
+                            if !exts.iter().any(|x| x == ext) {
+                                exts.push(ext.to_string());
+                            }
+                        } else {
+                            includes.push(g.to_string());
+                        }
+                    }
+                    "--no-filename" => no_filename = true,
+                    "--no-messages" | "--no-line-number" | "--line-number" => {}
+                    "--ignore-case" => ignore_case = true,
+                    "--fixed-strings" => fixed = true,
+                    "--only-matching" => only_matching = true,
+                    "--files-with-matches" => files_only = true,
+                    "--count" => count_only = true,
+                    "--word-regexp" => word_regex = true,
+                    _ => return None,
+                }
+            }
+            idx += 1;
             continue;
         }
         if !end_opts && tok.starts_with('-') && tok.len() > 1 {
-            for ch in tok.chars().skip(1) {
+            let short = &tok[1..];
+            if is_rg && short == "g" {
+                idx += 1;
+                let g = toks.get(idx)?;
+                if g.is_empty() || g.starts_with('!') {
+                    return None;
+                }
+                if let Some(ext) = g.strip_prefix("*.").filter(|s| {
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                }) {
+                    if !exts.iter().any(|x| x == ext) {
+                        exts.push(ext.to_string());
+                    }
+                } else {
+                    includes.push(g.to_string());
+                }
+                idx += 1;
+                continue;
+            }
+            for ch in short.chars() {
                 match ch {
-                    'n' | 'H' | 's' | 'r' | 'R' | 'E' => {}
+                    'n' | 'H' | 's' => {}
+                    'N' if is_rg => {}
+                    'I' if is_rg => no_filename = true,
+                    'r' | 'R' | 'E' if !is_rg => {}
                     'h' => no_filename = true,
                     'i' => ignore_case = true,
                     'F' => fixed = true,
@@ -1000,15 +1080,19 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
                     _ => return None,
                 }
             }
+            idx += 1;
             continue;
         }
         positional.push(tok.clone());
+        idx += 1;
     }
-    if positional.len() != 2 {
+    let (pat, target) = if is_rg && positional.len() == 1 {
+        (positional[0].as_str(), ".")
+    } else if positional.len() == 2 {
+        (positional[0].as_str(), positional[1].as_str())
+    } else {
         return None;
-    }
-    let pat = &positional[0];
-    let target = &positional[1];
+    };
     if pat.is_empty()
         || target.is_empty()
         || target == "-"
@@ -1106,6 +1190,13 @@ pub fn try_accelerate_grep_pipeline(raw: &str) -> Option<String> {
     if word_regex {
         flags.push_str(" -w");
     }
+    if !exts.is_empty() {
+        flags.push_str(&format!(" --ext {}", exts.join(",")));
+    }
+    for inc in &includes {
+        let inc_esc = inc.replace('"', "\\\"");
+        flags.push_str(&format!(" --include \"{inc_esc}\""));
+    }
     let pat_esc = pat.replace('"', "\\\"");
     let tgt_esc = target.replace('"', "\\\"");
     Some(format!(
@@ -1140,8 +1231,10 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
             Regex::new(r#"^\s*cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$"#).unwrap(),
             Regex::new(r#"^\s*head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))\s*$"#).unwrap(),
             Regex::new(r#"^\s*tail\s+(?:-n\s*(\d+)|-(\d+))\s*$"#).unwrap(),
-            Regex::new(r#"^\s*sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s*$"#)
-                .unwrap(),
+            Regex::new(
+                r#"^\s*sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)\s*$"#,
+            )
+            .unwrap(),
         )
     });
     let cat_cap = cat_re.captures(lhs_clean)?;
@@ -1181,20 +1274,19 @@ pub fn try_accelerate_cat_slice(raw: &str) -> Option<String> {
         format!("--tail {n}")
     } else {
         let sc = sed_re.captures(rhs_clean)?;
-        let s: usize = sc
+        let s_str = sc
             .get(1)
             .or_else(|| sc.get(3))
             .or_else(|| sc.get(5))?
-            .as_str()
-            .parse()
-            .ok()?;
-        let e: usize = sc
+            .as_str();
+        let e_str = sc
             .get(2)
             .or_else(|| sc.get(4))
-            .or_else(|| sc.get(6))?
-            .as_str()
-            .parse()
-            .ok()?;
+            .or_else(|| sc.get(6))
+            .map(|m| m.as_str())
+            .unwrap_or(s_str);
+        let s: usize = s_str.parse().ok()?;
+        let e: usize = e_str.parse().ok()?;
         if s == 0 || e < s {
             return None;
         }
@@ -2910,5 +3002,34 @@ mod tests {
         assert!(try_accelerate_ls_slice("ls -d */ | head -10").is_none());
         assert!(try_accelerate_ls_slice("ls *.rs | head -10").is_none());
         assert!(try_accelerate_ls_slice("ls | grep foo | head -10").is_none());
+
+        // Single-line `sed -n '<N>p'` and `rg` pipeline accelerators
+        let (_, h51, _) = heal_windows_command("sed -n '46p' index.md | cut -c1-120", true, true);
+        assert!(
+            h51.contains("read \"index.md\" --lines 46-46 --width 120"),
+            "{h51}"
+        );
+
+        let (_, h52, _) = heal_windows_command(
+            "rg -o --no-filename 'token=[a-z]+' -g '*.js' | sort -u | head -20",
+            true,
+            true,
+        );
+        assert!(
+            h52.contains(
+                "search --max 20 --unique -o --no-filename --ext js \"token=[a-z]+\" \".\""
+            ),
+            "{h52}"
+        );
+
+        let (_, h53, _) =
+            heal_windows_command("rg -n 'auth' notes.md | cut -c1-140 | head -15", true, true);
+        assert!(
+            h53.contains("search --width 140 --max 15 \"auth\" \"notes.md\""),
+            "{h53}"
+        );
+
+        assert!(try_accelerate_grep_pipeline("rg -a -b -o 'foo' app.exe | head -10").is_none());
+        assert!(try_accelerate_grep_pipeline("rg -o 'foo' -g '!*.test.js' | head -10").is_none());
     }
 }

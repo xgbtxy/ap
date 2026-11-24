@@ -2361,6 +2361,170 @@ pub fn scan_secrets_md(
     (out.join("\n"), jv)
 }
 
+fn json_key_child_path(parent: &str, key: &str) -> String {
+    let simple = !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if simple {
+        format!("{parent}.{key}")
+    } else {
+        let esc = key.replace('"', "\\\"");
+        format!("{parent}[\"{esc}\"]")
+    }
+}
+
+fn json_preview_val(v: &Value) -> String {
+    let raw = match v {
+        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}")),
+        Value::Null | Value::Bool(_) | Value::Number(_) => v.to_string(),
+        Value::Array(a) => format!("[{} item(s)]", a.len()),
+        Value::Object(m) => format!("{{{} key(s)}}", m.len()),
+    };
+    let clean = raw.replace(['\r', '\n'], " ");
+    if clean.chars().count() > 120 {
+        let cut: String = clean.chars().take(119).collect();
+        format!("{cut}…")
+    } else {
+        clean
+    }
+}
+
+#[derive(Default)]
+struct JsonDiffAcc {
+    added: Vec<(String, String)>,
+    removed: Vec<(String, String)>,
+    changed: Vec<(String, String, String)>,
+    unchanged_leaves: usize,
+    truncated: bool,
+}
+
+fn collect_json_diff(old_v: &Value, new_v: &Value, path: &str, acc: &mut JsonDiffAcc) {
+    const CAP: usize = 120;
+    match (old_v, new_v) {
+        (Value::Object(om), Value::Object(nm)) => {
+            let mut keys: Vec<&String> = om.keys().collect();
+            for k in nm.keys() {
+                if !om.contains_key(k) {
+                    keys.push(k);
+                }
+            }
+            keys.sort();
+            for k in keys {
+                let cp = json_key_child_path(path, k);
+                match (om.get(k), nm.get(k)) {
+                    (None, Some(nv)) => {
+                        if acc.added.len() < CAP {
+                            acc.added.push((cp, json_preview_val(nv)));
+                        } else {
+                            acc.truncated = true;
+                        }
+                    }
+                    (Some(ov), None) => {
+                        if acc.removed.len() < CAP {
+                            acc.removed.push((cp, json_preview_val(ov)));
+                        } else {
+                            acc.truncated = true;
+                        }
+                    }
+                    (Some(ov), Some(nv)) => collect_json_diff(ov, nv, &cp, acc),
+                    (None, None) => {}
+                }
+            }
+        }
+        (Value::Array(oa), Value::Array(na)) => {
+            let max_len = oa.len().max(na.len());
+            for idx in 0..max_len {
+                let cp = format!("{path}[{idx}]");
+                match (oa.get(idx), na.get(idx)) {
+                    (None, Some(nv)) => {
+                        if acc.added.len() < CAP {
+                            acc.added.push((cp, json_preview_val(nv)));
+                        } else {
+                            acc.truncated = true;
+                        }
+                    }
+                    (Some(ov), None) => {
+                        if acc.removed.len() < CAP {
+                            acc.removed.push((cp, json_preview_val(ov)));
+                        } else {
+                            acc.truncated = true;
+                        }
+                    }
+                    (Some(ov), Some(nv)) => collect_json_diff(ov, nv, &cp, acc),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ => {
+            if old_v == new_v {
+                acc.unchanged_leaves += 1;
+            } else if acc.changed.len() < CAP {
+                acc.changed.push((
+                    path.to_string(),
+                    json_preview_val(old_v),
+                    json_preview_val(new_v),
+                ));
+            } else {
+                acc.truncated = true;
+            }
+        }
+    }
+}
+
+/// Pure-Rust semantic structural JSON diff ignoring whitespace and object key ordering.
+pub fn diff_json_structural_md(
+    new_val: &Value,
+    old_val: &Value,
+    new_label: &str,
+    old_label: &str,
+) -> (String, Value) {
+    let mut acc = JsonDiffAcc::default();
+    collect_json_diff(old_val, new_val, "$", &mut acc);
+    let mut lines = vec![format!(
+        "## Structural JSON Diff: `{new_label}` vs `{old_label}` (+{} added, -{} removed, ~{} changed, {} unchanged)",
+        acc.added.len(),
+        acc.removed.len(),
+        acc.changed.len(),
+        acc.unchanged_leaves
+    )];
+    if acc.added.is_empty() && acc.removed.is_empty() && acc.changed.is_empty() {
+        lines.push("*(0 semantic differences — formatting or key order only)*".to_string());
+    } else {
+        if !acc.added.is_empty() {
+            lines.push("### Added".to_string());
+            for (p, v) in &acc.added {
+                lines.push(format!("- `{p}`: `{v}`"));
+            }
+        }
+        if !acc.removed.is_empty() {
+            lines.push("### Removed".to_string());
+            for (p, v) in &acc.removed {
+                lines.push(format!("- `{p}`: `{v}`"));
+            }
+        }
+        if !acc.changed.is_empty() {
+            lines.push("### Changed".to_string());
+            for (p, ov, nv) in &acc.changed {
+                lines.push(format!("- `{p}`: `{ov}` -> `{nv}`"));
+            }
+        }
+        if acc.truncated {
+            lines.push("*(diff output capped at 120 entries per category)*".to_string());
+        }
+    }
+    let jv = serde_json::json!({
+        "added": acc.added.iter().map(|(p, v)| serde_json::json!({"path": p, "value": v})).collect::<Vec<_>>(),
+        "removed": acc.removed.iter().map(|(p, v)| serde_json::json!({"path": p, "value": v})).collect::<Vec<_>>(),
+        "changed": acc.changed.iter().map(|(p, o, n)| serde_json::json!({"path": p, "old": o, "new": n})).collect::<Vec<_>>(),
+        "truncated": acc.truncated,
+        "counts": {
+            "added": acc.added.len(),
+            "removed": acc.removed.len(),
+            "changed": acc.changed.len(),
+            "unchanged": acc.unchanged_leaves,
+        }
+    });
+    (lines.join("\n"), jv)
+}
+
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
@@ -2633,5 +2797,38 @@ mod inspect_tests {
         assert!(!md.contains("TOP_SECRET_JWT_NEVER_EMIT"), "{md}");
         assert_eq!(jv["counts"]["unauth_2xx"], 1);
         assert_eq!(jv["counts"]["cors_creds_exposed"], 1);
+    }
+
+    #[test]
+    fn diffs_json_structurally_ignoring_key_order() {
+        let old_v: Value = serde_json::from_str(
+            r#"{"b": 2, "a": 1, "nested": {"keep": true, "drop": "x"}, "arr": [10, 20]}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"nested": {"drop": "x", "keep": true}, "arr": [10, 20], "a": 1, "b": 2}"#,
+        )
+        .unwrap();
+        let (same_md, same_jv) = diff_json_structural_md(&reordered, &old_v, "re.json", "old.json");
+        assert!(same_md.contains("0 semantic differences"), "{same_md}");
+        assert_eq!(same_jv["counts"]["added"], 0);
+        assert_eq!(same_jv["counts"]["removed"], 0);
+        assert_eq!(same_jv["counts"]["changed"], 0);
+
+        let new_v: Value = serde_json::from_str(
+            r#"{"a": 1, "b": 3, "nested": {"keep": true, "add": "y"}, "arr": [10, 25, 30]}"#,
+        )
+        .unwrap();
+        let (diff_md, diff_jv) = diff_json_structural_md(&new_v, &old_v, "new.json", "old.json");
+        assert!(
+            diff_md.contains("$.b")
+                && diff_md.contains("$.nested.add")
+                && diff_md.contains("$.nested.drop")
+                && diff_md.contains("$.arr[2]"),
+            "{diff_md}"
+        );
+        assert_eq!(diff_jv["counts"]["added"], 2);
+        assert_eq!(diff_jv["counts"]["removed"], 1);
+        assert_eq!(diff_jv["counts"]["changed"], 2);
     }
 }

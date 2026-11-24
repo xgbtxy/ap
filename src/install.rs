@@ -2935,6 +2935,18 @@ export function shouldAutoSieveUnboundedRead(
 }}
 
 /**
+ * Guard unguarded standalone Bash `curl` HTTP probes with `--max-time 30` so slow endpoints fail fast
+ * instead of hanging into DeepSeek's KV-cache eviction window or stalling turns.
+ */
+export function guardUnboundedCurlTimeout(cmd: string): string | undefined {{
+	if (!cmd || /<<|\b(?:python3?|py|node)\b/i.test(cmd)) return undefined;
+	if (!/(?:^|[;&|]\s*)curl(?:\.exe)?\s+/.test(cmd)) return undefined;
+	if (/\s(?:-m|--max-time|--connect-timeout)\b/.test(cmd)) return undefined;
+	const next = cmd.replace(/(^|[;&|]\s*)(curl(?:\.exe)?)(?=\s)/g, "$1$2 --max-time 30");
+	return next !== cmd ? next : undefined;
+}}
+
+/**
  * Strip explicit top-level `null` optional fields so strict tool schemas (e.g. read, mcp_*)
  * never reject DeepSeek or other models sending `{{ offset: null, limit: null }}`.
  */
@@ -3000,21 +3012,25 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {{
 		if (bodyEnd <= bodyStart) break;
 		matchedAny = true;
 		out += cmd.slice(cursor, prefixStart) + hm[1];
-		const inner = cmd.slice(bodyStart, bodyEnd);
-		const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(inner);
+		let inner = cmd.slice(bodyStart, bodyEnd);
+		const innerTimed =
+			/\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b/i.test(inner) && !/\s-TimeoutSec\b/i.test(inner)
+				? inner.replace(/(^|[;&|(\s])(Invoke-WebRequest|Invoke-RestMethod)(?=\s)/gi, "$1$2 -TimeoutSec 25")
+				: inner;
+		const hasUtf8 = /OutputEncoding|UTF8Encoding/i.test(innerTimed);
 		const utf8Prefix = hasUtf8 ? "" : "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
-		const hasPsVar = /\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*|\?|\()/i.test(inner);
-		const hasPsBacktick = /(?<!\\)`/.test(inner);
-		if (!inner.includes("'") && !/\$\(/.test(inner) && (hasPsVar || hasPsBacktick)) {{
-			const sqInner = inner.replace(/\\"/g, '"').replace(/\\\$/g, "$").replace(/\\`/g, "`");
+		const hasPsVar = /\$(?:_|PSItem\b|env:|null\b|true\b|false\b|[A-Za-z_]\w*|\?|\()/i.test(innerTimed);
+		const hasPsBacktick = /(?<!\\)`/.test(innerTimed);
+		if (!innerTimed.includes("'") && !/\$\(/.test(innerTimed) && (hasPsVar || hasPsBacktick)) {{
+			const sqInner = innerTimed.replace(/\\"/g, '"').replace(/\\\$/g, "$").replace(/\\`/g, "`");
 			out += `'${{utf8Prefix}}${{sqInner}}'`;
 		}} else if (hasPsVar || hasPsBacktick || !hasUtf8) {{
-			const innerEsc = inner
+			const innerEsc = innerTimed
 				.replace(/(?<!\\)\$(?=[A-Za-z_?(])/g, "\\$")
 				.replace(/(?<!\\)`/g, "\\`");
 			out += `"${{utf8Prefix}}${{innerEsc}}"`;
 		}} else {{
-			out += `"${{inner}}"`;
+			out += `"${{innerTimed}}"`;
 		}}
 		cursor = bodyEnd + 1;
 	}}
@@ -3254,14 +3270,15 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	const grepRaw = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
 	const stripQuotes = (s: string) => s.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
 	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(grepRaw))) return undefined;
-	if (!/^grep(?:\s|$)/.test(grepRaw)) return undefined;
+	if (!/^(?:grep|rg)(?:\s|$)/.test(grepRaw)) return undefined;
 	const gToks = (grepRaw.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) => {{
 		if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {{
 			return t.slice(1, -1).replace(/\\"/g, '"');
 		}}
 		return t;
 	}});
-	if (gToks[0] !== "grep") return undefined;
+	const isRg = gToks[0] === "rg";
+	if (gToks[0] !== "grep" && !isRg) return undefined;
 	let ignoreCase = false;
 	let fixed = false;
 	let filesOnly = false;
@@ -3269,6 +3286,18 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	let wordRe = false;
 	let onlyMatch = false;
 	let noFilename = false;
+	const exts: string[] = [];
+	const includes: string[] = [];
+	const addGlob = (g: string): boolean => {{
+		if (!g || g.startsWith("!")) return false;
+		const em = g.match(/^\*\.([A-Za-z0-9_]+)$/);
+		if (em) {{
+			if (!exts.includes(em[1])) exts.push(em[1]);
+		}} else {{
+			includes.push(g);
+		}}
+		return true;
+	}};
 	let endOpts = false;
 	const gPos: string[] = [];
 	for (let gi = 1; gi < gToks.length; gi += 1) {{
@@ -3277,9 +3306,46 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 			endOpts = true;
 			continue;
 		}}
+		if (!endOpts && gt.startsWith("--")) {{
+			if (!isRg) return undefined;
+			if (gt.startsWith("--glob=")) {{
+				if (!addGlob(gt.slice(7))) return undefined;
+			}} else if (gt === "--glob") {{
+				gi += 1;
+				if (gi >= gToks.length || !addGlob(gToks[gi])) return undefined;
+			}} else if (gt === "--no-filename") {{
+				noFilename = true;
+			}} else if (gt === "--no-messages" || gt === "--no-line-number" || gt === "--line-number") {{
+				// compatible defaults
+			}} else if (gt === "--ignore-case") {{
+				ignoreCase = true;
+			}} else if (gt === "--fixed-strings") {{
+				fixed = true;
+			}} else if (gt === "--only-matching") {{
+				onlyMatch = true;
+			}} else if (gt === "--files-with-matches") {{
+				filesOnly = true;
+			}} else if (gt === "--count") {{
+				countOnly = true;
+			}} else if (gt === "--word-regexp") {{
+				wordRe = true;
+			}} else {{
+				return undefined;
+			}}
+			continue;
+		}}
 		if (!endOpts && gt.startsWith("-") && gt.length > 1) {{
-			for (const ch of gt.slice(1)) {{
-				if (ch === "n" || ch === "E" || ch === "H" || ch === "s" || ch === "r" || ch === "R") continue;
+			const sh = gt.slice(1);
+			if (isRg && sh === "g") {{
+				gi += 1;
+				if (gi >= gToks.length || !addGlob(gToks[gi])) return undefined;
+				continue;
+			}}
+			for (const ch of sh) {{
+				if (ch === "n" || ch === "H" || ch === "s") continue;
+				else if (isRg && ch === "N") continue;
+				else if (isRg && ch === "I") noFilename = true;
+				else if (!isRg && (ch === "r" || ch === "R" || ch === "E")) continue;
 				else if (ch === "h") noFilename = true;
 				else if (ch === "i") ignoreCase = true;
 				else if (ch === "F") fixed = true;
@@ -3293,7 +3359,9 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		}}
 		gPos.push(gt);
 	}}
-	if (gPos.length !== 2 || !gPos[0] || !gPos[1] || gPos[1] === "-" || /[*?,]/.test(gPos[1])) {{
+	const patPos = gPos[0];
+	const tgtPos = isRg && gPos.length === 1 ? "." : gPos.length === 2 ? gPos[1] : "";
+	if (!patPos || !tgtPos || tgtPos === "-" || /[*?,]/.test(tgtPos) || (gPos.length !== 2 && !(isRg && gPos.length === 1))) {{
 		return undefined;
 	}}
 	let cutWidth = 0;
@@ -3348,8 +3416,10 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		ignoreCase ? " -i" : "",
 		fixed ? " --fixed-strings" : "",
 		wordRe ? " -w" : "",
+		exts.length > 0 ? ` --ext ${{exts.join(",")}}` : "",
+		...includes.map((inc) => ` --include "${{inc.replace(/"/g, '\\"')}}"`),
 	].join("");
-	return `${{cdLeadPfx}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(gPos[0])}} "${{gPos[1].replace(/"/g, '\\"')}}"`;
+	return `${{cdLeadPfx}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(patPos)}} "${{tgtPos.replace(/"/g, '\\"')}}"`;
 }}
 
 function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
@@ -3473,11 +3543,12 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		const sliceWidthFlag = sliceWidth > 0 ? ` --width ${{sliceWidth}}` : "";
 		if (!/[|;&><{{}}`]|\$\(/.test(sliceCore)) {{
 			const sedM = sliceCore.match(
-				/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
+				/^sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/,
 			);
 			if (sedM) {{
 				const s = Number(sedM[1] || sedM[3] || sedM[5]);
-				const e = Number(sedM[2] || sedM[4] || sedM[6]);
+				const eRaw = sedM[2] || sedM[4] || sedM[6];
+				const e = eRaw ? Number(eRaw) : s;
 				const f = sedM[7] || sedM[8] || sedM[9] || "";
 				if (s >= 1 && e >= s && qPathOk(f)) {{
 					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
@@ -3519,7 +3590,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 				if (qPathOk(f)) {{
 					const rHead = rhs.match(/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))$/);
 					const rTail = rhs.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
-					const rSed = rhs.match(/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)$/);
+					const rSed = rhs.match(/^sed\s+-n\s+(?:'(\d+)(?:,(\d+))?p'|"(\d+)(?:,(\d+))?p"|(\d+)(?:,(\d+))?p)$/);
 					const esc = f.replace(/"/g, '\\"');
 					if (rHead) {{
 						const isBytes = Boolean(rHead[1]);
@@ -3534,7 +3605,8 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --tail ${{n}}${{sliceWidthFlag}}`;
 					}} else if (rSed) {{
 						const s = Number(rSed[1] || rSed[3] || rSed[5]);
-						const e = Number(rSed[2] || rSed[4] || rSed[6]);
+						const eRaw = rSed[2] || rSed[4] || rSed[6];
+						const e = eRaw ? Number(eRaw) : s;
 						if (s >= 1 && e >= s) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
 					}}
 				}}
@@ -3936,6 +4008,15 @@ export function healCommand(
 	if (clampedSleep) {{
 		cmd = clampedSleep;
 		changed = true;
+	}}
+
+	// 9b. Inject bounded `--max-time 30` into unguarded standalone Bash `curl` probes (cuts HTTP hangs before KV-cache drops)
+	if (toolName === "bash") {{
+		const guardedCurl = guardUnboundedCurlTimeout(cmd);
+		if (guardedCurl) {{
+			cmd = guardedCurl;
+			changed = true;
+		}}
 	}}
 
 	// 10. Shield Git Bash MSYS2 path conversion when invoking Windows CLIs with `/flag` or `openssl -subj '/...'`

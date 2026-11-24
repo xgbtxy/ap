@@ -1260,19 +1260,52 @@ fn read_single_target(
     }
 
     if let Some(ref old_path_str) = cli.diff {
-        let old_p = Path::new(old_path_str);
+        let norm_old = crate::ls::normalize_cli_path(old_path_str);
+        let old_p = Path::new(&norm_old);
         let old_bytes = fs::read(old_p).map_err(|e| {
             (
                 1,
                 format!("[ap read --diff] failed to read `{old_path_str}`: {e}"),
             )
         })?;
+        if !crate::binary::is_binary_magic(&raw_bytes)
+            && !crate::binary::is_binary_magic(&old_bytes)
+        {
+            if let (Ok(new_v), Ok(old_v)) = (
+                serde_json::from_slice::<serde_json::Value>(&raw_bytes),
+                serde_json::from_slice::<serde_json::Value>(&old_bytes),
+            ) {
+                if matches!(
+                    new_v,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ) && matches!(
+                    old_v,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ) {
+                    let (rendered, json_diff) =
+                        crate::inspect::diff_json_structural_md(&new_v, &old_v, &label, &norm_old);
+                    record_event(
+                        "read",
+                        (raw_bytes.len() + old_bytes.len()) as u64,
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        "json-diff",
+                    );
+                    let jv = json!({
+                        "ok": true,
+                        "target": label,
+                        "old_target": norm_old,
+                        "format": "json-diff",
+                        "json_diff": json_diff,
+                        "content": rendered,
+                    });
+                    return Ok((rendered, jv));
+                }
+            }
+        }
         let rendered = crate::binary::diff_binaries_or_archives_md(
-            &raw_bytes,
-            &old_bytes,
-            &label,
-            old_path_str,
-            &ext,
+            &raw_bytes, &old_bytes, &label, &norm_old, &ext,
         );
         record_event(
             "read",
@@ -1285,7 +1318,7 @@ fn read_single_target(
         let jv = json!({
             "ok": true,
             "target": label,
-            "old_target": old_path_str,
+            "old_target": norm_old,
             "format": "binary-diff",
             "content": rendered,
         });

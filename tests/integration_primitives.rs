@@ -10160,3 +10160,187 @@ assert.ok(edited && edited.oldText === "| colA  | colB  |" && edited.strategy ==
         );
     }
 }
+
+#[test]
+fn test_v263_json_structural_diff_rg_pipe_sed_single_and_http_timeout_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Structural JSON diff in `ap read --diff` & MCP `ap_read`
+    let old_p = root.join("old.json");
+    let new_p = root.join("new.json");
+    let re_p = root.join("reordered.json");
+    fs::write(
+        &old_p,
+        r#"{"b": 2, "a": 1, "nested": {"keep": true, "drop": "x"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &new_p,
+        r#"{"a": 1, "b": 3, "nested": {"keep": true, "add": "y"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &re_p,
+        r#"{"nested": {"drop": "x", "keep": true}, "a": 1, "b": 2}"#,
+    )
+    .unwrap();
+
+    let dj = run_ap(
+        root,
+        &[
+            "read",
+            new_p.to_str().unwrap(),
+            "--diff",
+            old_p.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        dj.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dj.stderr)
+    );
+    let dv: Value = serde_json::from_slice(&dj.stdout).unwrap();
+    assert_eq!(dv["format"], "json-diff");
+    assert_eq!(dv["json_diff"]["counts"]["added"], 1);
+    assert_eq!(dv["json_diff"]["counts"]["removed"], 1);
+    assert_eq!(dv["json_diff"]["counts"]["changed"], 1);
+    let content_s = dv["content"].as_str().unwrap();
+    assert!(
+        content_s.contains("$.b")
+            && content_s.contains("$.nested.add")
+            && content_s.contains("$.nested.drop"),
+        "{content_s}"
+    );
+
+    let rj = run_ap(
+        root,
+        &[
+            "read",
+            re_p.to_str().unwrap(),
+            "--diff",
+            old_p.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        rj.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rj.stderr)
+    );
+    let rj_out = String::from_utf8_lossy(&rj.stdout);
+    assert!(rj_out.contains("0 semantic differences"), "{rj_out}");
+
+    let mcp_req = format!(
+        "{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_read",
+                "arguments": {
+                    "target": new_p.to_str().unwrap(),
+                    "diff": old_p.to_str().unwrap()
+                }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mv: Value = serde_json::from_str(
+        String::from_utf8_lossy(&mcp_out.stdout)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mv["result"]["isError"], Value::Bool(false), "{mv}");
+    assert!(
+        mv["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Structural JSON Diff"),
+        "{mv}"
+    );
+
+    // 2. Live Node verification of `sed -n '46p'`, `rg` pipelines, PowerShell `-TimeoutSec 25` & Bash `curl --max-time 30`
+    let home = root.join("home_v263");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand, healBashPowerShellCommand, guardUnboundedCurlTimeout } = mod;
+
+const s1 = healCommand("sed -n '46p' index.md | cut -c1-120", "bash");
+assert.ok(s1 && s1.includes('read "index.md" --lines 46-46 --width 120'), s1);
+
+const r1 = healCommand("rg -o --no-filename 'token=[a-z]+' -g '*.js' | sort -u | head -20", "bash");
+assert.ok(r1 && r1.includes('search --max 20 --unique -o --no-filename --ext js \'token=[a-z]+\' "."'), r1);
+
+const r2 = healCommand("rg -n 'auth' notes.md | cut -c1-140 | head -15", "bash");
+assert.ok(r2 && r2.includes('search --width 140 --max 15 \'auth\' "notes.md"'), r2);
+
+assert.equal(healCommand("rg -a -b -o 'foo' app.exe | head -10", "bash"), undefined);
+
+const psHttp = healBashPowerShellCommand('powershell -NoProfile -Command "Invoke-WebRequest https://example.com -UseBasicParsing"');
+assert.ok(psHttp && psHttp.includes("-TimeoutSec 25") && psHttp.includes("OutputEncoding"), psHttp);
+
+const cTimed = guardUnboundedCurlTimeout("curl -s https://example.com/health");
+assert.equal(cTimed, "curl --max-time 30 -s https://example.com/health");
+assert.equal(guardUnboundedCurlTimeout("curl -s -m 10 https://example.com"), undefined);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.63 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
