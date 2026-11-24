@@ -1702,6 +1702,57 @@ export function sieveCodemodeContentBlocks(
 }}
 
 /**
+ * Resolve the primary payload text block index in a multi-block `tool_result` (e.g. `read` file
+ * content in `content[0]` when upstream hooks append trailing advisory blocks at `content[1..N]`).
+ */
+export function findPrimaryToolResultTextIndex(
+	content: ReadonlyArray<{{ type?: string; text?: string }}>,
+	toolName?: string,
+): number {{
+	if (!Array.isArray(content) || content.length === 0) return -1;
+	let firstIdx = -1;
+	for (let i = 0; i < content.length; i++) {{
+		if (content[i]?.type === "text" && typeof content[i].text === "string") {{
+			firstIdx = i;
+			break;
+		}}
+	}}
+	if (firstIdx < 0) return -1;
+	if (toolName === "read") return firstIdx;
+	return firstIdx;
+}}
+
+/**
+ * Losslessly auto-sieve every oversized text block in a `bash`/`powershell` `tool_result`
+ * while preserving trailing advisory notices and non-text (`image`) blocks verbatim in place.
+ */
+export function sieveShellContentBlocks(
+	content: ReadonlyArray<{{ type?: string; text?: string; [k: string]: unknown }}>,
+	sieveFn: (rawBody: string) => string | undefined,
+	isFastModel = false,
+	hardLimitOverride?: number,
+): Array<{{ type?: string; text?: string; [k: string]: unknown }}> | undefined {{
+	if (!Array.isArray(content) || content.length === 0) return undefined;
+	let changed = false;
+	const out = content.map((blk) => {{
+		if (
+			blk?.type === "text" &&
+			typeof blk.text === "string" &&
+			!blk.text.includes("[sieve id=") &&
+			shouldAutoSieveShellOutput(blk.text, isFastModel, hardLimitOverride)
+		) {{
+			const digested = sieveFn(blk.text);
+			if (digested && digested.length > 40 && digested.length < blk.text.length * 0.78) {{
+				changed = true;
+				return {{ ...blk, text: digested }};
+			}}
+		}}
+		return blk;
+	}});
+	return changed ? out : undefined;
+}}
+
+/**
  * Format an instant (<12ms) post-edit Tree-sitter/JSON/TOML syntax alert from `ap splice check --json`.
  * Returns `undefined` whenever syntax is clean (`ok !== false`) so zero bytes are added on valid edits.
  */
@@ -1918,7 +1969,7 @@ export function classifyShellFailureTip(
 	if (QUOTE_OR_BS_ERR.test(outText)) {{
 		return `[ap quote-tip] Avoid nested quotes/backslashes inside inline python -c; use a single-quoted heredoc (python - <<'PY' ... PY) or write a script file via write/ap_edit.`;
 	}}
-	if (/\b(?:json\.decoder\.)?JSONDecodeError\b|Unexpected token .* in JSON/i.test(outText)) {{
+	if (/\b(?:json\.decoder\.)?JSONDecodeError\b|Unexpected token .* in JSON|\bConvertFrom-Json\b/i.test(outText)) {{
 		return `[ap json-tip] JSON parse failed (empty/HTML/non-JSON response); inspect HTTP status & raw prefix first or use \`ap probe http --select\` / \`ap read --json-path\` instead of blind json.loads.`;
 	}}
 	if (/dir: cannot access '\/[bs]'/i.test(outText)) {{
@@ -3960,6 +4011,8 @@ export function healCommand(
 				cmd = moreToCat;
 				changed = true;
 			}}
+		}}
+		if (!cmd.includes("<<")) {{
 			if (/(?:^|[\s=;])[A-Za-z]:\\/.test(cmd)) {{
 				const normDrv = normalizeUnquotedBashDrivePaths(cmd);
 				if (normDrv !== cmd) {{
@@ -3967,8 +4020,6 @@ export function healCommand(
 					changed = true;
 				}}
 			}}
-		}}
-		if (!cmd.includes("<<")) {{
 			const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
 			if (fixedBs !== cmd) {{
 				cmd = fixedBs;
@@ -6090,6 +6141,7 @@ export default function (pi: ExtensionAPI) {{
 			}}
 		}}
 
+		const primaryTextIdx = findPrimaryToolResultTextIndex(workingContent, event.toolName);
 		let lastTextIdx = -1;
 		for (let i = workingContent.length - 1; i >= 0; i--) {{
 			if (workingContent[i]?.type === "text" && typeof workingContent[i].text === "string") {{
@@ -6105,7 +6157,7 @@ export default function (pi: ExtensionAPI) {{
 				: {{ content: workingContent }};
 		}}
 
-		const fullText = extractAllToolResultText(workingContent);
+		let fullText = extractAllToolResultText(workingContent);
 		let outText = workingContent[lastTextIdx].text as string;
 		let textMutated = false;
 
@@ -6115,23 +6167,25 @@ export default function (pi: ExtensionAPI) {{
 			const off = String(event.input?.offset ?? "");
 			const lim = String(event.input?.limit ?? "");
 			const startOff = Math.max(1, Math.floor(Number(event.input?.offset) || 1));
+			const readIdx = primaryTextIdx >= 0 ? primaryTextIdx : lastTextIdx;
+			let readText = workingContent[readIdx].text as string;
+			let readBlockMutated = false;
+			let readAdvisory = "";
 			const readDetails = event.details as {{ truncation?: {{ truncated?: boolean }} }} | undefined;
 			const isTruncated =
 				readDetails?.truncation?.truncated === true ||
-				/use offset=\d+|lines remaining|more lines in file|truncated to \d+/i.test(outText);
-			const hashed = annotateReadWithHashlines(outText, startOff);
+				/use offset=\d+|lines remaining|more lines in file|truncated to \d+/i.test(readText);
+			const hashed = annotateReadWithHashlines(readText, startOff);
 			if (hashed) {{
-				outText = hashed;
-				textMutated = true;
+				readText = hashed;
+				readBlockMutated = true;
 				mutated = true;
 			}}
 			if (typeof event.toolCallId === "string") {{
 				const clamped = clampedReadCallIds.get(event.toolCallId);
 				if (clamped) {{
 					clampedReadCallIds.delete(event.toolCallId);
-					outText += `\n[ap read-clamped] Requested offset=${{clamped.requestedOffset}} > EOF (${{clamped.totalLines}} lines); showing tail from L${{clamped.clampedOffset}}.`;
-					textMutated = true;
-					mutated = true;
+					readAdvisory += `\n[ap read-clamped] Requested offset=${{clamped.requestedOffset}} > EOF (${{clamped.totalLines}} lines); showing tail from L${{clamped.clampedOffset}}.`;
 				}}
 			}}
 			if (p) {{
@@ -6139,10 +6193,8 @@ export default function (pi: ExtensionAPI) {{
 				const hits = (unchangedReads.get(key) ?? 0) + 1;
 				unchangedReads.set(key, hits);
 				if (hits >= REREAD_THRESHOLD) {{
-					outText += `\n[ap reread-guard] Exact unchanged slice (${{p}}) read ${{hits}}x already in this session. Avoid re-reading; use ap_search/ap_locate or proceed directly to edits.`;
+					readAdvisory += `\n[ap reread-guard] Exact unchanged slice (${{p}}) read ${{hits}}x already in this session. Avoid re-reading; use ap_search/ap_locate or proceed directly to edits.`;
 					guardsTriggered += 1;
-					textMutated = true;
-					mutated = true;
 				}} else if (isTruncated) {{
 					const cwd = ctx?.cwd || process.cwd();
 					const absPath = isAbsolute(p) ? p : resolve(cwd, p);
@@ -6156,10 +6208,8 @@ export default function (pi: ExtensionAPI) {{
 								windowsHide: true,
 							}});
 							if (ol.status === 0 && ol.stdout?.trim()) {{
-								outText += `\n[ap read-outline] File was truncated; full AST symbol map (jump directly via read(offset=...) or ap_read(symbol=...)):\n${{ol.stdout.trim().slice(0, 1800)}}`;
+								readAdvisory += `\n[ap read-outline] File was truncated; full AST symbol map (jump directly via read(offset=...) or ap_read(symbol=...)):\n${{ol.stdout.trim().slice(0, 1800)}}`;
 								outlinedPaths.add(normOutlineKey);
-								textMutated = true;
-								mutated = true;
 							}}
 						}} else {{
 							try {{
@@ -6167,10 +6217,8 @@ export default function (pi: ExtensionAPI) {{
 								if (rawDoc.length <= 2_000_000) {{
 									const nonCodeOl = extractNonCodeOutline(p, rawDoc);
 									if (nonCodeOl) {{
-										outText += `\n${{nonCodeOl}}`;
+										readAdvisory += `\n${{nonCodeOl}}`;
 										outlinedPaths.add(normOutlineKey);
-										textMutated = true;
-										mutated = true;
 									}}
 								}}
 							}} catch {{
@@ -6178,33 +6226,43 @@ export default function (pi: ExtensionAPI) {{
 							}}
 						}}
 					}}
-				}} else if (shouldAutoSieveUnboundedRead(outText, event.input, isFast, apProfileOverrides?.sieveHardChars)) {{
+				}} else if (shouldAutoSieveUnboundedRead(readText, event.input, isFast, apProfileOverrides?.sieveHardChars)) {{
 					const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-read"], {{
-						input: outText,
+						input: readText,
 						encoding: "utf8",
 						timeout: 4000,
 						windowsHide: true,
 						env: {{ ...process.env, SIEVE_HOME }},
 					}});
-					if (res.status === 0 && res.stdout && res.stdout.length > 40 && res.stdout.length < outText.length * 0.78) {{
-						outText = `${{res.stdout.trimEnd()}}\n[ap read-sieve] Unbounded full-file read archived losslessly; use read(offset, limit) for exact edit lines or ap sieve peek/search.`;
+					if (res.status === 0 && res.stdout && res.stdout.length > 40 && res.stdout.length < readText.length * 0.78) {{
+						readText = `${{res.stdout.trimEnd()}}\n[ap read-sieve] Unbounded full-file read archived losslessly; use read(offset, limit) for exact edit lines or ap sieve peek/search.`;
 						sievedCount += 1;
-						textMutated = true;
+						readBlockMutated = true;
 						mutated = true;
 					}}
-				}} else if (!largeReadTipShown && outText.length >= LARGE_CODE_READ_CHARS && CODE_FILE_EXT.test(p)) {{
-					outText += `\n[ap read-tip] Large code file loaded; use ap_read(outline=true) or ap_read(symbol="...") for AST-exact slices (~85% fewer tokens).`;
+				}} else if (!largeReadTipShown && readText.length >= LARGE_CODE_READ_CHARS && CODE_FILE_EXT.test(p)) {{
+					readAdvisory += `\n[ap read-tip] Large code file loaded; use ap_read(outline=true) or ap_read(symbol="...") for AST-exact slices (~85% fewer tokens).`;
 					largeReadTipShown = true;
-					textMutated = true;
-					mutated = true;
 				}} else {{
-					const docTip = classifyOversizedDocRead(p, outText.length);
+					const docTip = classifyOversizedDocRead(p, readText.length);
 					if (docTip) {{
-						outText += `\n${{docTip}}`;
-						textMutated = true;
-						mutated = true;
+						readAdvisory += `\n${{docTip}}`;
 					}}
 				}}
+			}}
+			if (readBlockMutated) {{
+				if (readIdx === lastTextIdx) {{
+					outText = readText;
+					textMutated = true;
+				}} else {{
+					workingContent = workingContent.map((c, idx) => (idx === readIdx ? {{ ...c, text: readText }} : c));
+					fullText = extractAllToolResultText(workingContent);
+				}}
+			}}
+			if (readAdvisory) {{
+				outText += readAdvisory;
+				textMutated = true;
+				mutated = true;
 			}}
 		}}
 
@@ -6218,7 +6276,7 @@ export default function (pi: ExtensionAPI) {{
 				edits?: Array<{{ oldText?: string }}>;
 			}} | undefined;
 			const rawPath = String(inp?.path ?? inp?.file_path ?? "").trim();
-			const failIdxMatch = outText.match(/\bedits\[(\d+)\]/);
+			const failIdxMatch = fullText.match(/\bedits\[(\d+)\]/);
 			const failIdx = failIdxMatch ? Number(failIdxMatch[1]) : -1;
 			const targetOld =
 				typeof inp?.oldText === "string"
@@ -6235,7 +6293,7 @@ export default function (pi: ExtensionAPI) {{
 					try {{
 						const content = readFileSync(absPath, "utf8");
 						if (content.length <= 2_000_000) {{
-							const isMulti = /multiple|occurrences|more than once/i.test(outText);
+							const isMulti = /multiple|occurrences|more than once/i.test(fullText);
 							const diag = isMulti
 								? findAllEditOccurrenceLines(content, targetOld) ?? findClosestEditWindow(content, targetOld)
 								: findClosestEditWindow(content, targetOld);
@@ -6327,24 +6385,44 @@ export default function (pi: ExtensionAPI) {{
 			}}
 		}}
 
-		// C. Dual-tier shell auto-sieve (>=24KB unconditional, >=14KB structured/noisy) + failure tips + loop-breaker
+		// C. Dual-tier multi-block shell auto-sieve (>=24KB unconditional, >=14KB structured/noisy) + failure tips + loop-breaker
 		if (event.toolName === "bash" || event.toolName === "powershell") {{
 			const cmd = typeof event.input?.command === "string" ? event.input.command : "";
 			const isSieveSelf = /\bap(?:\.exe)?\s+sieve\b/.test(cmd);
 			const isBoundedApCmd =
 				cmd.includes("ap.exe") ||
 				/\bap\s+(?:read|search|query|atlas|probe|guard|sieve|baton|splice|recall)\b/.test(cmd);
-			const skipSieve = isSieveSelf || (isBoundedApCmd && outText.length < 24000);
-			if (!skipSieve && shouldAutoSieveShellOutput(outText, isFast, apProfileOverrides?.sieveHardChars)) {{
-				const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-bash"], {{
-					input: outText,
-					encoding: "utf8",
-					timeout: 4000,
-					windowsHide: true,
-					env: {{ ...process.env, SIEVE_HOME }},
-				}});
-				if (res.status === 0 && res.stdout && res.stdout.length > 40 && res.stdout.length < outText.length * 0.78) {{
-					outText = res.stdout;
+			let maxShellBlockLen = 0;
+			let hasGiantShellLine = false;
+			for (const blk of workingContent) {{
+				if (blk?.type === "text" && typeof blk.text === "string") {{
+					if (blk.text.length > maxShellBlockLen) maxShellBlockLen = blk.text.length;
+					if (!hasGiantShellLine && blk.text.split("\n").some((l) => l.length > SIEVE_GIANT_LINE_CHARS)) {{
+						hasGiantShellLine = true;
+					}}
+				}}
+			}}
+			const skipSieve = isSieveSelf || (isBoundedApCmd && maxShellBlockLen < 24000 && !hasGiantShellLine);
+			if (!skipSieve) {{
+				const sievedShell = sieveShellContentBlocks(
+					workingContent,
+					(rawBody) => {{
+						const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-bash"], {{
+							input: rawBody,
+							encoding: "utf8",
+							timeout: 4000,
+							windowsHide: true,
+							env: {{ ...process.env, SIEVE_HOME }},
+						}});
+						return res.status === 0 && res.stdout ? res.stdout : undefined;
+					}},
+					isFast,
+					apProfileOverrides?.sieveHardChars,
+				);
+				if (sievedShell) {{
+					workingContent = sievedShell;
+					outText = workingContent[lastTextIdx].text as string;
+					fullText = extractAllToolResultText(workingContent);
 					sievedCount += 1;
 					mutated = true;
 				}}
@@ -6359,9 +6437,9 @@ export default function (pi: ExtensionAPI) {{
 				}}
 			}}
 
-			const benignGrep = event.isError && isBenignGrepNoMatch(cmd, outText);
+			const benignGrep = event.isError && isBenignGrepNoMatch(cmd, fullText);
 			if (event.isError && !benignGrep) {{
-				const failTip = classifyShellFailureTip(event.toolName, cmd, outText);
+				const failTip = classifyShellFailureTip(event.toolName, cmd, fullText);
 				if (failTip) {{
 					outText += `\n${{failTip}}`;
 					mutated = true;

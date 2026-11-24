@@ -681,33 +681,76 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     let multi_targets = !cli.extra_paths.is_empty();
     let mut targets: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut seen_canon: HashSet<PathBuf> = HashSet::new();
     if !multi_targets {
         let norm_root_str = crate::ls::normalize_cli_path(&cli_path);
         let root = Path::new(&norm_root_str);
-        if !root.exists() {
+        if root.exists() {
+            let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            let is_f = root_canon.is_file();
+            targets.push((String::new(), root_canon, is_f));
+        } else if norm_root_str.contains('*') || norm_root_str.contains('?') {
+            let expanded = expand_glob_target_paths(&norm_root_str);
+            if expanded.is_empty() {
+                eprintln!("[ap search] path not found: {norm_root_str}");
+                return 1;
+            }
+            for (disp, p) in expanded {
+                let canon = fs::canonicalize(&p).unwrap_or(p);
+                if !seen_canon.insert(canon.clone()) {
+                    continue;
+                }
+                let is_f = canon.is_file();
+                let prefix = if disp == "." || disp.is_empty() {
+                    String::new()
+                } else {
+                    disp
+                };
+                targets.push((prefix, canon, is_f));
+            }
+        } else {
             eprintln!("[ap search] path not found: {norm_root_str}");
             return 1;
         }
-        let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let is_f = root_canon.is_file();
-        targets.push((String::new(), root_canon, is_f));
     } else {
         for raw_t in std::iter::once(&cli_path).chain(cli.extra_paths.iter()) {
             let norm = crate::ls::normalize_cli_path(raw_t);
             let p = Path::new(&norm);
-            if !p.exists() {
-                eprintln!("[ap search] warning: path not found: {norm}");
-                continue;
-            }
-            let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            let is_f = canon.is_file();
-            let disp = norm.replace('\\', "/").trim_end_matches('/').to_string();
-            let prefix = if disp == "." || disp.is_empty() {
-                String::new()
+            if p.exists() {
+                let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                if !seen_canon.insert(canon.clone()) {
+                    continue;
+                }
+                let is_f = canon.is_file();
+                let disp = norm.replace('\\', "/").trim_end_matches('/').to_string();
+                let prefix = if disp == "." || disp.is_empty() {
+                    String::new()
+                } else {
+                    disp
+                };
+                targets.push((prefix, canon, is_f));
+            } else if norm.contains('*') || norm.contains('?') {
+                let expanded = expand_glob_target_paths(&norm);
+                if expanded.is_empty() {
+                    eprintln!("[ap search] warning: path not found: {norm}");
+                    continue;
+                }
+                for (disp, ep) in expanded {
+                    let canon = fs::canonicalize(&ep).unwrap_or(ep);
+                    if !seen_canon.insert(canon.clone()) {
+                        continue;
+                    }
+                    let is_f = canon.is_file();
+                    let prefix = if disp == "." || disp.is_empty() {
+                        String::new()
+                    } else {
+                        disp
+                    };
+                    targets.push((prefix, canon, is_f));
+                }
             } else {
-                disp
-            };
-            targets.push((prefix, canon, is_f));
+                eprintln!("[ap search] warning: path not found: {norm}");
+            }
         }
         if targets.is_empty() {
             eprintln!("[ap search] no valid search paths found");
@@ -1649,4 +1692,184 @@ pub fn run_cli(args: &[String]) -> i32 {
         println!("{rendered}");
     }
     0
+}
+
+fn glob_segment_match(pattern: &str, text: &str) -> bool {
+    #[cfg(windows)]
+    let (p, t): (Vec<char>, Vec<char>) = (
+        pattern.chars().flat_map(char::to_lowercase).collect(),
+        text.chars().flat_map(char::to_lowercase).collect(),
+    );
+    #[cfg(not(windows))]
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn expand_glob_target_paths(raw_norm: &str) -> Vec<(String, PathBuf)> {
+    const MAX_GLOB_TARGETS: usize = 256;
+    if !raw_norm.contains('*') && !raw_norm.contains('?') {
+        return Vec::new();
+    }
+    let clean = raw_norm.replace('\\', "/");
+    let trimmed = clean.trim_end_matches('/');
+    let Some(first_wild) = trimmed.find(['*', '?']) else {
+        return Vec::new();
+    };
+    let before_wild = &trimmed[..first_wild];
+    let (base_str, rest_str) = match before_wild.rfind('/') {
+        Some(slash) => {
+            let base = if slash == 0 {
+                "/"
+            } else if trimmed[..slash].ends_with(':') {
+                &trimmed[..=slash]
+            } else {
+                &trimmed[..slash]
+            };
+            (base, &trimmed[slash + 1..])
+        }
+        None => (".", trimmed),
+    };
+    let base_path = PathBuf::from(base_str);
+    if !base_path.exists() {
+        return Vec::new();
+    }
+    let segs: Vec<&str> = rest_str.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return Vec::new();
+    }
+    let mut frontier: Vec<PathBuf> = vec![base_path];
+    for (idx, seg) in segs.iter().enumerate() {
+        let mut next: Vec<PathBuf> = Vec::new();
+        if *seg == "." {
+            next = frontier;
+        } else if *seg == ".." {
+            next = frontier.into_iter().map(|p| p.join("..")).collect();
+        } else if !seg.contains('*') && !seg.contains('?') {
+            for p in frontier {
+                let cand = if p == Path::new(".") {
+                    PathBuf::from(seg)
+                } else {
+                    p.join(seg)
+                };
+                if cand.exists() {
+                    next.push(cand);
+                    if next.len() >= MAX_GLOB_TARGETS {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for dir in frontier {
+                let Ok(rd) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in rd.flatten() {
+                    let name_os = entry.file_name();
+                    let name = name_os.to_string_lossy();
+                    if SKIP_DIRS.contains(&name.as_ref()) && !seg.starts_with('.') {
+                        continue;
+                    }
+                    if glob_segment_match(seg, &name) {
+                        let child = if dir == Path::new(".") {
+                            PathBuf::from(name_os)
+                        } else {
+                            entry.path()
+                        };
+                        next.push(child);
+                        if next.len() >= MAX_GLOB_TARGETS {
+                            break;
+                        }
+                    }
+                }
+                if next.len() >= MAX_GLOB_TARGETS {
+                    break;
+                }
+            }
+        }
+        if idx + 1 < segs.len() {
+            next.retain(|p| p.is_dir());
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    let mut out: Vec<(String, PathBuf)> = frontier
+        .into_iter()
+        .map(|p| {
+            let mut disp = p.to_string_lossy().replace('\\', "/");
+            while let Some(stripped) = disp.strip_prefix("./") {
+                disp = stripped.to_string();
+            }
+            (disp.trim_end_matches('/').to_string(), p)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_segment_and_path_expansion_work_deterministically() {
+        assert!(glob_segment_match("pkg-*", "pkg-alpha"));
+        assert!(glob_segment_match("a?c.rs", "abc.rs"));
+        assert!(!glob_segment_match("a?c.rs", "abbc.rs"));
+        assert!(glob_segment_match("*.rs", "main.rs"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("pkg-one/sub")).unwrap();
+        fs::create_dir_all(root.join("pkg-two/sub")).unwrap();
+        fs::create_dir_all(root.join("misc/sub")).unwrap();
+        fs::write(root.join("pkg-one/sub/b_one.txt"), "1").unwrap();
+        fs::write(root.join("pkg-two/sub/b_two.txt"), "2").unwrap();
+        fs::write(root.join("misc/sub/b_misc.txt"), "3").unwrap();
+
+        let pat1 = format!("{}/pkg-*", root.to_string_lossy().replace('\\', "/"));
+        let r1 = expand_glob_target_paths(&pat1);
+        assert_eq!(r1.len(), 2, "{r1:?}");
+        assert!(r1[0].0.ends_with("pkg-one"));
+        assert!(r1[1].0.ends_with("pkg-two"));
+
+        let pat2 = format!(
+            "{}/pkg-*/sub/b*.txt",
+            root.to_string_lossy().replace('\\', "/")
+        );
+        let r2 = expand_glob_target_paths(&pat2);
+        assert_eq!(r2.len(), 2, "{r2:?}");
+        assert!(r2[0].0.ends_with("pkg-one/sub/b_one.txt"));
+        assert!(r2[1].0.ends_with("pkg-two/sub/b_two.txt"));
+
+        let pat3 = format!(
+            "{}/does-not-exist-*",
+            root.to_string_lossy().replace('\\', "/")
+        );
+        assert!(expand_glob_target_paths(&pat3).is_empty());
+    }
 }

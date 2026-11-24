@@ -11148,3 +11148,250 @@ fn test_v266_yaml_jsonc_config_multitarget_search_strings_alias_and_sieve_giant_
         sv_s.len()
     );
 }
+
+#[test]
+fn test_v267_multiblock_sieve_hashline_glob_search_and_drive_path_heal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Native `ap search` wildcard path expansion (`pkg-*`, `pkg-*/*.rs`, `no-such-*`)
+    fs::create_dir_all(root.join("pkg-alpha")).unwrap();
+    fs::create_dir_all(root.join("pkg-beta")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fs::write(
+        root.join("pkg-alpha/a.rs"),
+        "pub fn alpha_v267() -> &'static str { \"NEEDLE_267\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("pkg-beta/b.rs"),
+        "pub fn beta_v267() -> &'static str { \"NEEDLE_267\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("other/c.rs"),
+        "pub fn other_v267() -> &'static str { \"NEEDLE_267\" }\n",
+    )
+    .unwrap();
+
+    let gs1 = run_ap(root, &["search", "NEEDLE_267", "pkg-*"], None, &[]);
+    assert!(
+        gs1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gs1.stderr)
+    );
+    let gs1_out = String::from_utf8_lossy(&gs1.stdout);
+    assert!(
+        gs1_out.contains("pkg-alpha/a.rs")
+            && gs1_out.contains("pkg-beta/b.rs")
+            && !gs1_out.contains("other/c.rs"),
+        "{gs1_out}"
+    );
+
+    let gs2 = run_ap(root, &["search", "NEEDLE_267", "pkg-*/*.rs"], None, &[]);
+    assert!(
+        gs2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gs2.stderr)
+    );
+    let gs2_out = String::from_utf8_lossy(&gs2.stdout);
+    assert!(
+        gs2_out.contains("pkg-alpha/a.rs") && gs2_out.contains("pkg-beta/b.rs"),
+        "{gs2_out}"
+    );
+
+    let gs_miss = run_ap(root, &["search", "NEEDLE_267", "no-such-*"], None, &[]);
+    assert_eq!(gs_miss.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&gs_miss.stderr).contains("path not found"),
+        "{}",
+        String::from_utf8_lossy(&gs_miss.stderr)
+    );
+
+    // 2. MCP `ap_search` wildcard path
+    let mcp_req = format!(
+        "{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_search",
+                "arguments": {
+                    "pattern": "NEEDLE_267",
+                    "path": "pkg-*"
+                }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mv: Value = serde_json::from_str(
+        String::from_utf8_lossy(&mcp_out.stdout)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mv["result"]["isError"], Value::Bool(false), "{mv}");
+    let m_txt = mv["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        m_txt.contains("pkg-alpha/a.rs") && m_txt.contains("pkg-beta/b.rs"),
+        "{m_txt}"
+    );
+
+    // 3. Live Node verification of `zz-ap-accelerator.ts` multi-block tool_result, drive-path heal & PS ConvertFrom-Json tip
+    let home = root.join("home_v267");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let ap_bin = env!("CARGO_BIN_EXE_ap");
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const {
+  default: register,
+  findPrimaryToolResultTextIndex,
+  sieveShellContentBlocks,
+  healCommand,
+  classifyShellFailureTip,
+} = mod;
+
+// 3a. findPrimaryToolResultTextIndex
+assert.equal(
+  findPrimaryToolResultTextIndex(
+    [{ type: "image", data: "x" }, { type: "text", text: "line1\nline2" }, { type: "text", text: "[notice]" }],
+    "read",
+  ),
+  1,
+);
+
+// 3b. sieveShellContentBlocks preserves trailing advisory text & image blocks
+const bigLog = Array.from({ length: 500 }, (_, i) => `2026-11-24T12:00:00Z INFO item_${i} payload=${"x".repeat(40)}`).join("\n");
+const sievedDirect = sieveShellContentBlocks(
+  [{ type: "text", text: bigLog }, { type: "text", text: "[ext-notice] keep me" }, { type: "image", data: "img0" }],
+  () => "[sieve id=abc123] summary: archived 500 structured log entries losslessly",
+  false,
+);
+assert.ok(sievedDirect && sievedDirect[0].text.includes("[sieve id=abc123]"), "primary block sieved");
+assert.equal(sievedDirect[1].text, "[ext-notice] keep me");
+assert.equal(sievedDirect[2].type, "image");
+
+// 3c. Live registered `tool_result` handler across multi-block `read`, giant `read`, and oversized `bash`
+const handlers = new Map();
+const fakePi = {
+  on(name, fn) { handlers.set(name, fn); },
+  registerCommand() {},
+  getActiveTools() { return ["read", "edit", "write", "bash", "codemode"]; },
+};
+register(fakePi);
+const onToolResult = handlers.get("tool_result");
+assert.equal(typeof onToolResult, "function");
+
+// Multi-block normal `read`: content[0] gets L:HH| hashlines; trailing advisory block preserved untouched
+const readRes = onToolResult({
+  toolName: "read",
+  isError: false,
+  input: { path: "src/sample.rs", offset: 1, limit: 20 },
+  content: [
+    { type: "text", text: "fn first() {}\nfn second() {}" },
+    { type: "text", text: "[ext-notice] advisory" },
+  ],
+}, { cwd: process.env.TEST_ROOT });
+assert.ok(readRes && /^1:[0-9a-f]{2}\|fn first\(\) \{\}/m.test(readRes.content[0].text), JSON.stringify(readRes));
+assert.equal(readRes.content[1].text, "[ext-notice] advisory");
+
+// Multi-block unbounded giant `read`: content[0] is auto-sieved, content[1] preserved
+const bigDoc = Array.from({ length: 450 }, (_, i) => `row_${i}: ${"d".repeat(60)}`).join("\n");
+const giantReadRes = onToolResult({
+  toolName: "read",
+  isError: false,
+  input: { path: "big.log" },
+  content: [
+    { type: "text", text: bigDoc },
+    { type: "text", text: "[ext-notice] keep-read-trailer" },
+  ],
+}, { cwd: process.env.TEST_ROOT, model: { id: "deepseek-chat", provider: "deepseek" } });
+assert.ok(giantReadRes && giantReadRes.content[0].text.includes("[sieve id="), JSON.stringify(giantReadRes?.content?.map((c) => c.text?.slice(0, 80))));
+assert.equal(giantReadRes.content[1].text, "[ext-notice] keep-read-trailer");
+
+// Multi-block oversized `bash`: content[0] is auto-sieved even when content[1] is a 295-byte notice!
+const bashRes = onToolResult({
+  toolName: "bash",
+  isError: false,
+  input: { command: "cat server.log" },
+  content: [
+    { type: "text", text: bigLog },
+    { type: "text", text: "[ext-notice] keep-bash-trailer" },
+  ],
+}, { cwd: process.env.TEST_ROOT, model: { id: "deepseek-chat", provider: "deepseek" } });
+assert.ok(bashRes && bashRes.content[0].text.includes("[sieve id="), JSON.stringify(bashRes?.content?.map((c) => c.text?.slice(0, 80))));
+assert.equal(bashRes.content[1].text, "[ext-notice] keep-bash-trailer");
+
+// 3d. Script-command unquoted Windows drive-path heal + PowerShell ConvertFrom-Json tip
+const healedPy = healCommand('cd D:\\work\\proj && python3 -c "print(1)"', "bash");
+assert.ok(healedPy && healedPy.includes("cd D:/work/proj") && healedPy.includes("PYTHONUTF8=1"), healedPy);
+
+const psJsonTip = classifyShellFailureTip(
+  "powershell",
+  "Get-Content a.json | ConvertFrom-Json",
+  "ConvertFrom-Json : Invalid JSON primitive: bad.",
+);
+assert.ok(psJsonTip && psJsonTip.includes("[ap json-tip]"), psJsonTip);
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .env("TEST_ROOT", root)
+            .env("PATH", {
+                let mut paths = vec![Path::new(ap_bin).parent().unwrap().to_path_buf()];
+                if let Some(p) = std::env::var_os("PATH") {
+                    paths.extend(std::env::split_paths(&p));
+                }
+                std::env::join_paths(paths).unwrap()
+            })
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.67 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
