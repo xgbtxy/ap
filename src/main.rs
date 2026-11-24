@@ -134,7 +134,7 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
     let code = match name {
         "read" => return Some(read::run_cli(&sub_argv)),
         "ls" => return Some(ls::run_cli(&sub_argv)),
-        "bin" | "pe_info" | "pe" => {
+        "bin" | "pe_info" | "pe" | "strings" => {
             sub_argv[0] = "read".to_string();
             return Some(read::run_cli(&sub_argv));
         }

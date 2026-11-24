@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -52,6 +52,8 @@ struct SearchCli {
     /// Root file or directory to search (default: '.')
     #[arg(default_value = ".")]
     path: String,
+    /// Optional additional files or directories to search in the same pass (like `rg pat a b`)
+    extra_paths: Vec<String>,
     /// Additional patterns to search in the SAME single pass (repeatable: `--pat A --pat B`)
     #[arg(long = "pat")]
     extra_pats: Vec<String>,
@@ -677,14 +679,42 @@ pub fn run_cli(args: &[String]) -> i32 {
         only_matching: cli.only_matching,
     };
 
-    let norm_root_str = crate::ls::normalize_cli_path(&cli_path);
-    let root = Path::new(&norm_root_str);
-    if !root.exists() {
-        eprintln!("[ap search] path not found: {norm_root_str}");
-        return 1;
+    let multi_targets = !cli.extra_paths.is_empty();
+    let mut targets: Vec<(String, PathBuf, bool)> = Vec::new();
+    if !multi_targets {
+        let norm_root_str = crate::ls::normalize_cli_path(&cli_path);
+        let root = Path::new(&norm_root_str);
+        if !root.exists() {
+            eprintln!("[ap search] path not found: {norm_root_str}");
+            return 1;
+        }
+        let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let is_f = root_canon.is_file();
+        targets.push((String::new(), root_canon, is_f));
+    } else {
+        for raw_t in std::iter::once(&cli_path).chain(cli.extra_paths.iter()) {
+            let norm = crate::ls::normalize_cli_path(raw_t);
+            let p = Path::new(&norm);
+            if !p.exists() {
+                eprintln!("[ap search] warning: path not found: {norm}");
+                continue;
+            }
+            let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let is_f = canon.is_file();
+            let disp = norm.replace('\\', "/").trim_end_matches('/').to_string();
+            let prefix = if disp == "." || disp.is_empty() {
+                String::new()
+            } else {
+                disp
+            };
+            targets.push((prefix, canon, is_f));
+        }
+        if targets.is_empty() {
+            eprintln!("[ap search] no valid search paths found");
+            return 1;
+        }
     }
     let t0 = Instant::now();
-    let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut ext_allow: HashSet<String> = cli
         .ext_filter
         .split(',')
@@ -705,15 +735,11 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         include_paths.push(t.to_string());
     }
-    let skip_set: HashSet<&'static str> = SKIP_DIRS.iter().copied().collect();
-
-    let explicit_file = root_canon.is_file();
     let ast_query_arc = Arc::new(ast_query);
     let compiled_arc = Arc::new(compiled);
     let ext_allow_arc = Arc::new(ext_allow);
     let include_arc = Arc::new(include_paths);
     let exclude_arc = Arc::new(cli.exclude);
-    let root_canon_arc = Arc::new(root_canon.clone());
     let all_matches: Arc<Mutex<Vec<SearchMatch>>> = Arc::new(Mutex::new(Vec::new()));
     let hit_counter = Arc::new(AtomicUsize::new(0));
     let scanned_files_cnt = Arc::new(AtomicUsize::new(0));
@@ -779,6 +805,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     fn process_file(
         p: &Path,
         root_canon: &Path,
+        rel_prefix: &str,
         explicit_file: bool,
         ext_allow: &HashSet<String>,
         includes: &[String],
@@ -797,15 +824,25 @@ pub fn run_cli(args: &[String]) -> i32 {
             return local_matches;
         }
         let rel = if explicit_file {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string()
+            if !rel_prefix.is_empty() {
+                rel_prefix.to_string()
+            } else {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            }
         } else {
-            p.strip_prefix(root_canon)
+            let sub_rel = p
+                .strip_prefix(root_canon)
                 .unwrap_or(p)
                 .to_string_lossy()
-                .replace('\\', "/")
+                .replace('\\', "/");
+            if rel_prefix.is_empty() {
+                sub_rel
+            } else {
+                format!("{rel_prefix}/{sub_rel}")
+            }
         };
         if !matches_include_paths(&rel, includes) {
             return local_matches;
@@ -1257,89 +1294,103 @@ pub fn run_cli(args: &[String]) -> i32 {
         local_matches
     }
 
-    if explicit_file {
-        let local = process_file(
-            &root_canon,
-            &root_canon,
-            true,
-            &ext_allow_arc,
-            &include_arc,
-            &exclude_arc,
-            ast_query_arc.as_ref().as_ref(),
-            &compiled_arc,
-            multi_mode,
-            s_opts,
-            &scanned_files_cnt,
-            &total_bytes_cnt,
-            &filtered_non_code_cnt,
-            &filtered_tests_cnt,
-        );
-        if let Ok(mut guard) = all_matches.lock() {
-            guard.extend(local);
+    for (rel_prefix, target_canon, is_explicit_file) in targets {
+        if hit_counter.load(Ordering::Relaxed) >= hit_cap {
+            break;
         }
-    } else {
-        let walker = WalkBuilder::new(&root_canon)
-            .hidden(false)
-            .git_ignore(true)
-            .filter_entry(move |e| {
-                if e.depth() == 0 {
-                    return true;
+        if is_explicit_file {
+            let local = process_file(
+                &target_canon,
+                &target_canon,
+                &rel_prefix,
+                true,
+                &ext_allow_arc,
+                &include_arc,
+                &exclude_arc,
+                ast_query_arc.as_ref().as_ref(),
+                &compiled_arc,
+                multi_mode,
+                s_opts,
+                &scanned_files_cnt,
+                &total_bytes_cnt,
+                &filtered_non_code_cnt,
+                &filtered_tests_cnt,
+            );
+            if !local.is_empty() {
+                let added = local.len();
+                if let Ok(mut guard) = all_matches.lock() {
+                    guard.extend(local);
                 }
-                let nm = e.file_name().to_str().unwrap_or("");
-                !skip_set.contains(nm)
-            })
-            .build_parallel();
-
-        walker.run(|| {
-            let ast_q_c = Arc::clone(&ast_query_arc);
-            let compiled_c = Arc::clone(&compiled_arc);
-            let ext_allow_c = Arc::clone(&ext_allow_arc);
-            let include_c = Arc::clone(&include_arc);
-            let exclude_c = Arc::clone(&exclude_arc);
-            let root_c = Arc::clone(&root_canon_arc);
-            let matches_c = Arc::clone(&all_matches);
-            let hit_c = Arc::clone(&hit_counter);
-            let scanned_c = Arc::clone(&scanned_files_cnt);
-            let bytes_c = Arc::clone(&total_bytes_cnt);
-            let f_nc_c = Arc::clone(&filtered_non_code_cnt);
-            let f_test_c = Arc::clone(&filtered_tests_cnt);
-
-            Box::new(move |res| {
-                if hit_c.load(Ordering::Relaxed) >= hit_cap {
-                    return WalkState::Quit;
-                }
-                let Ok(entry) = res else {
-                    return WalkState::Continue;
-                };
-                let local = process_file(
-                    entry.path(),
-                    &root_c,
-                    false,
-                    &ext_allow_c,
-                    &include_c,
-                    &exclude_c,
-                    ast_q_c.as_ref().as_ref(),
-                    &compiled_c,
-                    multi_mode,
-                    s_opts,
-                    &scanned_c,
-                    &bytes_c,
-                    &f_nc_c,
-                    &f_test_c,
-                );
-                if !local.is_empty() {
-                    let added = local.len();
-                    if let Ok(mut guard) = matches_c.lock() {
-                        guard.extend(local);
+                hit_counter.fetch_add(added, Ordering::Relaxed);
+            }
+        } else {
+            let root_canon_arc = Arc::new(target_canon.clone());
+            let rel_prefix_arc = Arc::new(rel_prefix);
+            let walker = WalkBuilder::new(&target_canon)
+                .hidden(false)
+                .git_ignore(true)
+                .filter_entry(|e| {
+                    if e.depth() == 0 {
+                        return true;
                     }
-                    let prev = hit_c.fetch_add(added, Ordering::Relaxed);
-                    if prev + added >= hit_cap {
+                    let nm = e.file_name().to_str().unwrap_or("");
+                    !SKIP_DIRS.contains(&nm)
+                })
+                .build_parallel();
+
+            walker.run(|| {
+                let ast_q_c = Arc::clone(&ast_query_arc);
+                let compiled_c = Arc::clone(&compiled_arc);
+                let ext_allow_c = Arc::clone(&ext_allow_arc);
+                let include_c = Arc::clone(&include_arc);
+                let exclude_c = Arc::clone(&exclude_arc);
+                let root_c = Arc::clone(&root_canon_arc);
+                let prefix_c = Arc::clone(&rel_prefix_arc);
+                let matches_c = Arc::clone(&all_matches);
+                let hit_c = Arc::clone(&hit_counter);
+                let scanned_c = Arc::clone(&scanned_files_cnt);
+                let bytes_c = Arc::clone(&total_bytes_cnt);
+                let f_nc_c = Arc::clone(&filtered_non_code_cnt);
+                let f_test_c = Arc::clone(&filtered_tests_cnt);
+
+                Box::new(move |res| {
+                    if hit_c.load(Ordering::Relaxed) >= hit_cap {
                         return WalkState::Quit;
                     }
-                }
-                WalkState::Continue
-            })
-        });
+                    let Ok(entry) = res else {
+                        return WalkState::Continue;
+                    };
+                    let local = process_file(
+                        entry.path(),
+                        &root_c,
+                        &prefix_c,
+                        false,
+                        &ext_allow_c,
+                        &include_c,
+                        &exclude_c,
+                        ast_q_c.as_ref().as_ref(),
+                        &compiled_c,
+                        multi_mode,
+                        s_opts,
+                        &scanned_c,
+                        &bytes_c,
+                        &f_nc_c,
+                        &f_test_c,
+                    );
+                    if !local.is_empty() {
+                        let added = local.len();
+                        if let Ok(mut guard) = matches_c.lock() {
+                            guard.extend(local);
+                        }
+                        let prev = hit_c.fetch_add(added, Ordering::Relaxed);
+                        if prev + added >= hit_cap {
+                            return WalkState::Quit;
+                        }
+                    }
+                    WalkState::Continue
+                })
+            });
+        }
     }
 
     let scanned_files = scanned_files_cnt.load(Ordering::Relaxed);

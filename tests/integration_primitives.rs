@@ -10817,3 +10817,334 @@ assert.equal(shouldAutoSieveUnboundedRead("x".repeat(35000), { offset: 1, limit:
         );
     }
 }
+
+#[test]
+fn test_v266_yaml_jsonc_config_multitarget_search_strings_alias_and_sieve_giant_line() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    let tsconfig = root.join("tsconfig.json");
+    let tsconfig_old = root.join("tsconfig_old.json");
+    let compose = root.join("compose.yml");
+    let compose_old = root.join("compose_old.yml");
+    let dir_a = root.join("dir_a");
+    let dir_b = root.join("dir_b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let alpha = dir_a.join("alpha.rs");
+    let beta = dir_b.join("beta.rs");
+
+    fs::write(
+        &tsconfig,
+        r#"{
+  // compiler config
+  "compilerOptions": {
+    "target": "ES2022", /* upgraded */
+    "baseUrl": "https://example.com//keep",
+  },
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        &tsconfig_old,
+        r#"{
+  "compilerOptions": {
+    "baseUrl": "https://example.com//keep",
+    "target": "ES2020"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        &compose,
+        r#"services:
+  api:
+    image: app:v2
+    ports:
+      - "8080:80"
+  tasks:
+    - name: worker
+      replicas: 2
+  run: |
+    echo ready
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &compose_old,
+        r#"services:
+  api:
+    image: app:v1
+    ports:
+      - "8080:80"
+  tasks:
+    - name: worker
+      replicas: 1
+"#,
+    )
+    .unwrap();
+    fs::write(&alpha, "fn a() { let x = \"NEEDLE_266 TOK_ALPHA\"; }\n").unwrap();
+    fs::write(&beta, "fn b() { let y = \"NEEDLE_266 TOK_BETA\"; }\n").unwrap();
+
+    // 1. JSONC outline / json-path / diff
+    let jc_ol = run_ap(
+        root,
+        &["read", tsconfig.to_str().unwrap(), "--outline"],
+        None,
+        &[],
+    );
+    assert!(
+        jc_ol.status.success(),
+        "{}",
+        String::from_utf8_lossy(&jc_ol.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&jc_ol.stdout).contains("JSONC schema"),
+        "{}",
+        String::from_utf8_lossy(&jc_ol.stdout)
+    );
+
+    let jc_jp = run_ap(
+        root,
+        &[
+            "read",
+            tsconfig.to_str().unwrap(),
+            "--json-path",
+            "$.compilerOptions.target",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        jc_jp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&jc_jp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&jc_jp.stdout).contains("ES2022"),
+        "{}",
+        String::from_utf8_lossy(&jc_jp.stdout)
+    );
+
+    let jc_diff = run_ap(
+        root,
+        &[
+            "read",
+            tsconfig.to_str().unwrap(),
+            "--diff",
+            tsconfig_old.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        jc_diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&jc_diff.stderr)
+    );
+    let jdv: Value = serde_json::from_slice(&jc_diff.stdout).unwrap();
+    assert_eq!(jdv["format"], "config-diff");
+    assert_eq!(jdv["json_diff"]["counts"]["changed"], 1);
+
+    // 2. YAML outline / json-path / diff
+    let y_ol = run_ap(
+        root,
+        &["read", compose.to_str().unwrap(), "--outline"],
+        None,
+        &[],
+    );
+    assert!(
+        y_ol.status.success(),
+        "{}",
+        String::from_utf8_lossy(&y_ol.stderr)
+    );
+    let y_ol_s = String::from_utf8_lossy(&y_ol.stdout);
+    assert!(
+        y_ol_s.contains("YAML schema") && y_ol_s.contains("services"),
+        "{y_ol_s}"
+    );
+
+    let y_jp = run_ap(
+        root,
+        &[
+            "read",
+            compose.to_str().unwrap(),
+            "--json-path",
+            "$.services.api.ports",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        y_jp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&y_jp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&y_jp.stdout).contains("8080:80"),
+        "{}",
+        String::from_utf8_lossy(&y_jp.stdout)
+    );
+
+    let y_diff = run_ap(
+        root,
+        &[
+            "read",
+            compose.to_str().unwrap(),
+            "--diff",
+            compose_old.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        y_diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&y_diff.stderr)
+    );
+    let ydv: Value = serde_json::from_slice(&y_diff.stdout).unwrap();
+    assert_eq!(ydv["format"], "config-diff");
+    assert_eq!(ydv["json_diff"]["counts"]["added"], 1);
+    assert_eq!(ydv["json_diff"]["counts"]["changed"], 2);
+
+    // 3. Multi-target `ap search` across directories & explicit files
+    let md_srch = run_ap(root, &["search", "NEEDLE_266", "dir_a", "dir_b"], None, &[]);
+    assert!(
+        md_srch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&md_srch.stderr)
+    );
+    let md_s = String::from_utf8_lossy(&md_srch.stdout);
+    assert!(
+        md_s.contains("dir_a/alpha.rs") && md_s.contains("dir_b/beta.rs"),
+        "{md_s}"
+    );
+
+    let mf_srch = run_ap(
+        root,
+        &[
+            "search",
+            "-o",
+            "-u",
+            "TOK_[A-Z]+",
+            "dir_a/alpha.rs",
+            "dir_b/beta.rs",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        mf_srch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mf_srch.stderr)
+    );
+    let mf_s = String::from_utf8_lossy(&mf_srch.stdout);
+    assert!(
+        mf_s.contains("TOK_ALPHA") && mf_s.contains("TOK_BETA"),
+        "{mf_s}"
+    );
+
+    // 4. Top-level `ap strings` alias
+    let st_res = run_ap(root, &["strings", alpha.to_str().unwrap()], None, &[]);
+    assert!(
+        st_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st_res.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&st_res.stdout).contains("NEEDLE_266"),
+        "{}",
+        String::from_utf8_lossy(&st_res.stdout)
+    );
+
+    // 5. MCP `ap_read` (YAML json_path & JSONC diff) + `ap_search` multi-target `paths`
+    let mcp_req = format!(
+        "{}\n{}\n{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_read",
+                "arguments": {
+                    "target": compose.to_str().unwrap(),
+                    "json_path": "$.services.tasks[*].name"
+                }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_read",
+                "arguments": {
+                    "target": tsconfig.to_str().unwrap(),
+                    "diff": tsconfig_old.to_str().unwrap()
+                }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_search",
+                "arguments": {
+                    "pattern": "NEEDLE_266",
+                    "path": "dir_a",
+                    "paths": ["dir_b"]
+                }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mcp_lines: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(mcp_lines.len(), 3);
+    assert!(mcp_lines[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("worker"));
+    assert!(mcp_lines[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("$.compilerOptions.target"));
+    let s_txt = mcp_lines[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        s_txt.contains("dir_a/alpha.rs") && s_txt.contains("dir_b/beta.rs"),
+        "{s_txt}"
+    );
+
+    // 6. `ap sieve pipe` giant single-line compression
+    let giant_input = format!("BOOT\nERROR {}\nEND\n", "x".repeat(45 * 1024));
+    let sieve_out = run_ap(
+        root,
+        &["sieve", "pipe", "--label", "giant"],
+        Some(&giant_input),
+        &[],
+    );
+    assert!(
+        sieve_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sieve_out.stderr)
+    );
+    let sv_s = String::from_utf8_lossy(&sieve_out.stdout);
+    assert!(
+        sv_s.len() < 4000 && sv_s.contains("[sieve id="),
+        "len={}\n{sv_s}",
+        sv_s.len()
+    );
+}

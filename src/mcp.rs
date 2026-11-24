@@ -17,7 +17,7 @@ fn mcp_tools_schema() -> Value {
                         "items": { "type": "string" }
                     },
                     "symbol": { "type": "string", "description": "Optional Tree-sitter AST symbol name(s) to extract cleanly (comma-separated, e.g. 'Engine.commit,parse_spec')" },
-                    "outline": { "type": "boolean", "description": "Emit ONLY the compact Tree-sitter AST symbol outline (for code), C/C++ outline, JSON/HAR/XML/PLIST/TOML/INI schema, or heading outline (for Markdown)" },
+                    "outline": { "type": "boolean", "description": "Emit ONLY the compact Tree-sitter AST symbol outline (for code), C/C++ outline, JSON/JSONC/HAR/XML/PLIST/YAML/TOML/INI schema, or heading outline (for Markdown)" },
                     "section": { "type": "string", "description": "Optional Markdown heading substring to extract ONLY that `# Heading` section cleanly" },
                     "lines": { "type": "string", "description": "Optional line window or comma-separated multi-ranges, e.g. '1-30,120-160'" },
                     "width": { "type": "integer", "description": "Optional max characters per output line (UTF-8 safe, like `cut -c1-N` without splitting CJK)" },
@@ -29,7 +29,7 @@ fn mcp_tools_schema() -> Value {
                     "offset": { "type": "string", "description": "Optional byte offset or comma-separated multi-offsets (e.g. '18000,95000') for slicing minified bundles in 1 call" },
                     "chars": { "type": "integer", "description": "Optional slice window length with offset (default: 2400)" },
                     "pretty": { "type": "boolean", "description": "Pretty-format minified JS/JSON snippets" },
-                    "json_path": { "type": "string", "description": "Zero-jq JSON/JSONL or structured config (XML/PLIST/TOML/INI) path query (e.g. 'items[*].name' or '..token')" },
+                    "json_path": { "type": "string", "description": "Zero-jq JSON/JSONC/JSONL or structured config (XML/PLIST/YAML/TOML/INI) path query (e.g. 'items[*].name' or '..token')" },
                     "map_pos": { "type": "string", "description": "SourceMap v3 generated 'line:col' to resolve back to original source via VLQ" },
                     "decode": { "type": "boolean", "description": "Auto-decode embedded JWT tokens, Base64 blobs, and URL-encoded strings" },
                     "render": { "type": "boolean", "description": "Render JS-driven URLs in real Headless Edge/Chrome" },
@@ -43,7 +43,7 @@ fn mcp_tools_schema() -> Value {
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins" },
                     "jwt": { "type": "boolean", "description": "Decode JWT header/claims/UTC timestamps & defensive security posture flags (accepts file or inline eyJ... token)" },
                     "secrets": { "type": "boolean", "description": "Scan file or archive entry for hardcoded keys/tokens/URI credentials (all values auto-redacted)" },
-                    "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) or structured JSON/XML/PLIST/TOML/INI file for structural/patch diffing" },
+                    "diff": { "type": "string", "description": "Optional path to older binary/archive (.dll/.exe/.so/.asar/.jar/.zip) or structured JSON/JSONC/XML/PLIST/YAML/TOML/INI file for structural/patch diffing" },
                     "scrub": { "type": "boolean", "description": "Scrub leaked secrets (API keys/tokens/PEM/URI creds) and defang indirect prompt-injection payloads before returning output" }
                 }
             }
@@ -81,6 +81,11 @@ fn mcp_tools_schema() -> Value {
                         "items": { "type": "string" }
                     },
                     "path": { "type": "string", "description": "Directory or file to search (default: '.')" },
+                    "paths": {
+                        "type": "array",
+                        "description": "Optional additional files or directories to search in the same pass",
+                        "items": { "type": "string" }
+                    },
                     "ext": { "type": "string", "description": "Optional comma-separated extensions, e.g. 'ts,js' or 'asar,vsix,map'" },
                     "pretty": { "type": "boolean", "description": "Pretty-format matches inside minified single-line bundles" },
                     "multiline": { "type": "boolean", "description": "Enable cross-line multiline regex matching" },
@@ -1461,6 +1466,13 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             cli.push(first_pat);
             cli.push(path.to_string());
+            if let Some(extra_paths) = args.get("paths").and_then(Value::as_array) {
+                for item in extra_paths {
+                    if let Some(p) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        cli.push(p.to_string());
+                    }
+                }
+            }
             for extra in all_pats.iter().skip(1) {
                 cli.push("--pat".to_string());
                 cli.push(extra.clone());

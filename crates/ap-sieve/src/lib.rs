@@ -218,7 +218,9 @@ fn archive_stream(
         let _ = fs::write(&meta_path, ms);
     }
     index_archive(store, &id, label, raw_text);
-    prune_ring_buffer(store, DEFAULT_MAX_STORE_BYTES);
+    if raw_text.len() >= 16_384 || id.as_bytes().first().copied().unwrap_or(0) % 8 == 0 {
+        prune_ring_buffer(store, DEFAULT_MAX_STORE_BYTES);
+    }
     id
 }
 
@@ -742,11 +744,13 @@ fn summarize_log(raw: &str) -> String {
     let mut error_windows: Vec<(usize, usize)> = Vec::new();
 
     for (idx, &ln) in lines.iter().enumerate() {
-        let norm = ts_re.replace_all(ln, "<TS>").trim().to_string();
+        let norm_head = trunc_chars(ln, 240);
+        let norm = ts_re.replace_all(&norm_head, "<TS>").trim().to_string();
         if !norm.is_empty() {
             *norm_counts.entry(norm).or_insert(0) += 1;
         }
-        if err_re.is_match(ln) {
+        let err_head = trunc_chars(ln, 4096);
+        if err_re.is_match(&err_head) {
             let start = idx.saturating_sub(1);
             let end = (idx + 3).min(n.saturating_sub(1));
             if let Some(last) = error_windows.last_mut() {
@@ -778,7 +782,10 @@ fn summarize_log(raw: &str) -> String {
         for &(s, e) in &error_windows {
             let sig_end = (e + 1).min(s + 3);
             let sig = (s..sig_end)
-                .map(|k| trunc_chars(&num_re.replace_all(lines[k], "#"), 80))
+                .map(|k| {
+                    let prefix = trunc_chars(lines[k], 240);
+                    trunc_chars(&num_re.replace_all(&prefix, "#"), 80)
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             if !seen_sigs.insert(sig) {
@@ -1764,6 +1771,29 @@ mod tests {
         assert!(
             go_digest.contains("pkg/handler.go:18:9 | error[go]"),
             "{go_digest}"
+        );
+    }
+
+    #[test]
+    fn compresses_giant_single_line_log_fast_and_compact() {
+        let tmp = std::env::temp_dir().join(format!("ap_sieve_giant_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let giant_line = format!(
+            "INFO boot\nERROR bundle crash: {}\nDONE\n",
+            "x".repeat(45 * 1024)
+        );
+        let res = compress_stream_in(&tmp, &giant_line, "giant-line", 0, 12.0);
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            res.rendered.len() < 4000,
+            "compressed output too large: {}",
+            res.rendered.len()
+        );
+        assert!(
+            res.rendered.contains("[sieve id="),
+            "missing archive header: {}",
+            res.rendered
         );
     }
 }

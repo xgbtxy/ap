@@ -3319,7 +3319,565 @@ pub fn parse_ini_to_json(text: &str, ext: &str) -> Option<Value> {
     }
 }
 
-/// Dispatch structured configuration parsing (XML, Apple PLIST, TOML, INI) into normalized JSON.
+/// Strip `//` line comments, `/* ... */` block comments, and trailing commas outside JSON string literals.
+pub fn strip_jsonc_comments_and_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut no_comments = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+
+    while i < n {
+        let ch = chars[i];
+        if in_str {
+            no_comments.push(ch);
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+            no_comments.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '/' && i + 1 < n && chars[i + 1] == '/' {
+            i += 2;
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && i + 1 < n && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
+                if chars[i] == '\n' {
+                    no_comments.push('\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        no_comments.push(ch);
+        i += 1;
+    }
+
+    let c2: Vec<char> = no_comments.chars().collect();
+    let m = c2.len();
+    let mut out = String::with_capacity(no_comments.len());
+    in_str = false;
+    esc = false;
+    i = 0;
+    while i < m {
+        let ch = c2[i];
+        if in_str {
+            out.push(ch);
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut j = i + 1;
+            while j < m && c2[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < m && (c2[j] == '}' || c2[j] == ']') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// Pure-Rust JSONC parser supporting `//`, `/* ... */` comments, and trailing commas.
+pub fn parse_jsonc_to_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim_start_matches('\u{FEFF}').trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    let cleaned = strip_jsonc_comments_and_trailing_commas(trimmed);
+    serde_json::from_str::<Value>(&cleaned).ok()
+}
+
+fn yaml_indent(line: &str) -> usize {
+    line.chars().take_while(|&c| c == ' ').count()
+}
+
+fn strip_yaml_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if q == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if q == b'\'' && b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+fn find_yaml_mapping_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if q == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if q == b'\'' && b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'[' || b == b'{' {
+            depth += 1;
+        } else if (b == b']' || b == b'}') && depth > 0 {
+            depth -= 1;
+        } else if b == b':' && depth == 0 {
+            let next_is_sep = bytes
+                .get(i + 1)
+                .map(|nb| nb.is_ascii_whitespace())
+                .unwrap_or(true);
+            if next_is_sep {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_yaml_flow_items(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if q == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if q == b'\'' && b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'[' || b == b'{' {
+            depth += 1;
+        } else if (b == b']' || b == b'}') && depth > 0 {
+            depth -= 1;
+        } else if b == b',' && depth == 0 {
+            let s = inner[start..i].trim();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn unquote_yaml_key(raw: &str) -> String {
+    let t = raw.trim();
+    if let Some(inner) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        unescape_toml_basic(inner)
+    } else if let Some(inner) = t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        inner.replace("''", "'")
+    } else {
+        t.to_string()
+    }
+}
+
+fn parse_yaml_scalar_or_flow(raw: &str) -> Value {
+    let t = raw.trim();
+    if t.is_empty() || matches!(t, "~" | "null" | "Null" | "NULL") {
+        return Value::Null;
+    }
+    if let Some(inner) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Value::String(unescape_toml_basic(inner));
+    }
+    if let Some(inner) = t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return Value::String(inner.replace("''", "'"));
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let items = split_yaml_flow_items(inner)
+            .into_iter()
+            .map(parse_yaml_scalar_or_flow)
+            .collect();
+        return Value::Array(items);
+    }
+    if let Some(inner) = t.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        let mut map = serde_json::Map::new();
+        for item in split_yaml_flow_items(inner) {
+            if let Some(col) = find_yaml_mapping_colon(item) {
+                let k = unquote_yaml_key(&item[..col]);
+                let v = parse_yaml_scalar_or_flow(&item[col + 1..]);
+                if !k.is_empty() {
+                    map.insert(k, v);
+                }
+            }
+        }
+        return Value::Object(map);
+    }
+    match t {
+        "true" | "True" | "TRUE" => return Value::Bool(true),
+        "false" | "False" | "FALSE" => return Value::Bool(false),
+        _ => {}
+    }
+    let is_plain_int = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .chars()
+        .all(|c| c.is_ascii_digit());
+    if is_plain_int {
+        let unsigned = t.strip_prefix('-').unwrap_or(t);
+        if unsigned == "0" || !unsigned.starts_with('0') {
+            if let Ok(n) = t.parse::<i64>() {
+                return Value::Number(n.into());
+            }
+        }
+    }
+    if t.contains('.') && !t.contains(':') {
+        let unsigned = t.strip_prefix('-').unwrap_or(t);
+        if unsigned.starts_with("0.") || !unsigned.starts_with('0') {
+            if let Ok(f) = t.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(f) {
+                    return Value::Number(num);
+                }
+            }
+        }
+    }
+    Value::String(t.to_string())
+}
+
+fn read_yaml_block_scalar(
+    lines: &[&str],
+    idx: &mut usize,
+    parent_indent: usize,
+    indicator: &str,
+) -> Value {
+    let folded = indicator.starts_with('>');
+    let chomp_strip = indicator.contains('-');
+    let chomp_keep = indicator.contains('+');
+    let mut content_indent: Option<usize> = None;
+    let mut collected: Vec<String> = Vec::new();
+
+    while *idx < lines.len() {
+        let line = lines[*idx];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            collected.push(String::new());
+            *idx += 1;
+            continue;
+        }
+        let ind = yaml_indent(line);
+        if ind <= parent_indent {
+            break;
+        }
+        let target_ind = *content_indent.get_or_insert(ind);
+        if ind < target_ind {
+            break;
+        }
+        collected.push(line[target_ind..].to_string());
+        *idx += 1;
+    }
+
+    while !chomp_keep && collected.last().is_some_and(|l| l.is_empty()) {
+        collected.pop();
+    }
+    if collected.is_empty() {
+        return Value::String(String::new());
+    }
+    let mut out = if folded {
+        let mut buf = String::new();
+        for (i, l) in collected.iter().enumerate() {
+            if l.is_empty() {
+                buf.push('\n');
+            } else {
+                if i > 0 && !collected[i - 1].is_empty() {
+                    buf.push(' ');
+                }
+                buf.push_str(l);
+            }
+        }
+        buf
+    } else {
+        collected.join("\n")
+    };
+    if !chomp_strip && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Value::String(out)
+}
+
+fn skip_yaml_blank_and_comments(lines: &[&str], idx: &mut usize) {
+    while *idx < lines.len() {
+        let stripped = strip_yaml_inline_comment(lines[*idx]).trim();
+        if stripped.is_empty() {
+            *idx += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn parse_yaml_rhs(lines: &[&str], idx: &mut usize, rhs: &str, key_indent: usize) -> Value {
+    let t = rhs.trim();
+    if t.starts_with('|') || t.starts_with('>') {
+        let ind_str = t.split_whitespace().next().unwrap_or(t);
+        if ind_str
+            .chars()
+            .all(|c| matches!(c, '|' | '>' | '-' | '+') || c.is_ascii_digit())
+        {
+            return read_yaml_block_scalar(lines, idx, key_indent, ind_str);
+        }
+    }
+    if !t.is_empty() {
+        return parse_yaml_scalar_or_flow(t);
+    }
+    skip_yaml_blank_and_comments(lines, idx);
+    if *idx >= lines.len() {
+        return Value::Null;
+    }
+    let next_clean = strip_yaml_inline_comment(lines[*idx]);
+    let next_ind = yaml_indent(next_clean);
+    let next_trim = next_clean.trim_start();
+    if next_ind > key_indent {
+        parse_yaml_block(lines, idx, next_ind)
+    } else if next_ind == key_indent && (next_trim == "-" || next_trim.starts_with("- ")) {
+        parse_yaml_sequence(lines, idx, next_ind)
+    } else {
+        Value::Null
+    }
+}
+
+fn parse_yaml_mapping_into(
+    lines: &[&str],
+    idx: &mut usize,
+    map_indent: usize,
+    map: &mut serde_json::Map<String, Value>,
+) {
+    while *idx < lines.len() {
+        skip_yaml_blank_and_comments(lines, idx);
+        if *idx >= lines.len() {
+            break;
+        }
+        let clean = strip_yaml_inline_comment(lines[*idx]);
+        let ind = yaml_indent(clean);
+        if ind != map_indent {
+            break;
+        }
+        let trimmed = clean.trim_start();
+        if trimmed == "-" || trimmed.starts_with("- ") {
+            break;
+        }
+        let Some(col) = find_yaml_mapping_colon(trimmed) else {
+            break;
+        };
+        let key = unquote_yaml_key(&trimmed[..col]);
+        let rhs = &trimmed[col + 1..];
+        *idx += 1;
+        let val = parse_yaml_rhs(lines, idx, rhs, map_indent);
+        if !key.is_empty() {
+            map.insert(key, val);
+        }
+    }
+}
+
+fn parse_yaml_sequence(lines: &[&str], idx: &mut usize, seq_indent: usize) -> Value {
+    let mut items = Vec::new();
+    while *idx < lines.len() {
+        skip_yaml_blank_and_comments(lines, idx);
+        if *idx >= lines.len() {
+            break;
+        }
+        let clean = strip_yaml_inline_comment(lines[*idx]);
+        let ind = yaml_indent(clean);
+        if ind != seq_indent {
+            break;
+        }
+        let trimmed = clean.trim_start();
+        let after_dash = if trimmed == "-" {
+            ""
+        } else if let Some(rest) = trimmed.strip_prefix("- ") {
+            rest.trim_start()
+        } else {
+            break;
+        };
+        *idx += 1;
+
+        if after_dash.starts_with('|') || after_dash.starts_with('>') {
+            let ind_str = after_dash.split_whitespace().next().unwrap_or(after_dash);
+            if ind_str
+                .chars()
+                .all(|c| matches!(c, '|' | '>' | '-' | '+') || c.is_ascii_digit())
+            {
+                items.push(read_yaml_block_scalar(lines, idx, seq_indent, ind_str));
+                continue;
+            }
+        }
+        if after_dash.is_empty() {
+            skip_yaml_blank_and_comments(lines, idx);
+            if *idx < lines.len() {
+                let n_ind = yaml_indent(strip_yaml_inline_comment(lines[*idx]));
+                if n_ind > seq_indent {
+                    items.push(parse_yaml_block(lines, idx, n_ind));
+                    continue;
+                }
+            }
+            items.push(Value::Null);
+        } else if let Some(col) = find_yaml_mapping_colon(after_dash) {
+            let mut item_map = serde_json::Map::new();
+            let k = unquote_yaml_key(&after_dash[..col]);
+            let rhs = &after_dash[col + 1..];
+            let sub_indent = seq_indent + 2;
+            let v = parse_yaml_rhs(lines, idx, rhs, seq_indent);
+            if !k.is_empty() {
+                item_map.insert(k, v);
+            }
+            parse_yaml_mapping_into(lines, idx, sub_indent, &mut item_map);
+            items.push(Value::Object(item_map));
+        } else {
+            items.push(parse_yaml_scalar_or_flow(after_dash));
+        }
+    }
+    Value::Array(items)
+}
+
+fn parse_yaml_block(lines: &[&str], idx: &mut usize, expected_indent: usize) -> Value {
+    skip_yaml_blank_and_comments(lines, idx);
+    if *idx >= lines.len() {
+        return Value::Null;
+    }
+    let clean = strip_yaml_inline_comment(lines[*idx]);
+    let ind = yaml_indent(clean);
+    if ind < expected_indent {
+        return Value::Null;
+    }
+    let trimmed = clean.trim_start();
+    if trimmed == "-" || trimmed.starts_with("- ") {
+        return parse_yaml_sequence(lines, idx, ind);
+    }
+    if find_yaml_mapping_colon(trimmed).is_some() {
+        let mut map = serde_json::Map::new();
+        parse_yaml_mapping_into(lines, idx, ind, &mut map);
+        return Value::Object(map);
+    }
+    *idx += 1;
+    parse_yaml_scalar_or_flow(trimmed)
+}
+
+/// Pure-Rust indentation-aware YAML parser supporting mappings, sequences, `- k: v` items, block scalars & multi-doc streams.
+pub fn parse_yaml_to_json(text: &str) -> Option<Value> {
+    let clean = text.trim_start_matches('\u{FEFF}');
+    let mut docs_raw: Vec<Vec<&str>> = Vec::new();
+    let mut cur_doc: Vec<&str> = Vec::new();
+
+    for line in clean.lines() {
+        let t = line.trim();
+        if t == "---" || t.starts_with("--- ") {
+            if !cur_doc.is_empty() {
+                docs_raw.push(std::mem::take(&mut cur_doc));
+            }
+            if let Some(rest) = t.strip_prefix("--- ") {
+                if !rest.trim().is_empty() {
+                    cur_doc.push(rest);
+                }
+            }
+            continue;
+        }
+        if t == "..." {
+            if !cur_doc.is_empty() {
+                docs_raw.push(std::mem::take(&mut cur_doc));
+            }
+            continue;
+        }
+        cur_doc.push(line);
+    }
+    if !cur_doc.is_empty() {
+        docs_raw.push(cur_doc);
+    }
+
+    let mut parsed_docs = Vec::new();
+    for doc_lines in &docs_raw {
+        let mut idx = 0usize;
+        skip_yaml_blank_and_comments(doc_lines, &mut idx);
+        if idx >= doc_lines.len() {
+            continue;
+        }
+        let val = parse_yaml_block(doc_lines, &mut idx, 0);
+        if !val.is_null() {
+            parsed_docs.push(val);
+        }
+    }
+
+    match parsed_docs.len() {
+        0 => None,
+        1 => Some(parsed_docs.into_iter().next().unwrap()),
+        _ => Some(Value::Array(parsed_docs)),
+    }
+}
+
+/// Dispatch structured configuration parsing (XML, Apple PLIST, TOML, INI, YAML, JSONC) into normalized JSON.
 pub fn parse_structured_config_to_json(text: &str, ext: &str) -> Option<(&'static str, Value)> {
     let low = ext.trim().trim_start_matches('.').to_ascii_lowercase();
     match low.as_str() {
@@ -3329,6 +3887,8 @@ pub fn parse_structured_config_to_json(text: &str, ext: &str) -> Option<(&'stati
             parse_xml_to_json(text).map(|v| ("XML", v))
         }
         "toml" => parse_toml_to_json(text).map(|v| ("TOML", v)),
+        "yaml" | "yml" => parse_yaml_to_json(text).map(|v| ("YAML", v)),
+        "jsonc" | "json" => parse_jsonc_to_json(text).map(|v| ("JSONC", v)),
         "ini" | "cfg" | "conf" | "inf" | "properties" | "editorconfig" => {
             parse_ini_to_json(text, &low).map(|v| ("INI", v))
         }
@@ -3336,6 +3896,10 @@ pub fn parse_structured_config_to_json(text: &str, ext: &str) -> Option<(&'stati
             let trimmed = text.trim_start_matches('\u{FEFF}').trim_start();
             if trimmed.starts_with("<?xml") {
                 parse_xml_to_json(text).map(|v| ("XML", v))
+            } else if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && serde_json::from_str::<Value>(trimmed).is_err()
+            {
+                parse_jsonc_to_json(text).map(|v| ("JSONC", v))
             } else {
                 None
             }
@@ -3767,5 +4331,82 @@ name = "demo"
         assert!(i_out.contains("database: object"), "{i_out}");
         let i_q = query_json_or_structured(ini, "ini", "$.database.host").unwrap();
         assert!(i_q.contains("127.0.0.1"), "{i_q}");
+    }
+
+    #[test]
+    fn parses_yaml_and_jsonc_for_outline_query_and_diff() {
+        // 1. JSONC with // line comments, /* block */ comments, trailing commas & URL string preservation
+        let jsonc = r#"{
+  // TypeScript compiler config
+  "compilerOptions": {
+    "target": "ES2022", /* block comment */
+    "url": "https://example.com//keep",
+  },
+}"#;
+        let jsonc_old = r#"{
+  "compilerOptions": {
+    "url": "https://example.com//keep",
+    "target": "ES2020"
+  }
+}"#;
+        let (jc_kind, jc_out) = outline_structured_config(jsonc, "json").unwrap();
+        assert_eq!(jc_kind, "JSONC");
+        assert!(jc_out.contains("compilerOptions: object"), "{jc_out}");
+        let jc_q = query_json_or_structured(jsonc, "json", "$.compilerOptions.target").unwrap();
+        assert!(jc_q.contains("ES2022"), "{jc_q}");
+        let jc_u = query_json_or_structured(jsonc, "json", "$.compilerOptions.url").unwrap();
+        assert!(jc_u.contains("https://example.com//keep"), "{jc_u}");
+        let (_, v_new) = parse_structured_config_to_json(jsonc, "json").unwrap();
+        let (_, v_old) = parse_structured_config_to_json(jsonc_old, "json").unwrap();
+        let (jc_diff, jc_jv) = diff_json_structural_md(&v_new, &v_old, "new.json", "old.json");
+        assert!(jc_diff.contains("$.compilerOptions.target"), "{jc_diff}");
+        assert_eq!(jc_jv["counts"]["changed"], 1);
+
+        // 2. YAML (nested maps, block/inline sequences, block scalar, flow array & multi-doc)
+        let yaml_a = r#"
+services:
+  api:
+    image: nginx:1.25 # inline comment
+    ports:
+      - "8080:80"
+    tags: [web, edge]
+  routes:
+    - name: health
+      port: 8081
+    - name: metrics
+      port: 9090
+  script: |
+    echo ok
+    exit 0
+"#;
+        let yaml_b = r#"
+services:
+  routes:
+    - port: 8081
+      name: health
+    - port: 9090
+      name: metrics
+  script: |
+    echo ok
+    exit 0
+  api:
+    tags: [web, edge]
+    ports:
+      - "8080:80"
+    image: nginx:1.25
+"#;
+        let (y_kind, y_out) = outline_structured_config(yaml_a, "yml").unwrap();
+        assert_eq!(y_kind, "YAML");
+        assert!(y_out.contains("services: object"), "{y_out}");
+        let y_q = query_json_or_structured(yaml_a, "yaml", "$.services.routes[*].port").unwrap();
+        assert!(y_q.contains("8081") && y_q.contains("9090"), "{y_q}");
+        let (_, ya) = parse_structured_config_to_json(yaml_a, "yaml").unwrap();
+        let (_, yb) = parse_structured_config_to_json(yaml_b, "yaml").unwrap();
+        let (y_same, _) = diff_json_structural_md(&yb, &ya, "b.yml", "a.yml");
+        assert!(y_same.contains("0 semantic differences"), "{y_same}");
+
+        let multi_yaml = "---\na: 1\n---\nb: 2\n...\n";
+        let (_, ym) = parse_structured_config_to_json(multi_yaml, "yaml").unwrap();
+        assert!(ym.is_array() && ym.as_array().unwrap().len() == 2, "{ym}");
     }
 }
