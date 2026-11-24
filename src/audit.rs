@@ -1379,12 +1379,22 @@ pub fn audit_home(home: &Path, max_per_harness: usize, compare: bool) -> Value {
     }
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+    let prompt_cache_hit_pct = if totals.prompt_input_tokens + totals.prompt_cache_read_tokens > 0 {
+        ((totals.prompt_cache_read_tokens as f64
+            / (totals.prompt_input_tokens + totals.prompt_cache_read_tokens) as f64)
+            * 1000.0)
+            .round()
+            / 10.0
+    } else {
+        0.0
+    };
     let maintainer_targets = build_maintainer_targets(&totals);
     let recommended_adapters =
         build_adapter_recommendations(&harnesses, &model_families_detected, &totals);
     let mut out = json!({
         "privacy_guarantee": "100% local & strictly anonymized: zero prompts, zero code snippets, zero file paths, and zero raw model IDs/credentials emitted.",
         "elapsed_ms": elapsed_ms,
+        "prompt_cache_hit_pct": prompt_cache_hit_pct,
         "harnesses_detected": harnesses,
         "model_families_detected": model_families_detected,
         "aggregate_friction_counts": totals,

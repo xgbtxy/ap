@@ -2379,6 +2379,9 @@ export function healEditBlock(
 	if (nonBlankOld.some((l) => l.trim().length >= 8)) {{
 		const normLoose = (s: string) =>
 			s
+				.replace(/[\u200B\uFEFF]/g, "")
+				.replace(/\u00A0/g, " ")
+				.replace(/[—–]/g, "-")
 				.trim()
 				.replace(/[：]/g, ":")
 				.replace(/[，]/g, ",")
@@ -2387,6 +2390,7 @@ export function healEditBlock(
 				.replace(/[“”]/g, '"')
 				.replace(/[‘’]/g, "'")
 				.replace(/\s+/g, " ")
+				.replace(/\s*\|\s*/g, "|")
 				.replace(/\s*([:,()])\s*/g, "$1");
 		const looseHits: number[] = [];
 		for (let i = 0; i <= fileLines.length - n; i++) {{
@@ -3348,6 +3352,45 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	return `${{cdLeadPfx}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(gPos[0])}} "${{gPos[1].replace(/"/g, '\\"')}}"`;
 }}
 
+function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
+	const stages = splitUnquotedPipes(cmdTailBody.trim());
+	if (!stages || stages.length !== 2) return undefined;
+	const lhs = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
+	const rhs = stages[1].trim();
+	if (/[;&><{{}}`]|\$\(/.test(lhs) || /[;&><{{}}`]|\$\(/.test(rhs)) return undefined;
+	const headM = rhs.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
+	if (!headM) return undefined;
+	const limit = Number(headM[1] || headM[2]);
+	if (!Number.isInteger(limit) || limit < 1) return undefined;
+	const toks = (lhs.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) =>
+		(t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")) ? t.slice(1, -1) : t,
+	);
+	if (toks[0] !== "ls") return undefined;
+	let showAll = false;
+	let sortMtime = false;
+	let sortSize = false;
+	let tgt: string | undefined = undefined;
+	for (let i = 1; i < toks.length; i += 1) {{
+		const t = toks[i];
+		if (t.startsWith("-") && t.length > 1) {{
+			if (t.startsWith("--")) return undefined;
+			for (const ch of t.slice(1)) {{
+				if ("l1hFp".includes(ch)) continue;
+				else if (ch === "a" || ch === "A") showAll = true;
+				else if (ch === "t") sortMtime = true;
+				else if (ch === "S") sortSize = true;
+				else return undefined;
+			}}
+			continue;
+		}}
+		if (tgt !== undefined || /[*?,]/.test(t)) return undefined;
+		tgt = t;
+	}}
+	const esc = (tgt || ".").replace(/"/g, '\\"');
+	const flags = `${{showAll ? " -a" : ""}}${{sortMtime ? " -t" : sortSize ? " -S" : ""}}`;
+	return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 --limit ${{limit}}`;
+}}
+
 function accelerateSingleBashSegment(seg: string, toolName: string): string | undefined {{
 	const fastGrep = rewriteSlowRecursiveGrep(seg, toolName);
 	if (fastGrep) return fastGrep;
@@ -3418,13 +3461,14 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		}}
 	}}
 
-	// 1d. Rewrite bare `sed -n '<A>,<B>p'`, `head -n <N>`, `tail -n <N>`, `cat <file> | head|tail|sed`,
-	// or unified `grep ... | cut/sort/uniq/head` pipelines -> bounded `ap read` / `ap search`
+	// 1d. Rewrite bare `sed -n '<A>,<B>p'`, `head -n|-c <N>`, `tail -n <N>`, `cat <file> [2>/dev/null] | ...`,
+	// `ls ... | head -n <N>`, or unified `grep ... | cut/sort/uniq/head` pipelines -> bounded `ap` commands
 	if (toolName === "bash") {{
 		const trimmedTail = cmdTailBody.trim();
 		const qPathOk = (f: string) => Boolean(f) && f !== "-" && !/[*?,]/.test(f);
+		const stripErr = (s: string) => s.replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
 		const cutOnlyM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
-		const sliceCore = cutOnlyM ? cutOnlyM[1].trim() : trimmedTail;
+		const sliceCore = stripErr(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
 		const sliceWidth = cutOnlyM && Number(cutOnlyM[2]) >= 1 ? Number(cutOnlyM[2]) : 0;
 		const sliceWidthFlag = sliceWidth > 0 ? ` --width ${{sliceWidth}}` : "";
 		if (!/[|;&><{{}}`]|\$\(/.test(sliceCore)) {{
@@ -3439,12 +3483,17 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
 				}}
 			}}
-			const headM = sliceCore.match(/^head\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
+			const headM = sliceCore.match(
+				/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&>-]+))\s*$/,
+			);
 			if (headM) {{
-				const n = Number(headM[1] || headM[2]);
-				const f = headM[3] || headM[4] || headM[5] || "";
-				if (n >= 1 && qPathOk(f)) {{
-					return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{sliceWidthFlag}}`;
+				const isBytes = Boolean(headM[1]);
+				const n = Number(headM[2] || headM[3] || headM[4]);
+				const f = headM[5] || headM[6] || headM[7] || "";
+				if (n >= 1 && qPathOk(f) && !(isBytes && sliceWidth > 0)) {{
+					return isBytes
+						? `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --offset 0 --chars ${{n}}`
+						: `${{cdLeadPfx}}"${{AP_BIN}}" read "${{f.replace(/"/g, '\\"')}}" --lines 1-${{n}}${{sliceWidthFlag}}`;
 				}}
 			}}
 			const tailM = sliceCore.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))\s*$/);
@@ -3458,27 +3507,35 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		}}
 		const grepPipeOut = accelerateGrepPipeline(trimmedTail, cdLeadPfx);
 		if (grepPipeOut) return grepPipeOut;
-		if (!/[;&><{{}}`]|\$\(/.test(trimmedTail) && trimmedTail.includes("|")) {{
-			const parts = trimmedTail.split("|");
-			if (parts.length === 2) {{
-				const catM = parts[0].trim().match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
-				const rhs = parts[1].trim();
+		const lsPipeOut = accelerateLsPipeline(trimmedTail, cdLeadPfx);
+		if (lsPipeOut) return lsPipeOut;
+		const catStages = splitUnquotedPipes(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
+		if (catStages && catStages.length === 2) {{
+			const catLhs = stripErr(catStages[0]);
+			const rhs = catStages[1].trim();
+			if (!/[;&><{{}}`]|\$\(/.test(catLhs) && !/[;&><{{}}`]|\$\(/.test(rhs)) {{
+				const catM = catLhs.match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
 				const f = catM ? catM[1] || catM[2] || catM[3] || "" : "";
 				if (qPathOk(f)) {{
-					const rHead = rhs.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
+					const rHead = rhs.match(/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))$/);
 					const rTail = rhs.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
 					const rSed = rhs.match(/^sed\s+-n\s+(?:'(\d+),(\d+)p'|"(\d+),(\d+)p"|(\d+),(\d+)p)$/);
 					const esc = f.replace(/"/g, '\\"');
 					if (rHead) {{
-						const n = Number(rHead[1] || rHead[2]);
-						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines 1-${{n}}`;
+						const isBytes = Boolean(rHead[1]);
+						const n = Number(rHead[2] || rHead[3] || rHead[4]);
+						if (n >= 1 && !(isBytes && sliceWidth > 0)) {{
+							return isBytes
+								? `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --offset 0 --chars ${{n}}`
+								: `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines 1-${{n}}${{sliceWidthFlag}}`;
+						}}
 					}} else if (rTail) {{
 						const n = Number(rTail[1] || rTail[2]);
-						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --tail ${{n}}`;
+						if (n >= 1) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --tail ${{n}}${{sliceWidthFlag}}`;
 					}} else if (rSed) {{
 						const s = Number(rSed[1] || rSed[3] || rSed[5]);
 						const e = Number(rSed[2] || rSed[4] || rSed[6]);
-						if (s >= 1 && e >= s) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{s}}-${{e}}`;
+						if (s >= 1 && e >= s) return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{s}}-${{e}}${{sliceWidthFlag}}`;
 					}}
 				}}
 			}}
@@ -5944,7 +6001,11 @@ export default function (pi: ExtensionAPI) {{
 					}}
 				}}
 			}}
-			outText += `${{closestSnippet}}\n[ap edit-tip] Patch target missed; use the exact lines above, ap_edit (4-tier fuzzy + AST symbols), or ap splice view.`;
+			const hunkMsg =
+				Array.isArray(inp?.edits) && failIdx >= 0
+					? `\n[ap edit-hunk] edits[${{failIdx}}] (${{targetOld.split("\n").length}} line(s)) missed; fix only this hunk (other hunks can stay unchanged).`
+					: "";
+			outText += `${{closestSnippet}}${{hunkMsg}}\n[ap edit-tip] Patch target missed; use the exact lines above, ap_edit (4-tier fuzzy + AST symbols), or ap splice view.`;
 			mutated = true;
 		}}
 

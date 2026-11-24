@@ -107,6 +107,9 @@ fn mcp_tools_schema() -> Value {
                         "description": "Relative-path substring or suffix filters to skip (e.g. ['fixtures', '*.gen.ts'])",
                         "items": { "type": "string" }
                     },
+                    "around": { "type": "integer", "description": "Context characters on each side when slicing matches inside minified single-line bundles (default: 160)" },
+                    "max_hits": { "type": "integer", "description": "Maximum total matches to return across files (default: 50)" },
+                    "per_pattern": { "type": "integer", "description": "Max hits per pattern in multi-pattern (`patterns`) mode (0 = fair auto quota across all patterns)" },
                     "width": { "type": "integer", "description": "Optional max characters per output snippet (UTF-8 safe, like `cut -c1-N` without splitting CJK)" },
                     "json": { "type": "boolean", "description": "Emit structured JSON populated into structuredContent (matches/files/counts) for zero-parse codemode pipelines" }
                 }
@@ -1580,6 +1583,28 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 if w > 0 {
                     cli.push("--width".to_string());
                     cli.push(w.to_string());
+                }
+            }
+            if let Some(ar) = args.get("around").and_then(Value::as_u64) {
+                if ar > 0 {
+                    cli.push("--around".to_string());
+                    cli.push(ar.to_string());
+                }
+            }
+            if let Some(mh) = args
+                .get("max_hits")
+                .or_else(|| args.get("max"))
+                .and_then(Value::as_u64)
+            {
+                if mh > 0 {
+                    cli.push("--max-hits".to_string());
+                    cli.push(mh.to_string());
+                }
+            }
+            if let Some(pp) = args.get("per_pattern").and_then(Value::as_u64) {
+                if pp > 0 {
+                    cli.push("--per-pattern".to_string());
+                    cli.push(pp.to_string());
                 }
             }
             if args.get("json").and_then(Value::as_bool).unwrap_or(false) {

@@ -1,6 +1,6 @@
 {
   "name": "agent-primitives",
-  "version": "2.61.0",
+  "version": "2.62.0",
   "description": "Single-binary zero-dependency Rust engine & MCP 2025-06-18 server (`--profile full|core|deferred`, 37 tools + ap_discover/ap_call) for AI coding and desktop agents",
   "license": "MIT",
   "repository": {

@@ -9952,3 +9952,211 @@ assert.equal(shouldAutoSieveUnboundedRead(txt30k, { path: "a.md", offset: 1, lim
         );
     }
 }
+
+#[test]
+fn test_v262_fair_multipattern_search_ls_cat_headc_accel_and_edit_tier3() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Fair multi-pattern `ap search` (single minified bundle where KEY_NOISY has 25 hits before rare keys)
+    let mut bundle = String::new();
+    for i in 0..25 {
+        bundle.push_str(&format!("fn_n{i}=function(){{return \"KEY_NOISY_{i}\";}};"));
+    }
+    bundle.push_str("const a=\"KEY_RARE_A_1\";const b=\"KEY_RARE_B_1\";const c=\"KEY_RARE_A_2\";const d=\"KEY_RARE_B_2\";");
+    let bundle_path = root.join("bundle.js");
+    fs::write(&bundle_path, &bundle).unwrap();
+
+    let sr = run_ap(
+        root,
+        &[
+            "search",
+            "KEY_NOISY",
+            bundle_path.to_str().unwrap(),
+            "--pat",
+            "KEY_RARE_A",
+            "--pat",
+            "KEY_RARE_B",
+            "--around",
+            "20",
+            "--max",
+            "12",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        sr.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sr.stderr)
+    );
+    let sr_out = String::from_utf8_lossy(&sr.stdout);
+    assert!(
+        sr_out.contains("KEY_NOISY")
+            && sr_out.contains("KEY_RARE_A")
+            && sr_out.contains("KEY_RARE_B"),
+        "All three patterns must survive multi-pattern interleaving: {sr_out}"
+    );
+
+    let sr_cap = run_ap(
+        root,
+        &[
+            "search",
+            "KEY_NOISY",
+            bundle_path.to_str().unwrap(),
+            "--pat",
+            "KEY_RARE_A",
+            "--per-pattern",
+            "2",
+            "--max",
+            "10",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        sr_cap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sr_cap.stderr)
+    );
+    let cap_out = String::from_utf8_lossy(&sr_cap.stdout);
+    assert!(cap_out.contains("KEY_RARE_A"), "{cap_out}");
+
+    // 2. MCP `ap_search` forwarding `around`, `max_hits`, `per_pattern`
+    let mcp_req = format!(
+        "{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_search",
+                "arguments": {
+                    "patterns": ["KEY_NOISY", "KEY_RARE_A"],
+                    "path": bundle_path.to_str().unwrap(),
+                    "around": 24,
+                    "max_hits": 6,
+                    "per_pattern": 2,
+                    "json": true
+                }
+            }
+        })
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    assert!(
+        mcp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_out.stderr)
+    );
+    let mcp_line = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap()
+        .to_string();
+    let mv: Value = serde_json::from_str(&mcp_line).unwrap();
+    assert_eq!(mv["result"]["isError"], Value::Bool(false), "{mv}");
+    let sc_text = serde_json::to_string(&mv["result"]["structuredContent"]).unwrap();
+    assert!(
+        sc_text.contains("KEY_NOISY") && sc_text.contains("KEY_RARE_A"),
+        "{sc_text}"
+    );
+
+    // 3. `ap read --offset 0 --chars 32`
+    let rd = run_ap(
+        root,
+        &[
+            "read",
+            bundle_path.to_str().unwrap(),
+            "--offset",
+            "0",
+            "--chars",
+            "32",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        rd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rd.stderr)
+    );
+    let rd_out = String::from_utf8_lossy(&rd.stdout);
+    assert!(rd_out.contains("KEY_NOISY_0"), "{rd_out}");
+
+    // 4. Pi accelerator live Node checks (`ls|head`, compound `ls`, `cat 2>/dev/null|head`, `cat|head -c`, `head -c`, Tier-3 pipe edit)
+    let home = root.join("home_v262");
+    let home_s = home.to_string_lossy().to_string();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    let init_res = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            &home_s,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        init_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_res.stderr)
+    );
+    let ts_file = home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+    if Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let script = r#"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand, healEditBlock } = mod;
+
+const l1 = healCommand('ls -la "src" 2>/dev/null | head -n 20', "bash");
+assert.ok(l1 && l1.includes('ls "src" -a --depth 1 --limit 20'), l1);
+
+const l2 = healCommand('ls -la dir1 2>/dev/null | head -10; echo "---"; ls -lt dir2 | head -5', "bash");
+assert.ok(
+  l2 && l2.includes('ls "dir1" -a --depth 1 --limit 10') && l2.includes('ls "dir2" -t --depth 1 --limit 5'),
+  l2,
+);
+
+const c1 = healCommand("cat config.json 2>/dev/null | head -20", "bash");
+assert.ok(c1 && c1.includes('read "config.json" --lines 1-20'), c1);
+
+const c2 = healCommand("cat bundle.js 2>/dev/null | head -c 1800", "bash");
+assert.ok(c2 && c2.includes('read "bundle.js" --offset 0 --chars 1800'), c2);
+
+const h1 = healCommand("head -c 1200 bundle.js", "bash");
+assert.ok(h1 && h1.includes('read "bundle.js" --offset 0 --chars 1200'), h1);
+
+assert.equal(healCommand("ls -r | head -10", "bash"), undefined);
+
+const edited = healEditBlock("| colA  | colB  |\n| 1     | 2     |\n", "| colA | colB |", "| colA | colC |");
+assert.ok(edited && edited.oldText === "| colA  | colB  |" && edited.strategy === "punctuation-loose-unique", JSON.stringify(edited));
+"#;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.62 accelerator check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

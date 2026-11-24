@@ -136,6 +136,9 @@ struct SearchCli {
     /// Maximum characters per returned snippet line (0 = keep default snippet)
     #[arg(long, alias = "max-line-len", default_value_t = 0)]
     width: usize,
+    /// Maximum matches per pattern in multi-pattern (`--pat`/`--stdin`) mode (0 = auto fair quota)
+    #[arg(long = "per-pattern", default_value_t = 0)]
+    per_pattern: usize,
     /// Emit structured JSON output
     #[arg(long)]
     json: bool,
@@ -151,6 +154,7 @@ struct SearchOpts {
     after_ctx: usize,
     invert: bool,
     max_hits: usize,
+    per_pattern: usize,
     code_only: bool,
     no_tests: bool,
     only_matching: bool,
@@ -667,6 +671,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         } else {
             cli.max_hits
         },
+        per_pattern: cli.per_pattern,
         code_only: cli.code_only,
         no_tests: cli.no_tests,
         only_matching: cli.only_matching,
@@ -715,7 +720,60 @@ pub fn run_cli(args: &[String]) -> i32 {
     let total_bytes_cnt = Arc::new(AtomicU64::new(0));
     let filtered_non_code_cnt = Arc::new(AtomicUsize::new(0));
     let filtered_tests_cnt = Arc::new(AtomicUsize::new(0));
-    let hit_cap = s_opts.max_hits;
+    let hit_cap = if multi_mode {
+        s_opts
+            .max_hits
+            .saturating_mul(compiled_arc.len().min(8))
+            .max(s_opts.max_hits)
+    } else {
+        s_opts.max_hits
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_compiled_text_hits(
+        compiled: &[(String, Regex)],
+        multi_mode: bool,
+        text: &str,
+        rel: &str,
+        ext: &str,
+        is_office: bool,
+        s_opts: SearchOpts,
+        filtered_non_code: &AtomicUsize,
+        filtered_tests: &AtomicUsize,
+        local_matches: &mut Vec<SearchMatch>,
+    ) {
+        let pat_cap = if s_opts.per_pattern > 0 {
+            s_opts.per_pattern
+        } else if multi_mode && compiled.len() > 1 {
+            (s_opts.max_hits / compiled.len()).max(5)
+        } else {
+            s_opts.max_hits
+        };
+        let pat_opts = SearchOpts {
+            max_hits: pat_cap,
+            ..s_opts
+        };
+        for (pl, r) in compiled {
+            let lbl = if multi_mode { pl.as_str() } else { "" };
+            let mut pat_hits = Vec::new();
+            push_text_matches(
+                lbl,
+                text,
+                rel,
+                ext,
+                is_office,
+                r,
+                pat_opts,
+                filtered_non_code,
+                filtered_tests,
+                &mut pat_hits,
+            );
+            local_matches.extend(pat_hits);
+            if !multi_mode && local_matches.len() >= s_opts.max_hits {
+                break;
+            }
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn process_file(
@@ -983,23 +1041,25 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 decode_any_bytes(&eb).0
                             };
                             let virt_rel = format!("{rel}::{nm}");
-                            for (pl, r) in compiled {
-                                let lbl = if multi_mode { pl.as_str() } else { "" };
-                                push_text_matches(
-                                    lbl,
-                                    &txt,
-                                    &virt_rel,
-                                    &eext,
-                                    false,
-                                    r,
-                                    s_opts,
-                                    filtered_non_code,
-                                    filtered_tests,
-                                    &mut local_matches,
-                                );
-                                if local_matches.len() >= s_opts.max_hits {
-                                    return local_matches;
-                                }
+                            push_compiled_text_hits(
+                                compiled,
+                                multi_mode,
+                                &txt,
+                                &virt_rel,
+                                &eext,
+                                false,
+                                s_opts,
+                                filtered_non_code,
+                                filtered_tests,
+                                &mut local_matches,
+                            );
+                            let cap = if multi_mode {
+                                s_opts.max_hits.saturating_mul(compiled.len().min(8))
+                            } else {
+                                s_opts.max_hits
+                            };
+                            if local_matches.len() >= cap {
+                                return local_matches;
                             }
                         }
                     }
@@ -1050,23 +1110,25 @@ pub fn run_cli(args: &[String]) -> i32 {
                     decode_any_bytes(eb).0
                 };
                 let virt_rel = format!("{rel}::{}", ent.path);
-                for (pl, r) in compiled {
-                    let lbl = if multi_mode { pl.as_str() } else { "" };
-                    push_text_matches(
-                        lbl,
-                        &txt,
-                        &virt_rel,
-                        &eext,
-                        false,
-                        r,
-                        s_opts,
-                        filtered_non_code,
-                        filtered_tests,
-                        &mut local_matches,
-                    );
-                    if local_matches.len() >= s_opts.max_hits {
-                        return local_matches;
-                    }
+                push_compiled_text_hits(
+                    compiled,
+                    multi_mode,
+                    &txt,
+                    &virt_rel,
+                    &eext,
+                    false,
+                    s_opts,
+                    filtered_non_code,
+                    filtered_tests,
+                    &mut local_matches,
+                );
+                let cap = if multi_mode {
+                    s_opts.max_hits.saturating_mul(compiled.len().min(8))
+                } else {
+                    s_opts.max_hits
+                };
+                if local_matches.len() >= cap {
+                    return local_matches;
                 }
             }
             return local_matches;
@@ -1076,24 +1138,18 @@ pub fn run_cli(args: &[String]) -> i32 {
         if ext == "pyc" || (explicit_file && crate::binary::is_pyc_magic(&bytes)) {
             let txt = crate::binary::extract_pyc_searchable_text(&bytes);
             if !txt.is_empty() {
-                for (pl, r) in compiled {
-                    let lbl = if multi_mode { pl.as_str() } else { "" };
-                    push_text_matches(
-                        lbl,
-                        &txt,
-                        &rel,
-                        "py",
-                        false,
-                        r,
-                        s_opts,
-                        filtered_non_code,
-                        filtered_tests,
-                        &mut local_matches,
-                    );
-                    if local_matches.len() >= s_opts.max_hits {
-                        return local_matches;
-                    }
-                }
+                push_compiled_text_hits(
+                    compiled,
+                    multi_mode,
+                    &txt,
+                    &rel,
+                    "py",
+                    false,
+                    s_opts,
+                    filtered_non_code,
+                    filtered_tests,
+                    &mut local_matches,
+                );
             }
             return local_matches;
         }
@@ -1186,24 +1242,18 @@ pub fn run_cli(args: &[String]) -> i32 {
             return local_matches;
         }
 
-        for (pl, r) in compiled {
-            let lbl = if multi_mode { pl.as_str() } else { "" };
-            push_text_matches(
-                lbl,
-                &text,
-                &rel,
-                &ext,
-                is_office,
-                r,
-                s_opts,
-                filtered_non_code,
-                filtered_tests,
-                &mut local_matches,
-            );
-            if local_matches.len() >= s_opts.max_hits {
-                break;
-            }
-        }
+        push_compiled_text_hits(
+            compiled,
+            multi_mode,
+            &text,
+            &rel,
+            &ext,
+            is_office,
+            s_opts,
+            filtered_non_code,
+            filtered_tests,
+            &mut local_matches,
+        );
         local_matches
     }
 
@@ -1318,8 +1368,53 @@ pub fn run_cli(args: &[String]) -> i32 {
             .then_with(|| a.line.cmp(&b.line))
             .then_with(|| a.pattern.cmp(&b.pattern))
     });
-    if !cli.count && !cli.files_only && !cli.unique && matches.len() > cli.max_hits {
-        matches.truncate(cli.max_hits);
+    if !cli.count
+        && !cli.files_only
+        && !cli.unique
+        && (matches.len() > cli.max_hits || cli.per_pattern > 0)
+    {
+        if multi_mode && compiled_arc.len() > 1 {
+            use std::collections::VecDeque;
+            let mut buckets: BTreeMap<String, VecDeque<SearchMatch>> = BTreeMap::new();
+            for m in matches.drain(..) {
+                buckets.entry(m.pattern.clone()).or_default().push_back(m);
+            }
+            if cli.per_pattern > 0 {
+                for q in buckets.values_mut() {
+                    while q.len() > cli.per_pattern {
+                        q.pop_back();
+                    }
+                }
+            }
+            let order: Vec<String> = compiled_arc.iter().map(|(p, _)| p.clone()).collect();
+            let mut selected = Vec::with_capacity(cli.max_hits);
+            loop {
+                let mut progressed = false;
+                for pat_key in &order {
+                    if selected.len() >= cli.max_hits {
+                        break;
+                    }
+                    if let Some(q) = buckets.get_mut(pat_key) {
+                        if let Some(m) = q.pop_front() {
+                            selected.push(m);
+                            progressed = true;
+                        }
+                    }
+                }
+                if !progressed || selected.len() >= cli.max_hits {
+                    break;
+                }
+            }
+            selected.sort_by(|a, b| {
+                a.file
+                    .cmp(&b.file)
+                    .then_with(|| a.line.cmp(&b.line))
+                    .then_with(|| a.pattern.cmp(&b.pattern))
+            });
+            matches = selected;
+        } else if matches.len() > cli.max_hits {
+            matches.truncate(cli.max_hits);
+        }
     }
     if cli.width > 0 {
         for m in &mut matches {
