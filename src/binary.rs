@@ -1,7 +1,9 @@
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
+use std::time::Instant;
 use zip::ZipArchive;
 
 /// Mini-beautifier for single-line / minified JS & JSON snippets (zero dependencies).
@@ -4166,6 +4168,408 @@ pub fn extract_strings_md(
     lines.join("\n")
 }
 
+fn classify_import_risk_bucket(name: &str) -> Option<&'static str> {
+    let low = name.to_ascii_lowercase();
+    if [
+        "createprocess",
+        "shellexecute",
+        "winexec",
+        "system",
+        "popen",
+        "execve",
+        "execvp",
+        "execl",
+        "posix_spawn",
+        "loadlibrary",
+        "dlopen",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("exec");
+    }
+    if [
+        "virtualalloc",
+        "virtualprotect",
+        "writeprocessmemory",
+        "createremotethread",
+        "mmap",
+        "mprotect",
+        "strcpy",
+        "strcat",
+        "sprintf",
+        "vsprintf",
+        "gets",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("memory");
+    }
+    if [
+        "namedpipe",
+        "rpcserver",
+        "ndrserver",
+        "cocreateinstance",
+        "createservice",
+        "openservice",
+        "deviceiocontrol",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("ipc_rpc");
+    }
+    if [
+        "createfile",
+        "writefile",
+        "deletefile",
+        "movefile",
+        "copyfile",
+        "setfilesecurity",
+        "setnamedsecurityinfo",
+        "fopen",
+        "unlink",
+        "chmod",
+        "chown",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("file_path");
+    }
+    if [
+        "wsastartup",
+        "wsaconnect",
+        "httpsendrequest",
+        "internetopen",
+        "winhttp",
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "sendto",
+        "recvfrom",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("net");
+    }
+    if [
+        "adjusttoken",
+        "impersonate",
+        "openprocesstoken",
+        "logonuser",
+        "setuid",
+        "setgid",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("priv_auth");
+    }
+    if [
+        "cryptacquire",
+        "cryptdecrypt",
+        "cryptencrypt",
+        "bcrypt",
+        "evp_",
+        "aes_",
+        "rsa_",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("crypto");
+    }
+    None
+}
+
+fn classify_surface_string(s: &str) -> Option<&'static str> {
+    let low = s.to_ascii_lowercase();
+    if low.contains("\\\\.\\pipe\\") || low.contains("/pipe/") {
+        return Some("named_pipes");
+    }
+    if low.contains("ncacn_") || low.contains("ncalrpc:") {
+        return Some("rpc_endpoints");
+    }
+    if low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("ws://")
+        || low.starts_with("wss://")
+    {
+        if !low.contains("schemas.microsoft.com")
+            && !low.contains("www.w3.org/")
+            && !low.contains("ns.adobe.com")
+        {
+            return Some("urls");
+        }
+        return None;
+    }
+    if let Some(pos) = low.find("://") {
+        let scheme = &low[..pos];
+        if (2..=18).contains(&scheme.len())
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.')
+            && !matches!(scheme, "http" | "https" | "ws" | "wss" | "urn")
+        {
+            return Some("uri_schemes");
+        }
+    }
+    if low.starts_with("hklm\\")
+        || low.starts_with("hkcu\\")
+        || low.starts_with("hkcr\\")
+        || low.starts_with("hkey_")
+        || low.contains("software\\")
+        || low.contains("system\\currentcontrolset\\")
+    {
+        return Some("registry_keys");
+    }
+    if low.contains("cmd.exe")
+        || low.contains("powershell")
+        || low.contains("/bin/sh")
+        || low.contains("/bin/bash")
+        || (low.contains(" %s") && (low.contains(" --") || low.contains("/c ")))
+    {
+        return Some("cmd_templates");
+    }
+    if (low.contains('/') || low.contains('\\'))
+        && [
+            ".dll", ".exe", ".so", ".dylib", ".sqlite", ".db", "/etc/", "/var/", "/tmp/",
+        ]
+        .iter()
+        .any(|k| low.contains(k))
+    {
+        return Some("interesting_paths");
+    }
+    None
+}
+
+/// Pure-Rust single-pass native binary surface inspector (PE/ELF/Mach-O/raw).
+/// Emits structured JSON with format/mitigations, risk-bucketed imports/exports,
+/// and categorized ASCII + UTF-16LE surface artifacts with file offset + RVA/VAddr.
+pub fn inspect_binary_surface(bytes: &[u8]) -> Value {
+    let t0 = Instant::now();
+    let mut header_lines = Vec::new();
+    let mut pe_ctx: Option<PeContext> = None;
+    let mut elf_ctx: Option<ElfContext> = None;
+    let mut macho_ctx: Option<MachoContext> = None;
+    let format = if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
+        let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
+        if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
+            pe_ctx = Some(parse_pe_details(bytes, pe_off, &mut header_lines));
+            "pe"
+        } else {
+            "mz"
+        }
+    } else if bytes.starts_with(b"\x7FELF") && bytes.len() >= 20 {
+        elf_ctx = Some(parse_elf_details(bytes, &mut header_lines));
+        "elf"
+    } else if let Some(mc) = parse_macho_details(bytes, &mut header_lines) {
+        macho_ctx = Some(mc);
+        "macho"
+    } else {
+        "raw"
+    };
+
+    let mut import_buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut push_import = |sym: &str| {
+        if let Some(bucket) = classify_import_risk_bucket(sym) {
+            let list = import_buckets.entry(bucket.to_string()).or_default();
+            if list.len() < 24 && !list.iter().any(|x| x == sym) {
+                list.push(sym.to_string());
+            }
+        }
+    };
+    if let Some(ref pe) = pe_ctx {
+        for (_, sym) in &pe.iat_map {
+            push_import(sym);
+        }
+    }
+    for ln in &header_lines {
+        if let Some(rest) = ln
+            .strip_prefix("### ELF Imported Symbols")
+            .or_else(|| ln.strip_prefix("### Mach-O Symbols"))
+        {
+            if let Some((_, syms)) = rest.split_once(':') {
+                for sym in syms.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    push_import(sym);
+                }
+            }
+        } else if ln.starts_with("- `") && ln.contains("`: ") {
+            if let Some((_, syms)) = ln.split_once("`: ") {
+                for sym in syms.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    push_import(sym);
+                }
+            }
+        }
+    }
+
+    let mut artifacts: BTreeMap<&'static str, Vec<Value>> = BTreeMap::from([
+        ("named_pipes", Vec::new()),
+        ("rpc_endpoints", Vec::new()),
+        ("urls", Vec::new()),
+        ("uri_schemes", Vec::new()),
+        ("registry_keys", Vec::new()),
+        ("cmd_templates", Vec::new()),
+        ("interesting_paths", Vec::new()),
+    ]);
+    let mut seen_vals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let data = &bytes[..bytes.len().min(16 * 1024 * 1024)];
+
+    let mut record_str = |s: &str, enc: &str, off: usize| {
+        let trimmed = s.trim();
+        let Some(cat) = classify_surface_string(trimmed) else {
+            return;
+        };
+        let bucket = artifacts.get_mut(cat).unwrap();
+        if bucket.len() >= 24 || !seen_vals.insert(format!("{cat}:{trimmed}")) {
+            return;
+        }
+        let va_hint = pe_ctx
+            .as_ref()
+            .and_then(|p| {
+                file_offset_to_rva(off, &p.secs).map(|(r, sec)| format!("rva=0x{r:x} ({sec})"))
+            })
+            .or_else(|| {
+                elf_ctx.as_ref().and_then(|e| {
+                    elf_file_offset_to_vaddr(off, &e.secs)
+                        .map(|(v, sec)| format!("vaddr=0x{v:x} ({sec})"))
+                })
+            })
+            .or_else(|| {
+                macho_ctx.as_ref().and_then(|m| {
+                    macho_file_offset_to_vmaddr(off, m)
+                        .map(|(v, sec)| format!("vaddr=0x{v:x} ({sec})"))
+                })
+            });
+        bucket.push(json!({
+            "value": trimmed,
+            "encoding": enc,
+            "offset": format!("0x{off:x}"),
+            "addr": va_hint,
+        }));
+    };
+
+    // Single-pass ASCII strings (>= 5 chars)
+    let mut i = 0usize;
+    while i < data.len() {
+        if (0x20..=0x7E).contains(&data[i]) {
+            let st = i;
+            while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 260 {
+                i += 1;
+            }
+            if i - st >= 5 {
+                let s = String::from_utf8_lossy(&data[st..i]);
+                record_str(&s, "ascii", st);
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Single-pass UTF-16LE wide strings (>= 5 chars)
+    let mut j = 0usize;
+    while j + 1 < data.len() {
+        if (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 {
+            let st = j;
+            let mut s = String::new();
+            while j + 1 < data.len()
+                && (0x20..=0x7E).contains(&data[j])
+                && data[j + 1] == 0
+                && s.len() < 240
+            {
+                s.push(data[j] as char);
+                j += 2;
+            }
+            if s.len() >= 5 {
+                record_str(&s, "utf16le", st);
+            }
+        } else {
+            j += 1;
+        }
+    }
+
+    let total_risky_imports: usize = import_buckets.values().map(|v| v.len()).sum();
+    let total_surface_artifacts: usize = artifacts.values().map(|v| v.len()).sum();
+    let ent = shannon_entropy(&bytes[..bytes.len().min(4 * 1024 * 1024)]);
+
+    json!({
+        "ok": true,
+        "format": format,
+        "size_bytes": bytes.len(),
+        "sha256": sha256_hex(bytes),
+        "entropy": (ent * 100.0).round() / 100.0,
+        "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0,
+        "header_summary": header_lines.into_iter().take(12).collect::<Vec<_>>(),
+        "total_risky_imports": total_risky_imports,
+        "import_risk_buckets": import_buckets,
+        "total_surface_artifacts": total_surface_artifacts,
+        "artifacts": artifacts,
+    })
+}
+
+pub fn format_binary_surface_md(surf: &Value) -> String {
+    let mut out = vec![format!(
+        "# BINARY SURFACE `{}` ({} B | entropy={} | {}ms)",
+        surf["format"].as_str().unwrap_or("bin"),
+        surf["size_bytes"].as_u64().unwrap_or(0),
+        surf["entropy"].as_f64().unwrap_or(0.0),
+        surf["elapsed_ms"].as_f64().unwrap_or(0.0),
+    )];
+    out.push(format!(
+        "- SHA-256: `{}` | Risky Imports: {} | Surface Artifacts: {}",
+        surf["sha256"].as_str().unwrap_or(""),
+        surf["total_risky_imports"].as_u64().unwrap_or(0),
+        surf["total_surface_artifacts"].as_u64().unwrap_or(0),
+    ));
+    if let Some(hdrs) = surf["header_summary"].as_array() {
+        for h in hdrs.iter().take(6).filter_map(Value::as_str) {
+            out.push(h.to_string());
+        }
+    }
+    if let Some(buckets) = surf["import_risk_buckets"].as_object() {
+        if !buckets.is_empty() {
+            out.push("\n## Risk-Bucketed Imports".to_string());
+            for (k, v) in buckets {
+                let items: Vec<&str> = v
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                out.push(format!(
+                    "- **{k}** ({}): `{}`",
+                    items.len(),
+                    items.join("`, `")
+                ));
+            }
+        }
+    }
+    if let Some(arts) = surf["artifacts"].as_object() {
+        out.push("\n## Surface Artifacts".to_string());
+        for (cat, v) in arts {
+            let arr = v.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() {
+                continue;
+            }
+            out.push(format!("### {cat} ({})", arr.len()));
+            for item in arr.iter().take(12) {
+                let val = item["value"].as_str().unwrap_or("");
+                let off = item["offset"].as_str().unwrap_or("");
+                let enc = item["encoding"].as_str().unwrap_or("");
+                let addr = item["addr"].as_str().unwrap_or("");
+                if addr.is_empty() {
+                    out.push(format!("  - `[{enc} @{off}]` {val}"));
+                } else {
+                    out.push(format!("  - `[{enc} @{off} {addr}]` {val}"));
+                }
+            }
+        }
+    }
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4858,6 +5262,56 @@ mod tests {
         assert!(
             queried.contains("API_TOKEN_ASCII_V268") && !queried.contains("WIDE_SERVICE_V268"),
             "{queried}"
+        );
+    }
+
+    #[test]
+    fn extracts_binary_surface_buckets_and_categorized_artifacts() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x7FELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+        blob.extend_from_slice(b"\x03\x00\x3E\x00\x01\x00\x00\x00");
+        blob.resize(64, 0);
+        blob.extend_from_slice(b"\\\\.\\pipe\\demo_ipc_v1\x00");
+        blob.extend_from_slice(b"https://api.example.invalid/v1/status\x00");
+        blob.extend_from_slice(b"HKLM\\SOFTWARE\\DemoVendor\\Agent\x00");
+        blob.extend_from_slice(b"cmd.exe /c echo %s\x00");
+        for b in b"ncalrpc:demo_rpc_ep" {
+            blob.push(*b);
+            blob.push(0);
+        }
+        blob.extend_from_slice(b"\x00\x00");
+
+        let surf = inspect_binary_surface(&blob);
+        assert_eq!(surf["ok"], true);
+        assert!(surf["artifacts"]["named_pipes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["value"].as_str().unwrap().contains("demo_ipc_v1")));
+        assert!(surf["artifacts"]["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["value"].as_str().unwrap().contains("api.example.invalid")));
+        assert!(surf["artifacts"]["registry_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["value"].as_str().unwrap().contains("HKLM\\SOFTWARE")));
+        assert!(surf["artifacts"]["cmd_templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["value"].as_str().unwrap().contains("cmd.exe")));
+        assert!(surf["artifacts"]["rpc_endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["value"].as_str().unwrap().contains("ncalrpc:demo_rpc_ep")));
+        let md = format_binary_surface_md(&surf);
+        assert!(
+            md.contains("BINARY SURFACE") && md.contains("demo_ipc_v1"),
+            "{md}"
         );
     }
 }

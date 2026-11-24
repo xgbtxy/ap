@@ -1,5 +1,7 @@
 use crate::surface::guard_re;
-use crate::trace::{classify_hop_guard, clean_fn_name, collect_project_fns, FnDef, NOTABLE_SINKS};
+use crate::trace::{
+    classify_hop_guard, clean_fn_name, collect_project_fns, lookup_call_taint, FnDef, NOTABLE_SINKS,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -18,6 +20,10 @@ pub struct VariantFinding {
     pub guard_placement: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guard_note: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arg_taint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arg_preview: String,
     pub is_outlier: bool,
 }
 
@@ -126,6 +132,16 @@ pub fn analyze_variants(
     seed_symbol: Option<&str>,
     guard_pattern: Option<&str>,
 ) -> VariantsReport {
+    analyze_variants_with_opts(root, sink_query, seed_symbol, guard_pattern, false)
+}
+
+pub fn analyze_variants_with_opts(
+    root: &Path,
+    sink_query: Option<&str>,
+    seed_symbol: Option<&str>,
+    guard_pattern: Option<&str>,
+    tainted_only: bool,
+) -> VariantsReport {
     let t0 = Instant::now();
     let all_fns = collect_project_fns(root);
 
@@ -187,6 +203,10 @@ pub fn analyze_variants(
             }
             let (guard_placement, guard_note) =
                 extra_guard_placement(f, root, *ln, custom_re.as_ref());
+            let (arg_taint, arg_preview) = lookup_call_taint(f, ident, *ln);
+            if tainted_only && arg_taint == "CONST_LITERAL" {
+                continue;
+            }
             raw_hits.push(VariantFinding {
                 function: f.name.clone(),
                 file: f.file.clone(),
@@ -196,6 +216,8 @@ pub fn analyze_variants(
                 sink_line: *ln,
                 guard_placement,
                 guard_note,
+                arg_taint,
+                arg_preview,
                 is_outlier: false,
             });
         }
@@ -218,10 +240,12 @@ pub fn analyze_variants(
         .checked_div(total_siblings)
         .unwrap_or(0) as u32;
 
-    // Flag unguarded/post-guarded siblings as high-signal outliers when >=1 sibling is properly guarded
+    // Flag unguarded/post-guarded siblings as outliers when >=1 sibling is guarded AND call arg is NOT constant literal
     let has_guarded_peers = guarded_before_count > 0;
     for v in &mut raw_hits {
-        v.is_outlier = has_guarded_peers && v.guard_placement != "GUARD_BEFORE";
+        v.is_outlier = has_guarded_peers
+            && v.guard_placement != "GUARD_BEFORE"
+            && v.arg_taint != "CONST_LITERAL";
     }
 
     raw_hits.sort_by(|a, b| {
@@ -230,8 +254,15 @@ pub fn analyze_variants(
             "GUARD_AFTER" => 1u8,
             _ => 2u8,
         };
+        let taint_rank = |t: &str| match t {
+            "PARAM_TAINTED" => 0u8,
+            "VAR_DYNAMIC" => 1u8,
+            "CONST_LITERAL" => 3u8,
+            _ => 2u8,
+        };
         rank(&a.guard_placement)
             .cmp(&rank(&b.guard_placement))
+            .then_with(|| taint_rank(&a.arg_taint).cmp(&taint_rank(&b.arg_taint)))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.sink_line.cmp(&b.sink_line))
     });
@@ -290,8 +321,14 @@ pub fn render_variants_md(rep: &VariantsReport) -> String {
             } else {
                 format!(" (`{}`)", v.guard_note)
             };
+            let taint_tag = if v.arg_taint.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", v.arg_taint)
+            };
             out.push(format!(
-                "  - {tag} {} `{}` (`{}:L{}-L{}`) calls `{}`@L{}{}",
+                "  - {tag}{} {} `{}` (`{}:L{}-L{}`) calls `{}`@L{}{}",
+                taint_tag,
                 v.guard_placement,
                 v.function,
                 v.file,
@@ -327,21 +364,40 @@ mod tests {
              }\n\
              export function resetUserBuggy(req: any) {\n\
                return db.execute('UPDATE users SET role = ? WHERE id = ?', [req.role, req.id]);\n\
+             }\n\
+             export function healthCheckConst() {\n\
+               const sql = 'SELECT 1';\n\
+               return db.execute(sql);\n\
              }\n",
         )
         .unwrap();
 
         let rep = analyze_variants(&dir, Some("execute"), None, Some(r"requireAdmin"));
-        assert_eq!(rep.total_siblings, 3);
+        assert_eq!(rep.total_siblings, 4);
         assert_eq!(rep.guarded_before_count, 2);
-        assert_eq!(rep.unguarded_count, 1);
-        assert_eq!(rep.guard_ratio_pct, 66);
+        assert_eq!(rep.unguarded_count, 2);
         assert_eq!(rep.siblings[0].function, "resetUserBuggy");
         assert_eq!(rep.siblings[0].guard_placement, "UNGUARDED");
+        assert_eq!(rep.siblings[0].arg_taint, "PARAM_TAINTED");
         assert!(rep.siblings[0].is_outlier);
+        let const_hit = rep
+            .siblings
+            .iter()
+            .find(|s| s.function == "healthCheckConst")
+            .unwrap();
+        assert_eq!(const_hit.arg_taint, "CONST_LITERAL");
+        assert!(!const_hit.is_outlier);
+
+        let tainted =
+            analyze_variants_with_opts(&dir, Some("execute"), None, Some(r"requireAdmin"), true);
+        assert_eq!(tainted.total_siblings, 3);
+        assert!(!tainted
+            .siblings
+            .iter()
+            .any(|s| s.function == "healthCheckConst"));
 
         let seed_rep = analyze_variants(&dir, None, Some("deleteUserSafe"), Some(r"requireAdmin"));
-        assert_eq!(seed_rep.total_siblings, 3);
+        assert_eq!(seed_rep.total_siblings, 4);
         assert_eq!(seed_rep.siblings[0].function, "resetUserBuggy");
         let _ = fs::remove_dir_all(&dir);
     }

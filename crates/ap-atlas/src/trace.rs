@@ -58,6 +58,15 @@ pub(crate) const NOTABLE_SINKS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallArgInfo {
+    pub callee: String,
+    pub line: usize,
+    pub arg_taint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arg_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FnDef {
     pub name: String,
     pub file: String,
@@ -66,6 +75,8 @@ pub struct FnDef {
     pub called_idents: Vec<(String, usize)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_lines: Vec<(usize, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_args: Vec<CallArgInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +97,10 @@ pub struct ReachabilityHop {
     pub guard_placement: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guard_note: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arg_taint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arg_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,11 +191,275 @@ fn node_name(node: Node, src: &[u8]) -> Option<String> {
     None
 }
 
-fn collect_called_idents(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
+fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
+    let k = node.kind();
+    if k.contains("type") && k != "typed_parameter" && k != "typed_default_parameter" {
+        return;
+    }
+    if matches!(k, "identifier" | "shorthand_property_identifier_pattern") {
+        if let Ok(s) = node.utf8_text(src) {
+            let t = s.trim();
+            if !t.is_empty() && t != "self" && t != "this" {
+                out.insert(t.to_string());
+            }
+        }
+        return;
+    }
+    let mut cur = node.walk();
+    for ch in node.children(&mut cur) {
+        if ch.kind().contains("type_annotation") || ch.kind() == "type" {
+            continue;
+        }
+        collect_param_idents(ch, src, out);
+    }
+}
+
+fn find_param_names(fn_node: Node, src: &[u8]) -> HashSet<String> {
+    let mut params = HashSet::new();
+    for field in ["parameters", "parameter_list", "formal_parameters"] {
+        if let Some(pn) = fn_node.child_by_field_name(field) {
+            collect_param_idents(pn, src, &mut params);
+        }
+    }
+    if params.is_empty() {
+        if let Some(decl) = fn_node.child_by_field_name("declarator") {
+            for field in ["parameters", "parameter_list"] {
+                if let Some(pn) = decl.child_by_field_name(field) {
+                    collect_param_idents(pn, src, &mut params);
+                }
+            }
+        }
+    }
+    params
+}
+
+fn is_const_literal_expr(node: Node, src: &[u8], const_vars: &HashSet<String>) -> bool {
+    let k = node.kind();
+    if matches!(
+        k,
+        "string"
+            | "string_literal"
+            | "raw_string_literal"
+            | "interpreted_string_literal"
+            | "number"
+            | "integer"
+            | "float"
+            | "integer_literal"
+            | "float_literal"
+            | "number_literal"
+            | "true"
+            | "false"
+            | "boolean_literal"
+            | "null"
+            | "none"
+            | "nil"
+            | "char_literal"
+    ) {
+        return true;
+    }
+    if k == "template_string" {
+        let mut cur = node.walk();
+        for ch in node.children(&mut cur) {
+            if ch.kind() == "template_substitution" {
+                return false;
+            }
+        }
+        return true;
+    }
+    if matches!(k, "identifier" | "field_identifier" | "property_identifier") {
+        if let Ok(s) = node.utf8_text(src) {
+            return const_vars.contains(s.trim());
+        }
+        return false;
+    }
+    if matches!(k, "parenthesized_expression" | "unary_expression") {
+        let mut cur = node.walk();
+        let mut has_child = false;
+        for ch in node.children(&mut cur) {
+            if matches!(ch.kind(), "(" | ")" | "-" | "+" | "!" | "~") {
+                continue;
+            }
+            has_child = true;
+            if !is_const_literal_expr(ch, src, const_vars) {
+                return false;
+            }
+        }
+        return has_child;
+    }
+    if matches!(k, "binary_expression" | "concatenation") {
+        let mut cur = node.walk();
+        let mut has_operand = false;
+        for ch in node.children(&mut cur) {
+            if matches!(ch.kind(), "+" | "-" | "*" | "/" | "%") {
+                continue;
+            }
+            has_operand = true;
+            if !is_const_literal_expr(ch, src, const_vars) {
+                return false;
+            }
+        }
+        return has_operand;
+    }
+    false
+}
+
+fn expr_contains_param(node: Node, src: &[u8], params: &HashSet<String>) -> bool {
+    let k = node.kind();
+    if k.contains("comment") || k.contains("string") && k != "template_string" {
+        return false;
+    }
+    if matches!(k, "identifier" | "field_identifier" | "property_identifier") {
+        if let Ok(s) = node.utf8_text(src) {
+            if params.contains(s.trim()) {
+                return true;
+            }
+        }
+    }
+    let mut cur = node.walk();
+    for ch in node.children(&mut cur) {
+        if expr_contains_param(ch, src, params) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_callee_short_name(fn_expr: Node, src: &[u8]) -> Option<String> {
+    let k = fn_expr.kind();
+    if matches!(k, "identifier" | "property_identifier" | "field_identifier") {
+        return fn_expr
+            .utf8_text(src)
+            .ok()
+            .map(clean_fn_name)
+            .filter(|s| !s.is_empty());
+    }
+    for field in ["property", "field", "name", "attribute"] {
+        if let Some(ch) = fn_expr.child_by_field_name(field) {
+            if let Some(nm) = extract_callee_short_name(ch, src) {
+                return Some(nm);
+            }
+        }
+    }
+    let mut cur = fn_expr.walk();
+    let mut last = None;
+    for ch in fn_expr.children(&mut cur) {
+        if let Some(nm) = extract_callee_short_name(ch, src) {
+            last = Some(nm);
+        }
+    }
+    last
+}
+
+fn update_local_const_binding(node: Node, src: &[u8], const_vars: &mut HashSet<String>) {
+    let k = node.kind();
+    if matches!(
+        k,
+        "variable_declarator" | "init_declarator" | "let_declaration"
+    ) {
+        let lhs = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("pattern"))
+            .or_else(|| node.child_by_field_name("declarator"));
+        let rhs = node.child_by_field_name("value");
+        if let (Some(ln), Some(rn)) = (lhs, rhs) {
+            if let Ok(nm) = ln.utf8_text(src) {
+                let id = nm.trim();
+                if !id.is_empty() && !id.contains(' ') {
+                    if is_const_literal_expr(rn, src, const_vars) {
+                        const_vars.insert(id.to_string());
+                    } else {
+                        const_vars.remove(id);
+                    }
+                }
+            }
+        }
+    } else if matches!(k, "assignment_expression" | "assignment") {
+        if let (Some(ln), Some(rn)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) {
+            if let Ok(nm) = ln.utf8_text(src) {
+                let id = nm.trim();
+                if !id.is_empty() && !id.contains(' ') {
+                    if is_const_literal_expr(rn, src, const_vars) {
+                        const_vars.insert(id.to_string());
+                    } else {
+                        const_vars.remove(id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_called_idents(
+    node: Node,
+    src: &[u8],
+    params: &HashSet<String>,
+    const_vars: &mut HashSet<String>,
+    out: &mut Vec<(String, usize)>,
+    call_args: &mut Vec<CallArgInfo>,
+) {
     let k = node.kind();
     if k.contains("comment") || k.contains("string") || k == "template_string" {
         return;
     }
+    update_local_const_binding(node, src, const_vars);
+
+    if matches!(k, "call_expression" | "call" | "new_expression") {
+        let callee_node = node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor"))
+            .or_else(|| node.named_child(0));
+        let args_node = node
+            .child_by_field_name("arguments")
+            .or_else(|| node.child_by_field_name("argument_list"));
+        if let (Some(cn), Some(an)) = (callee_node, args_node) {
+            if let Some(callee_nm) = extract_callee_short_name(cn, src) {
+                let mut value_args: Vec<Node> = Vec::new();
+                let mut acur = an.walk();
+                for ch in an.children(&mut acur) {
+                    if !matches!(ch.kind(), "(" | ")" | "," | ";") && !ch.kind().contains("comment")
+                    {
+                        value_args.push(ch);
+                    }
+                }
+                let taint = if value_args.is_empty()
+                    || value_args
+                        .iter()
+                        .all(|a| is_const_literal_expr(*a, src, const_vars))
+                {
+                    "CONST_LITERAL"
+                } else if value_args
+                    .iter()
+                    .any(|a| expr_contains_param(*a, src, params))
+                {
+                    "PARAM_TAINTED"
+                } else {
+                    "VAR_DYNAMIC"
+                };
+                let arg_preview = an
+                    .utf8_text(src)
+                    .ok()
+                    .map(|s| {
+                        s.split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(72)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                call_args.push(CallArgInfo {
+                    callee: callee_nm,
+                    line: node.start_position().row + 1,
+                    arg_taint: taint.to_string(),
+                    arg_preview,
+                });
+            }
+        }
+    }
+
     if matches!(k, "identifier" | "property_identifier" | "field_identifier") {
         if let Ok(s) = node.utf8_text(src) {
             let trimmed = s.trim();
@@ -191,8 +470,20 @@ fn collect_called_idents(node: Node, src: &[u8], out: &mut Vec<(String, usize)>)
     }
     let mut cur = node.walk();
     for ch in node.children(&mut cur) {
-        collect_called_idents(ch, src, out);
+        collect_called_idents(ch, src, params, const_vars, out, call_args);
     }
+}
+
+pub(crate) fn lookup_call_taint(f: &FnDef, callee: &str, line: usize) -> (String, String) {
+    if let Some(hit) = f
+        .call_args
+        .iter()
+        .find(|c| c.callee == callee && c.line == line)
+        .or_else(|| f.call_args.iter().find(|c| c.callee == callee))
+    {
+        return (hit.arg_taint.clone(), hit.arg_preview.clone());
+    }
+    (String::new(), String::new())
 }
 
 fn is_cpp_ext(ext: &str) -> bool {
@@ -278,6 +569,7 @@ fn extract_cpp_fallback_fns(src: &str, src_lines: &[&str], rel: &str, out: &mut 
                             end_line,
                             called_idents: idents,
                             guard_lines: extract_guard_lines(src_lines, start_line, end_line),
+                            call_args: Vec::new(),
                         });
                     }
                     i = end_idx + 1;
@@ -301,11 +593,28 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
     );
     if is_fn {
         if let Some(name) = node_name(node, src.as_bytes()) {
+            let params = find_param_names(node, src.as_bytes());
+            let mut const_vars = HashSet::new();
             let mut idents = Vec::new();
+            let mut call_args = Vec::new();
             if let Some(body) = node.child_by_field_name("body") {
-                collect_called_idents(body, src.as_bytes(), &mut idents);
+                collect_called_idents(
+                    body,
+                    src.as_bytes(),
+                    &params,
+                    &mut const_vars,
+                    &mut idents,
+                    &mut call_args,
+                );
             } else {
-                collect_called_idents(node, src.as_bytes(), &mut idents);
+                collect_called_idents(
+                    node,
+                    src.as_bytes(),
+                    &params,
+                    &mut const_vars,
+                    &mut idents,
+                    &mut call_args,
+                );
             }
             let start_line = node.start_position().row + 1;
             let end_line = node.end_position().row + 1;
@@ -316,6 +625,7 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                 end_line,
                 called_idents: idents,
                 guard_lines: extract_guard_lines(src_lines, start_line, end_line),
+                call_args,
             });
         }
     } else if node.kind() == "variable_declarator" {
@@ -330,11 +640,28 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                 if let Ok(name) = nm_n.utf8_text(src.as_bytes()) {
                     let clean_name = name.trim();
                     if !clean_name.is_empty() {
+                        let params = find_param_names(val_n, src.as_bytes());
+                        let mut const_vars = HashSet::new();
                         let mut idents = Vec::new();
+                        let mut call_args = Vec::new();
                         if let Some(body) = val_n.child_by_field_name("body") {
-                            collect_called_idents(body, src.as_bytes(), &mut idents);
+                            collect_called_idents(
+                                body,
+                                src.as_bytes(),
+                                &params,
+                                &mut const_vars,
+                                &mut idents,
+                                &mut call_args,
+                            );
                         } else {
-                            collect_called_idents(val_n, src.as_bytes(), &mut idents);
+                            collect_called_idents(
+                                val_n,
+                                src.as_bytes(),
+                                &params,
+                                &mut const_vars,
+                                &mut idents,
+                                &mut call_args,
+                            );
                         }
                         let start_line = node.start_position().row + 1;
                         let end_line = val_n.end_position().row + 1;
@@ -345,6 +672,7 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                             end_line,
                             called_idents: idents,
                             guard_lines: extract_guard_lines(src_lines, start_line, end_line),
+                            call_args,
                         });
                     }
                 }
@@ -384,6 +712,7 @@ fn compute_reachability_paths(
     target_norm: &str,
     to_sink: Option<&str>,
     include_sinks: bool,
+    tainted_only: bool,
     max_depth: usize,
 ) -> Vec<ReachabilityPath> {
     let sink_query = to_sink.map(clean_fn_name).filter(|s| !s.is_empty());
@@ -427,6 +756,7 @@ fn compute_reachability_paths(
                 continue;
             }
             let (guard_placement, guard_note) = classify_hop_guard(cur_fn, *ln);
+            let (arg_taint, arg_preview) = lookup_call_taint(cur_fn, id_s, *ln);
             let hop = ReachabilityHop {
                 caller: cur_fn.name.clone(),
                 callee: id_s.to_string(),
@@ -434,6 +764,8 @@ fn compute_reachability_paths(
                 line: *ln,
                 guard_placement,
                 guard_note,
+                arg_taint: arg_taint.clone(),
+                arg_preview,
             };
 
             let is_sink_hit = if let Some(ref q) = sink_query {
@@ -442,7 +774,7 @@ fn compute_reachability_paths(
                 NOTABLE_SINKS.contains(&id_s)
             };
 
-            if is_sink_hit {
+            if is_sink_hit && !(tainted_only && arg_taint == "CONST_LITERAL") {
                 let mut full_hops = hops.clone();
                 full_hops.push(hop.clone());
                 let sig = format!(
@@ -556,6 +888,17 @@ pub fn trace_symbol_chain_to(
     include_sinks: bool,
     max_depth: usize,
 ) -> TraceReport {
+    trace_symbol_chain_to_opts(root, target, to_sink, include_sinks, false, max_depth)
+}
+
+pub fn trace_symbol_chain_to_opts(
+    root: &Path,
+    target: &str,
+    to_sink: Option<&str>,
+    include_sinks: bool,
+    tainted_only: bool,
+    max_depth: usize,
+) -> TraceReport {
     let t0 = Instant::now();
     let target_clean = clean_fn_name(target);
     let target_ref = target_clean.as_str();
@@ -661,8 +1004,14 @@ pub fn trace_symbol_chain_to(
         }
     }
 
-    let reachability_paths =
-        compute_reachability_paths(&all_fns, target_ref, to_sink, include_sinks, max_depth);
+    let reachability_paths = compute_reachability_paths(
+        &all_fns,
+        target_ref,
+        to_sink,
+        include_sinks,
+        tainted_only,
+        max_depth,
+    );
 
     TraceReport {
         target: target_clean,
@@ -762,15 +1111,26 @@ pub fn render_trace_md(rep: &TraceReport) -> String {
                     .hops
                     .iter()
                     .map(|h| {
+                        let taint = if h.arg_taint.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", h.arg_taint)
+                        };
                         if h.guard_note.is_empty() {
                             format!(
-                                "`{}` -> `{}` ({}:L{}, {})",
-                                h.caller, h.callee, h.file, h.line, h.guard_placement
+                                "`{}` -> `{}` ({}:L{}, {}{})",
+                                h.caller, h.callee, h.file, h.line, h.guard_placement, taint
                             )
                         } else {
                             format!(
-                                "`{}` -> `{}` ({}:L{}, {} `{}`)",
-                                h.caller, h.callee, h.file, h.line, h.guard_placement, h.guard_note
+                                "`{}` -> `{}` ({}:L{}, {} `{}`{})",
+                                h.caller,
+                                h.callee,
+                                h.file,
+                                h.line,
+                                h.guard_placement,
+                                h.guard_note,
+                                taint
                             )
                         }
                     })
@@ -903,6 +1263,49 @@ mod tests {
             rep.reachability_paths
         );
         assert_eq!(rep.reachability_paths[0].sink, "system");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_classifies_param_taint_vs_const_literal_and_filters_tainted_only() {
+        let dir = std::env::temp_dir().join(format!("ap_trace_taint_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("taint.ts"),
+            "export function handleUser(cmd: string) {\n\
+               return execSync(cmd);\n\
+             }\n\
+             export function handleConst() {\n\
+               const fixed = 'git status';\n\
+               return execSync(fixed);\n\
+             }\n",
+        )
+        .unwrap();
+
+        let tainted =
+            trace_symbol_chain_to_opts(&dir, "handleUser", Some("execSync"), false, true, 3);
+        assert_eq!(tainted.reachability_paths.len(), 1);
+        assert_eq!(
+            tainted.reachability_paths[0].hops[0].arg_taint,
+            "PARAM_TAINTED"
+        );
+
+        let filtered =
+            trace_symbol_chain_to_opts(&dir, "handleConst", Some("execSync"), false, true, 3);
+        assert!(
+            filtered.reachability_paths.is_empty(),
+            "CONST_LITERAL should be filtered when tainted_only=true: {:?}",
+            filtered.reachability_paths
+        );
+
+        let unfiltered =
+            trace_symbol_chain_to_opts(&dir, "handleConst", Some("execSync"), false, false, 3);
+        assert_eq!(unfiltered.reachability_paths.len(), 1);
+        assert_eq!(
+            unfiltered.reachability_paths[0].hops[0].arg_taint,
+            "CONST_LITERAL"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

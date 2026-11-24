@@ -95,6 +95,9 @@ struct ReadCli {
     /// Resolve PE64/ELF64 (x64 & AArch64) string & IAT import cross-references with enclosing function RVAs
     #[arg(long)]
     xref: bool,
+    /// Pure-Rust binary surface inspector: format, mitigations, risk-bucketed imports & categorized ASCII/UTF-16LE artifacts
+    #[arg(long)]
+    surface: bool,
     /// Pure-Rust zero-OpenSSL X.509 PEM/DER certificate inspector (Subject, Issuer, Validity, SANs, SHA-256)
     #[arg(long)]
     cert: bool,
@@ -1766,6 +1769,29 @@ fn read_single_target(
                     | "pyc"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
+                if cli.surface {
+                    format_tag = "binary-surface";
+                    let surf_json = crate::binary::inspect_binary_surface(&raw_bytes);
+                    let rendered = if cli.json {
+                        serde_json::to_string_pretty(&surf_json).unwrap_or_default()
+                    } else {
+                        crate::binary::format_binary_surface_md(&surf_json)
+                    };
+                    record_event(
+                        "read",
+                        raw_bytes.len() as u64,
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        format_tag,
+                    );
+                    let mut jv = surf_json;
+                    if let Some(m) = jv.as_object_mut() {
+                        m.insert("target".to_string(), json!(label));
+                        m.insert("format_tag".to_string(), json!(format_tag));
+                    }
+                    return Ok((rendered, jv));
+                }
                 format_tag = "binary";
                 crate::binary::inspect_binary_with_xref_md(
                     &raw_bytes,

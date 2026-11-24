@@ -34,6 +34,7 @@ fn mcp_tools_schema() -> Value {
                     "va": { "type": "string", "description": "PE/ELF virtual address to offset/XREFs" },
                     "find_bytes": { "type": "string", "description": "Wildcard hex pattern e.g. '48 8D ?? E8'" },
                     "xref": { "type": "boolean", "description": "PE64/ELF64 string & IAT XREFs" },
+                    "surface": { "type": "boolean", "description": "Binary surface: mitigations, risk-bucketed imports & categorized pipes/RPC/URLs/registry/paths" },
                     "cert": { "type": "boolean", "description": "X.509 PEM/DER inspector" },
                     "proto": { "type": "boolean", "description": "Raw protobuf wire decoder" },
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML routes, sinks & origins" },
@@ -283,8 +284,9 @@ fn mcp_tools_schema() -> Value {
                 "depth": { "type": "integer" },
                 "to": { "type": "string" },
                 "sinks": { "type": "boolean" },
-                "variants_sink": { "type": "string", "description": "Sweep sibling fns calling this sink for guard asymmetry (omit symbol to sweep)" },
-                "guard": { "type": "string", "description": "Custom guard regex for variants_sink" }
+                "variants_sink": { "type": "string" },
+                "guard": { "type": "string" },
+                "tainted_only": { "type": "boolean" }
             }
         }
     },
@@ -608,7 +610,8 @@ fn mcp_tools_schema() -> Value {
                     "top": { "type": "integer", "description": "Max rules to retrieve (default: 3)" },
                     "triggers": { "type": "string", "description": "Trigger keywords/globs for `add`" },
                     "rule": { "type": "string", "description": "Concise actionable rule text for `add`" },
-                    "kind": { "type": "string", "description": "Rule category (default: 'gotcha')" },
+                    "kind": { "type": "string", "description": "Rule category (default: 'gotcha'; use 'negative'/'deadend' for DO-NOT-REPEAT traps)" },
+                    "max_chars": { "type": "integer", "description": "Max total chars returned across matched rules (default: 0 = unlimited)" },
                     "file": { "type": "string", "description": "Optional bound source file path for provenance hash tracking on `add`" },
                     "prune_stale": { "type": "boolean", "description": "When true on `verify`, delete rules whose bound source_file was modified or deleted" }
                 },
@@ -1213,6 +1216,13 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .unwrap_or(false)
             {
                 cli.push("--outline".to_string());
+            }
+            if args
+                .get("surface")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--surface".to_string());
             }
             if let Some(l) = args
                 .get("lines")
@@ -2090,17 +2100,22 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
+            let tainted_only = args
+                .get("tainted_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             let root_p = std::path::Path::new(path);
             if !root_p.exists() {
                 return (false, format!("[atlas] path not found: {path}"));
             }
             if variants_sink.is_some() {
-                let rep = ap_atlas::variants::analyze_variants(
+                let rep = ap_atlas::variants::analyze_variants_with_opts(
                     root_p,
                     variants_sink,
                     (!sym.is_empty()).then_some(sym),
                     guard,
+                    tainted_only,
                 );
                 let out = ap_atlas::variants::render_variants_md(&rep);
                 crate::stats::record_event("trace", 0, out.len() as u64, 0, 1, "mcp-variants");
@@ -2119,8 +2134,14 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             let include_sinks = args.get("sinks").and_then(Value::as_bool).unwrap_or(false);
-            let rep =
-                ap_atlas::trace::trace_symbol_chain_to(root_p, sym, to_sink, include_sinks, depth);
+            let rep = ap_atlas::trace::trace_symbol_chain_to_opts(
+                root_p,
+                sym,
+                to_sink,
+                include_sinks,
+                tainted_only,
+                depth,
+            );
             let out = ap_atlas::trace::render_trace_md(&rep);
             crate::stats::record_event("trace", 0, out.len() as u64, 0, 1, "mcp-trace");
             (true, out)
@@ -3098,15 +3119,48 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         .map(String::from)
                         .collect();
                     let top = args.get("top").and_then(Value::as_u64).unwrap_or(3) as usize;
-                    match ap_recall::match_rules_in(&conn, cwd_p, q, &file_list, top) {
-                        Ok((hits, elapsed_ms)) => (
-                            true,
-                            serde_json::to_string_pretty(&json!({
-                                "elapsed_ms": (elapsed_ms * 100.0).round() / 100.0,
-                                "matches": hits
-                            }))
-                            .unwrap_or_default(),
-                        ),
+                    let kind_opt = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let max_chars =
+                        args.get("max_chars").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    match ap_recall::match_rules_with_opts(
+                        &conn, cwd_p, q, &file_list, top, kind_opt, max_chars,
+                    ) {
+                        Ok((hits, elapsed_ms)) => {
+                            let negative_constraints: Vec<&ap_recall::RuleMatch> = hits
+                                .iter()
+                                .filter(|h| {
+                                    let k = h.kind.to_ascii_lowercase();
+                                    k.contains("negative")
+                                        || k.contains("deadend")
+                                        || k == "trap"
+                                        || k == "blocker"
+                                })
+                                .collect();
+                            let positive_rules: Vec<&ap_recall::RuleMatch> = hits
+                                .iter()
+                                .filter(|h| {
+                                    let k = h.kind.to_ascii_lowercase();
+                                    !(k.contains("negative")
+                                        || k.contains("deadend")
+                                        || k == "trap"
+                                        || k == "blocker")
+                                })
+                                .collect();
+                            (
+                                true,
+                                serde_json::to_string_pretty(&json!({
+                                    "elapsed_ms": (elapsed_ms * 100.0).round() / 100.0,
+                                    "negative_constraints": negative_constraints,
+                                    "rules": positive_rules,
+                                    "matches": hits
+                                }))
+                                .unwrap_or_default(),
+                            )
+                        }
                         Err(e) => (false, format!("recall match failed: {e}")),
                     }
                 }

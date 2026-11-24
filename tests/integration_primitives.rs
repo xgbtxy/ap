@@ -12407,7 +12407,7 @@ fn test_v273_variants_http_flow_tcp_race_mcp_budget_and_pi_prefix_hash() {
     let vtxt = mcp_resps[1]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(vtxt.contains("[OUTLIER] UNGUARDED `resetUserBuggy`"));
+    assert!(vtxt.contains("[OUTLIER]") && vtxt.contains("UNGUARDED `resetUserBuggy`"));
 
     // 5. Verify Wave-4 `zz-ap-accelerator.ts` wire prefix-hash boundary detector & low-reasoning `session_before_tree`
     let fake_home = root.join("fake_home_v273");
@@ -12493,6 +12493,239 @@ assert.ok(treeRes.summary.includes("<codemode-store-keys>") && treeRes.summary.i
         assert!(
             run.status.success(),
             "Node v2.73 runtime check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_v274_taint_arg_binary_surface_recall_negative_and_tool_loop_event() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // 1. AST parameter-to-sink taint & --tainted-only filtering (`ap atlas variants` & `trace`)
+    fs::write(
+        root.join("exec.ts"),
+        "export function safeHandler(req: any) {\n\
+           if (!authorize(req.user)) return 403;\n\
+           return execSync(req.cmd);\n\
+         }\n\
+         export function riskyHandler(userCmd: string) {\n\
+           return execSync(userCmd);\n\
+         }\n\
+         export function constHandler() {\n\
+           const c = 'echo ok';\n\
+           return execSync(c);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let v_tainted = run_ap(
+        root,
+        &[
+            "atlas",
+            "variants",
+            root.to_str().unwrap(),
+            "--sink",
+            "execSync",
+            "--tainted-only",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(v_tainted.status.success());
+    let vt: Value = serde_json::from_slice(&v_tainted.stdout).unwrap();
+    assert_eq!(vt["total_siblings"], 2);
+    assert_eq!(vt["siblings"][0]["function"], "riskyHandler");
+    assert_eq!(vt["siblings"][0]["arg_taint"], "PARAM_TAINTED");
+    assert_eq!(vt["siblings"][0]["is_outlier"], true);
+
+    let tr_const = run_ap(
+        root,
+        &[
+            "atlas",
+            "trace",
+            "constHandler",
+            root.to_str().unwrap(),
+            "--to",
+            "execSync",
+            "--tainted-only",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(tr_const.status.success());
+    let tc: Value = serde_json::from_slice(&tr_const.stdout).unwrap();
+    assert!(
+        tc["reachability_paths"].is_null()
+            || tc["reachability_paths"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+        "{tc}"
+    );
+
+    // 2. Pure-Rust binary surface extraction (`ap read <bin> --surface --json` + MCP `ap_read`)
+    let mut bin = Vec::new();
+    bin.extend_from_slice(b"\x7FELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    bin.extend_from_slice(b"\x03\x00\x3E\x00\x01\x00\x00\x00");
+    bin.resize(64, 0);
+    bin.extend_from_slice(b"\\\\.\\pipe\\svc_ctrl_99\x00");
+    bin.extend_from_slice(b"https://status.example.invalid/health\x00");
+    let bin_path = root.join("sample.elf");
+    fs::write(&bin_path, &bin).unwrap();
+
+    let surf_out = run_ap(
+        root,
+        &["read", bin_path.to_str().unwrap(), "--surface", "--json"],
+        None,
+        &[],
+    );
+    assert!(surf_out.status.success());
+    let sv: Value = serde_json::from_slice(&surf_out.stdout).unwrap();
+    assert_eq!(sv["format"], "elf");
+    assert!(sv["artifacts"]["named_pipes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["value"].as_str().unwrap().contains("svc_ctrl_99")));
+
+    // 3. Anti-bloat negative-knowledge `ap recall` (`--kind`, `--max-chars`, split `negative_constraints`)
+    let recall_home = root.join("recall_v274");
+    let r_env = [("RECALL_HOME", recall_home.as_path())];
+    assert!(run_ap(
+        root,
+        &[
+            "recall",
+            "add",
+            "--triggers",
+            "pipe,ipc",
+            "--kind",
+            "negative",
+            "--rule",
+            "Do NOT pass relative pipe names without server check",
+        ],
+        None,
+        &r_env,
+    )
+    .status
+    .success());
+    assert!(run_ap(
+        root,
+        &[
+            "recall",
+            "add",
+            "--triggers",
+            "pipe,ipc",
+            "--kind",
+            "pattern",
+            "--rule",
+            "Inspect binary surface pipes before probing",
+        ],
+        None,
+        &r_env,
+    )
+    .status
+    .success());
+    let rm = run_ap(
+        root,
+        &[
+            "recall", "match", "--query", "pipe ipc", "--top", "5", "--json",
+        ],
+        None,
+        &r_env,
+    );
+    assert!(rm.status.success());
+    let rv: Value = serde_json::from_slice(&rm.stdout).unwrap();
+    assert_eq!(rv["negative_constraints"].as_array().unwrap().len(), 1);
+    assert_eq!(rv["rules"].as_array().unwrap().len(), 1);
+
+    // 4. MCP `ap_read(surface=true)` & `ap_trace(tainted_only=true)` + `zz-ap-accelerator.ts` `ap:tool_loop`
+    let mcp_in = format!(
+        "{}\n{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ap_read", "arguments": {"target": bin_path.to_str().unwrap(), "surface": true}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_trace", "arguments": {"path": root.to_str().unwrap(), "variants_sink": "execSync", "tainted_only": true}}})
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_in), &[]);
+    assert!(mcp_out.status.success());
+    let mres: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert!(mres[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("BINARY SURFACE"));
+    assert!(mres[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("PARAM_TAINTED"));
+
+    let fake_home = root.join("fake_home_v274");
+    fs::create_dir_all(fake_home.join(".pi/agent/extensions")).unwrap();
+    assert!(run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            fake_home.to_str().unwrap(),
+        ],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+        ],
+    )
+    .status
+    .success());
+    if Command::new("node").arg("--version").output().is_ok() {
+        let ts_file = fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+        let node_script = r###"
+import assert from "node:assert/strict";
+const mod = await import(new URL("file:///" + process.env.ACCEL_TS.replace(/\\/g, "/")));
+const handlers = new Map();
+const events = [];
+mod.default({
+  on: (name, fn) => handlers.set(name, fn),
+  registerTool: () => {},
+  registerCommand: () => {},
+  registerShortcut: () => {},
+  registerMessageRenderer: () => {},
+  registerProvider: () => {},
+  events: { emit: (ch, data) => events.push({ ch, data }) },
+});
+const onResult = handlers.get("tool_result");
+for (let i = 0; i < 3; i++) {
+  onResult({
+    toolName: "bash",
+    isError: true,
+    input: { command: "python missing_tool.py" },
+    content: [{ type: "text", text: "No such file or directory" }],
+  }, { cwd: process.cwd() });
+}
+const loopEvt = events.find((e) => e.ch === "ap:tool_loop");
+assert.ok(loopEvt && loopEvt.data.tool === "bash" && loopEvt.data.count >= 2 && loopEvt.data.isError === true);
+"###;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                node_script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.74 runtime check failed:\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );

@@ -83,6 +83,12 @@ enum SubCmd {
         files: String,
         #[arg(long, default_value_t = 3)]
         top: usize,
+        /// Optional rule kind filter (e.g. 'gotcha', 'pattern', 'negative', 'deadend')
+        #[arg(long, default_value = "")]
+        kind: String,
+        /// Optional total character budget across emitted rules (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        max_chars: usize,
         #[arg(long)]
         json: bool,
     },
@@ -402,8 +408,18 @@ struct StoredRow {
     triggers: String,
     rule: String,
     hits: i64,
+    created_at: i64,
     source_file: String,
     source_hash: String,
+}
+
+fn is_negative_kind(kind: &str) -> bool {
+    let k = kind.to_ascii_lowercase();
+    matches!(
+        k.as_str(),
+        "negative" | "deadend" | "trap" | "anti" | "blocker" | "forbidden"
+    ) || k.contains("negative")
+        || k.contains("deadend")
 }
 
 pub fn match_rules(
@@ -422,10 +438,26 @@ pub fn match_rules_in(
     files: &[String],
     top_k: usize,
 ) -> rusqlite::Result<(Vec<RuleMatch>, f64)> {
+    match_rules_with_opts(conn, cwd, query, files, top_k, None, 0)
+}
+
+pub fn match_rules_with_opts(
+    conn: &Connection,
+    cwd: &Path,
+    query: &str,
+    files: &[String],
+    top_k: usize,
+    kind_filter: Option<&str>,
+    max_chars: usize,
+) -> rusqlite::Result<(Vec<RuleMatch>, f64)> {
     let t0 = Instant::now();
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut rows_by_id: HashMap<String, StoredRow> = HashMap::new();
 
+    let kind_req = kind_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
     let q_lower = query.to_lowercase();
     let norm_files: Vec<String> = files
         .iter()
@@ -441,7 +473,7 @@ pub fn match_rules_in(
 
     {
         let mut stmt = conn.prepare(
-            "SELECT id, kind, triggers, rule, hits, source_file, source_hash FROM rules",
+            "SELECT id, kind, triggers, rule, hits, created_at, source_file, source_hash FROM rules",
         )?;
         let iter = stmt.query_map([], |r| {
             Ok((
@@ -451,13 +483,19 @@ pub fn match_rules_in(
                     triggers: r.get(2)?,
                     rule: r.get(3)?,
                     hits: r.get(4)?,
-                    source_file: r.get(5)?,
-                    source_hash: r.get(6)?,
+                    created_at: r.get(5)?,
+                    source_file: r.get(6)?,
+                    source_hash: r.get(7)?,
                 },
             ))
         })?;
         for item in iter {
             let (rid, row) = item?;
+            if let Some(ref kr) = kind_req {
+                if !row.kind.to_ascii_lowercase().contains(kr.as_str()) {
+                    continue;
+                }
+            }
             let mut sc = 0.0;
             for trig in row
                 .triggers
@@ -524,6 +562,9 @@ pub fn match_rules_in(
                 Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
             }) {
                 for pair in rows.flatten() {
+                    if !rows_by_id.contains_key(&pair.0) {
+                        continue;
+                    }
                     let boost = (-pair.1).max(0.5);
                     *scores.entry(pair.0).or_insert(0.0) += boost;
                 }
@@ -531,10 +572,17 @@ pub fn match_rules_in(
         }
     }
 
+    let now = now_epoch();
     let mut provenance_by_id: HashMap<String, (bool, String)> = HashMap::new();
     for (rid, sc) in scores.iter_mut() {
         if *sc > 0.0 {
             if let Some(r) = rows_by_id.get(rid) {
+                // Utility-decay bonus: reinforced hits boost score; unhit old entries gently decay
+                let age_days = ((now - r.created_at).max(0) as f64) / 86_400.0;
+                *sc += (r.hits as f64).min(10.0) * 0.20 - (age_days * 0.01).min(1.5);
+                if is_negative_kind(&r.kind) {
+                    *sc += 0.25;
+                }
                 let (is_stale, reason) = check_provenance(cwd, &r.source_file, &r.source_hash);
                 if is_stale {
                     *sc *= if reason == "source_file_deleted" {
@@ -548,14 +596,19 @@ pub fn match_rules_in(
         }
     }
 
-    let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+    let mut ranked: Vec<(String, f64)> = scores.into_iter().filter(|(_, sc)| *sc > 0.0).collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(top_k);
 
-    let now = now_epoch();
+    let mut used_chars = 0usize;
     let mut results = Vec::new();
     for (rid, sc) in ranked {
         if let Some(r) = rows_by_id.get(&rid) {
+            let entry_len = r.kind.len() + r.triggers.len() + r.rule.len() + 16;
+            if max_chars > 0 && !results.is_empty() && used_chars + entry_len > max_chars {
+                break;
+            }
+            used_chars += entry_len;
             let _ = conn.execute(
                 "UPDATE rules SET hits = hits + 1, last_hit_at = ?1 WHERE id = ?2",
                 params![now, rid],
@@ -708,6 +761,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             query,
             files,
             top,
+            kind,
+            max_chars,
             json: as_json,
         } => {
             let file_list: Vec<String> = files
@@ -716,13 +771,20 @@ pub fn run_cli(args: &[String]) -> i32 {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
-            match match_rules_in(&conn, &cwd, &query, &file_list, top) {
+            let kind_opt = (!kind.trim().is_empty()).then_some(kind.as_str());
+            match match_rules_with_opts(&conn, &cwd, &query, &file_list, top, kind_opt, max_chars) {
                 Ok((hits, elapsed_ms)) => {
+                    let negative_constraints: Vec<&RuleMatch> =
+                        hits.iter().filter(|h| is_negative_kind(&h.kind)).collect();
+                    let positive_rules: Vec<&RuleMatch> =
+                        hits.iter().filter(|h| !is_negative_kind(&h.kind)).collect();
                     if as_json {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
                                 "elapsed_ms": (elapsed_ms * 100.0).round() / 100.0,
+                                "negative_constraints": negative_constraints,
+                                "rules": positive_rules,
                                 "matches": hits
                             }))
                             .unwrap_or_default()
@@ -737,7 +799,21 @@ pub fn run_cli(args: &[String]) -> i32 {
                         "# Recall Active Rules ({} matched in {elapsed_ms:.2}ms)",
                         hits.len()
                     );
-                    for h in hits {
+                    if !negative_constraints.is_empty() {
+                        println!("## Negative Constraints (DO NOT REPEAT)");
+                        for h in negative_constraints {
+                            let stale_note = if h.stale {
+                                format!(" [STALE: {} ({})]", h.stale_reason, h.source_file)
+                            } else {
+                                String::new()
+                            };
+                            println!(
+                                "- **[{}]** (`{}`): {}{stale_note}",
+                                h.kind, h.triggers, h.rule
+                            );
+                        }
+                    }
+                    for h in positive_rules {
                         let stale_note = if h.stale {
                             format!(" [STALE: {} ({})]", h.stale_reason, h.source_file)
                         } else {
@@ -871,6 +947,44 @@ mod tests {
 
         let rep_after = verify_vault(&conn, &dir, false).unwrap();
         assert_eq!(rep_after.total_rules, 0);
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_filters_kind_splits_negative_and_enforces_max_chars() {
+        let dir = std::env::temp_dir().join(format!("ap_recall_neg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conn = open_vault(&dir.join("vault.db")).unwrap();
+
+        add_rule_with_provenance(
+            &conn,
+            &dir,
+            "auth,oauth",
+            "Do NOT reuse legacy unsigned fallback token in auth middleware",
+            "negative",
+            "",
+        )
+        .unwrap();
+        add_rule_with_provenance(
+            &conn,
+            &dir,
+            "auth,oauth",
+            "Verify issuer and audience claims strictly with constant-time compare",
+            "pattern",
+            "",
+        )
+        .unwrap();
+
+        let (neg_only, _) =
+            match_rules_with_opts(&conn, &dir, "auth oauth", &[], 5, Some("negative"), 0).unwrap();
+        assert_eq!(neg_only.len(), 1);
+        assert!(is_negative_kind(&neg_only[0].kind));
+
+        let (capped, _) =
+            match_rules_with_opts(&conn, &dir, "auth oauth", &[], 5, None, 60).unwrap();
+        assert_eq!(capped.len(), 1, "max_chars=60 should cap to 1 rule");
         drop(conn);
         let _ = fs::remove_dir_all(&dir);
     }

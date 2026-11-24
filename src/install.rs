@@ -7310,6 +7310,15 @@ export default function (pi: ExtensionAPI) {{
 					outText = `${{outText}}${{hint}}`;
 					guardsTriggered += 1;
 					mutated = true;
+					const evBus = (pi as {{ events?: {{ emit?: (ch: string, d: unknown) => void }} }}).events;
+					if (typeof evBus?.emit === "function") {{
+						evBus.emit("ap:tool_loop", {{
+							tool: event.toolName,
+							count: repeats,
+							signature: fp.slice(0, 120),
+							isError: Boolean(effectiveErr),
+						}});
+					}}
 				}}
 			}}
 		}}

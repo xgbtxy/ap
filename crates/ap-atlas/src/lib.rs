@@ -204,6 +204,9 @@ enum SubCmd {
         /// Also compute multi-hop reachability paths to all notable I/O/exec/DOM/SQL sinks
         #[arg(long)]
         sinks: bool,
+        /// Filter out reachability paths whose sink call argument is a constant literal
+        #[arg(long)]
+        tainted_only: bool,
         #[arg(long)]
         json: bool,
     },
@@ -220,6 +223,9 @@ enum SubCmd {
         /// Optional custom guard regex in addition to built-in auth/bounds patterns
         #[arg(long)]
         guard: Option<String>,
+        /// Omit sibling calls whose sink argument is a constant literal (`CONST_LITERAL`)
+        #[arg(long)]
+        tainted_only: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1532,6 +1538,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             depth,
             to,
             sinks,
+            tainted_only,
             json,
         }) => {
             let root_p = PathBuf::from(&root);
@@ -1539,7 +1546,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                 eprintln!("[atlas] path not found: {root}");
                 return 1;
             }
-            let rep = trace::trace_symbol_chain_to(&root_p, &symbol, to.as_deref(), sinks, depth);
+            let rep = trace::trace_symbol_chain_to_opts(
+                &root_p,
+                &symbol,
+                to.as_deref(),
+                sinks,
+                tainted_only,
+                depth,
+            );
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
             } else {
@@ -1552,6 +1566,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             sink,
             seed,
             guard,
+            tainted_only,
             json,
         }) => {
             let root_p = PathBuf::from(&root);
@@ -1559,11 +1574,12 @@ pub fn run_cli(args: &[String]) -> i32 {
                 eprintln!("[atlas] path not found: {root}");
                 return 1;
             }
-            let rep = variants::analyze_variants(
+            let rep = variants::analyze_variants_with_opts(
                 &root_p,
                 sink.as_deref(),
                 seed.as_deref(),
                 guard.as_deref(),
+                tainted_only,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
