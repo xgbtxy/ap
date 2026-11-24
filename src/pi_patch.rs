@@ -312,7 +312,7 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "codemode_result_output_shim",
-        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects and String.prototype.output (eliminates TypeError on raw string results)",
+        summary: "Attach non-enumerable .output string shim on QuickJS codemode tool-result objects and pre-lockdown String.prototype.output (lockdown/frozen-safe)",
         hunks: &[
             PatchHunk {
                 id: "bundle_codemode_result_output_shim",
@@ -322,8 +322,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\") {\n\t\t\t\tObject.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 ],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\") {\n\t\t\t\tObject.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\" && Object.isExtensible(String.prototype)) {\n\t\t\t\ttry { Object.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true }); } catch (_e) {}\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\ttry {\n\t\t\t\t\tif (!Object.isExtensible(value)) value = Object.assign({}, value);\n\t\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t\t} catch (_e) {}\n\t\t\t}\n\t\t\tentry.resolve(value);",
             },
             PatchHunk {
                 id: "prelude_codemode_result_output_shim",
@@ -333,8 +334,23 @@ const PATCH_SPECS: &[PatchSpec] = &[
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && !(\"output\" in value)) {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(\"\\n\") : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                     "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                    "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\") {\n\t\t\t\tObject.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
                 ],
-                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\") {\n\t\t\t\tObject.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t}\n\t\t\tentry.resolve(value);",
+                new: "\t\t\tlet value;\n\t\t\ttry {\n\t\t\t\tvalue = payload === undefined ? undefined : parse(payload);\n\t\t\t} catch (error) {\n\t\t\t\tentry.reject(error);\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tif (typeof \"\".output !== \"string\" && Object.isExtensible(String.prototype)) {\n\t\t\t\ttry { Object.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true }); } catch (_e) {}\n\t\t\t}\n\t\t\tif (value && typeof value === \"object\" && !Array.isArray(value) && typeof value.output !== \"string\") {\n\t\t\t\tconst _out = typeof value.text === \"string\" ? value.text : typeof value.stdout === \"string\" ? value.stdout : Array.isArray(value.content) ? value.content.map((c) => c && typeof c.text === \"string\" ? c.text : \"\").filter(Boolean).join(String.fromCharCode(10)) : stringify(value);\n\t\t\t\ttry {\n\t\t\t\t\tif (!Object.isExtensible(value)) value = Object.assign({}, value);\n\t\t\t\t\tObject.defineProperty(value, \"output\", { value: _out, enumerable: false, configurable: true });\n\t\t\t\t} catch (_e) {}\n\t\t\t}\n\t\t\tentry.resolve(value);",
+            },
+            PatchHunk {
+                id: "bundle_codemode_string_output_prelockdown",
+                rel_hint: None,
+                old: "\t\"use strict\";\n\n\t// Freeze every object reachable from the built-in globals,",
+                alt_olds: &[],
+                new: "\t\"use strict\";\n\tif (typeof \"\".output !== \"string\" && Object.isExtensible(String.prototype)) {\n\t\ttry { Object.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true }); } catch (_e) {}\n\t}\n\n\t// Freeze every object reachable from the built-in globals,",
+            },
+            PatchHunk {
+                id: "prelude_codemode_string_output_prelockdown",
+                rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
+                old: "\t\"use strict\";\n\n\t// Freeze every object reachable from the built-in globals,",
+                alt_olds: &[],
+                new: "\t\"use strict\";\n\tif (typeof \"\".output !== \"string\" && Object.isExtensible(String.prototype)) {\n\t\ttry { Object.defineProperty(String.prototype, \"output\", { get() { return String(this); }, enumerable: false, configurable: true }); } catch (_e) {}\n\t}\n\n\t// Freeze every object reachable from the built-in globals,",
             },
         ],
     },
@@ -985,11 +1001,12 @@ mod tests {
         fs::write(
             chunks.join("codemode-worker.js"),
             format!(
-                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
+                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
                 CODEMODE_BUILTINS_OLD.replace('\n', "\r\n"),
                 CODEMODE_WRAPPER_OLD,
                 PATCH_SPECS[10].hunks[0].old.replace('\n', "\r\n"),
                 PATCH_SPECS[11].hunks[0].old.replace('\n', "\r\n"),
+                PATCH_SPECS[11].hunks[2].old.replace('\n', "\r\n"),
                 PATCH_SPECS[14].hunks[0].old.replace('\n', "\r\n"),
                 PATCH_SPECS[15].hunks[0].old.replace('\n', "\r\n"),
             ),
@@ -998,9 +1015,10 @@ mod tests {
         fs::write(
             prelude_dir.join("prelude-source.js"),
             format!(
-                "{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n",
                 PATCH_SPECS[10].hunks[1].old,
                 PATCH_SPECS[11].hunks[1].old,
+                PATCH_SPECS[11].hunks[3].old,
                 PATCH_SPECS[14].hunks[1].old,
                 PATCH_SPECS[15].hunks[1].old,
             ),
@@ -1062,28 +1080,39 @@ mod tests {
             .iter()
             .find(|s| s.id == "codemode_result_output_shim")
             .unwrap();
-        assert_eq!(spec.hunks.len(), 2);
+        assert_eq!(spec.hunks.len(), 4);
         for h in spec.hunks {
             assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
             assert!(!h.new.contains(r#""\r""#), "unsafe \\r in {}", h.id);
-            assert!(h.new.contains("String.fromCharCode(10)"));
-            assert!(h.new.contains("String.prototype"));
-            assert_eq!(h.alt_olds.len(), 3);
-            assert!(h
-                .alt_olds
-                .iter()
-                .any(|a| a.contains("String.fromCharCode(10)")
-                    && a.contains("typeof value.output !== \"string\"")));
             assert!(
-                h.alt_olds
+                !h.new.contains("${"),
+                "unsafe template interpolation in {}",
+                h.id
+            );
+            assert!(h.new.contains("String.prototype"));
+            assert!(h.new.contains("Object.isExtensible(String.prototype)"));
+            if h.id.ends_with("_result_output_shim") {
+                assert!(h.new.contains("String.fromCharCode(10)"));
+                assert!(h.new.contains("Object.isExtensible(value)"));
+                assert_eq!(h.alt_olds.len(), 4);
+                assert!(h
+                    .alt_olds
+                    .iter()
+                    .any(|a| a.contains("String.fromCharCode(10)")
+                        && a.contains("typeof value.output !== \"string\"")));
+                assert!(h
+                    .alt_olds
                     .iter()
                     .any(|a| a.contains("typeof value.output !== \"string\"")
-                        && a.contains(r#""\n""#))
-            );
-            assert!(h
-                .alt_olds
-                .iter()
-                .any(|a| a.contains("!(\"output\" in value)") && a.contains(r#""\n""#)));
+                        && a.contains(r#""\n""#)));
+                assert!(h
+                    .alt_olds
+                    .iter()
+                    .any(|a| a.contains("!(\"output\" in value)") && a.contains(r#""\n""#)));
+                assert!(h.alt_olds.iter().any(|a| a
+                    .contains("Object.defineProperty(String.prototype, \"output\"")
+                    && !a.contains("Object.isExtensible(String.prototype)")));
+            }
         }
         let strip_spec = PATCH_SPECS
             .iter()
@@ -1159,13 +1188,154 @@ mod tests {
         ));
         assert!(fs::read_to_string(chunks.join("codemode-worker.js"))
             .unwrap()
-            .contains("String.prototype"));
+            .contains("Object.isExtensible(String.prototype)"));
         assert!(fs::read_to_string(prelude_dir.join("prelude-source.js"))
             .unwrap()
-            .contains("String.prototype"));
+            .contains("Object.isExtensible(String.prototype)"));
 
         let second = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn patch15_upgrades_v270_and_survives_frozen_lockdown() {
+        let base = std::env::temp_dir().join(format!("ap_pi_p15_v270_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        let prelude_dir = pi_dir
+            .join("node_modules")
+            .join("@earendil-works")
+            .join("pi-codemode")
+            .join("dist")
+            .join("runtime");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&prelude_dir).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.0-test"}"#,
+        )
+        .unwrap();
+
+        let p15 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "codemode_result_output_shim")
+            .unwrap();
+        fs::write(
+            chunks.join("codemode-worker.js"),
+            format!("{}\n{}\n", p15.hunks[2].old, p15.hunks[0].alt_olds[3]),
+        )
+        .unwrap();
+        fs::write(
+            prelude_dir.join("prelude-source.js"),
+            format!("{}\n{}\n", p15.hunks[3].old, p15.hunks[1].alt_olds[3]),
+        )
+        .unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            newly.len(),
+            4,
+            "expected all 4 patch15 hunks to upgrade: {newly:?}"
+        );
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            let prelock = p15.hunks[2]
+                .new
+                .split("// Freeze every object")
+                .next()
+                .unwrap();
+            let settle_body = p15.hunks[0].new;
+            let script = format!(
+                r#"
+import assert from "node:assert/strict";
+import vm from "node:vm";
+
+// 1) Pre-lockdown + frozen String.prototype/Object.prototype (matches Pi codemode prelude)
+const ctx1 = vm.createContext({{}});
+vm.runInContext(`
+{prelock}
+Object.freeze(String.prototype);
+Object.freeze(Object.prototype);
+const parse = JSON.parse;
+const stringify = JSON.stringify;
+function settle(payload) {{
+  let resolved;
+  const entry = {{ resolve(v) {{ resolved = v; }}, reject(e) {{ throw e; }} }};
+{settle_body}
+  return resolved;
+}}
+const s = settle(JSON.stringify("hello"));
+if (s !== "hello" || s.output !== "hello") throw new Error("string output failed");
+const obj = settle(JSON.stringify({{ text: "ok" }}));
+if (obj.output !== "ok") throw new Error("object output failed");
+let frozen = Object.freeze({{ stdout: "frz" }});
+const frz = (() => {{
+  let value = frozen;
+  let resolved;
+  const entry = {{ resolve(v) {{ resolved = v; }} }};
+  if (value && typeof value === "object" && !Array.isArray(value) && typeof value.output !== "string") {{
+    const _out = typeof value.text === "string" ? value.text : typeof value.stdout === "string" ? value.stdout : stringify(value);
+    try {{
+      if (!Object.isExtensible(value)) value = Object.assign({{}}, value);
+      Object.defineProperty(value, "output", {{ value: _out, enumerable: false, configurable: true }});
+    }} catch (_e) {{}}
+  }}
+  entry.resolve(value);
+  return resolved;
+}})();
+if (frz.output !== "frz") throw new Error("frozen object output failed");
+`, ctx1);
+
+// 2) Even if String.prototype was ALREADY frozen before pre-lockdown, settle() must NOT throw
+const ctx2 = vm.createContext({{}});
+vm.runInContext(`
+"use strict";
+Object.freeze(String.prototype);
+const parse = JSON.parse;
+const stringify = JSON.stringify;
+function settle(payload) {{
+  let resolved;
+  const entry = {{ resolve(v) {{ resolved = v; }}, reject(e) {{ throw e; }} }};
+{settle_body}
+  return resolved;
+}}
+const s2 = settle(JSON.stringify("plain"));
+if (s2 !== "plain") throw new Error("already-frozen String.prototype failed");
+const o2 = settle(JSON.stringify({{ content: [{{ type: "text", text: "hi" }}] }}));
+if (o2.output !== "hi") throw new Error("content output failed");
+`, ctx2);
+assert.ok(true);
+"#
+            );
+            let run = std::process::Command::new("node")
+                .args(["--input-type=module", "-e", &script])
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "Frozen lockdown JS check failed:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+
         let _ = fs::remove_dir_all(&base);
     }
 }
