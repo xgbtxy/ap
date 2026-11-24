@@ -9439,7 +9439,9 @@ fn test_v258_fast_audit_tab_space_patch_and_find_accel() {
     let ts_src =
         fs::read_to_string(fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts")).unwrap();
     assert!(
-        ts_src.contains("1e. Rewrite bounded POSIX") && ts_src.contains("--files-only"),
+        ts_src.contains("1e. Rewrite bounded POSIX")
+            && ts_src.contains("--files-only")
+            && ts_src.contains("replace(/\\s*2>\\s*\\/dev\\/null\\s*$/, \"\")"),
         "Pi hook missing v2.58 find->ap ls parity"
     );
 }

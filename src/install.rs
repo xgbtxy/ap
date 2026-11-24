@@ -3210,16 +3210,16 @@ export function healCommand(
 	}}
 
 	// 1e. Rewrite bounded POSIX `find [path] [-maxdepth N] [-type f|d] [-name "*.ext"] [2>/dev/null] [| head -n M]` -> bounded `ap ls`
-	if (toolName === "bash" && !/[;&><{{}}`]|\$\(/.test(cmdTailBody)) {{
+	if (toolName === "bash" && /^\s*find(?:\s|$)/.test(cmdTailBody)) {{
 		let findCore = cmdTailBody.trim();
-		let findLimit = 0;
+		let findLimit = -1;
 		const headPipeM = findCore.match(/^([\s\S]+?)\s*\|\s*head\s+(?:-n\s*(\d+)|-(\d+))\s*$/);
 		if (headPipeM) {{
 			findLimit = Number(headPipeM[2] || headPipeM[3]);
 			findCore = headPipeM[1].trim();
 		}}
-		if (findLimit >= 0 && !findCore.includes("|")) {{
-			findCore = findCore.replace(/\s*2>\s*\/dev\/null\s*$/, "").trim();
+		findCore = findCore.replace(/\s*2>\s*\/dev\/null\s*$/, "").trim();
+		if (findLimit !== 0 && !/[|;&><{{}}`]|\$\(/.test(findCore)) {{
 			const fToks = (findCore.match(/"[^"]*"|'[^']*'|\S+/g) || []).map((t) =>
 				t.replace(/^(['"])(.*)\1$/, "$2"),
 			);
