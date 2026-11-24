@@ -506,6 +506,119 @@ pub fn sync_stopped_from_text(state: &mut FrontierState, source_label: &str, tex
     marked
 }
 
+pub fn is_high_priority_guard(guard_hint: &str) -> bool {
+    let low = guard_hint.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    [
+        "unguarded",
+        "guard_after",
+        "param_tainted",
+        "none_nearby",
+        "missing-origin-check",
+        "no-origin-or-auth-check",
+        "new_diff",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+}
+
+fn contains_ascii_word(haystack_low: &str, needle: &str) -> bool {
+    let bytes = haystack_low.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() || bytes.len() < nb.len() {
+        return false;
+    }
+    for (idx, win) in bytes.windows(nb.len()).enumerate() {
+        if win == nb {
+            let left_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+            let right_i = idx + nb.len();
+            let right_ok = right_i >= bytes.len() || !bytes[right_i].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_line_citation(low: &str) -> bool {
+    let b = low.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'l' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let left_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+            if left_ok {
+                return true;
+            }
+        }
+        if low[i..].starts_with("line ")
+            && low[i + 5..]
+                .chars()
+                .next()
+                .is_some_and(|d| d.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn classify_shallow_stop(item: &FrontierItem) -> Option<&'static str> {
+    if item.status != FrontierStatus::Stopped {
+        return None;
+    }
+    let r = item.reason.trim();
+    let ev = item.evidence_ref.trim();
+    let r_low = r.to_ascii_lowercase();
+    let has_guard_proof = has_line_citation(&r_low)
+        || [
+            "guard",
+            "check",
+            "allowlist",
+            "whitelist",
+            "acl",
+            "authz",
+            "verified",
+            "matched prior record",
+            "paired control",
+            "invariant",
+            "sanitiz",
+        ]
+        .iter()
+        .any(|kw| r_low.contains(kw))
+        || (!ev.is_empty() && r.len() >= 16);
+
+    if has_guard_proof {
+        return None;
+    }
+    if r.len() < 16 && ev.is_empty() {
+        return Some("unbacked_short_reason");
+    }
+    let has_weak_refusal = [
+        "400",
+        "401",
+        "403",
+        "404",
+        "405",
+        "429",
+        "502",
+        "503",
+        "timeout",
+        "timed out",
+        "refused",
+        "skip",
+        "later",
+        "todo",
+    ]
+    .iter()
+    .any(|kw| contains_ascii_word(&r_low, kw));
+    if has_weak_refusal {
+        return Some("shallow_refusal_without_guard_proof");
+    }
+    None
+}
+
 pub fn status_summary_json(state: &FrontierState, top_k: usize) -> Value {
     let mut per_axis: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     let mut counts: HashMap<&'static str, usize> = HashMap::new();
@@ -609,6 +722,753 @@ pub fn render_status_md(state: &FrontierState, top_k: usize) -> String {
         }
     }
     format!("{}\n", out.join("\n"))
+}
+
+pub fn compute_coverage_report(
+    state: &FrontierState,
+    top_k: usize,
+    exclude_axes: &[String],
+) -> Value {
+    #[derive(Default)]
+    struct AxCounts {
+        total: usize,
+        unvisited: usize,
+        high_priority_unvisited: usize,
+        probed: usize,
+        stopped: usize,
+        shallow_stopped: usize,
+        confirmed: usize,
+        deferred: usize,
+    }
+
+    let mut per_axis: BTreeMap<String, AxCounts> = BTreeMap::new();
+    let mut unvisited = 0usize;
+    let mut high_priority_unvisited = 0usize;
+    let mut probed = 0usize;
+    let mut stopped = 0usize;
+    let mut confirmed = 0usize;
+    let mut deferred = 0usize;
+    let mut shallow_items: Vec<(FrontierItem, &'static str)> = Vec::new();
+
+    for it in &state.items {
+        let ax = per_axis.entry(it.axis.clone()).or_default();
+        ax.total += 1;
+        match it.status {
+            FrontierStatus::Unvisited => {
+                unvisited += 1;
+                ax.unvisited += 1;
+                if is_high_priority_guard(&it.guard_hint) {
+                    high_priority_unvisited += 1;
+                    ax.high_priority_unvisited += 1;
+                }
+            }
+            FrontierStatus::Probed => {
+                probed += 1;
+                ax.probed += 1;
+            }
+            FrontierStatus::Stopped => {
+                stopped += 1;
+                ax.stopped += 1;
+                if let Some(kind) = classify_shallow_stop(it) {
+                    ax.shallow_stopped += 1;
+                    shallow_items.push((it.clone(), kind));
+                }
+            }
+            FrontierStatus::Confirmed => {
+                confirmed += 1;
+                ax.confirmed += 1;
+            }
+            FrontierStatus::Deferred => {
+                deferred += 1;
+                ax.deferred += 1;
+            }
+        }
+    }
+
+    let mut unexplored_axes = Vec::new();
+    let mut explored_axes = Vec::new();
+    let mut axis_breakdown = Vec::new();
+    for (ax, c) in &per_axis {
+        let explored = c.probed + c.stopped + c.confirmed;
+        if explored == 0 && c.unvisited > 0 {
+            unexplored_axes.push(ax.clone());
+        } else if explored > 0 {
+            explored_axes.push(ax.clone());
+        }
+        let cov_pct = (explored * 100) / c.total.max(1);
+        axis_breakdown.push(json!({
+            "axis": ax,
+            "total": c.total,
+            "unvisited": c.unvisited,
+            "high_priority_unvisited": c.high_priority_unvisited,
+            "probed": c.probed,
+            "stopped": c.stopped,
+            "shallow_stopped": c.shallow_stopped,
+            "confirmed": c.confirmed,
+            "deferred": c.deferred,
+            "coverage_pct": cov_pct,
+        }));
+    }
+
+    let total = state.items.len();
+    let shallow_n = shallow_items.len();
+    let pressure_score: u32 = if total == 0 {
+        100
+    } else {
+        let p_axes = (unexplored_axes.len() * 15).min(45);
+        let p_hp = (high_priority_unvisited * 5).min(30);
+        let p_sh = (shallow_n * 6).min(25);
+        (p_axes + p_hp + p_sh).min(100) as u32
+    };
+
+    let exhaustion_verdict = if total == 0 {
+        "UNSCANNED_EMPTY_FRONTIER"
+    } else if pressure_score >= 50 || !unexplored_axes.is_empty() || high_priority_unvisited >= 3 {
+        "FALSE_EXHAUSTION_HIGH_PRESSURE"
+    } else if pressure_score >= 20 || unvisited > 0 || shallow_n > 0 {
+        "PARTIAL_COVERAGE"
+    } else {
+        "GENUINELY_SATURATED"
+    };
+
+    let total_axes = per_axis.len();
+    let axis_coverage_pct = (explored_axes.len() * 100)
+        .checked_div(total_axes)
+        .unwrap_or(0);
+    let item_coverage_pct = ((probed + stopped + confirmed) * 100)
+        .checked_div(total)
+        .unwrap_or(0);
+
+    let limit = top_k.clamp(1, 20);
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut challenge_targets: Vec<Value> = Vec::new();
+    let mut push_challenge = |it: &FrontierItem, kind: &str, shallow_kind: Option<&str>| {
+        if challenge_targets.len() >= limit || !seen_ids.insert(it.id.clone()) {
+            return;
+        }
+        let mut obj = serde_json::to_value(it).unwrap_or_else(|_| json!({}));
+        if let Some(m) = obj.as_object_mut() {
+            m.insert("challenge_kind".to_string(), json!(kind));
+            if let Some(sk) = shallow_kind {
+                m.insert("shallow_kind".to_string(), json!(sk));
+            }
+        }
+        challenge_targets.push(obj);
+    };
+
+    // 1) Diverse unvisited high-priority items in unexplored axes first
+    let unexplored_set: HashSet<&str> = unexplored_axes.iter().map(String::as_str).collect();
+    let mut hp_unexp: Vec<&FrontierItem> = state
+        .items
+        .iter()
+        .filter(|it| {
+            it.status == FrontierStatus::Unvisited
+                && unexplored_set.contains(it.axis.as_str())
+                && is_high_priority_guard(&it.guard_hint)
+        })
+        .collect();
+    hp_unexp.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.axis.cmp(&b.axis)));
+    let mut hp_axes_used: HashSet<&str> = HashSet::new();
+    for it in &hp_unexp {
+        if hp_axes_used.insert(it.axis.as_str()) {
+            push_challenge(it, "unexplored_axis_high_priority", None);
+        }
+    }
+    for it in &hp_unexp {
+        push_challenge(it, "unexplored_axis_high_priority", None);
+    }
+
+    // 2) Diversity-picked remaining unvisited frontier nodes
+    for it in pick_next_diverse(state, limit, exclude_axes) {
+        push_challenge(it, "unvisited_frontier", None);
+    }
+
+    // 3) Shallow-stopped nodes lacking concrete guard proof
+    for (it, sk) in &shallow_items {
+        push_challenge(it, "shallow_stop_rechallenge", Some(sk));
+    }
+
+    let shallow_stopped_json: Vec<Value> = shallow_items
+        .iter()
+        .take(20)
+        .map(|(it, sk)| {
+            json!({
+                "id": it.id,
+                "axis": it.axis,
+                "target": it.target,
+                "line": it.line,
+                "symbol": it.symbol,
+                "reason": it.reason,
+                "shallow_kind": sk,
+            })
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "total": total,
+        "unvisited": unvisited,
+        "high_priority_unvisited": high_priority_unvisited,
+        "probed": probed,
+        "stopped": stopped,
+        "shallow_stopped": shallow_n,
+        "confirmed": confirmed,
+        "deferred": deferred,
+        "axis_coverage_pct": axis_coverage_pct,
+        "item_coverage_pct": item_coverage_pct,
+        "pressure_score": pressure_score,
+        "exhaustion_verdict": exhaustion_verdict,
+        "explored_axes": explored_axes,
+        "unexplored_axes": unexplored_axes,
+        "axis_breakdown": axis_breakdown,
+        "shallow_stopped_items": shallow_stopped_json,
+        "challenge_targets": challenge_targets,
+        "verification_rule": "Confirm a concrete guard/invariant proof to clear a stop; never fabricate unverified claims.",
+    })
+}
+
+pub fn render_coverage_md(rep: &Value, is_challenge: bool) -> String {
+    let verdict = rep["exhaustion_verdict"].as_str().unwrap_or("UNKNOWN");
+    let pressure = rep["pressure_score"].as_u64().unwrap_or(0);
+    let ax_pct = rep["axis_coverage_pct"].as_u64().unwrap_or(0);
+    let it_pct = rep["item_coverage_pct"].as_u64().unwrap_or(0);
+    let total = rep["total"].as_u64().unwrap_or(0);
+    let unv = rep["unvisited"].as_u64().unwrap_or(0);
+    let hp_unv = rep["high_priority_unvisited"].as_u64().unwrap_or(0);
+    let sh = rep["shallow_stopped"].as_u64().unwrap_or(0);
+    let heading = if is_challenge {
+        "# FRONTIER CHALLENGE"
+    } else {
+        "# FRONTIER COVERAGE MATRIX"
+    };
+    let mut out = vec![
+        format!(
+            "{heading} [{verdict}] (pressure={pressure}/100 | axis_cov={ax_pct}% | item_cov={it_pct}% | total={total}, unvisited={unv}, hp_unvisited={hp_unv}, shallow_stops={sh})"
+        ),
+    ];
+    if let Some(unexp) = rep["unexplored_axes"].as_array() {
+        let names: Vec<&str> = unexp.iter().filter_map(Value::as_str).collect();
+        if !names.is_empty() {
+            out.push(format!(
+                "**Unexplored Axes ({})**: {}",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+    }
+    if let Some(rows) = rep["axis_breakdown"].as_array() {
+        for r in rows {
+            out.push(format!(
+                "- `{}`: {}% (tot={}, unv={}, hp={}, prb={}, stp={}, sh={}, cnf={})",
+                r["axis"].as_str().unwrap_or(""),
+                r["coverage_pct"].as_u64().unwrap_or(0),
+                r["total"].as_u64().unwrap_or(0),
+                r["unvisited"].as_u64().unwrap_or(0),
+                r["high_priority_unvisited"].as_u64().unwrap_or(0),
+                r["probed"].as_u64().unwrap_or(0),
+                r["stopped"].as_u64().unwrap_or(0),
+                r["shallow_stopped"].as_u64().unwrap_or(0),
+                r["confirmed"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    if is_challenge {
+        if let Some(tgts) = rep["challenge_targets"].as_array() {
+            if !tgts.is_empty() {
+                out.push("\n## Challenge Obligations".to_string());
+                for t in tgts {
+                    out.push(format!(
+                        "- [{}] `{}` [{}] `{}:{}` (`{}` | guard_hint=`{}`)",
+                        t["challenge_kind"].as_str().unwrap_or(""),
+                        t["id"].as_str().unwrap_or(""),
+                        t["axis"].as_str().unwrap_or(""),
+                        t["target"].as_str().unwrap_or(""),
+                        t["line"].as_u64().unwrap_or(0),
+                        t["symbol"].as_str().unwrap_or(""),
+                        t["guard_hint"].as_str().unwrap_or(""),
+                    ));
+                }
+            }
+        }
+        out.push(format!(
+            "\n*Rule: {}*",
+            rep["verification_rule"].as_str().unwrap_or("")
+        ));
+    }
+    format!("{}\n", out.join("\n"))
+}
+
+fn map_sink_to_axis(sink: &str) -> &'static str {
+    let low = sink.to_ascii_lowercase();
+    if low.contains("exec")
+        || low.contains("spawn")
+        || low == "system"
+        || low == "popen"
+        || low.contains("createprocess")
+    {
+        "exec_spawn"
+    } else if low.contains("file") || low.contains("stream") {
+        "fs_path_io"
+    } else if matches!(low.as_str(), "prepare" | "query" | "execute") {
+        "sql_query"
+    } else if low.contains("html")
+        || low == "eval"
+        || low == "function"
+        || low.contains("openexternal")
+    {
+        "dom_client"
+    } else if low.contains("postmessage") || low == "sendsync" || low == "invoke" {
+        "ipc_pipe_proto"
+    } else {
+        "variant_outlier"
+    }
+}
+
+struct ItemDraft<'a> {
+    axis: &'a str,
+    module: &'a str,
+    target: &'a str,
+    line: usize,
+    symbol: &'a str,
+    snippet: &'a str,
+    guard_hint: &'a str,
+    score: u32,
+}
+
+fn make_frontier_item(d: ItemDraft<'_>) -> FrontierItem {
+    let id = format!(
+        "{}:{}",
+        d.axis,
+        fnv1a_hex(&format!(
+            "{}|{}|{}",
+            d.axis,
+            d.target,
+            d.symbol.to_ascii_lowercase()
+        ))
+    );
+    FrontierItem {
+        id,
+        axis: d.axis.to_string(),
+        module: clip(d.module, 64),
+        target: d.target.to_string(),
+        line: d.line,
+        symbol: clip(d.symbol, 96),
+        snippet: clip(d.snippet, 180),
+        guard_hint: clip(d.guard_hint, 96),
+        score: d.score,
+        status: FrontierStatus::Unvisited,
+        reason: String::new(),
+        evidence_ref: String::new(),
+        updated_at: now_iso_utc(),
+    }
+}
+
+pub fn ingest_tool_json_str(
+    state: &mut FrontierState,
+    raw: &str,
+    kind_hint: Option<&str>,
+) -> Result<(String, usize, usize), String> {
+    let val: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let hint = kind_hint
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "auto");
+
+    let surf_inner = val.get("surface").filter(|v| v.is_object()).unwrap_or(&val);
+    let is_variants = hint.as_deref() == Some("variants")
+        || (val.get("siblings").is_some() && val.get("target_sinks").is_some());
+    let is_bin_surface = hint.as_deref() == Some("surface")
+        || (surf_inner.get("artifacts").is_some()
+            && surf_inner.get("import_risk_buckets").is_some());
+    let is_routes = hint.as_deref() == Some("routes")
+        || (surf_inner.get("routes").is_some()
+            || surf_inner.get("graphql_ops").is_some()
+            || surf_inner.get("ws_sse_endpoints").is_some());
+
+    if let Some(root) = val
+        .get("root")
+        .or_else(|| val.get("target"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        if !state.source_roots.iter().any(|r| r == root) {
+            state.source_roots.push(root.to_string());
+        }
+    }
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut push_item = |d: ItemDraft<'_>| {
+        if upsert_item(state, make_frontier_item(d)) {
+            added += 1;
+        } else {
+            skipped += 1;
+        }
+    };
+
+    if is_variants {
+        if let Some(sibs) = val.get("siblings").and_then(Value::as_array) {
+            for s in sibs {
+                let taint = s["arg_taint"].as_str().unwrap_or("");
+                if taint == "CONST_LITERAL" {
+                    continue;
+                }
+                let guard = s["guard_placement"].as_str().unwrap_or("UNGUARDED");
+                let is_out = s["is_outlier"].as_bool().unwrap_or(false);
+                if !is_out && guard == "GUARD_BEFORE" {
+                    continue;
+                }
+                let file = s["file"].as_str().unwrap_or("").trim();
+                let func = s["function"].as_str().unwrap_or("").trim();
+                let sink = s["sink"].as_str().unwrap_or("").trim();
+                if file.is_empty() || sink.is_empty() {
+                    continue;
+                }
+                let line = s["sink_line"].as_u64().unwrap_or(0) as usize;
+                let axis = map_sink_to_axis(sink);
+                let sym = format!("{func}->{sink}");
+                let gh = if taint.is_empty() {
+                    guard.to_string()
+                } else {
+                    format!("{guard},{taint}")
+                };
+                let score = if guard == "UNGUARDED" && taint == "PARAM_TAINTED" {
+                    96
+                } else if guard == "UNGUARDED" || guard == "GUARD_AFTER" {
+                    90
+                } else {
+                    82
+                };
+                let preview = s["arg_preview"].as_str().unwrap_or("");
+                let snip = if preview.is_empty() {
+                    format!("{func} calls {sink}")
+                } else {
+                    format!("{sink}({preview})")
+                };
+                push_item(ItemDraft {
+                    axis,
+                    module: file,
+                    target: file,
+                    line,
+                    symbol: &sym,
+                    snippet: &snip,
+                    guard_hint: &gh,
+                    score,
+                });
+            }
+        }
+        return Ok(("variants".to_string(), added, skipped));
+    }
+
+    if is_bin_surface {
+        let bin_label = val
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("binary")
+            .trim();
+        if let Some(arts) = surf_inner.get("artifacts").and_then(Value::as_object) {
+            for (cat, arr_v) in arts {
+                let (axis, score) = match cat.as_str() {
+                    "named_pipes" | "rpc_endpoints" => ("ipc_pipe_proto", 90u32),
+                    "urls" | "uri_schemes" => ("net_listen_rpc", 86u32),
+                    "interesting_paths" | "registry_keys" => ("fs_path_io", 84u32),
+                    "cmd_templates" => ("exec_spawn", 92u32),
+                    _ => ("binary_surface", 84u32),
+                };
+                let arr = arr_v.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                for entry in arr.iter().take(8) {
+                    let sval = entry["value"].as_str().unwrap_or("").trim();
+                    if sval.is_empty() {
+                        continue;
+                    }
+                    let enc = entry["encoding"].as_str().unwrap_or("ascii");
+                    let off = entry["offset"].as_str().unwrap_or("");
+                    let addr = entry["addr"].as_str().unwrap_or(off);
+                    let tgt = format!("{bin_label}::{sval}");
+                    let snip = format!("{sval} ({enc} {off})");
+                    push_item(ItemDraft {
+                        axis,
+                        module: bin_label,
+                        target: &tgt,
+                        line: 0,
+                        symbol: cat,
+                        snippet: &snip,
+                        guard_hint: addr,
+                        score,
+                    });
+                }
+            }
+        }
+        if let Some(buckets) = surf_inner
+            .get("import_risk_buckets")
+            .and_then(Value::as_object)
+        {
+            for (bucket, syms_v) in buckets.iter().take(6) {
+                let syms: Vec<&str> = syms_v
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if syms.is_empty() {
+                    continue;
+                }
+                let tgt = format!("{bin_label}::imports::{bucket}");
+                let snip = syms.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+                push_item(ItemDraft {
+                    axis: "binary_imports",
+                    module: bin_label,
+                    target: &tgt,
+                    line: 0,
+                    symbol: bucket,
+                    snippet: &snip,
+                    guard_hint: "import_risk",
+                    score: 85,
+                });
+            }
+        }
+        return Ok(("binary_surface".to_string(), added, skipped));
+    }
+
+    if is_routes {
+        let src_label = surf_inner
+            .get("target")
+            .or_else(|| val.get("target"))
+            .and_then(Value::as_str)
+            .unwrap_or("bundle")
+            .trim();
+        if let Some(diff) = surf_inner.get("diff").filter(|d| d.is_object()) {
+            for r in diff["new_routes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                let method = r["method"].as_str().unwrap_or("ANY");
+                let path = r["path"].as_str().unwrap_or("").trim();
+                if path.is_empty() {
+                    continue;
+                }
+                let file = r["file"].as_str().unwrap_or(src_label);
+                let line = r["line"].as_u64().unwrap_or(0) as usize;
+                let sym = format!("{method} {path}");
+                push_item(ItemDraft {
+                    axis: "web_api_route",
+                    module: file,
+                    target: path,
+                    line,
+                    symbol: &sym,
+                    snippet: &sym,
+                    guard_hint: "NEW_DIFF",
+                    score: 95,
+                });
+            }
+            for g in diff["new_graphql"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                let kind = g["kind"].as_str().unwrap_or("op");
+                let name = g["name"].as_str().unwrap_or("").trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let file = g["file"].as_str().unwrap_or(src_label);
+                let line = g["line"].as_u64().unwrap_or(0) as usize;
+                let sym = format!("{kind} {name}");
+                push_item(ItemDraft {
+                    axis: "graphql_op",
+                    module: file,
+                    target: name,
+                    line,
+                    symbol: &sym,
+                    snippet: &sym,
+                    guard_hint: "NEW_DIFF",
+                    score: 95,
+                });
+            }
+            for w in diff["new_ws_sse"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                let kind = w["kind"].as_str().unwrap_or("ws");
+                let ep = w["endpoint"].as_str().unwrap_or("").trim();
+                if ep.is_empty() {
+                    continue;
+                }
+                let file = w["file"].as_str().unwrap_or(src_label);
+                let line = w["line"].as_u64().unwrap_or(0) as usize;
+                push_item(ItemDraft {
+                    axis: "net_listen_rpc",
+                    module: file,
+                    target: ep,
+                    line,
+                    symbol: kind,
+                    snippet: ep,
+                    guard_hint: "NEW_DIFF",
+                    score: 95,
+                });
+            }
+            for ipc in diff["new_ipc_sinks"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                let kind = ipc["kind"].as_str().unwrap_or("ipc");
+                let file = ipc["file"].as_str().unwrap_or(src_label);
+                let line = ipc["line"].as_u64().unwrap_or(0) as usize;
+                let snip = ipc["snippet"].as_str().unwrap_or(kind);
+                let tgt = format!("{file}:L{line}");
+                push_item(ItemDraft {
+                    axis: "ipc_pipe_proto",
+                    module: file,
+                    target: &tgt,
+                    line,
+                    symbol: kind,
+                    snippet: snip,
+                    guard_hint: "NEW_DIFF",
+                    score: 95,
+                });
+            }
+            return Ok(("routes_diff".to_string(), added, skipped));
+        }
+
+        for r in surf_inner["routes"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .take(20)
+        {
+            let method = r["method"].as_str().unwrap_or("ANY");
+            let path = r["path"].as_str().unwrap_or("").trim();
+            if path.is_empty() {
+                continue;
+            }
+            let file = r["file"].as_str().unwrap_or(src_label);
+            let line = r["line"].as_u64().unwrap_or(0) as usize;
+            let risk = r["risk_score"].as_u64().unwrap_or(0).min(20) as u32;
+            let tags: Vec<&str> = r["tags"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let sym = format!("{method} {path}");
+            let gh = tags.join(",");
+            push_item(ItemDraft {
+                axis: "web_api_route",
+                module: file,
+                target: path,
+                line,
+                symbol: &sym,
+                snippet: &sym,
+                guard_hint: &gh,
+                score: 75 + risk,
+            });
+        }
+        for g in surf_inner["graphql_ops"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .take(15)
+        {
+            let kind = g["kind"].as_str().unwrap_or("op");
+            let name = g["name"].as_str().unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            let file = g["file"].as_str().unwrap_or(src_label);
+            let line = g["line"].as_u64().unwrap_or(0) as usize;
+            let sym = format!("{kind} {name}");
+            push_item(ItemDraft {
+                axis: "graphql_op",
+                module: file,
+                target: name,
+                line,
+                symbol: &sym,
+                snippet: &sym,
+                guard_hint: "",
+                score: 88,
+            });
+        }
+        for w in surf_inner["ws_sse_endpoints"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .take(15)
+        {
+            let kind = w["kind"].as_str().unwrap_or("ws");
+            let ep = w["endpoint"].as_str().unwrap_or("").trim();
+            if ep.is_empty() {
+                continue;
+            }
+            let file = w["file"].as_str().unwrap_or(src_label);
+            let line = w["line"].as_u64().unwrap_or(0) as usize;
+            push_item(ItemDraft {
+                axis: "net_listen_rpc",
+                module: file,
+                target: ep,
+                line,
+                symbol: kind,
+                snippet: ep,
+                guard_hint: "",
+                score: 88,
+            });
+        }
+        for pm in surf_inner["post_message_handlers"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|p| p["missing_origin_check"].as_bool().unwrap_or(false))
+            .take(12)
+        {
+            let file = pm["file"].as_str().unwrap_or(src_label);
+            let line = pm["line"].as_u64().unwrap_or(0) as usize;
+            let snip = pm["snippet"].as_str().unwrap_or("postMessage");
+            let tgt = format!("{file}:L{line}");
+            push_item(ItemDraft {
+                axis: "webview_browser",
+                module: file,
+                target: &tgt,
+                line,
+                symbol: "postMessage",
+                snippet: snip,
+                guard_hint: "MISSING-ORIGIN-CHECK",
+                score: 94,
+            });
+        }
+        for ipc in surf_inner["local_server_and_ipc"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .take(15)
+        {
+            let kind = ipc["kind"].as_str().unwrap_or("ipc");
+            let file = ipc["file"].as_str().unwrap_or(src_label);
+            let line = ipc["line"].as_u64().unwrap_or(0) as usize;
+            let snip = ipc["snippet"].as_str().unwrap_or(kind);
+            let gh = if ipc["missing_origin_or_auth"].as_bool().unwrap_or(false) {
+                "NO-ORIGIN-OR-AUTH-CHECK"
+            } else {
+                ""
+            };
+            let tgt = format!("{file}:L{line}");
+            push_item(ItemDraft {
+                axis: "ipc_pipe_proto",
+                module: file,
+                target: &tgt,
+                line,
+                symbol: kind,
+                snippet: snip,
+                guard_hint: gh,
+                score: 92,
+            });
+        }
+        return Ok(("routes".to_string(), added, skipped));
+    }
+
+    let (a, s) = seed_from_json_str(state, raw)?;
+    Ok(("frontier_items".to_string(), a, s))
 }
 
 pub struct FrontierSeedOpts<'a> {
@@ -882,6 +1742,102 @@ pub fn run_frontier_sync_stopped(
     0
 }
 
+pub fn run_frontier_coverage(cwd: &Path, store: Option<&str>, top_k: usize, as_json: bool) -> i32 {
+    let store_path = resolve_store_path(cwd, store);
+    let state = load_frontier(&store_path);
+    let rep = compute_coverage_report(&state, top_k, &[]);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+    } else {
+        print!("{}", render_coverage_md(&rep, false));
+    }
+    0
+}
+
+pub fn run_frontier_challenge(
+    cwd: &Path,
+    store: Option<&str>,
+    top_k: usize,
+    exclude_axes: &[String],
+    as_json: bool,
+) -> i32 {
+    let store_path = resolve_store_path(cwd, store);
+    let state = load_frontier(&store_path);
+    let rep = compute_coverage_report(&state, top_k, exclude_axes);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+    } else {
+        print!("{}", render_coverage_md(&rep, true));
+    }
+    0
+}
+
+pub fn run_frontier_ingest(
+    cwd: &Path,
+    store: Option<&str>,
+    from_file: Option<&str>,
+    from_stdin: bool,
+    kind_hint: Option<&str>,
+    as_json: bool,
+) -> i32 {
+    let store_path = resolve_store_path(cwd, store);
+    let mut state = load_frontier(&store_path);
+    let raw = if from_stdin {
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            eprintln!("[baton frontier] failed to read stdin");
+            return 1;
+        }
+        buf
+    } else if let Some(path_str) = from_file.map(str::trim).filter(|s| !s.is_empty()) {
+        match fs::read_to_string(path_str) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[baton frontier] cannot read {path_str}: {e}");
+                return 1;
+            }
+        }
+    } else {
+        eprintln!("[baton frontier] ingest requires --from-file or --stdin");
+        return 2;
+    };
+
+    let (detected_kind, added, skipped) = match ingest_tool_json_str(&mut state, &raw, kind_hint) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("[baton frontier] {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = save_frontier(&store_path, &mut state) {
+        eprintln!("[baton frontier] save failed: {e}");
+        return 1;
+    }
+    let cov = compute_coverage_report(&state, 5, &[]);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "detected_kind": detected_kind,
+                "added": added,
+                "skipped_existing": skipped,
+                "total": state.items.len(),
+                "store": store_path.to_string_lossy(),
+                "coverage_summary": cov,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "[baton frontier] ingested {detected_kind}: +{added} new ({skipped} existing kept), total={}, verdict={}",
+            state.items.len(),
+            cov["exhaustion_verdict"].as_str().unwrap_or("UNKNOWN"),
+        );
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +1880,100 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(st.items[0].status, FrontierStatus::Stopped);
         assert_eq!(st.items[1].status, FrontierStatus::Unvisited);
+    }
+
+    #[test]
+    fn coverage_detects_shallow_stops_and_false_exhaustion_pressure() {
+        let mut st = FrontierState::default();
+        let sample = json!({
+            "items": [
+                {"id": "exec_spawn:1", "axis": "exec_spawn", "target": "src/run.ts", "line": 12, "symbol": "execSync", "guard_hint": "UNGUARDED,PARAM_TAINTED", "score": 96},
+                {"id": "web_api_route:1", "axis": "web_api_route", "target": "/api/admin/role", "line": 44, "symbol": "POST /api/admin/role", "score": 88},
+                {"id": "ipc_pipe_proto:1", "axis": "ipc_pipe_proto", "target": "src/ipc.ts", "line": 80, "symbol": "ipcMain.on", "score": 85}
+            ]
+        });
+        seed_from_json_str(&mut st, &sample.to_string()).unwrap();
+        // Shallow refusal on web_api_route, backed guard proof on ipc_pipe_proto, unvisited UNGUARDED exec_spawn
+        st.items[1].status = FrontierStatus::Stopped;
+        st.items[1].reason = "returned 403 forbidden on GET".to_string();
+        st.items[2].status = FrontierStatus::Stopped;
+        st.items[2].reason =
+            "L82: requireAdminToken guard verified with paired control".to_string();
+
+        let rep = compute_coverage_report(&st, 5, &[]);
+        assert_eq!(rep["exhaustion_verdict"], "FALSE_EXHAUSTION_HIGH_PRESSURE");
+        assert!(rep["pressure_score"].as_u64().unwrap() >= 25);
+        assert_eq!(rep["shallow_stopped"], 1);
+        assert_eq!(rep["shallow_stopped_items"][0]["id"], "web_api_route:1");
+        assert_eq!(
+            rep["shallow_stopped_items"][0]["shallow_kind"],
+            "shallow_refusal_without_guard_proof"
+        );
+        assert_eq!(
+            rep["challenge_targets"][0]["challenge_kind"],
+            "unexplored_axis_high_priority"
+        );
+
+        // Fix shallow stop with concrete proof and mark exec_spawn probed -> GENUINELY_SATURATED
+        st.items[0].status = FrontierStatus::Probed;
+        st.items[1].reason = "L48: authorizeAdmin acl check blocks non-admin caller".to_string();
+        let sat = compute_coverage_report(&st, 5, &[]);
+        assert_eq!(sat["exhaustion_verdict"], "GENUINELY_SATURATED");
+        assert_eq!(sat["pressure_score"], 0);
+        assert_eq!(sat["shallow_stopped"], 0);
+    }
+
+    #[test]
+    fn ingest_auto_detects_variants_binary_surface_and_routes_diff() {
+        let mut st = FrontierState::default();
+        let variants_json = json!({
+            "root": "/tmp/app",
+            "target_sinks": ["execSync"],
+            "siblings": [
+                {"function": "badFn", "file": "src/a.ts", "sink": "execSync", "sink_line": 12, "guard_placement": "UNGUARDED", "arg_taint": "PARAM_TAINTED", "arg_preview": "req.cmd", "is_outlier": true},
+                {"function": "constFn", "file": "src/a.ts", "sink": "execSync", "sink_line": 22, "guard_placement": "UNGUARDED", "arg_taint": "CONST_LITERAL", "arg_preview": "'uptime'", "is_outlier": false},
+                {"function": "safeFn", "file": "src/a.ts", "sink": "execSync", "sink_line": 32, "guard_placement": "GUARD_BEFORE", "arg_taint": "PARAM_TAINTED", "is_outlier": false}
+            ]
+        });
+        let (k1, a1, _) = ingest_tool_json_str(&mut st, &variants_json.to_string(), None).unwrap();
+        assert_eq!(k1, "variants");
+        assert_eq!(a1, 1);
+        assert_eq!(st.items[0].axis, "exec_spawn");
+        assert_eq!(st.items[0].score, 96);
+
+        let bin_surface_json = json!({
+            "ok": true,
+            "target": "helper.exe",
+            "import_risk_buckets": {"exec_process": ["CreateProcessW"]},
+            "artifacts": {
+                "named_pipes": [{"value": "\\\\.\\pipe\\ctrl_pipe", "encoding": "utf16le", "offset": "0x200", "addr": "rva=0x1200 (.rdata)"}]
+            }
+        });
+        let (k2, a2, _) =
+            ingest_tool_json_str(&mut st, &bin_surface_json.to_string(), None).unwrap();
+        assert_eq!(k2, "binary_surface");
+        assert_eq!(a2, 2);
+
+        let routes_diff_json = json!({
+            "ok": true,
+            "target": "web_dist",
+            "surface": {
+                "routes": [{"method": "GET", "path": "/api/v1/old", "line": 1}],
+                "diff": {
+                    "new_routes": [{"method": "DELETE", "path": "/api/v2/admin/tenant/:id", "line": 42, "file": "dist/main.js"}],
+                    "new_graphql": [{"kind": "mutation", "name": "RotateKey", "line": 50, "file": "dist/main.js"}],
+                    "new_ws_sse": [],
+                    "new_ipc_sinks": []
+                }
+            }
+        });
+        let (k3, a3, _) =
+            ingest_tool_json_str(&mut st, &routes_diff_json.to_string(), None).unwrap();
+        assert_eq!(k3, "routes_diff");
+        assert_eq!(a3, 2);
+        assert!(st
+            .items
+            .iter()
+            .any(|x| x.guard_hint == "NEW_DIFF" && x.score == 95));
     }
 }

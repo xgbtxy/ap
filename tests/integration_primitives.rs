@@ -12966,3 +12966,232 @@ assert.deepEqual(JSON.parse(compacted[1].text), payload);
         );
     }
 }
+
+#[test]
+fn test_v276_baton_frontier_coverage_challenge_and_auto_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store_path = root.join("frontier_v276.json");
+    let store_s = store_path.to_string_lossy().to_string();
+
+    // 1. Real `ap atlas variants --json` -> `ap baton frontier ingest`
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/handlers.ts"),
+        "export function safeCmd(req: any) {\n\
+           if (!requireAdmin(req.user)) return 403;\n\
+           return execSync(req.cmd);\n\
+         }\n\
+         export function riskyCmd(req: any) {\n\
+           return execSync(req.cmd);\n\
+         }\n\
+         export function constCmd() {\n\
+           return execSync('uptime');\n\
+         }\n",
+    )
+    .unwrap();
+    let var_out = run_ap(
+        root,
+        &[
+            "atlas",
+            "variants",
+            root.to_str().unwrap(),
+            "--sink",
+            "execSync",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(var_out.status.success());
+    let var_file = root.join("variants.json");
+    fs::write(&var_file, &var_out.stdout).unwrap();
+
+    let ing_var = run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "ingest",
+            "--store",
+            &store_s,
+            "--from-file",
+            var_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(ing_var.status.success());
+    let iv: Value = serde_json::from_slice(&ing_var.stdout).unwrap();
+    assert_eq!(iv["ok"], true);
+    assert_eq!(iv["detected_kind"], "variants");
+    assert_eq!(iv["added"], 1);
+
+    // 2. Real `ap read --routes --diff --json` -> `ap baton frontier ingest`
+    let old_web = root.join("old_web");
+    let new_web = root.join("new_web");
+    fs::create_dir_all(old_web.join("dist")).unwrap();
+    fs::create_dir_all(new_web.join("dist")).unwrap();
+    fs::write(old_web.join("dist/app.js"), r#"fetch("/api/v1/ping");"#).unwrap();
+    fs::write(
+        new_web.join("dist/app.js"),
+        r#"fetch("/api/v1/ping"); axios.delete("/api/v2/admin/key/:id");"#,
+    )
+    .unwrap();
+    let routes_out = run_ap(
+        root,
+        &[
+            "read",
+            new_web.to_str().unwrap(),
+            "--routes",
+            "--diff",
+            old_web.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(routes_out.status.success());
+    let routes_file = root.join("routes_diff.json");
+    fs::write(&routes_file, &routes_out.stdout).unwrap();
+
+    let ing_routes = run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "ingest",
+            "--store",
+            &store_s,
+            "--from-file",
+            routes_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(ing_routes.status.success());
+    let ir: Value = serde_json::from_slice(&ing_routes.stdout).unwrap();
+    assert_eq!(ir["detected_kind"], "routes_diff");
+    assert_eq!(ir["added"], 1);
+
+    // 3. Real `ap read <bin> --surface --json` -> MCP `ap_frontier` action='ingest' + 'coverage'/'challenge'
+    let mut bin = Vec::new();
+    bin.extend_from_slice(b"\x7FELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    bin.extend_from_slice(b"\x03\x00\x3E\x00\x01\x00\x00\x00");
+    bin.resize(64, 0);
+    bin.extend_from_slice(b"\\\\.\\pipe\\svc_v276_pipe\x00");
+    let bin_path = root.join("agent.elf");
+    fs::write(&bin_path, &bin).unwrap();
+    let surf_out = run_ap(
+        root,
+        &["read", bin_path.to_str().unwrap(), "--surface", "--json"],
+        None,
+        &[],
+    );
+    assert!(surf_out.status.success());
+    let surf_str = String::from_utf8(surf_out.stdout).unwrap();
+
+    // Mark web route as shallow stop ("returned 403"), leaving exec_spawn + ipc_pipe_proto unvisited
+    let mk = run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "mark",
+            "/api/v2/admin/key/:id",
+            "--status",
+            "stopped",
+            "--reason",
+            "returned 403 forbidden",
+            "--store",
+            &store_s,
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(mk.status.success());
+
+    let mcp_in = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "ap_frontier", "arguments": {"action": "ingest", "store": &store_s, "payload_json": surf_str}}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "ap_frontier", "arguments": {"action": "challenge", "store": &store_s, "top_k": 5}}
+        }),
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_in), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    let ing_txt = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let ing_v: Value = serde_json::from_str(ing_txt).unwrap();
+    assert_eq!(ing_v["detected_kind"], "binary_surface");
+    assert_eq!(ing_v["added"], 1);
+
+    let chal_txt = resps[1]["result"]["content"][0]["text"].as_str().unwrap();
+    let chal_v: Value = serde_json::from_str(chal_txt).unwrap();
+    assert_eq!(
+        chal_v["exhaustion_verdict"],
+        "FALSE_EXHAUSTION_HIGH_PRESSURE"
+    );
+    assert_eq!(chal_v["shallow_stopped"], 1);
+    assert!(chal_v["pressure_score"].as_u64().unwrap() >= 35);
+    assert_eq!(
+        chal_v["challenge_targets"][0]["challenge_kind"],
+        "unexplored_axis_high_priority"
+    );
+
+    // 4. Resolve remaining unvisited + supply concrete guard line proof -> GENUINELY_SATURATED
+    for q in ["src/handlers.ts", "svc_v276_pipe"] {
+        assert!(run_ap(
+            root,
+            &["baton", "frontier", "mark", q, "--status", "probed", "--store", &store_s,],
+            None,
+            &[],
+        )
+        .status
+        .success());
+    }
+    assert!(run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "mark",
+            "/api/v2/admin/key/:id",
+            "--status",
+            "stopped",
+            "--reason",
+            "L112: requireAdminToken guard verified with paired non-admin token",
+            "--store",
+            &store_s,
+        ],
+        None,
+        &[],
+    )
+    .status
+    .success());
+
+    let cov_out = run_ap(
+        root,
+        &[
+            "baton", "frontier", "coverage", "--store", &store_s, "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(cov_out.status.success());
+    let cov_v: Value = serde_json::from_slice(&cov_out.stdout).unwrap();
+    assert_eq!(cov_v["exhaustion_verdict"], "GENUINELY_SATURATED");
+    assert_eq!(cov_v["pressure_score"], 0);
+    assert_eq!(cov_v["shallow_stopped"], 0);
+}

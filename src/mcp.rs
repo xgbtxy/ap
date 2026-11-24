@@ -649,25 +649,28 @@ fn mcp_tools_schema() -> Value {
         }),
         json!({
             "name": "ap_frontier",
-            "description": "Multi-session orthogonal exploration frontier tracker: `seed` (from surface scan or manual target), `next` (diversity-maximizing unvisited targets prioritizing unexplored axes), `mark` (probed/stopped/confirmed/deferred), `status`, or `sync_stopped`.",
+            "description": "Orthogonal exploration frontier tracker: `seed`, `next`, `mark`, `status`, `sync_stopped`, `coverage` (shallow-stop/pressure audit), `challenge`, or `ingest` (variants/surface/routes JSON).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "description": "'seed', 'next', 'mark', 'status', or 'sync_stopped'" },
+                    "action": { "type": "string", "description": "'seed'|'next'|'mark'|'status'|'sync_stopped'|'coverage'|'challenge'|'ingest'" },
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
-                    "store": { "type": "string", "description": "Optional custom frontier JSON store path (defaults to .baton/frontier.json)" },
-                    "scan_path": { "type": "string", "description": "For action='seed': directory/archive to scan via ap_surface and ingest into frontier" },
-                    "axis": { "type": "string", "description": "For manual action='seed': axis category name" },
-                    "target": { "type": "string", "description": "For manual action='seed': target path/endpoint" },
-                    "module": { "type": "string", "description": "For manual action='seed': module/component label" },
-                    "note": { "type": "string", "description": "For manual action='seed': short note/snippet" },
-                    "query": { "type": "string", "description": "For action='mark': item id prefix or target substring" },
-                    "status": { "type": "string", "description": "For action='mark': 'unvisited', 'probed', 'stopped', 'confirmed', or 'deferred'" },
-                    "reason": { "type": "string", "description": "For action='mark': concise reason" },
-                    "ref": { "type": "string", "description": "For action='mark': evidence file/ref" },
-                    "top_k": { "type": "integer", "description": "For action='next'/'status': max items (default: 5)" },
-                    "exclude_axes": { "type": "array", "items": { "type": "string" }, "description": "For action='next': axes to deprioritize" },
-                    "text_files": { "type": "array", "items": { "type": "string" }, "description": "For action='sync_stopped': prior notes/ledger paths to cross-reference" }
+                    "store": { "type": "string", "description": "Custom frontier JSON store path (default: .baton/frontier.json)" },
+                    "scan_path": { "type": "string", "description": "For 'seed': directory/archive to scan" },
+                    "from_file": { "type": "string", "description": "For 'ingest': JSON file from variants/surface/routes" },
+                    "payload_json": { "type": "string", "description": "For 'ingest': inline JSON payload" },
+                    "kind": { "type": "string", "description": "For 'ingest': auto|variants|surface|routes" },
+                    "axis": { "type": "string", "description": "For manual 'seed': axis category" },
+                    "target": { "type": "string", "description": "For manual 'seed': target path/endpoint" },
+                    "module": { "type": "string", "description": "For manual 'seed': module label" },
+                    "note": { "type": "string", "description": "For manual 'seed': note/snippet" },
+                    "query": { "type": "string", "description": "For 'mark': item id prefix or target substring" },
+                    "status": { "type": "string", "description": "For 'mark': unvisited|probed|stopped|confirmed|deferred" },
+                    "reason": { "type": "string", "description": "For 'mark': concise reason" },
+                    "ref": { "type": "string", "description": "For 'mark': evidence file/ref" },
+                    "top_k": { "type": "integer", "description": "Max items (default: 5)" },
+                    "exclude_axes": { "type": "array", "items": { "type": "string" }, "description": "Axes to deprioritize" },
+                    "text_files": { "type": "array", "items": { "type": "string" }, "description": "For 'sync_stopped': note/ledger paths" }
                 },
                 "required": ["action"]
             }
@@ -3494,9 +3497,75 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     let summary = ap_baton::frontier::status_summary_json(&state, top_k);
                     (true, serde_json::to_string_pretty(&summary).unwrap_or_default())
                 }
+                "coverage" | "challenge" => {
+                    let state = ap_baton::frontier::load_frontier(&store_path);
+                    let top_k = args
+                        .get("top_k")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(5)
+                        .clamp(1, 20) as usize;
+                    let exclude: Vec<String> = args
+                        .get("exclude_axes")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let rep =
+                        ap_baton::frontier::compute_coverage_report(&state, top_k, &exclude);
+                    (true, serde_json::to_string_pretty(&rep).unwrap_or_default())
+                }
+                "ingest" => {
+                    let kind_hint = args.get("kind").and_then(Value::as_str);
+                    let raw = if let Some(pj) = args
+                        .get("payload_json")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        pj.to_string()
+                    } else if let Some(ff) = args
+                        .get("from_file")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        match std::fs::read_to_string(ff) {
+                            Ok(s) => s,
+                            Err(e) => return (false, format!("[frontier] cannot read {ff}: {e}")),
+                        }
+                    } else {
+                        return (
+                            false,
+                            "Pass `payload_json` or `from_file` for `ap_frontier` action='ingest'."
+                                .to_string(),
+                        );
+                    };
+                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    match ap_baton::frontier::ingest_tool_json_str(&mut state, &raw, kind_hint) {
+                        Ok((detected_kind, added, skipped)) => {
+                            if let Err(e) = ap_baton::frontier::save_frontier(&store_path, &mut state)
+                            {
+                                return (false, format!("[frontier] save failed: {e}"));
+                            }
+                            let cov = ap_baton::frontier::compute_coverage_report(&state, 5, &[]);
+                            let out = json!({
+                                "ok": true,
+                                "detected_kind": detected_kind,
+                                "added": added,
+                                "skipped_existing": skipped,
+                                "total": state.items.len(),
+                                "store": store_path.to_string_lossy(),
+                                "coverage_summary": cov,
+                            });
+                            (true, serde_json::to_string_pretty(&out).unwrap_or_default())
+                        }
+                        Err(e) => (false, e),
+                    }
+                }
                 other => (
                     false,
-                    format!("Unknown ap_frontier action '{other}' (use seed|mark|next|status|sync_stopped)"),
+                    format!("Unknown ap_frontier action '{other}' (use seed|mark|next|status|sync_stopped|coverage|challenge|ingest)"),
                 ),
             }
         }

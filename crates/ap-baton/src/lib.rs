@@ -247,6 +247,39 @@ enum FrontierCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Objective coverage matrix, shallow-stop audit, and false-exhaustion pressure score
+    Coverage {
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(short = 'k', long, default_value_t = 5)]
+        top_k: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rank unvisited high-priority targets & shallow stops to challenge premature exhaustion
+    Challenge {
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(short = 'k', long, default_value_t = 5)]
+        top_k: usize,
+        #[arg(long = "exclude-axis")]
+        exclude_axes: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Auto-ingest JSON outputs from variants, binary --surface, or --routes [--diff]
+    Ingest {
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long)]
+        from_file: Option<String>,
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -826,6 +859,31 @@ pub fn run_cli(args: &[String]) -> i32 {
                 text_files,
                 json,
             } => frontier::run_frontier_sync_stopped(&cwd, store.as_deref(), &text_files, json),
+            FrontierCmd::Coverage { store, top_k, json } => {
+                frontier::run_frontier_coverage(&cwd, store.as_deref(), top_k, json)
+            }
+            FrontierCmd::Challenge {
+                store,
+                top_k,
+                exclude_axes,
+                json,
+            } => {
+                frontier::run_frontier_challenge(&cwd, store.as_deref(), top_k, &exclude_axes, json)
+            }
+            FrontierCmd::Ingest {
+                store,
+                from_file,
+                stdin,
+                kind,
+                json,
+            } => frontier::run_frontier_ingest(
+                &cwd,
+                store.as_deref(),
+                from_file.as_deref(),
+                stdin,
+                kind.as_deref(),
+                json,
+            ),
         },
     }
 }
