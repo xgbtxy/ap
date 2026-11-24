@@ -434,6 +434,33 @@ const PATCH_SPECS: &[PatchSpec] = &[
             },
         ],
     },
+    PatchSpec {
+        id: "codemode_mcp_short_aliases",
+        summary: "Expose unique MCP short aliases (tools.foo -> tools.mcp__server__foo) and describeTool suffix fallback inside QuickJS codemode (template-literal-safe)",
+        hunks: &[
+            PatchHunk {
+                id: "bundle_codemode_mcp_short_aliases",
+                rel_hint: None,
+                old: "\t\tif (!(name in tools)) tools[name] = fn;\n\t}\n\tObject.freeze(tools);",
+                alt_olds: &[],
+                new: "\t\tif (!(name in tools)) tools[name] = fn;\n\t}\n\tconst _mcpCounts = new Map();\n\tconst _mcpShort = [];\n\tfor (const { jsName } of allTools) {\n\t\tconst _m = /^mcp__[A-Za-z0-9_]+__(.+)$/.exec(jsName);\n\t\tif (_m && _m[1]) {\n\t\t\t_mcpCounts.set(_m[1], (_mcpCounts.get(_m[1]) || 0) + 1);\n\t\t\t_mcpShort.push([_m[1], jsName]);\n\t\t}\n\t}\n\tfor (const [_sh, _jn] of _mcpShort) {\n\t\tif (_mcpCounts.get(_sh) === 1 && !(_sh in tools)) {\n\t\t\tObject.defineProperty(tools, _sh, { value: tools[_jn], enumerable: false, configurable: false });\n\t\t}\n\t}\n\tObject.freeze(tools);",
+            },
+            PatchHunk {
+                id: "prelude_codemode_mcp_short_aliases",
+                rel_hint: Some("node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js"),
+                old: "\t\tif (!(name in tools)) tools[name] = fn;\n\t}\n\tObject.freeze(tools);",
+                alt_olds: &[],
+                new: "\t\tif (!(name in tools)) tools[name] = fn;\n\t}\n\tconst _mcpCounts = new Map();\n\tconst _mcpShort = [];\n\tfor (const { jsName } of allTools) {\n\t\tconst _m = /^mcp__[A-Za-z0-9_]+__(.+)$/.exec(jsName);\n\t\tif (_m && _m[1]) {\n\t\t\t_mcpCounts.set(_m[1], (_mcpCounts.get(_m[1]) || 0) + 1);\n\t\t\t_mcpShort.push([_m[1], jsName]);\n\t\t}\n\t}\n\tfor (const [_sh, _jn] of _mcpShort) {\n\t\tif (_mcpCounts.get(_sh) === 1 && !(_sh in tools)) {\n\t\t\tObject.defineProperty(tools, _sh, { value: tools[_jn], enumerable: false, configurable: false });\n\t\t}\n\t}\n\tObject.freeze(tools);",
+            },
+            PatchHunk {
+                id: "execute_describe_tool_mcp_alias",
+                rel_hint: Some("dist/extensions/codemode/execute.js"),
+                old: "                const tool = tools.find((candidate) => candidate.name === name || toCodemodeIdentifier(candidate.name) === name);",
+                alt_olds: &[],
+                new: "                let tool = tools.find((candidate) => candidate.name === name || toCodemodeIdentifier(candidate.name) === name);\n                if (!tool) { const _suf = \"__\" + name; const _m = tools.filter((c) => c.name.endsWith(_suf) || toCodemodeIdentifier(c.name).endsWith(_suf)); if (_m.length === 1) tool = _m[0]; }",
+            },
+        ],
+    },
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1001,7 +1028,7 @@ mod tests {
         fs::write(
             chunks.join("codemode-worker.js"),
             format!(
-                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
+                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
                 CODEMODE_BUILTINS_OLD.replace('\n', "\r\n"),
                 CODEMODE_WRAPPER_OLD,
                 PATCH_SPECS[10].hunks[0].old.replace('\n', "\r\n"),
@@ -1009,19 +1036,28 @@ mod tests {
                 PATCH_SPECS[11].hunks[2].old.replace('\n', "\r\n"),
                 PATCH_SPECS[14].hunks[0].old.replace('\n', "\r\n"),
                 PATCH_SPECS[15].hunks[0].old.replace('\n', "\r\n"),
+                PATCH_SPECS[16].hunks[0].old.replace('\n', "\r\n"),
             ),
         )
         .unwrap();
         fs::write(
             prelude_dir.join("prelude-source.js"),
             format!(
-                "{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n",
                 PATCH_SPECS[10].hunks[1].old,
                 PATCH_SPECS[11].hunks[1].old,
                 PATCH_SPECS[11].hunks[3].old,
                 PATCH_SPECS[14].hunks[1].old,
                 PATCH_SPECS[15].hunks[1].old,
+                PATCH_SPECS[16].hunks[1].old,
             ),
+        )
+        .unwrap();
+        let cm_ext_dir = pi_dir.join("dist").join("extensions").join("codemode");
+        fs::create_dir_all(&cm_ext_dir).unwrap();
+        fs::write(
+            cm_ext_dir.join("execute.js"),
+            format!("{}\n", PATCH_SPECS[16].hunks[2].old),
         )
         .unwrap();
         fs::write(
@@ -1051,7 +1087,7 @@ mod tests {
 
         let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(applied["report"]["all_applied"], true);
-        assert_eq!(applied["report"]["applied_count"], 16);
+        assert_eq!(applied["report"]["applied_count"], 17);
         assert!(fs::read_to_string(chunks.join("chunk-tools.js"))
             .unwrap()
             .contains(PATCH_SPECS[9].hunks[0].new));
@@ -1139,6 +1175,69 @@ mod tests {
                 "unsafe template interpolation in {}",
                 h.id
             );
+        }
+        let alias_spec = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "codemode_mcp_short_aliases")
+            .unwrap();
+        assert_eq!(alias_spec.hunks.len(), 3);
+        for h in alias_spec.hunks {
+            assert!(!h.new.contains(r#""\n""#), "unsafe \\n in {}", h.id);
+            assert!(
+                !h.new.contains("${"),
+                "unsafe template interpolation in {}",
+                h.id
+            );
+        }
+
+        // Verify runtime behavior of Patch #17 aliases & collision guard if Node is on PATH
+        if let Ok(node_check) = std::process::Command::new("node").arg("--version").output() {
+            if node_check.status.success() {
+                let alias_snippet = alias_spec.hunks[1].new;
+                let exec_snippet = alias_spec.hunks[2].new;
+                let js = format!(
+                    r#"
+const assert = require('assert');
+function setupTools(allTools) {{
+  const tools = {{}};
+  for (const {{ jsName: name }} of allTools) {{
+    const fn = () => name;
+{alias_snippet}
+  return tools;
+}}
+const uniq = setupTools([
+  {{ jsName: 'mcp__alpha__search_docs' }},
+  {{ jsName: 'mcp__alpha__dup_tool' }},
+  {{ jsName: 'mcp__beta__dup_tool' }},
+  {{ jsName: 'bash' }},
+]);
+assert.strictEqual(typeof uniq.search_docs, 'function');
+assert.strictEqual(uniq.search_docs(), 'mcp__alpha__search_docs');
+assert.strictEqual(uniq.dup_tool, undefined, 'colliding MCP suffix must not be aliased');
+assert.strictEqual(uniq.bash(), 'bash');
+
+function toCodemodeIdentifier(n) {{ return n.replace(/[^A-Za-z0-9_]/g, '_'); }}
+function lookup(tools, name) {{
+{exec_snippet}
+  return tool ? tool.name : null;
+}}
+const catalog = [{{ name: 'mcp__alpha__search_docs' }}, {{ name: 'mcp__alpha__dup' }}, {{ name: 'mcp__beta__dup' }}];
+assert.strictEqual(lookup(catalog, 'search_docs'), 'mcp__alpha__search_docs');
+assert.strictEqual(lookup(catalog, 'dup'), null, 'ambiguous describeTool suffix must not match');
+console.log('OK_PATCH17');
+"#,
+                );
+                let out = std::process::Command::new("node")
+                    .arg("-e")
+                    .arg(&js)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "Patch #17 Node runtime test failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         }
     }
 

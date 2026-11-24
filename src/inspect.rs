@@ -1402,13 +1402,15 @@ struct JsRouteRegexes {
     local_server_ipc: Regex,
     lazy_chunk: Regex,
     custom_header: Regex,
+    graphql_op: Regex,
+    ws_sse: Regex,
 }
 
 fn js_route_re() -> &'static JsRouteRegexes {
     static R: OnceLock<JsRouteRegexes> = OnceLock::new();
     R.get_or_init(|| JsRouteRegexes {
         api_path: Regex::new(
-            r#"['"`](/(?:api|v[1-9][0-9]?|rest|graphql|oauth[0-9]*|auth|admin|internal|rpc|gw|gateway|proxy|upload|download|export|import|webhook|console|manage|portal|service|services|backend|bff)/[A-Za-z0-9_./:${}-]{1,180})['"`]"#,
+            r#"['"`](/(?:api|v[1-9][0-9]?|rest|graphql|oauth[0-9]*|auth|admin|internal|rpc|gw|gateway|proxy|upload|download|export|import|webhook|console|manage|portal|service|services|backend|bff)/[A-Za-z0-9_./:?=&${}-]{1,180})['"`]"#,
         )
         .unwrap(),
         http_call: Regex::new(
@@ -1426,7 +1428,7 @@ fn js_route_re() -> &'static JsRouteRegexes {
         ext_origin: Regex::new(r#"(?:https?|wss?)://([A-Za-z0-9][A-Za-z0-9.-]{2,100}(?::\d{2,5})?)"#)
             .unwrap(),
         local_server_ipc: Regex::new(
-            r#"(?:\b(?:http|https|net)\.createServer\s*\(|\bnew\s+WebSocketServer\s*\(|['"`]/oauth/callback['"`]|\bipcMain\.(?:handle|on)\s*\(|\bcontextBridge\.exposeInMainWorld\s*\(|\bshell\.openExternal\s*\(|\b(?:execFile|execSync|spawn|spawnSync)\s*\()"#,
+            r#"(?:\b(?:http|https|net)\.createServer\s*\(|\bnew\s+WebSocketServer\s*\(|['"`]/oauth/callback['"`]|\bipcMain\.(?:handle|on)\s*\(|\bipcRenderer\.(?:send|invoke|sendSync)\s*\(|\bwebview\.loadURL\s*\(|\bnew\s+QWebChannel\s*\(|\bwindow\.chrome\.webview\.postMessage\s*\(|\bpostMessage\s*\([^)\r\n]{1,160},\s*['"]\*['"]\s*\)|\bcontextBridge\.exposeInMainWorld\s*\(|\bshell\.openExternal\s*\(|\b(?:execFile|execSync|spawn|spawnSync)\s*\()"#,
         )
         .unwrap(),
         lazy_chunk: Regex::new(
@@ -1437,7 +1439,34 @@ fn js_route_re() -> &'static JsRouteRegexes {
             r#"(?i)['"`](X-(?:Auth-Token|Domain-Id|Project-Id|Tenant-Id|User-Id|Csrf-Token|Xsrf-Token|Api-Key|Security-Token|Target-Services|Forwarded-[A-Za-z0-9-]+|Signature[A-Za-z0-9-]*|Request-[A-Za-z0-9-]+))['"`]"#,
         )
         .unwrap(),
+        graphql_op: Regex::new(
+            r#"(?:\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]{1,64})\s*(?:\(|\{)|\boperationName\s*:\s*['"]([A-Za-z_][A-Za-z0-9_]{1,64})['"])"#,
+        )
+        .unwrap(),
+        ws_sse: Regex::new(
+            r#"(?:(wss?://[^'"`\s\\<>]{3,160})|\bnew\s+(WebSocket|EventSource)\s*\(\s*([^,)\r\n]{1,120}))"#,
+        )
+        .unwrap(),
     })
+}
+
+struct LineIndex {
+    newlines: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(text: &str) -> Self {
+        let newlines = text
+            .bytes()
+            .enumerate()
+            .filter_map(|(i, b)| if b == b'\n' { Some(i) } else { None })
+            .collect();
+        Self { newlines }
+    }
+
+    fn line_of(&self, byte_off: usize) -> usize {
+        self.newlines.partition_point(|&nl| nl < byte_off) + 1
+    }
 }
 
 fn byte_line_col(text: &str, byte_off: usize) -> usize {
@@ -1766,11 +1795,112 @@ pub fn extract_har_routes_md(
     Some((md_lines.join("\n"), jv))
 }
 
-pub fn extract_js_routes_md(
+struct JsRouteEntry {
+    method: String,
+    line: usize,
+    file: Option<String>,
+    tags: Vec<&'static str>,
+    params: Vec<String>,
+}
+
+struct RankedJsRoute<'a> {
+    risk: u8,
+    path: &'a str,
+    entry: &'a JsRouteEntry,
+}
+
+#[derive(Default)]
+struct JsSurfaceData {
+    route_map: std::collections::BTreeMap<String, JsRouteEntry>,
+    graphql_ops: Vec<(String, String, usize, usize, Option<String>)>,
+    seen_graphql: std::collections::HashSet<(String, String)>,
+    ws_sse: Vec<(String, String, usize, usize, Option<String>)>,
+    seen_ws: std::collections::HashSet<String>,
+    post_messages: Vec<serde_json::Value>,
+    dom_sinks: Vec<serde_json::Value>,
+    origins: std::collections::BTreeSet<String>,
+    local_ipc_sinks: Vec<serde_json::Value>,
+    lazy_chunks: std::collections::BTreeSet<String>,
+    custom_headers: std::collections::BTreeSet<String>,
+    scanned_files: usize,
+}
+
+fn extract_route_param_hints(slice: &str, path: &str, end_off: usize) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut push_key = |raw: &str| {
+        if keys.len() >= 5 {
+            return;
+        }
+        let k = raw.trim();
+        if k.len() >= 2
+            && k.len() <= 28
+            && !matches!(
+                k.to_ascii_lowercase().as_str(),
+                "headers" | "method" | "url" | "timeout" | "mode" | "cache" | "signal" | "body"
+            )
+            && !keys.iter().any(|x| x == k)
+        {
+            keys.push(k.to_string());
+        }
+    };
+
+    if let Some((_, qs)) = path.split_once('?') {
+        for pair in qs.split('&') {
+            if let Some((k, _)) = pair.split_once('=') {
+                if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    push_key(k);
+                }
+            }
+        }
+    }
+
+    let mut w_end = (end_off + 180).min(slice.len());
+    while w_end > end_off && !slice.is_char_boundary(w_end) {
+        w_end -= 1;
+    }
+    let tail = &slice[end_off..w_end];
+    if let Some(open) = tail.find('{') {
+        let end_obj = tail[open..]
+            .find('}')
+            .map(|p| open + p)
+            .unwrap_or(tail.len());
+        let obj = &tail[open + 1..end_obj];
+        static KEY_RE: OnceLock<Regex> = OnceLock::new();
+        let kre =
+            KEY_RE.get_or_init(|| Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_]{1,28})\s*:"#).unwrap());
+        for cap in kre.captures_iter(obj) {
+            if let Some(km) = cap.get(1) {
+                push_key(km.as_str());
+            }
+        }
+    }
+    keys.truncate(5);
+    keys
+}
+
+fn route_risk_score(method: &str, tags: &[&'static str], params: &[String]) -> u8 {
+    let mut score = 0u8;
+    if matches!(method, "POST" | "PUT" | "DELETE" | "PATCH") {
+        score += 3;
+    }
+    if tags.contains(&"SENSITIVE") {
+        score += 4;
+    }
+    if tags.contains(&"PARAM") {
+        score += 2;
+    }
+    if !params.is_empty() {
+        score += 1;
+    }
+    score
+}
+
+fn collect_js_surface_into(
     text: &str,
-    label: &str,
+    rel_file: Option<&str>,
     query: Option<&str>,
-) -> (String, serde_json::Value) {
+    acc: &mut JsSurfaceData,
+) {
     let re = js_route_re();
     let scan_end = {
         let limit = text.len().min(24 * 1024 * 1024);
@@ -1781,6 +1911,7 @@ pub fn extract_js_routes_md(
         e
     };
     let slice = &text[..scan_end];
+    let line_idx = LineIndex::new(slice);
     let q_low = query
         .map(|q| q.trim().to_ascii_lowercase())
         .filter(|q| !q.is_empty());
@@ -1790,11 +1921,10 @@ pub fn extract_js_routes_md(
             None => true,
         }
     };
+    let file_owned = rel_file.map(str::to_string);
+    acc.scanned_files += 1;
 
-    let mut route_map: std::collections::BTreeMap<String, (String, usize, Vec<&'static str>)> =
-        std::collections::BTreeMap::new();
-
-    let mut add_route = |method: &str, raw_path: &str, off: usize| {
+    let mut add_route = |method: &str, raw_path: &str, off: usize, end_off: usize| {
         let p = raw_path.trim();
         if p.len() < 3 || p.contains("//") && !p.starts_with("http") {
             return;
@@ -1802,29 +1932,48 @@ pub fn extract_js_routes_md(
         if !matches_q(p) && !matches_q(method) {
             return;
         }
+        let line = line_idx.line_of(off);
+        let params = extract_route_param_hints(slice, p, end_off);
         let mut tags: Vec<&'static str> = Vec::new();
-        if p.contains(':') || p.contains('{') || p.contains("${") {
+        if p.contains(':') || p.contains('{') || p.contains("${") || p.contains('?') {
             tags.push("PARAM");
         }
         let pl = p.to_ascii_lowercase();
-        if [
+        let sens_path = [
             "admin", "delete", "remove", "grant", "role", "perm", "token", "secret", "upload",
             "export", "import", "proxy", "internal", "transfer", "billing", "passwd", "password",
         ]
         .iter()
-        .any(|kw| pl.contains(kw))
-        {
+        .any(|kw| pl.contains(kw));
+        let sens_param = params.iter().any(|k| is_sensitive_param_name(k));
+        if sens_path || sens_param {
             tags.push("SENSITIVE");
         }
         let m_up = method.to_ascii_uppercase();
-        route_map
+        acc.route_map
             .entry(p.to_string())
             .and_modify(|e| {
-                if e.0 == "ANY" && m_up != "ANY" {
-                    e.0 = m_up.clone();
+                if e.method == "ANY" && m_up != "ANY" {
+                    e.method = m_up.clone();
+                }
+                for t in &tags {
+                    if !e.tags.contains(t) {
+                        e.tags.push(*t);
+                    }
+                }
+                for pk in &params {
+                    if !e.params.contains(pk) && e.params.len() < 5 {
+                        e.params.push(pk.clone());
+                    }
                 }
             })
-            .or_insert((m_up, off, tags));
+            .or_insert(JsRouteEntry {
+                method: m_up,
+                line,
+                file: file_owned.clone(),
+                tags,
+                params,
+            });
     };
 
     for cap in re.http_call.captures_iter(slice) {
@@ -1834,7 +1983,7 @@ pub fn extract_js_routes_md(
             .map(|m| m.as_str())
             .unwrap_or("FETCH");
         if let Some(pm) = cap.get(4) {
-            add_route(method, pm.as_str(), pm.start());
+            add_route(method, pm.as_str(), pm.start(), pm.end());
         }
     }
     for cap in re.api_path.captures_iter(slice) {
@@ -1859,11 +2008,68 @@ pub fn extract_js_routes_md(
             } else {
                 "ANY"
             };
-            add_route(method, pm.as_str(), start);
+            add_route(method, pm.as_str(), start, pm.end());
         }
     }
 
-    let mut post_messages: Vec<serde_json::Value> = Vec::new();
+    for cap in re.graphql_op.captures_iter(slice) {
+        if acc.graphql_ops.len() >= 80 {
+            break;
+        }
+        let (kind, name, off) = if let (Some(k), Some(nm)) = (cap.get(1), cap.get(2)) {
+            (
+                k.as_str().to_ascii_lowercase(),
+                nm.as_str().to_string(),
+                nm.start(),
+            )
+        } else if let Some(nm) = cap.get(3) {
+            ("operation".to_string(), nm.as_str().to_string(), nm.start())
+        } else {
+            continue;
+        };
+        if !matches_q(&name) && !matches_q(&kind) && !matches_q("graphql") {
+            continue;
+        }
+        if acc.seen_graphql.insert((kind.clone(), name.clone())) {
+            acc.graphql_ops
+                .push((kind, name, line_idx.line_of(off), off, file_owned.clone()));
+        }
+    }
+
+    for cap in re.ws_sse.captures_iter(slice) {
+        if acc.ws_sse.len() >= 60 {
+            break;
+        }
+        let (kind, endpoint, off) = if let Some(url) = cap.get(1) {
+            ("ws-url".to_string(), url.as_str().to_string(), url.start())
+        } else if let (Some(k), Some(ep)) = (cap.get(2), cap.get(3)) {
+            (
+                k.as_str().to_string(),
+                ep.as_str()
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                    .to_string(),
+                ep.start(),
+            )
+        } else {
+            continue;
+        };
+        if endpoint.len() < 2
+            || (!matches_q(&endpoint) && !matches_q(&kind) && !matches_q("websocket"))
+        {
+            continue;
+        }
+        if acc.seen_ws.insert(endpoint.clone()) {
+            acc.ws_sse.push((
+                kind,
+                endpoint,
+                line_idx.line_of(off),
+                off,
+                file_owned.clone(),
+            ));
+        }
+    }
+
     for m in re.post_msg.find_iter(slice).take(30) {
         let hard_end = {
             let mut e = (m.end() + 480).min(slice.len());
@@ -1912,18 +2118,21 @@ pub fn extract_js_routes_md(
         if !matches_q(&snip) && !matches_q("postmessage") {
             continue;
         }
-        post_messages.push(serde_json::json!({
-            "line": byte_line_col(slice, m.start()),
+        let mut obj = serde_json::json!({
+            "line": line_idx.line_of(m.start()),
             "offset": m.start(),
             "missing_origin_check": !has_origin_check,
             "snippet": snip,
-        }));
+        });
+        if let Some(rf) = file_owned.as_deref() {
+            obj["file"] = serde_json::json!(rf);
+        }
+        acc.post_messages.push(obj);
     }
 
-    let mut dom_sinks: Vec<serde_json::Value> = Vec::new();
     let mut seen_sink_off = std::collections::HashSet::new();
     for m in re.dom_sink.find_iter(slice) {
-        if dom_sinks.len() >= 40 {
+        if acc.dom_sinks.len() >= 60 {
             break;
         }
         let w_start = {
@@ -1949,16 +2158,19 @@ pub fn extract_js_routes_md(
             continue;
         }
         if seen_sink_off.insert(m.start() / 32) {
-            dom_sinks.push(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "sink": m.as_str().trim(),
-                "line": byte_line_col(slice, m.start()),
+                "line": line_idx.line_of(m.start()),
                 "offset": m.start(),
                 "snippet": snip,
-            }));
+            });
+            if let Some(rf) = file_owned.as_deref() {
+                obj["file"] = serde_json::json!(rf);
+            }
+            acc.dom_sinks.push(obj);
         }
     }
 
-    let mut origins: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for cap in re.ext_origin.captures_iter(slice) {
         if let Some(hm) = cap.get(1) {
             let host = hm.as_str().to_ascii_lowercase();
@@ -1973,15 +2185,14 @@ pub fn extract_js_routes_md(
                 continue;
             }
             if matches_q(&host) {
-                origins.insert(host);
+                acc.origins.insert(host);
             }
         }
     }
 
-    let mut local_ipc_sinks: Vec<serde_json::Value> = Vec::new();
     let mut seen_ipc_off = std::collections::HashSet::new();
     for m in re.local_server_ipc.find_iter(slice) {
-        if local_ipc_sinks.len() >= 30 {
+        if acc.local_ipc_sinks.len() >= 60 {
             break;
         }
         let hard_end = {
@@ -2015,31 +2226,36 @@ pub fn extract_js_routes_md(
         let is_server = kind_s.contains("createServer")
             || kind_s.contains("WebSocketServer")
             || kind_s.contains("oauth/callback");
+        let is_wildcard_pm = kind_s.starts_with("postMessage");
         let win_low = win.to_ascii_lowercase();
-        let missing_auth = is_server
-            && !win_low.contains("origin")
-            && !win_low.contains("authorization")
-            && !win_low.contains("csrf")
-            && !win_low.contains("state")
-            && !win_low.contains("token");
+        let missing_auth = is_wildcard_pm
+            || (is_server
+                && !win_low.contains("origin")
+                && !win_low.contains("authorization")
+                && !win_low.contains("csrf")
+                && !win_low.contains("state")
+                && !win_low.contains("token"));
         let snip: String = win.replace(['\r', '\n'], " ").chars().take(120).collect();
         if !matches_q(&snip) && !matches_q(kind_s) {
             continue;
         }
         if seen_ipc_off.insert(m.start() / 24) {
-            local_ipc_sinks.push(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "kind": kind_s,
-                "line": byte_line_col(slice, m.start()),
+                "line": line_idx.line_of(m.start()),
                 "offset": m.start(),
                 "missing_origin_or_auth": missing_auth,
                 "snippet": snip,
-            }));
+            });
+            if let Some(rf) = file_owned.as_deref() {
+                obj["file"] = serde_json::json!(rf);
+            }
+            acc.local_ipc_sinks.push(obj);
         }
     }
 
-    let mut lazy_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for cap in re.lazy_chunk.captures_iter(slice) {
-        if lazy_chunks.len() >= 50 {
+        if acc.lazy_chunks.len() >= 80 {
             break;
         }
         let item = if let Some(m1) = cap.get(1) {
@@ -2050,59 +2266,268 @@ pub fn extract_js_routes_md(
             continue;
         };
         if matches_q(&item) {
-            lazy_chunks.insert(item);
+            acc.lazy_chunks.insert(item);
         }
     }
 
-    let mut custom_headers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for cap in re.custom_header.captures_iter(slice) {
         if let Some(hm) = cap.get(1) {
             let h = hm.as_str().to_string();
             if matches_q(&h) {
-                custom_headers.insert(h);
+                acc.custom_headers.insert(h);
             }
         }
     }
+}
+
+fn render_js_surface(
+    acc: JsSurfaceData,
+    label: &str,
+    diff_vs: Option<(&JsSurfaceData, &str)>,
+) -> (String, serde_json::Value) {
+    let mut sorted_routes: Vec<RankedJsRoute<'_>> = acc
+        .route_map
+        .iter()
+        .map(|(p, e)| RankedJsRoute {
+            risk: route_risk_score(&e.method, &e.tags, &e.params),
+            path: p.as_str(),
+            entry: e,
+        })
+        .collect();
+    sorted_routes.sort_by(|a, b| {
+        b.risk
+            .cmp(&a.risk)
+            .then_with(|| a.path.cmp(b.path))
+            .then_with(|| a.entry.method.cmp(&b.entry.method))
+    });
 
     let mut routes_json: Vec<serde_json::Value> = Vec::new();
     let mut route_lines: Vec<String> = Vec::new();
-    for (p, (method, off, tags)) in route_map.iter().take(120) {
-        let ln = byte_line_col(slice, *off);
-        let tag_str = if tags.is_empty() {
+    for r in sorted_routes.iter().take(120) {
+        let e = r.entry;
+        let tag_str = if e.tags.is_empty() {
             String::new()
         } else {
-            format!(" [{}]", tags.join(","))
+            format!(" [{}]", e.tags.join(","))
         };
-        route_lines.push(format!("- `{method}` `{p}`{tag_str} (L{ln}, @{off})"));
-        routes_json.push(serde_json::json!({
-            "method": method,
-            "path": p,
-            "line": ln,
-            "offset": off,
-            "tags": tags,
-        }));
+        let param_str = if e.params.is_empty() {
+            String::new()
+        } else {
+            format!(" params=[{}]", e.params.join(","))
+        };
+        let loc_str = match &e.file {
+            Some(rf) => format!("{rf}:L{}", e.line),
+            None => format!("L{}", e.line),
+        };
+        route_lines.push(format!(
+            "- `{}` `{}`{tag_str}{param_str} ({loc_str})",
+            e.method, r.path
+        ));
+        let mut rj = serde_json::json!({
+            "method": e.method,
+            "path": r.path,
+            "line": e.line,
+            "risk_score": r.risk,
+            "tags": e.tags,
+            "params": e.params,
+        });
+        if let Some(rf) = &e.file {
+            rj["file"] = serde_json::json!(rf);
+        }
+        routes_json.push(rj);
     }
 
     let mut out = vec![format!(
-        "# JS/API Surface `{label}` ({} route(s) | {} postMessage | {} local-server/IPC | {} DOM sink(s) | {} lazy chunk(s) | {} header(s) | {} origin(s))",
-        route_map.len(),
-        post_messages.len(),
-        local_ipc_sinks.len(),
-        dom_sinks.len(),
-        lazy_chunks.len(),
-        custom_headers.len(),
-        origins.len()
+        "# JS/API Surface `{label}` ({} file(s) | {} route(s) | {} GraphQL | {} WS/SSE | {} postMessage | {} local-server/IPC | {} DOM sink(s) | {} lazy chunk(s) | {} header(s) | {} origin(s))",
+        acc.scanned_files,
+        acc.route_map.len(),
+        acc.graphql_ops.len(),
+        acc.ws_sse.len(),
+        acc.post_messages.len(),
+        acc.local_ipc_sinks.len(),
+        acc.dom_sinks.len(),
+        acc.lazy_chunks.len(),
+        acc.custom_headers.len(),
+        acc.origins.len()
     )];
+
+    let mut diff_json = serde_json::Value::Null;
+    if let Some((old_acc, old_label)) = diff_vs {
+        let new_routes: Vec<serde_json::Value> = sorted_routes
+            .iter()
+            .filter(|r| {
+                !old_acc
+                    .route_map
+                    .get(r.path)
+                    .is_some_and(|oe| oe.method == r.entry.method)
+            })
+            .take(60)
+            .map(|r| {
+                serde_json::json!({
+                    "method": r.entry.method,
+                    "path": r.path,
+                    "line": r.entry.line,
+                    "file": r.entry.file,
+                    "risk_score": r.risk,
+                    "tags": r.entry.tags,
+                })
+            })
+            .collect();
+        let new_graphql: Vec<serde_json::Value> = acc
+            .graphql_ops
+            .iter()
+            .filter(|(k, nm, _, _, _)| !old_acc.seen_graphql.contains(&(k.clone(), nm.clone())))
+            .take(30)
+            .map(|(k, nm, ln, _, f)| serde_json::json!({"kind": k, "name": nm, "line": ln, "file": f}))
+            .collect();
+        let new_ws: Vec<serde_json::Value> = acc
+            .ws_sse
+            .iter()
+            .filter(|(_, ep, _, _, _)| !old_acc.seen_ws.contains(ep))
+            .take(30)
+            .map(|(k, ep, ln, _, f)| serde_json::json!({"kind": k, "endpoint": ep, "line": ln, "file": f}))
+            .collect();
+        let old_ipc_keys: std::collections::HashSet<(String, String)> = old_acc
+            .local_ipc_sinks
+            .iter()
+            .map(|s| {
+                (
+                    s["kind"].as_str().unwrap_or("").to_string(),
+                    s["snippet"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(40)
+                        .collect(),
+                )
+            })
+            .collect();
+        let new_ipc: Vec<serde_json::Value> = acc
+            .local_ipc_sinks
+            .iter()
+            .filter(|s| {
+                let k = s["kind"].as_str().unwrap_or("").to_string();
+                let sn: String = s["snippet"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(40)
+                    .collect();
+                !old_ipc_keys.contains(&(k, sn))
+            })
+            .take(30)
+            .cloned()
+            .collect();
+        let new_origins: Vec<String> = acc
+            .origins
+            .difference(&old_acc.origins)
+            .take(40)
+            .cloned()
+            .collect();
+        let removed_routes = old_acc
+            .route_map
+            .keys()
+            .filter(|p| !acc.route_map.contains_key(*p))
+            .count();
+
+        let mut d_lines = Vec::new();
+        for nr in &new_routes {
+            d_lines.push(format!(
+                "- +ROUTE `{}` `{}`",
+                nr["method"].as_str().unwrap_or(""),
+                nr["path"].as_str().unwrap_or("")
+            ));
+        }
+        for ng in &new_graphql {
+            d_lines.push(format!(
+                "- +GRAPHQL `{}` `{}`",
+                ng["kind"].as_str().unwrap_or(""),
+                ng["name"].as_str().unwrap_or("")
+            ));
+        }
+        for nw in &new_ws {
+            d_lines.push(format!(
+                "- +WS/SSE `{}` `{}`",
+                nw["kind"].as_str().unwrap_or(""),
+                nw["endpoint"].as_str().unwrap_or("")
+            ));
+        }
+        for ni in &new_ipc {
+            d_lines.push(format!(
+                "- +IPC `{}` (`{}`)",
+                ni["kind"].as_str().unwrap_or(""),
+                ni["snippet"].as_str().unwrap_or("")
+            ));
+        }
+        out.push(format!(
+            "\n## Net-New Surface vs `{old_label}` ({} new route(s), {} new GraphQL, {} new WS/SSE, {} new IPC, {} removed route(s))\n{}",
+            new_routes.len(),
+            new_graphql.len(),
+            new_ws.len(),
+            new_ipc.len(),
+            removed_routes,
+            if d_lines.is_empty() {
+                "*(no net-new surface detected)*".to_string()
+            } else {
+                d_lines.join("\n")
+            }
+        ));
+        diff_json = serde_json::json!({
+            "baseline": old_label,
+            "new_routes": new_routes,
+            "new_graphql": new_graphql,
+            "new_ws_sse": new_ws,
+            "new_ipc_sinks": new_ipc,
+            "new_origins": new_origins,
+            "removed_routes_count": removed_routes,
+        });
+    }
+
     if !route_lines.is_empty() {
         out.push(format!(
-            "\n## API / HTTP Routes (showing {}/{})\n{}",
+            "\n## API / HTTP Routes (risk-ranked {}/{})\n{}",
             route_lines.len(),
-            route_map.len(),
+            acc.route_map.len(),
             route_lines.join("\n")
         ));
     }
-    if !post_messages.is_empty() {
-        let pm_lines: Vec<String> = post_messages
+    if !acc.graphql_ops.is_empty() {
+        let gl: Vec<String> = acc
+            .graphql_ops
+            .iter()
+            .take(40)
+            .map(|(k, nm, ln, _, file)| match file {
+                Some(rf) => format!("- `{k}` `{nm}` ({rf}:L{ln})"),
+                None => format!("- `{k}` `{nm}` (L{ln})"),
+            })
+            .collect();
+        out.push(format!(
+            "\n## GraphQL Operations ({}/{})\n{}",
+            gl.len(),
+            acc.graphql_ops.len(),
+            gl.join("\n")
+        ));
+    }
+    if !acc.ws_sse.is_empty() {
+        let wl: Vec<String> = acc
+            .ws_sse
+            .iter()
+            .take(30)
+            .map(|(k, ep, ln, _, file)| match file {
+                Some(rf) => format!("- `{k}` `{ep}` ({rf}:L{ln})"),
+                None => format!("- `{k}` `{ep}` (L{ln})"),
+            })
+            .collect();
+        out.push(format!(
+            "\n## WebSocket / SSE Endpoints ({}/{})\n{}",
+            wl.len(),
+            acc.ws_sse.len(),
+            wl.join("\n")
+        ));
+    }
+    if !acc.post_messages.is_empty() {
+        let pm_lines: Vec<String> = acc
+            .post_messages
             .iter()
             .map(|p| {
                 let flag = if p["missing_origin_check"].as_bool().unwrap_or(false) {
@@ -2110,12 +2535,11 @@ pub fn extract_js_routes_md(
                 } else {
                     " [origin-checked]"
                 };
-                format!(
-                    "- L{} (@{}){flag}: `{}`",
-                    p["line"],
-                    p["offset"],
-                    p["snippet"].as_str().unwrap_or("")
-                )
+                let loc = match p["file"].as_str() {
+                    Some(rf) => format!("{rf}:L{} (@{})", p["line"], p["offset"]),
+                    None => format!("L{} (@{})", p["line"], p["offset"]),
+                };
+                format!("- {loc}{flag}: `{}`", p["snippet"].as_str().unwrap_or(""))
             })
             .collect();
         out.push(format!(
@@ -2123,16 +2547,19 @@ pub fn extract_js_routes_md(
             pm_lines.join("\n")
         ));
     }
-    if !dom_sinks.is_empty() {
-        let sk_lines: Vec<String> = dom_sinks
+    if !acc.dom_sinks.is_empty() {
+        let sk_lines: Vec<String> = acc
+            .dom_sinks
             .iter()
             .take(25)
             .map(|s| {
+                let loc = match s["file"].as_str() {
+                    Some(rf) => format!("{rf}:L{}, @{}", s["line"], s["offset"]),
+                    None => format!("L{}, @{}", s["line"], s["offset"]),
+                };
                 format!(
-                    "- `{}` (L{}, @{}): `{}`",
+                    "- `{}` ({loc}): `{}`",
                     s["sink"].as_str().unwrap_or(""),
-                    s["line"],
-                    s["offset"],
                     s["snippet"].as_str().unwrap_or("")
                 )
             })
@@ -2140,25 +2567,28 @@ pub fn extract_js_routes_md(
         out.push(format!(
             "\n## Client-Side DOM / Eval / Navigation Sinks (showing {}/{})\n{}",
             sk_lines.len(),
-            dom_sinks.len(),
+            acc.dom_sinks.len(),
             sk_lines.join("\n")
         ));
     }
-    if !local_ipc_sinks.is_empty() {
-        let ipc_lines: Vec<String> = local_ipc_sinks
+    if !acc.local_ipc_sinks.is_empty() {
+        let ipc_lines: Vec<String> = acc
+            .local_ipc_sinks
             .iter()
-            .take(20)
+            .take(25)
             .map(|s| {
                 let flag = if s["missing_origin_or_auth"].as_bool().unwrap_or(false) {
                     " **[NO-ORIGIN-OR-AUTH-CHECK]**"
                 } else {
                     ""
                 };
+                let loc = match s["file"].as_str() {
+                    Some(rf) => format!("{rf}:L{}, @{}", s["line"], s["offset"]),
+                    None => format!("L{}, @{}", s["line"], s["offset"]),
+                };
                 format!(
-                    "- `{}` (L{}, @{}){flag}: `{}`",
+                    "- `{}` ({loc}){flag}: `{}`",
                     s["kind"].as_str().unwrap_or(""),
-                    s["line"],
-                    s["offset"],
                     s["snippet"].as_str().unwrap_or("")
                 )
             })
@@ -2168,20 +2598,22 @@ pub fn extract_js_routes_md(
             ipc_lines.join("\n")
         ));
     }
-    if !lazy_chunks.is_empty() {
-        let ch_list: Vec<String> = lazy_chunks
+    if !acc.lazy_chunks.is_empty() {
+        let ch_list: Vec<String> = acc
+            .lazy_chunks
             .iter()
             .take(30)
             .map(|c| format!("`{c}`"))
             .collect();
         out.push(format!(
             "\n## Lazy Webpack / Vite Chunks ({})\n{}",
-            lazy_chunks.len(),
+            acc.lazy_chunks.len(),
             ch_list.join(", ")
         ));
     }
-    if !custom_headers.is_empty() {
-        let h_list: Vec<String> = custom_headers
+    if !acc.custom_headers.is_empty() {
+        let h_list: Vec<String> = acc
+            .custom_headers
             .iter()
             .take(25)
             .map(|h| format!("`{h}`"))
@@ -2191,34 +2623,203 @@ pub fn extract_js_routes_md(
             h_list.join(", ")
         ));
     }
-    if !origins.is_empty() {
-        let org_list: Vec<String> = origins.iter().take(40).map(|o| format!("`{o}`")).collect();
+    if !acc.origins.is_empty() {
+        let org_list: Vec<String> = acc
+            .origins
+            .iter()
+            .take(40)
+            .map(|o| format!("`{o}`"))
+            .collect();
         out.push(format!("\n## External Origins\n{}", org_list.join(", ")));
     }
 
-    let origins_vec: Vec<String> = origins.into_iter().take(80).collect();
-    let chunks_vec: Vec<String> = lazy_chunks.into_iter().take(50).collect();
-    let headers_vec: Vec<String> = custom_headers.into_iter().take(30).collect();
-    let jv = serde_json::json!({
+    let graphql_json: Vec<serde_json::Value> = acc
+        .graphql_ops
+        .iter()
+        .take(80)
+        .map(|(k, nm, ln, off, file)| {
+            let mut o = serde_json::json!({"kind": k, "name": nm, "line": ln, "offset": off});
+            if let Some(rf) = file {
+                o["file"] = serde_json::json!(rf);
+            }
+            o
+        })
+        .collect();
+    let ws_json: Vec<serde_json::Value> = acc
+        .ws_sse
+        .iter()
+        .take(60)
+        .map(|(k, ep, ln, off, file)| {
+            let mut o = serde_json::json!({"kind": k, "endpoint": ep, "line": ln, "offset": off});
+            if let Some(rf) = file {
+                o["file"] = serde_json::json!(rf);
+            }
+            o
+        })
+        .collect();
+    let origins_vec: Vec<String> = acc.origins.into_iter().take(80).collect();
+    let chunks_vec: Vec<String> = acc.lazy_chunks.into_iter().take(50).collect();
+    let headers_vec: Vec<String> = acc.custom_headers.into_iter().take(30).collect();
+    let mut jv = serde_json::json!({
         "target": label,
+        "scanned_files": acc.scanned_files,
         "counts": {
-            "routes": route_map.len(),
-            "post_message": post_messages.len(),
-            "local_server_ipc": local_ipc_sinks.len(),
-            "dom_sinks": dom_sinks.len(),
+            "routes": acc.route_map.len(),
+            "graphql": graphql_json.len(),
+            "ws_sse": ws_json.len(),
+            "post_message": acc.post_messages.len(),
+            "local_server_ipc": acc.local_ipc_sinks.len(),
+            "dom_sinks": acc.dom_sinks.len(),
             "lazy_chunks": chunks_vec.len(),
             "custom_headers": headers_vec.len(),
             "origins": origins_vec.len(),
         },
         "routes": routes_json,
-        "post_message_handlers": post_messages,
-        "local_server_and_ipc": local_ipc_sinks,
-        "client_sinks": dom_sinks,
+        "graphql_ops": graphql_json,
+        "ws_sse_endpoints": ws_json,
+        "post_message_handlers": acc.post_messages,
+        "local_server_and_ipc": acc.local_ipc_sinks,
+        "client_sinks": acc.dom_sinks,
         "lazy_chunks": chunks_vec,
         "custom_headers": headers_vec,
         "external_origins": origins_vec,
     });
+    if !diff_json.is_null() {
+        jv["diff"] = diff_json;
+    }
     (out.join("\n"), jv)
+}
+
+pub fn extract_js_routes_md(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+) -> (String, serde_json::Value) {
+    let mut acc = JsSurfaceData::default();
+    collect_js_surface_into(text, None, query, &mut acc);
+    render_js_surface(acc, label, None)
+}
+
+pub fn extract_js_routes_diff_md(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+    old_text: &str,
+    old_label: &str,
+) -> (String, serde_json::Value) {
+    let mut acc = JsSurfaceData::default();
+    collect_js_surface_into(text, None, query, &mut acc);
+    let mut old_acc = JsSurfaceData::default();
+    collect_js_surface_into(old_text, None, query, &mut old_acc);
+    render_js_surface(acc, label, Some((&old_acc, old_label)))
+}
+
+fn collect_surface_for_path(
+    path: &std::path::Path,
+    query: Option<&str>,
+    max_files: usize,
+) -> Result<(JsSurfaceData, String), (i32, String)> {
+    if path.is_file() {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            (
+                1,
+                format!(
+                    "[ap read --routes] failed to read `{}`: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+        let mut acc = JsSurfaceData::default();
+        collect_js_surface_into(&raw, None, query, &mut acc);
+        return Ok((acc, path.display().to_string()));
+    }
+    if !path.is_dir() {
+        return Err((
+            1,
+            format!("[ap read --routes] path not found: `{}`", path.display()),
+        ));
+    }
+
+    let walker = ignore::WalkBuilder::new(path)
+        .git_ignore(true)
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let nm = e.file_name().to_string_lossy();
+                return !matches!(
+                    nm.as_ref(),
+                    ".git" | "node_modules" | "target" | "__pycache__" | ".venv" | "venv"
+                );
+            }
+            true
+        })
+        .build();
+
+    let mut files: Vec<(bool, String, std::path::PathBuf)> = Vec::new();
+    for entry in walker.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let p = entry.path();
+        let name_low = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name_low.ends_with(".d.ts") {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            ext.as_str(),
+            "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "html" | "htm"
+        ) {
+            continue;
+        }
+        if let Ok(meta) = p.metadata() {
+            if meta.len() > 24 * 1024 * 1024 {
+                continue;
+            }
+        }
+        let rel = p
+            .strip_prefix(path)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let rel_low = rel.to_ascii_lowercase();
+        let is_vendor = rel_low.contains("vendor") || rel_low.contains("polyfill");
+        files.push((is_vendor, rel, p.to_path_buf()));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut acc = JsSurfaceData::default();
+    for (_, rel, fp) in files.into_iter().take(max_files) {
+        if let Ok(raw) = std::fs::read_to_string(&fp) {
+            collect_js_surface_into(&raw, Some(&rel), query, &mut acc);
+        }
+    }
+    Ok((acc, path.display().to_string()))
+}
+
+/// Pure-Rust `<100ms` recursive JS/TS/HTML bundle directory surface extractor with optional cross-build `--diff`.
+pub fn extract_js_dir_routes_md(
+    dir: &std::path::Path,
+    query: Option<&str>,
+    old_path: Option<&std::path::Path>,
+) -> Result<(String, serde_json::Value), (i32, String)> {
+    let (acc, label) = collect_surface_for_path(dir, query, 120)?;
+    if let Some(op) = old_path {
+        let (old_acc, old_label) = collect_surface_for_path(op, query, 120)?;
+        Ok(render_js_surface(acc, &label, Some((&old_acc, &old_label))))
+    } else {
+        Ok(render_js_surface(acc, &label, None))
+    }
 }
 
 fn redact_secret(raw: &str) -> String {
@@ -4020,6 +4621,78 @@ mod inspect_tests {
         );
         assert_eq!(jv["counts"]["post_message"], 2);
         assert_eq!(jv["counts"]["lazy_chunks"], 1);
+    }
+
+    #[test]
+    fn extracts_graphql_ws_ipc_risk_ranking_and_dir_diff() {
+        let dir_old = std::env::temp_dir().join(format!("ap_js_dir_old_{}", std::process::id()));
+        let dir_new = std::env::temp_dir().join(format!("ap_js_dir_new_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_old);
+        let _ = std::fs::remove_dir_all(&dir_new);
+        std::fs::create_dir_all(dir_old.join("dist")).unwrap();
+        std::fs::create_dir_all(dir_new.join("dist")).unwrap();
+        std::fs::create_dir_all(dir_new.join("node_modules/pkg")).unwrap();
+
+        std::fs::write(
+            dir_old.join("dist/app.js"),
+            r#"fetch("/api/v1/health"); const q = "query GetHealth { ok }";"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_new.join("node_modules/pkg/ignored.js"),
+            r#"fetch("/api/v1/should_skip_node_modules");"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_new.join("dist/main.js"),
+            r#"
+fetch("/api/v1/health");
+axios.delete("/api/v2/admin/tenant/:id", { tenantId: id, reason: r });
+const m = "mutation DeleteTenant($id: ID!) { deleteTenant(id: $id) { ok } }";
+const ws = new WebSocket("wss://stream.acme.test/events");
+ipcRenderer.invoke("bridge:openPath", { file: target });
+webview.loadURL(nextUrl);
+window.parent.postMessage(payload, '*');
+"#,
+        )
+        .unwrap();
+
+        let (md, jv) =
+            extract_js_dir_routes_md(&dir_new, None, Some(&dir_old)).expect("dir routes diff ok");
+        // High-risk DELETE + SENSITIVE + PARAM route must rank before GET/FETCH /api/v1/health
+        assert_eq!(jv["routes"][0]["path"], "/api/v2/admin/tenant/:id");
+        assert!(md.contains("tenantId"), "missing param hint in:\n{md}");
+        assert!(
+            md.contains("DeleteTenant"),
+            "missing GraphQL mutation in:\n{md}"
+        );
+        assert!(
+            md.contains("wss://stream.acme.test/events"),
+            "missing WS endpoint in:\n{md}"
+        );
+        assert!(
+            md.contains("ipcRenderer.invoke"),
+            "missing ipcRenderer in:\n{md}"
+        );
+        assert!(
+            md.contains("webview.loadURL"),
+            "missing webview.loadURL in:\n{md}"
+        );
+        assert!(
+            !md.contains("should_skip_node_modules"),
+            "node_modules must be skipped"
+        );
+        assert_eq!(
+            jv["diff"]["new_routes"][0]["path"],
+            "/api/v2/admin/tenant/:id"
+        );
+        assert_eq!(jv["diff"]["new_graphql"][0]["name"], "DeleteTenant");
+        assert_eq!(
+            jv["diff"]["new_ws_sse"][0]["endpoint"],
+            "wss://stream.acme.test/events"
+        );
+        let _ = std::fs::remove_dir_all(&dir_old);
+        let _ = std::fs::remove_dir_all(&dir_new);
     }
 
     #[test]

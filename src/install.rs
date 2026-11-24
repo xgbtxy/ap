@@ -2177,10 +2177,23 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (next.includes("tools.mcp__agent-primitives__")) {{
 		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
 	}}
-	if (/\btools\.ap_[a-z_]+\b/.test(next)) {{
-		next = next.replace(/\btools\.(ap_[a-z_]+)\b/g, (m, name: string) =>
-			AP_MCP_TOOL_NAMES.has(name) ? `tools.mcp__agent_primitives__${{name}}` : m,
+	if (/\btools\??\.ap_[a-z_]+\b/.test(next)) {{
+		next = next.replace(/\btools(\??\.)(ap_[a-z_]+)\b/g, (m, sep: string, name: string) =>
+			AP_MCP_TOOL_NAMES.has(name) ? `tools${{sep}}mcp__agent_primitives__${{name}}` : m,
 		);
+	}}
+	if (/\btools\[['"]ap_[a-z_]+['"]\]/.test(next)) {{
+		next = next.replace(/\btools\[(['"])(ap_[a-z_]+)\1\]/g, (m, q: string, name: string) =>
+			AP_MCP_TOOL_NAMES.has(name) ? `tools[${{q}}mcp__agent_primitives__${{name}}${{q}}]` : m,
+		);
+	}}
+	if (/\bdescribeTool\(['"]ap_[a-z_]+['"]\)/.test(next)) {{
+		next = next.replace(/\bdescribeTool\((['"])(ap_[a-z_]+)\1\)/g, (m, q: string, name: string) =>
+			AP_MCP_TOOL_NAMES.has(name) ? `describeTool(${{q}}mcp__agent_primitives__${{name}}${{q}})` : m,
+		);
+	}}
+	if (/\btools\.(?:describeTool|searchTools|describeNamespace)\b/.test(next)) {{
+		next = next.replace(/\btools\.(describeTool|searchTools|describeNamespace)\b/g, "$1");
 	}}
 	if (next.includes("String.raw`")) {{
 		next = next.replace(
@@ -2269,6 +2282,30 @@ export function sieveCodemodeContentBlocks(
 	}}
 	if (!shouldAutoSieveShellOutput(sieveInput, isFastModel, hardLimitOverride, contextTokens)) {{
 		return undefined;
+	}}
+	// Lossless whitespace compaction on pretty-printed JSON before invoking `ap sieve`
+	const trimmedJson = sieveInput.trim();
+	if (
+		(trimmedJson.startsWith("{{") && trimmedJson.endsWith("}}")) ||
+		(trimmedJson.startsWith("[") && trimmedJson.endsWith("]"))
+	) {{
+		try {{
+			const compacted = JSON.stringify(JSON.parse(trimmedJson));
+			if (
+				compacted &&
+				compacted.length < sieveInput.length * 0.9 &&
+				!shouldAutoSieveShellOutput(compacted, isFastModel, hardLimitOverride, contextTokens)
+			) {{
+				const finalCompact = errorTail ? `${{compacted}}\n\n${{errorTail}}` : compacted;
+				const outCompact: Array<{{ type?: string; text?: string; [k: string]: unknown }}> = [];
+				if (hasHeader) outCompact.push(first);
+				outCompact.push(...preservedNonText);
+				outCompact.push({{ type: "text", text: finalCompact }});
+				return outCompact;
+			}}
+		}} catch {{
+			// Fall through to full `ap sieve`
+		}}
 	}}
 	const digested = sieveFn(sieveInput);
 	if (!digested || digested.length <= 40 || digested.length >= sieveInput.length * 0.78) {{

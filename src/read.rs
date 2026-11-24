@@ -1183,6 +1183,33 @@ fn read_single_target(
             return Err((1, format!("[ap read] path not found: {target}")));
         }
         if p.is_dir() {
+            if cli.routes {
+                let old_path = cli.diff.as_deref().map(|s| {
+                    let norm_old = crate::ls::normalize_cli_path(s);
+                    std::path::PathBuf::from(norm_old)
+                });
+                let (rendered, jv_inner) = crate::inspect::extract_js_dir_routes_md(
+                    p,
+                    cli.query.as_deref(),
+                    old_path.as_deref(),
+                )?;
+                record_event(
+                    "read",
+                    rendered.len() as u64,
+                    rendered.len() as u64,
+                    0,
+                    1,
+                    "js-dir-routes",
+                );
+                let jv = json!({
+                    "ok": true,
+                    "target": target,
+                    "format": "js-dir-routes",
+                    "surface": jv_inner,
+                    "content": rendered,
+                });
+                return Ok((rendered, jv));
+            }
             let data = ap_atlas::scan_workspace(p, "", 35, 14);
             let md = ap_atlas::render_atlas_md(&data);
             return Ok((
@@ -1274,109 +1301,113 @@ fn read_single_target(
         return Ok((rendered, jv));
     }
 
-    if let Some(ref old_path_str) = cli.diff {
-        let norm_old = crate::ls::normalize_cli_path(old_path_str);
-        let old_p = Path::new(&norm_old);
-        let old_bytes = fs::read(old_p).map_err(|e| {
-            (
+    if !cli.routes {
+        if let Some(ref old_path_str) = cli.diff {
+            let norm_old = crate::ls::normalize_cli_path(old_path_str);
+            let old_p = Path::new(&norm_old);
+            let old_bytes = fs::read(old_p).map_err(|e| {
+                (
+                    1,
+                    format!("[ap read --diff] failed to read `{old_path_str}`: {e}"),
+                )
+            })?;
+            if !crate::binary::is_binary_magic(&raw_bytes)
+                && !crate::binary::is_binary_magic(&old_bytes)
+            {
+                if let (Ok(new_v), Ok(old_v)) = (
+                    serde_json::from_slice::<serde_json::Value>(&raw_bytes),
+                    serde_json::from_slice::<serde_json::Value>(&old_bytes),
+                ) {
+                    if matches!(
+                        new_v,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    ) && matches!(
+                        old_v,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    ) {
+                        let (rendered, json_diff) = crate::inspect::diff_json_structural_md(
+                            &new_v, &old_v, &label, &norm_old,
+                        );
+                        record_event(
+                            "read",
+                            (raw_bytes.len() + old_bytes.len()) as u64,
+                            rendered.len() as u64,
+                            0,
+                            1,
+                            "json-diff",
+                        );
+                        let jv = json!({
+                            "ok": true,
+                            "target": label,
+                            "old_target": norm_old,
+                            "format": "json-diff",
+                            "json_diff": json_diff,
+                            "content": rendered,
+                        });
+                        return Ok((rendered, jv));
+                    }
+                }
+                let old_ext = old_p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let (new_txt, _, _) = decode_any_bytes(&raw_bytes);
+                let (old_txt, _, _) = decode_any_bytes(&old_bytes);
+                if let (Some((_, new_v)), Some((_, old_v))) = (
+                    crate::inspect::parse_structured_config_to_json(&new_txt, &ext),
+                    crate::inspect::parse_structured_config_to_json(&old_txt, &old_ext),
+                ) {
+                    if matches!(
+                        new_v,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    ) && matches!(
+                        old_v,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    ) {
+                        let (rendered, json_diff) = crate::inspect::diff_json_structural_md(
+                            &new_v, &old_v, &label, &norm_old,
+                        );
+                        record_event(
+                            "read",
+                            (raw_bytes.len() + old_bytes.len()) as u64,
+                            rendered.len() as u64,
+                            0,
+                            1,
+                            "config-diff",
+                        );
+                        let jv = json!({
+                            "ok": true,
+                            "target": label,
+                            "old_target": norm_old,
+                            "format": "config-diff",
+                            "json_diff": json_diff,
+                            "content": rendered,
+                        });
+                        return Ok((rendered, jv));
+                    }
+                }
+            }
+            let rendered = crate::binary::diff_binaries_or_archives_md(
+                &raw_bytes, &old_bytes, &label, &norm_old, &ext,
+            );
+            record_event(
+                "read",
+                (raw_bytes.len() + old_bytes.len()) as u64,
+                rendered.len() as u64,
+                0,
                 1,
-                format!("[ap read --diff] failed to read `{old_path_str}`: {e}"),
-            )
-        })?;
-        if !crate::binary::is_binary_magic(&raw_bytes)
-            && !crate::binary::is_binary_magic(&old_bytes)
-        {
-            if let (Ok(new_v), Ok(old_v)) = (
-                serde_json::from_slice::<serde_json::Value>(&raw_bytes),
-                serde_json::from_slice::<serde_json::Value>(&old_bytes),
-            ) {
-                if matches!(
-                    new_v,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                ) && matches!(
-                    old_v,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                ) {
-                    let (rendered, json_diff) =
-                        crate::inspect::diff_json_structural_md(&new_v, &old_v, &label, &norm_old);
-                    record_event(
-                        "read",
-                        (raw_bytes.len() + old_bytes.len()) as u64,
-                        rendered.len() as u64,
-                        0,
-                        1,
-                        "json-diff",
-                    );
-                    let jv = json!({
-                        "ok": true,
-                        "target": label,
-                        "old_target": norm_old,
-                        "format": "json-diff",
-                        "json_diff": json_diff,
-                        "content": rendered,
-                    });
-                    return Ok((rendered, jv));
-                }
-            }
-            let old_ext = old_p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let (new_txt, _, _) = decode_any_bytes(&raw_bytes);
-            let (old_txt, _, _) = decode_any_bytes(&old_bytes);
-            if let (Some((_, new_v)), Some((_, old_v))) = (
-                crate::inspect::parse_structured_config_to_json(&new_txt, &ext),
-                crate::inspect::parse_structured_config_to_json(&old_txt, &old_ext),
-            ) {
-                if matches!(
-                    new_v,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                ) && matches!(
-                    old_v,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                ) {
-                    let (rendered, json_diff) =
-                        crate::inspect::diff_json_structural_md(&new_v, &old_v, &label, &norm_old);
-                    record_event(
-                        "read",
-                        (raw_bytes.len() + old_bytes.len()) as u64,
-                        rendered.len() as u64,
-                        0,
-                        1,
-                        "config-diff",
-                    );
-                    let jv = json!({
-                        "ok": true,
-                        "target": label,
-                        "old_target": norm_old,
-                        "format": "config-diff",
-                        "json_diff": json_diff,
-                        "content": rendered,
-                    });
-                    return Ok((rendered, jv));
-                }
-            }
+                "binary-diff",
+            );
+            let jv = json!({
+                "ok": true,
+                "target": label,
+                "old_target": norm_old,
+                "format": "binary-diff",
+                "content": rendered,
+            });
+            return Ok((rendered, jv));
         }
-        let rendered = crate::binary::diff_binaries_or_archives_md(
-            &raw_bytes, &old_bytes, &label, &norm_old, &ext,
-        );
-        record_event(
-            "read",
-            (raw_bytes.len() + old_bytes.len()) as u64,
-            rendered.len() as u64,
-            0,
-            1,
-            "binary-diff",
-        );
-        let jv = json!({
-            "ok": true,
-            "target": label,
-            "old_target": norm_old,
-            "format": "binary-diff",
-            "content": rendered,
-        });
-        return Ok((rendered, jv));
     }
 
     if let Some(ref addr_spec) = cli.rva {
@@ -1569,6 +1600,33 @@ fn read_single_target(
             crate::inspect::extract_har_routes_md(&decoded_txt, &label, cli.query.as_deref())
         {
             (h_md, h_jv, "har-routes")
+        } else if let Some(ref old_path_str) = cli.diff {
+            let norm_old = crate::ls::normalize_cli_path(old_path_str);
+            let old_p = Path::new(&norm_old);
+            if old_p.is_dir() {
+                crate::inspect::extract_js_dir_routes_md(
+                    Path::new(&target),
+                    cli.query.as_deref(),
+                    Some(old_p),
+                )
+                .map(|(m, j)| (m, j, "js-routes"))?
+            } else {
+                let old_bytes = fs::read(old_p).map_err(|e| {
+                    (
+                        1,
+                        format!("[ap read --routes --diff] failed to read `{old_path_str}`: {e}"),
+                    )
+                })?;
+                let (old_txt, _, _) = decode_any_bytes(&old_bytes);
+                let (j_md, j_jv) = crate::inspect::extract_js_routes_diff_md(
+                    &decoded_txt,
+                    &label,
+                    cli.query.as_deref(),
+                    &old_txt,
+                    old_path_str,
+                );
+                (j_md, j_jv, "js-routes")
+            }
         } else {
             let (j_md, j_jv) =
                 crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());

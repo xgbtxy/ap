@@ -57,6 +57,14 @@ pub(crate) const NOTABLE_SINKS: &[&str] = &[
     "dangerouslySetInnerHTML",
 ];
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallArgInfo {
     pub callee: String,
@@ -64,6 +72,10 @@ pub struct CallArgInfo {
     pub arg_taint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arg_preview: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_param_masks: Vec<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub arg_const_mask: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +89,17 @@ pub struct FnDef {
     pub guard_lines: Vec<(usize, String)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_args: Vec<CallArgInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub return_param_mask: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FnSummary {
+    pub param_to_return: u32,
+    pub param_to_sinks: HashMap<String, u32>,
+    pub any_sink_mask: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +124,8 @@ pub struct ReachabilityHop {
     pub arg_taint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arg_preview: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub taint_via_summary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,7 +216,7 @@ fn node_name(node: Node, src: &[u8]) -> Option<String> {
     None
 }
 
-fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
+fn collect_param_idents_ordered(node: Node, src: &[u8], out: &mut Vec<String>) {
     let k = node.kind();
     if k.contains("type") && k != "typed_parameter" && k != "typed_default_parameter" {
         return;
@@ -199,8 +224,13 @@ fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
     if matches!(k, "identifier" | "shorthand_property_identifier_pattern") {
         if let Ok(s) = node.utf8_text(src) {
             let t = s.trim();
-            if !t.is_empty() && t != "self" && t != "this" {
-                out.insert(t.to_string());
+            if !t.is_empty()
+                && t != "self"
+                && t != "this"
+                && out.len() < 32
+                && !out.iter().any(|existing| existing == t)
+            {
+                out.push(t.to_string());
             }
         }
         return;
@@ -210,27 +240,47 @@ fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
         if ch.kind().contains("type_annotation") || ch.kind() == "type" {
             continue;
         }
-        collect_param_idents(ch, src, out);
+        collect_param_idents_ordered(ch, src, out);
     }
 }
 
-fn find_param_names(fn_node: Node, src: &[u8]) -> HashSet<String> {
-    let mut params = HashSet::new();
+fn find_param_names(fn_node: Node, src: &[u8]) -> Vec<String> {
+    let mut params = Vec::new();
     for field in ["parameters", "parameter_list", "formal_parameters"] {
         if let Some(pn) = fn_node.child_by_field_name(field) {
-            collect_param_idents(pn, src, &mut params);
+            collect_param_idents_ordered(pn, src, &mut params);
         }
     }
     if params.is_empty() {
         if let Some(decl) = fn_node.child_by_field_name("declarator") {
             for field in ["parameters", "parameter_list"] {
                 if let Some(pn) = decl.child_by_field_name(field) {
-                    collect_param_idents(pn, src, &mut params);
+                    collect_param_idents_ordered(pn, src, &mut params);
                 }
             }
         }
     }
     params
+}
+
+fn param_bit(ident: &str, params: &[String]) -> u32 {
+    params
+        .iter()
+        .position(|p| p == ident)
+        .filter(|&i| i < 32)
+        .map(|i| 1u32 << i)
+        .unwrap_or(0)
+}
+
+fn is_sanitizer_callee(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low.starts_with("escape")
+        || low.starts_with("sanitize")
+        || low.starts_with("validate")
+        || matches!(
+            low.as_str(),
+            "parseint" | "parsefloat" | "number" | "boolean" | "string" | "encodeuricomponent"
+        )
 }
 
 fn is_const_literal_expr(node: Node, src: &[u8], const_vars: &HashSet<String>) -> bool {
@@ -303,25 +353,50 @@ fn is_const_literal_expr(node: Node, src: &[u8], const_vars: &HashSet<String>) -
     false
 }
 
-fn expr_contains_param(node: Node, src: &[u8], params: &HashSet<String>) -> bool {
+fn expr_param_mask(
+    node: Node,
+    src: &[u8],
+    params: &[String],
+    tainted_vars: &HashMap<String, u32>,
+) -> u32 {
     let k = node.kind();
-    if k.contains("comment") || k.contains("string") && k != "template_string" {
-        return false;
+    if k.contains("comment") || (k.contains("string") && k != "template_string") {
+        return 0;
     }
-    if matches!(k, "identifier" | "field_identifier" | "property_identifier") {
-        if let Ok(s) = node.utf8_text(src) {
-            if params.contains(s.trim()) {
-                return true;
+    if matches!(k, "call_expression" | "call") {
+        if let Some(fn_node) = node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0))
+        {
+            if let Some(nm) = extract_callee_short_name(fn_node, src) {
+                if is_sanitizer_callee(&nm) {
+                    return 0;
+                }
             }
         }
     }
+    if matches!(
+        k,
+        "identifier" | "shorthand_property_identifier" | "field_identifier" | "property_identifier"
+    ) {
+        if let Ok(s) = node.utf8_text(src) {
+            let trimmed = s.trim();
+            let pb = param_bit(trimmed, params);
+            if pb != 0 {
+                return pb;
+            }
+            if let Some(&tb) = tainted_vars.get(trimmed) {
+                return tb;
+            }
+        }
+        return 0;
+    }
+    let mut mask = 0u32;
     let mut cur = node.walk();
     for ch in node.children(&mut cur) {
-        if expr_contains_param(ch, src, params) {
-            return true;
-        }
+        mask |= expr_param_mask(ch, src, params, tainted_vars);
     }
-    false
+    mask
 }
 
 fn extract_callee_short_name(fn_expr: Node, src: &[u8]) -> Option<String> {
@@ -350,41 +425,47 @@ fn extract_callee_short_name(fn_expr: Node, src: &[u8]) -> Option<String> {
     last
 }
 
-fn update_local_const_binding(node: Node, src: &[u8], const_vars: &mut HashSet<String>) {
+fn update_local_bindings(
+    node: Node,
+    src: &[u8],
+    params: &[String],
+    const_vars: &mut HashSet<String>,
+    tainted_vars: &mut HashMap<String, u32>,
+) {
     let k = node.kind();
-    if matches!(
+    let (lhs, rhs) = if matches!(
         k,
         "variable_declarator" | "init_declarator" | "let_declaration"
     ) {
-        let lhs = node
+        let l = node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("pattern"))
             .or_else(|| node.child_by_field_name("declarator"));
-        let rhs = node.child_by_field_name("value");
-        if let (Some(ln), Some(rn)) = (lhs, rhs) {
-            if let Ok(nm) = ln.utf8_text(src) {
-                let id = nm.trim();
-                if !id.is_empty() && !id.contains(' ') {
-                    if is_const_literal_expr(rn, src, const_vars) {
-                        const_vars.insert(id.to_string());
-                    } else {
-                        const_vars.remove(id);
-                    }
-                }
-            }
-        }
+        let r = node.child_by_field_name("value");
+        (l, r)
     } else if matches!(k, "assignment_expression" | "assignment") {
-        if let (Some(ln), Some(rn)) = (
+        (
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
-        ) {
-            if let Ok(nm) = ln.utf8_text(src) {
-                let id = nm.trim();
-                if !id.is_empty() && !id.contains(' ') {
-                    if is_const_literal_expr(rn, src, const_vars) {
-                        const_vars.insert(id.to_string());
+        )
+    } else {
+        return;
+    };
+
+    if let (Some(ln), Some(rn)) = (lhs, rhs) {
+        if let Ok(nm) = ln.utf8_text(src) {
+            let id = nm.trim();
+            if !id.is_empty() && !id.contains(' ') {
+                if is_const_literal_expr(rn, src, const_vars) {
+                    const_vars.insert(id.to_string());
+                    tainted_vars.remove(id);
+                } else {
+                    const_vars.remove(id);
+                    let m = expr_param_mask(rn, src, params, tainted_vars);
+                    if m != 0 {
+                        tainted_vars.insert(id.to_string(), m);
                     } else {
-                        const_vars.remove(id);
+                        tainted_vars.remove(id);
                     }
                 }
             }
@@ -392,19 +473,30 @@ fn update_local_const_binding(node: Node, src: &[u8], const_vars: &mut HashSet<S
     }
 }
 
-fn collect_called_idents(
-    node: Node,
-    src: &[u8],
-    params: &HashSet<String>,
-    const_vars: &mut HashSet<String>,
-    out: &mut Vec<(String, usize)>,
-    call_args: &mut Vec<CallArgInfo>,
-) {
+struct FnBodyState<'a> {
+    params: &'a [String],
+    const_vars: HashSet<String>,
+    tainted_vars: HashMap<String, u32>,
+    return_param_mask: u32,
+    idents: Vec<(String, usize)>,
+    call_args: Vec<CallArgInfo>,
+}
+
+fn collect_called_idents(node: Node, src: &[u8], st: &mut FnBodyState<'_>) {
     let k = node.kind();
     if k.contains("comment") || k.contains("string") || k == "template_string" {
         return;
     }
-    update_local_const_binding(node, src, const_vars);
+    update_local_bindings(
+        node,
+        src,
+        st.params,
+        &mut st.const_vars,
+        &mut st.tainted_vars,
+    );
+    if matches!(k, "return_statement" | "return_expression") {
+        st.return_param_mask |= expr_param_mask(node, src, st.params, &st.tainted_vars);
+    }
 
     if matches!(k, "call_expression" | "call" | "new_expression") {
         let callee_node = node
@@ -424,16 +516,26 @@ fn collect_called_idents(
                         value_args.push(ch);
                     }
                 }
+                let mut arg_param_masks = Vec::with_capacity(value_args.len().min(32));
+                let mut arg_const_mask = 0u32;
+                let mut combined_param_mask = 0u32;
+                for (idx, arg) in value_args.iter().enumerate() {
+                    let pm = expr_param_mask(*arg, src, st.params, &st.tainted_vars);
+                    if idx < 32 {
+                        arg_param_masks.push(pm);
+                        if pm == 0 && is_const_literal_expr(*arg, src, &st.const_vars) {
+                            arg_const_mask |= 1u32 << idx;
+                        }
+                    }
+                    combined_param_mask |= pm;
+                }
                 let taint = if value_args.is_empty()
                     || value_args
                         .iter()
-                        .all(|a| is_const_literal_expr(*a, src, const_vars))
+                        .all(|a| is_const_literal_expr(*a, src, &st.const_vars))
                 {
                     "CONST_LITERAL"
-                } else if value_args
-                    .iter()
-                    .any(|a| expr_contains_param(*a, src, params))
-                {
+                } else if combined_param_mask != 0 {
                     "PARAM_TAINTED"
                 } else {
                     "VAR_DYNAMIC"
@@ -450,11 +552,13 @@ fn collect_called_idents(
                             .collect::<String>()
                     })
                     .unwrap_or_default();
-                call_args.push(CallArgInfo {
+                st.call_args.push(CallArgInfo {
                     callee: callee_nm,
                     line: node.start_position().row + 1,
                     arg_taint: taint.to_string(),
                     arg_preview,
+                    arg_param_masks,
+                    arg_const_mask,
                 });
             }
         }
@@ -464,26 +568,175 @@ fn collect_called_idents(
         if let Ok(s) = node.utf8_text(src) {
             let trimmed = s.trim();
             if trimmed.len() >= 2 {
-                out.push((trimmed.to_string(), node.start_position().row + 1));
+                st.idents
+                    .push((trimmed.to_string(), node.start_position().row + 1));
             }
         }
     }
     let mut cur = node.walk();
     for ch in node.children(&mut cur) {
-        collect_called_idents(ch, src, params, const_vars, out, call_args);
+        collect_called_idents(ch, src, st);
     }
 }
 
-pub(crate) fn lookup_call_taint(f: &FnDef, callee: &str, line: usize) -> (String, String) {
-    if let Some(hit) = f
-        .call_args
+pub(crate) fn compute_callee_summaries(all_fns: &[FnDef]) -> HashMap<String, FnSummary> {
+    let mut summaries: HashMap<String, FnSummary> = HashMap::new();
+    for f in all_fns {
+        let entry = summaries.entry(f.name.clone()).or_default();
+        entry.param_to_return |= f.return_param_mask;
+        for c in &f.call_args {
+            if NOTABLE_SINKS.contains(&c.callee.as_str()) {
+                let m = c.arg_param_masks.iter().copied().fold(0u32, |a, b| a | b);
+                if m != 0 {
+                    *entry.param_to_sinks.entry(c.callee.clone()).or_insert(0) |= m;
+                    entry.any_sink_mask |= m;
+                }
+            }
+        }
+    }
+    // 2-pass bottom-up interprocedural propagation (entry -> mid -> leaf -> sink)
+    for _ in 0..2 {
+        let prev = summaries.clone();
+        for f in all_fns {
+            for c in &f.call_args {
+                let Some(callee_sum) = prev.get(&c.callee) else {
+                    continue;
+                };
+                if callee_sum.param_to_sinks.is_empty() && callee_sum.param_to_return == 0 {
+                    continue;
+                }
+                for (sink, &sink_pm) in &callee_sum.param_to_sinks {
+                    let mut caller_pm = 0u32;
+                    for (idx, &arg_pm) in c.arg_param_masks.iter().enumerate() {
+                        if idx < 32 && (sink_pm & (1u32 << idx)) != 0 {
+                            caller_pm |= arg_pm;
+                        }
+                    }
+                    if caller_pm != 0 {
+                        let s = summaries.entry(f.name.clone()).or_default();
+                        *s.param_to_sinks.entry(sink.clone()).or_insert(0) |= caller_pm;
+                        s.any_sink_mask |= caller_pm;
+                    }
+                }
+            }
+        }
+    }
+    summaries
+}
+
+pub(crate) fn lookup_call_arg<'a>(
+    f: &'a FnDef,
+    callee: &str,
+    line: usize,
+) -> Option<&'a CallArgInfo> {
+    f.call_args
         .iter()
         .find(|c| c.callee == callee && c.line == line)
         .or_else(|| f.call_args.iter().find(|c| c.callee == callee))
-    {
-        return (hit.arg_taint.clone(), hit.arg_preview.clone());
+}
+
+pub(crate) fn lookup_call_taint_with_summary(
+    f: &FnDef,
+    callee: &str,
+    line: usize,
+    sink_filter: Option<&str>,
+    summaries: &HashMap<String, FnSummary>,
+    active_param_mask: Option<u32>,
+    active_dynamic_mask: Option<u32>,
+) -> (String, String, bool) {
+    let Some(hit) = lookup_call_arg(f, callee, line) else {
+        return (String::new(), String::new(), false);
+    };
+
+    let mut via_summary = false;
+    let mut taint = hit.arg_taint.clone();
+
+    if let Some(active_pm) = active_param_mask {
+        let dyn_pm = active_dynamic_mask.unwrap_or(0);
+        if !hit.arg_param_masks.is_empty() {
+            let mut relevant_pm = 0u32;
+            let mut relevant_dyn = 0u32;
+            let mut all_slots_known_safe = true;
+            for (i, &pm) in hit.arg_param_masks.iter().enumerate() {
+                let is_const_slot = i < 32 && (hit.arg_const_mask & (1u32 << i)) != 0;
+                if is_const_slot {
+                    continue;
+                }
+                let pm_taint = pm & active_pm;
+                let pm_dyn = pm & dyn_pm;
+                relevant_pm |= pm_taint;
+                relevant_dyn |= pm_dyn;
+                if pm == 0 || pm_taint != 0 || pm_dyn != 0 {
+                    all_slots_known_safe = false;
+                }
+            }
+            if relevant_pm != 0 {
+                taint = "PARAM_TAINTED".to_string();
+                if active_pm != u32::MAX {
+                    via_summary = true;
+                }
+            } else if relevant_dyn != 0 {
+                taint = "VAR_DYNAMIC".to_string();
+                via_summary = true;
+            } else if all_slots_known_safe && taint != "CONST_LITERAL" {
+                taint = "CONST_LITERAL".to_string();
+                via_summary = true;
+            }
+        }
     }
-    (String::new(), String::new())
+
+    if let Some(sum) = summaries.get(callee) {
+        let sink_param_mask = if let Some(sq) = sink_filter {
+            let sq_norm = clean_fn_name(sq);
+            if sink_matches_query(callee, &sq_norm) {
+                sum.any_sink_mask
+            } else {
+                sum.param_to_sinks
+                    .iter()
+                    .filter(|(sk, _)| sink_matches_query(sk, &sq_norm))
+                    .fold(0u32, |acc, (_, &m)| acc | m)
+            }
+        } else {
+            sum.any_sink_mask
+        };
+        if sink_param_mask != 0 && !hit.arg_param_masks.is_empty() {
+            let gate = active_param_mask.unwrap_or(u32::MAX);
+            let dyn_gate = active_dynamic_mask.unwrap_or(0);
+            let mut taint_hits = 0u32;
+            let mut dyn_hits = 0u32;
+            let mut all_sinking_const = true;
+            let mut any_sinking_checked = false;
+            for (i, &pm) in hit.arg_param_masks.iter().enumerate() {
+                if i >= 32 || (sink_param_mask & (1u32 << i)) == 0 {
+                    continue;
+                }
+                any_sinking_checked = true;
+                let eff_pm = pm & gate;
+                let eff_dyn = pm & dyn_gate;
+                taint_hits |= eff_pm;
+                dyn_hits |= eff_dyn;
+                let is_const = (hit.arg_const_mask & (1u32 << i)) != 0
+                    || (pm != 0 && eff_pm == 0 && eff_dyn == 0);
+                if !is_const {
+                    all_sinking_const = false;
+                }
+            }
+            if any_sinking_checked {
+                if taint_hits != 0 {
+                    taint = "PARAM_TAINTED".to_string();
+                    via_summary = true;
+                } else if dyn_hits != 0 {
+                    taint = "VAR_DYNAMIC".to_string();
+                    via_summary = true;
+                } else if all_sinking_const {
+                    taint = "CONST_LITERAL".to_string();
+                    via_summary = true;
+                }
+            }
+        }
+    }
+
+    (taint, hit.arg_preview.clone(), via_summary)
 }
 
 fn is_cpp_ext(ext: &str) -> bool {
@@ -570,6 +823,8 @@ fn extract_cpp_fallback_fns(src: &str, src_lines: &[&str], rel: &str, out: &mut 
                             called_idents: idents,
                             guard_lines: extract_guard_lines(src_lines, start_line, end_line),
                             call_args: Vec::new(),
+                            params: Vec::new(),
+                            return_param_mask: 0,
                         });
                     }
                     i = end_idx + 1;
@@ -580,6 +835,43 @@ fn extract_cpp_fallback_fns(src: &str, src_lines: &[&str], rel: &str, out: &mut 
         i += 1;
     }
     let _ = src;
+}
+
+struct FnBodyFacts {
+    params: Vec<String>,
+    idents: Vec<(String, usize)>,
+    call_args: Vec<CallArgInfo>,
+    return_param_mask: u32,
+}
+
+fn collect_fn_body_facts(fn_node: Node, src: &[u8]) -> FnBodyFacts {
+    let params = find_param_names(fn_node, src);
+    let mut st = FnBodyState {
+        params: &params,
+        const_vars: HashSet::new(),
+        tainted_vars: HashMap::new(),
+        return_param_mask: 0,
+        idents: Vec::new(),
+        call_args: Vec::new(),
+    };
+    let target = fn_node.child_by_field_name("body").unwrap_or(fn_node);
+    collect_called_idents(target, src, &mut st);
+    if fn_node.kind() == "arrow_function"
+        && fn_node
+            .child_by_field_name("body")
+            .is_some_and(|b| b.kind() != "statement_block")
+    {
+        st.return_param_mask |= expr_param_mask(target, src, st.params, &st.tainted_vars);
+    }
+    let idents = st.idents;
+    let call_args = st.call_args;
+    let return_param_mask = st.return_param_mask;
+    FnBodyFacts {
+        params,
+        idents,
+        call_args,
+        return_param_mask,
+    }
 }
 
 fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut Vec<FnDef>) {
@@ -593,29 +885,7 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
     );
     if is_fn {
         if let Some(name) = node_name(node, src.as_bytes()) {
-            let params = find_param_names(node, src.as_bytes());
-            let mut const_vars = HashSet::new();
-            let mut idents = Vec::new();
-            let mut call_args = Vec::new();
-            if let Some(body) = node.child_by_field_name("body") {
-                collect_called_idents(
-                    body,
-                    src.as_bytes(),
-                    &params,
-                    &mut const_vars,
-                    &mut idents,
-                    &mut call_args,
-                );
-            } else {
-                collect_called_idents(
-                    node,
-                    src.as_bytes(),
-                    &params,
-                    &mut const_vars,
-                    &mut idents,
-                    &mut call_args,
-                );
-            }
+            let facts = collect_fn_body_facts(node, src.as_bytes());
             let start_line = node.start_position().row + 1;
             let end_line = node.end_position().row + 1;
             out.push(FnDef {
@@ -623,9 +893,11 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                 file: rel.to_string(),
                 start_line,
                 end_line,
-                called_idents: idents,
+                called_idents: facts.idents,
                 guard_lines: extract_guard_lines(src_lines, start_line, end_line),
-                call_args,
+                call_args: facts.call_args,
+                params: facts.params,
+                return_param_mask: facts.return_param_mask,
             });
         }
     } else if node.kind() == "variable_declarator" {
@@ -640,29 +912,7 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                 if let Ok(name) = nm_n.utf8_text(src.as_bytes()) {
                     let clean_name = name.trim();
                     if !clean_name.is_empty() {
-                        let params = find_param_names(val_n, src.as_bytes());
-                        let mut const_vars = HashSet::new();
-                        let mut idents = Vec::new();
-                        let mut call_args = Vec::new();
-                        if let Some(body) = val_n.child_by_field_name("body") {
-                            collect_called_idents(
-                                body,
-                                src.as_bytes(),
-                                &params,
-                                &mut const_vars,
-                                &mut idents,
-                                &mut call_args,
-                            );
-                        } else {
-                            collect_called_idents(
-                                val_n,
-                                src.as_bytes(),
-                                &params,
-                                &mut const_vars,
-                                &mut idents,
-                                &mut call_args,
-                            );
-                        }
+                        let facts = collect_fn_body_facts(val_n, src.as_bytes());
                         let start_line = node.start_position().row + 1;
                         let end_line = val_n.end_position().row + 1;
                         out.push(FnDef {
@@ -670,9 +920,11 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                             file: rel.to_string(),
                             start_line,
                             end_line,
-                            called_idents: idents,
+                            called_idents: facts.idents,
                             guard_lines: extract_guard_lines(src_lines, start_line, end_line),
-                            call_args,
+                            call_args: facts.call_args,
+                            params: facts.params,
+                            return_param_mask: facts.return_param_mask,
                         });
                     }
                 }
@@ -709,6 +961,7 @@ fn sink_matches_query(ident: &str, query_norm: &str) -> bool {
 
 fn compute_reachability_paths(
     all_fns: &[FnDef],
+    summaries: &HashMap<String, FnSummary>,
     target_norm: &str,
     to_sink: Option<&str>,
     include_sinks: bool,
@@ -736,19 +989,37 @@ fn compute_reachability_paths(
     }
 
     let limit = max_depth.clamp(1, 8);
-    let mut queue: VecDeque<(usize, Vec<ReachabilityHop>)> = VecDeque::new();
-    let mut visited_depth: HashMap<usize, usize> = HashMap::new();
+    // Queue carries (fn_idx, hops, active_param_mask, active_dynamic_mask)
+    let mut queue: VecDeque<(usize, Vec<ReachabilityHop>, u32, u32)> = VecDeque::new();
+    let mut visited_depth: HashMap<(usize, u32), usize> = HashMap::new();
     for s_idx in &start_indices {
-        visited_depth.insert(*s_idx, 0);
-        queue.push_back((*s_idx, Vec::new()));
+        let init_mask = if all_fns[*s_idx].params.is_empty() {
+            0
+        } else if all_fns[*s_idx].params.len() >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << all_fns[*s_idx].params.len()) - 1
+        };
+        visited_depth.insert((*s_idx, init_mask), 0);
+        queue.push_back((*s_idx, Vec::new(), init_mask, 0));
     }
 
     let mut paths: Vec<ReachabilityPath> = Vec::new();
     let mut seen_signatures: HashSet<String> = HashSet::new();
 
-    while let Some((cur_idx, hops)) = queue.pop_front() {
+    while let Some((cur_idx, hops, active_pm, active_dyn)) = queue.pop_front() {
         let cur_fn = &all_fns[cur_idx];
         let mut seen_edge: HashSet<(&str, usize)> = HashSet::new();
+        let active_opt = if hops.is_empty() {
+            None
+        } else {
+            Some(active_pm)
+        };
+        let dyn_opt = if hops.is_empty() {
+            None
+        } else {
+            Some(active_dyn)
+        };
 
         for (ident, ln) in &cur_fn.called_idents {
             let id_s = ident.as_str();
@@ -756,7 +1027,15 @@ fn compute_reachability_paths(
                 continue;
             }
             let (guard_placement, guard_note) = classify_hop_guard(cur_fn, *ln);
-            let (arg_taint, arg_preview) = lookup_call_taint(cur_fn, id_s, *ln);
+            let (arg_taint, arg_preview, taint_via_summary) = lookup_call_taint_with_summary(
+                cur_fn,
+                id_s,
+                *ln,
+                sink_query.as_deref(),
+                summaries,
+                active_opt,
+                dyn_opt,
+            );
             let hop = ReachabilityHop {
                 caller: cur_fn.name.clone(),
                 callee: id_s.to_string(),
@@ -766,6 +1045,7 @@ fn compute_reachability_paths(
                 guard_note,
                 arg_taint: arg_taint.clone(),
                 arg_preview,
+                taint_via_summary,
             };
 
             let is_sink_hit = if let Some(ref q) = sink_query {
@@ -801,6 +1081,25 @@ fn compute_reachability_paths(
 
             if hops.len() + 1 < limit {
                 if let Some(callees) = by_name.get(id_s) {
+                    let call_info = lookup_call_arg(cur_fn, id_s, *ln);
+                    let (next_pm, next_dyn) = if let Some(ci) = call_info {
+                        let mut pm = 0u32;
+                        let mut dm = 0u32;
+                        for (i, &arg_m) in ci.arg_param_masks.iter().enumerate() {
+                            if i >= 32 {
+                                break;
+                            }
+                            let is_const = (ci.arg_const_mask & (1u32 << i)) != 0;
+                            if (arg_m & active_pm) != 0 {
+                                pm |= 1u32 << i;
+                            } else if !is_const && ((arg_m & active_dyn) != 0 || arg_m == 0) {
+                                dm |= 1u32 << i;
+                            }
+                        }
+                        (pm, dm)
+                    } else {
+                        (u32::MAX, 0)
+                    };
                     for &next_idx in callees {
                         let already_in_chain =
                             hops.iter().any(|h| h.caller == all_fns[next_idx].name)
@@ -809,12 +1108,15 @@ fn compute_reachability_paths(
                             continue;
                         }
                         let next_depth = hops.len() + 1;
-                        let best_prev = visited_depth.get(&next_idx).copied().unwrap_or(usize::MAX);
+                        let best_prev = visited_depth
+                            .get(&(next_idx, next_pm))
+                            .copied()
+                            .unwrap_or(usize::MAX);
                         if next_depth <= best_prev {
-                            visited_depth.insert(next_idx, next_depth);
+                            visited_depth.insert((next_idx, next_pm), next_depth);
                             let mut next_hops = hops.clone();
                             next_hops.push(hop.clone());
-                            queue.push_back((next_idx, next_hops));
+                            queue.push_back((next_idx, next_hops, next_pm, next_dyn));
                         }
                     }
                 }
@@ -1004,8 +1306,10 @@ pub fn trace_symbol_chain_to_opts(
         }
     }
 
+    let summaries = compute_callee_summaries(&all_fns);
     let reachability_paths = compute_reachability_paths(
         &all_fns,
+        &summaries,
         target_ref,
         to_sink,
         include_sinks,
@@ -1305,6 +1609,60 @@ mod tests {
         assert_eq!(
             unfiltered.reachability_paths[0].hops[0].arg_taint,
             "CONST_LITERAL"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_two_hop_callee_summary_propagates_param_taint_and_downgrades_const() {
+        let dir = std::env::temp_dir().join(format!("ap_trace_interproc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("flow.ts"),
+            "export function leafExec(cmdArg: string, note: string) {\n\
+               console.log(note);\n\
+               return execSync(cmdArg);\n\
+             }\n\
+             export function midWrap(pathIn: string) {\n\
+               const cmd = 'tool ' + pathIn;\n\
+               return leafExec(cmd, 'tag');\n\
+             }\n\
+             export function entryTainted(input: any) {\n\
+               return midWrap(input.path);\n\
+             }\n\
+             export function entryConst(req: any) {\n\
+               return leafExec('git status', req.x);\n\
+             }\n\
+             export function entrySanitized(req: any) {\n\
+               const clean = sanitizeInput(req.cmd);\n\
+               return execSync(clean);\n\
+             }\n",
+        )
+        .unwrap();
+
+        let tainted =
+            trace_symbol_chain_to_opts(&dir, "entryTainted", Some("execSync"), false, true, 4);
+        assert_eq!(tainted.reachability_paths.len(), 1);
+        let path = &tainted.reachability_paths[0];
+        assert_eq!(path.hops.len(), 3);
+        assert!(path.hops.iter().all(|h| h.arg_taint == "PARAM_TAINTED"));
+        assert!(path.hops.iter().all(|h| h.taint_via_summary));
+
+        let const_filtered =
+            trace_symbol_chain_to_opts(&dir, "entryConst", Some("execSync"), false, true, 4);
+        assert!(
+            const_filtered.reachability_paths.is_empty(),
+            "only sinking param[0] got const literal, so tainted_only must drop it: {:?}",
+            const_filtered.reachability_paths
+        );
+
+        let sanitized =
+            trace_symbol_chain_to_opts(&dir, "entrySanitized", Some("execSync"), false, true, 3);
+        assert_eq!(sanitized.reachability_paths.len(), 1);
+        assert_ne!(
+            sanitized.reachability_paths[0].hops[0].arg_taint,
+            "PARAM_TAINTED"
         );
         let _ = fs::remove_dir_all(&dir);
     }

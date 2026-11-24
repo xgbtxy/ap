@@ -6393,7 +6393,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 16);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 17);
     }
 }
 
@@ -7157,7 +7157,7 @@ fn test_v244_pi_patch13_quote_safe_grep_ps_backtick_and_loop_sleep() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 16);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 17);
     }
 }
 
@@ -7216,7 +7216,7 @@ fn test_v245_windows_win_probe_msys_shield_tmp_path_and_pi_patch14() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 16);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 17);
     }
 
     // 3. Verify `ap mcp` discovers `ap_win` across 37 specialist tools
@@ -12726,6 +12726,241 @@ assert.ok(loopEvt && loopEvt.data.tool === "bash" && loopEvt.data.count >= 2 && 
         assert!(
             run.status.success(),
             "Node v2.74 runtime check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_v275_interproc_taint_js_dir_routes_diff_mcp_alias_and_json_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. 2-hop interprocedural callee-summary taint & CONST_LITERAL downgrade
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/pipeline.ts"),
+        "export function leafExec(cmdArg: string, note: string) {\n\
+           console.log(note);\n\
+           return execSync(cmdArg);\n\
+         }\n\
+         export function midWrap(pathIn: string) {\n\
+           const full = '/srv/' + pathIn;\n\
+           return leafExec(full, 'ok');\n\
+         }\n\
+         export function entryTainted(input: any) {\n\
+           return midWrap(input.path);\n\
+         }\n\
+         export function entryConst(req: any) {\n\
+           return leafExec('uptime', req.tag);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let tr_tainted = run_ap(
+        root,
+        &[
+            "atlas",
+            "trace",
+            "entryTainted",
+            root.to_str().unwrap(),
+            "--to",
+            "execSync",
+            "--tainted-only",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(tr_tainted.status.success());
+    let tv: Value = serde_json::from_slice(&tr_tainted.stdout).unwrap();
+    let paths = tv["reachability_paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 1);
+    let hops = paths[0]["hops"].as_array().unwrap();
+    assert_eq!(hops.len(), 3);
+    assert!(hops
+        .iter()
+        .all(|h| h["arg_taint"] == "PARAM_TAINTED" && h["taint_via_summary"] == true));
+
+    let tr_const = run_ap(
+        root,
+        &[
+            "atlas",
+            "trace",
+            "entryConst",
+            root.to_str().unwrap(),
+            "--to",
+            "execSync",
+            "--tainted-only",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(tr_const.status.success());
+    let cv: Value = serde_json::from_slice(&tr_const.stdout).unwrap();
+    assert!(
+        cv["reachability_paths"].is_null()
+            || cv["reachability_paths"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+        "const sink arg must be filtered under --tainted-only: {cv}"
+    );
+
+    let var_out = run_ap(
+        root,
+        &[
+            "atlas",
+            "variants",
+            root.to_str().unwrap(),
+            "--sink",
+            "leafExec",
+            "--tainted-only",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(var_out.status.success());
+    let vv: Value = serde_json::from_slice(&var_out.stdout).unwrap();
+    let sibs = vv["siblings"].as_array().unwrap();
+    assert_eq!(sibs.len(), 1);
+    assert_eq!(sibs[0]["function"], "midWrap");
+    assert_eq!(sibs[0]["taint_via_summary"], true);
+
+    // 2. Directory `ap read <dir> --routes --diff <old_dir> --json`
+    let old_web = root.join("old_web");
+    let new_web = root.join("new_web");
+    fs::create_dir_all(old_web.join("dist")).unwrap();
+    fs::create_dir_all(new_web.join("dist")).unwrap();
+    fs::write(
+        old_web.join("dist/app.js"),
+        r#"fetch("/api/v1/health"); const q = "query GetHealth { ok }";"#,
+    )
+    .unwrap();
+    fs::write(
+        new_web.join("dist/app.js"),
+        r#"
+fetch("/api/v1/health");
+axios.post("/api/v2/admin/users/:id", { tenantId: tid, role: r });
+const m = "mutation CreateAdmin($id: ID!) { createAdmin(id: $id) { ok } }";
+const ws = new WebSocket("wss://rt.acme.test/ws");
+ipcRenderer.invoke("desktop:open", { target: p });
+webview.loadURL(targetUrl);
+"#,
+    )
+    .unwrap();
+
+    let dir_routes = run_ap(
+        root,
+        &[
+            "read",
+            new_web.to_str().unwrap(),
+            "--routes",
+            "--diff",
+            old_web.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(dir_routes.status.success());
+    let drv: Value = serde_json::from_slice(&dir_routes.stdout).unwrap();
+    assert_eq!(drv["format"], "js-dir-routes");
+    assert_eq!(
+        drv["surface"]["routes"][0]["path"],
+        "/api/v2/admin/users/:id"
+    );
+    assert_eq!(drv["surface"]["graphql_ops"][0]["name"], "CreateAdmin");
+    assert_eq!(
+        drv["surface"]["ws_sse_endpoints"][0]["endpoint"],
+        "wss://rt.acme.test/ws"
+    );
+    assert_eq!(
+        drv["surface"]["diff"]["new_routes"][0]["path"],
+        "/api/v2/admin/users/:id"
+    );
+    assert_eq!(
+        drv["surface"]["diff"]["new_graphql"][0]["name"],
+        "CreateAdmin"
+    );
+
+    // 3. `zz-ap-accelerator.ts`: healCodemodeSource MCP aliases & lossless JSON compaction in sieveCodemodeContentBlocks
+    let fake_home = root.join("fake_home_v275");
+    fs::create_dir_all(fake_home.join(".pi/agent/extensions")).unwrap();
+    assert!(run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            fake_home.to_str().unwrap(),
+        ],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+        ],
+    )
+    .status
+    .success());
+    if Command::new("node").arg("--version").output().is_ok() {
+        let ts_file = fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+        let node_script = r###"
+import assert from "node:assert/strict";
+const mod = await import(new URL("file:///" + process.env.ACCEL_TS.replace(/\\/g, "/")));
+const handlers = new Map();
+mod.default({
+  on: (name, fn) => handlers.set(name, fn),
+  registerTool: () => {},
+  registerCommand: () => {},
+  registerShortcut: () => {},
+  registerMessageRenderer: () => {},
+  registerProvider: () => {},
+  events: { emit: () => {} },
+});
+const onToolCall = handlers.get("tool_call");
+const ev = {
+  toolName: "codemode",
+  input: {
+    code: 'if (tools?.ap_search && tools["ap_read"]) { const d = await tools.describeTool("ap_read"); return tools.ap_read({ target: "a" }); }'
+  }
+};
+onToolCall(ev, { cwd: process.cwd() });
+assert.ok(ev.input.code.includes("tools?.mcp__agent_primitives__ap_search"), "optional chain mcp alias healed");
+assert.ok(ev.input.code.includes('tools["mcp__agent_primitives__ap_read"]'), "bracket access healed");
+assert.ok(ev.input.code.includes('tools.mcp__agent_primitives__ap_read('), "dot access healed");
+assert.ok(ev.input.code.includes('describeTool("mcp__agent_primitives__ap_read")') && !ev.input.code.includes('tools.describeTool('), "tools.describeTool healed");
+
+const payload = Array.from({ length: 500 }, (_, i) => [i % 10, 1, 2]);
+const pretty = JSON.stringify(payload, null, 2);
+let sieveCalled = false;
+const compacted = mod.sieveCodemodeContentBlocks(
+  [{ type: "text", text: "Script completed (4ms)" }, { type: "text", text: pretty }],
+  () => { sieveCalled = true; return "[sieve id=unexpected]"; },
+  false,
+);
+assert.equal(sieveCalled, false, "pretty JSON compacting under limit must skip ap sieve");
+assert.ok(compacted && compacted.length === 2);
+assert.deepEqual(JSON.parse(compacted[1].text), payload);
+"###;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                node_script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.75 runtime check failed:\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );

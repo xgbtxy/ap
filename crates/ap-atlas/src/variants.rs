@@ -1,6 +1,7 @@
 use crate::surface::guard_re;
 use crate::trace::{
-    classify_hop_guard, clean_fn_name, collect_project_fns, lookup_call_taint, FnDef, NOTABLE_SINKS,
+    classify_hop_guard, clean_fn_name, collect_project_fns, compute_callee_summaries,
+    lookup_call_taint_with_summary, FnDef, NOTABLE_SINKS,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariantFinding {
@@ -24,6 +29,8 @@ pub struct VariantFinding {
     pub arg_taint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arg_preview: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub taint_via_summary: bool,
     pub is_outlier: bool,
 }
 
@@ -144,6 +151,7 @@ pub fn analyze_variants_with_opts(
 ) -> VariantsReport {
     let t0 = Instant::now();
     let all_fns = collect_project_fns(root);
+    let summaries = compute_callee_summaries(&all_fns);
 
     let custom_re = guard_pattern
         .map(str::trim)
@@ -203,7 +211,8 @@ pub fn analyze_variants_with_opts(
             }
             let (guard_placement, guard_note) =
                 extra_guard_placement(f, root, *ln, custom_re.as_ref());
-            let (arg_taint, arg_preview) = lookup_call_taint(f, ident, *ln);
+            let (arg_taint, arg_preview, taint_via_summary) =
+                lookup_call_taint_with_summary(f, ident, *ln, sink_clean, &summaries, None, None);
             if tainted_only && arg_taint == "CONST_LITERAL" {
                 continue;
             }
@@ -218,6 +227,7 @@ pub fn analyze_variants_with_opts(
                 guard_note,
                 arg_taint,
                 arg_preview,
+                taint_via_summary,
                 is_outlier: false,
             });
         }
@@ -399,6 +409,44 @@ mod tests {
         let seed_rep = analyze_variants(&dir, None, Some("deleteUserSafe"), Some(r"requireAdmin"));
         assert_eq!(seed_rep.total_siblings, 4);
         assert_eq!(seed_rep.siblings[0].function, "resetUserBuggy");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn variants_uses_callee_summaries_to_downgrade_non_sinking_param() {
+        let dir = std::env::temp_dir().join(format!("ap_variants_sum_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("wrap.ts"),
+            "function runShell(cmd: string, label: string) {\n\
+               console.log(label);\n\
+               return execSync(cmd);\n\
+             }\n\
+             export function callSafe(req: any) {\n\
+               if (!authorize(req.user)) return 403;\n\
+               return runShell('uptime', req.tag);\n\
+             }\n\
+             export function callBuggy(req: any) {\n\
+               return runShell(req.cmd, 'fixed');\n\
+             }\n",
+        )
+        .unwrap();
+
+        let rep = analyze_variants_with_opts(&dir, Some("runShell"), None, None, true);
+        assert_eq!(rep.total_siblings, 1);
+        assert_eq!(rep.siblings[0].function, "callBuggy");
+        assert_eq!(rep.siblings[0].arg_taint, "PARAM_TAINTED");
+        assert!(rep.siblings[0].taint_via_summary);
+
+        let full = analyze_variants(&dir, Some("runShell"), None, None);
+        let safe_hit = full
+            .siblings
+            .iter()
+            .find(|s| s.function == "callSafe")
+            .unwrap();
+        assert_eq!(safe_hit.arg_taint, "CONST_LITERAL");
+        assert!(safe_hit.taint_via_summary);
         let _ = fs::remove_dir_all(&dir);
     }
 }
