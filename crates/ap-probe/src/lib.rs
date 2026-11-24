@@ -171,6 +171,9 @@ struct HttpArgs {
     /// Synchronized Barrier concurrency/TOCTOU race burst count (2..=32 parallel threads firing simultaneously)
     #[arg(long, default_value_t = 0)]
     race: usize,
+    /// Ordered stateful multi-step HTTP flow JSON file (or `-` for stdin) with `{{var}}` extraction & cross-step assertions
+    #[arg(long)]
+    flow: Option<String>,
     /// Optional sensitive sentinel token(s) to flag immediately if leaked in any auth-matrix candidate response body
     #[arg(long = "sentinel")]
     sentinels: Vec<String>,
@@ -664,9 +667,15 @@ pub fn run_cli(args: &[String]) -> i32 {
                 select,
                 audit_headers,
                 race,
+                flow,
                 sentinels,
                 json,
             } = *boxed;
+            if let Some(fl) = flow.as_deref().filter(|s| !s.trim().is_empty()) {
+                return http_probe::run_http_flow(
+                    fl, &headers, &sentinels, timeout, insecure, follow, json,
+                );
+            }
             if race >= 2 {
                 return http_probe::run_http_race(
                     vary_request.as_deref(),
@@ -676,6 +685,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     body.as_deref(),
                     race,
                     cdp_cookies,
+                    select.as_deref(),
                     timeout,
                     insecure,
                     follow,

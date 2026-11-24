@@ -12214,3 +12214,287 @@ assert.equal(decideDeepSeekCacheWarming({ provider: "deepseek", modelId: "deepse
         );
     }
 }
+
+#[test]
+fn test_v273_variants_http_flow_tcp_race_mcp_budget_and_pi_prefix_hash() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // 1. AST Sibling & Guard-Asymmetry Sweeper (`ap atlas variants`)
+    fs::write(
+        root.join("ops.ts"),
+        "export function deleteUserSafe(req: any) {\n\
+           if (!requireAdmin(req.user)) return 403;\n\
+           return db.execute('DELETE FROM users WHERE id = ?', [req.id]);\n\
+         }\n\
+         export function updateUserSafe(req: any) {\n\
+           if (!authorize(req.user)) return 403;\n\
+           return db.execute('UPDATE users SET name = ? WHERE id = ?', [req.name, req.id]);\n\
+         }\n\
+         export function resetUserBuggy(req: any) {\n\
+           return db.execute('UPDATE users SET role = ? WHERE id = ?', [req.role, req.id]);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let var_out = run_ap(
+        root,
+        &[
+            "atlas",
+            "variants",
+            root.to_str().unwrap(),
+            "--sink",
+            "execute",
+            "--guard",
+            "requireAdmin",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(var_out.status.success());
+    let vv: Value = serde_json::from_slice(&var_out.stdout).unwrap();
+    assert_eq!(vv["total_siblings"], 3);
+    assert_eq!(vv["unguarded_count"], 1);
+    assert_eq!(vv["guard_ratio_pct"], 66);
+    assert_eq!(vv["siblings"][0]["function"], "resetUserBuggy");
+    assert_eq!(vv["siblings"][0]["is_outlier"], true);
+
+    // 2. Low-jitter TCP barrier `ap probe http --race 4 --select id`
+    let race_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let race_port = race_listener.local_addr().unwrap().port();
+    let race_handle = std::thread::spawn(move || {
+        for i in 0..4 {
+            let (mut sock, _) = race_listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let body = format!(r#"{{"ok":true,"id":"dup_{}"}}"#, i % 2);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+    let race_out = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            "-X",
+            "POST",
+            "-d",
+            r#"{"amount":100}"#,
+            "--race",
+            "4",
+            "--select",
+            "id",
+            "--json",
+            &format!("http://127.0.0.1:{race_port}/redeem"),
+        ],
+        None,
+        &[],
+    );
+    race_handle.join().unwrap();
+    assert!(race_out.status.success());
+    let rv: Value = serde_json::from_slice(&race_out.stdout).unwrap();
+    assert_eq!(rv["transport"], "tcp_barrier");
+    assert_eq!(rv["ok_2xx"], 4);
+    assert_eq!(rv["unique_body_count"], 2);
+    assert_eq!(rv["distinct_selected_count"], 2);
+    assert_eq!(rv["race_anomaly"], true);
+    assert!(rv["latency_ms"]["spread"].is_number());
+
+    // 3. Stateful multi-step `--flow -` runner with `{{var}}` extraction & sentinel check
+    let flow_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let flow_port = flow_listener.local_addr().unwrap().port();
+    let flow_handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut sock, _) = flow_listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let resp = if first_line.starts_with("POST /items ") {
+                let body = r#"{"ok":true,"data":{"id":"item_99"}}"#;
+                format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Flow-Tok: tok_abc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else if first_line.starts_with("POST /items/item_99/note ") {
+                let body = r#"{"saved":true}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                let body = r#"{"id":"item_99","note":"second_order_secret_77"}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+    let flow_spec = serde_json::json!({
+        "sentinels": ["second_order_secret_77"],
+        "steps": [
+            {
+                "name": "create",
+                "method": "POST",
+                "url": format!("http://127.0.0.1:{flow_port}/items"),
+                "body": "{\"name\":\"demo\"}",
+                "extract": { "item_id": "data.id", "ftok": "header:x-flow-tok" },
+                "expect_status": 201
+            },
+            {
+                "name": "write_second_order",
+                "method": "POST",
+                "url": format!("http://127.0.0.1:{flow_port}/items/{{{{item_id}}}}/note"),
+                "headers": ["X-Flow-Tok: {{ftok}}"],
+                "body": "{\"note\":\"second_order_secret_77\"}",
+                "expect_status": 200
+            },
+            {
+                "name": "read_back",
+                "method": "GET",
+                "url": format!("http://127.0.0.1:{flow_port}/items/{{{{item_id}}}}"),
+                "expect_status": 200
+            }
+        ]
+    });
+    let flow_out = run_ap(
+        root,
+        &["probe", "http", "--flow", "-", "--json"],
+        Some(&flow_spec.to_string()),
+        &[],
+    );
+    flow_handle.join().unwrap();
+    assert!(flow_out.status.success());
+    let fv: Value = serde_json::from_slice(&flow_out.stdout).unwrap();
+    assert_eq!(fv["ok"], true);
+    assert_eq!(fv["vars"]["item_id"], "item_99");
+    assert_eq!(fv["vars"]["ftok"], "tok_abc");
+    assert_eq!(fv["sentinel_leak_steps"], 1);
+    assert_eq!(fv["steps"][2]["sentinel_hits"][0], "second_order_secret_77");
+
+    // 4. MCP `ap_trace(variants_sink=...)` + compact `tools/list` (`len == 37`, payload < 36KB)
+    let mcp_in = format!(
+        "{}\n{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_trace", "arguments": {"path": root.to_str().unwrap(), "variants_sink": "execute", "guard": "requireAdmin"}}})
+    );
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_in), &[]);
+    assert!(mcp_out.status.success());
+    let mcp_resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(
+        mcp_resps[0]["result"]["tools"].as_array().unwrap().len(),
+        37
+    );
+    assert!(mcp_resps[0]["result"]["tools"].to_string().len() < 36_000);
+    let vtxt = mcp_resps[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(vtxt.contains("[OUTLIER] UNGUARDED `resetUserBuggy`"));
+
+    // 5. Verify Wave-4 `zz-ap-accelerator.ts` wire prefix-hash boundary detector & low-reasoning `session_before_tree`
+    let fake_home = root.join("fake_home_v273");
+    fs::create_dir_all(fake_home.join(".pi/agent/extensions")).unwrap();
+    let init_out = run_ap(
+        root,
+        &[
+            "init",
+            "-a",
+            "pi",
+            "--with-hooks",
+            "--no-rules",
+            "--home",
+            fake_home.to_str().unwrap(),
+        ],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+        ],
+    );
+    assert!(init_out.status.success());
+    if Command::new("node").arg("--version").output().is_ok() {
+        let ts_file = fake_home.join(".pi/agent/extensions/zz-ap-accelerator.ts");
+        let node_script = r###"
+import assert from "node:assert/strict";
+const mod = await import(new URL("file:///" + process.env.ACCEL_TS.replace(/\\/g, "/")));
+const { default: registerExt, snapshotProviderRequestHashes, classifyCacheDropCause } = mod;
+const h1 = snapshotProviderRequestHashes({ model: "deepseek-flash", reasoning_effort: "high", tools: [{ name: "a" }], messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "ok" }] });
+const h2Tools = snapshotProviderRequestHashes({ model: "deepseek-flash", reasoning_effort: "high", tools: [{ name: "b" }], messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "ok" }] });
+const h2Effort = snapshotProviderRequestHashes({ model: "deepseek-flash", reasoning_effort: "low", tools: [{ name: "a" }], messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "ok" }] });
+const h2Msg = snapshotProviderRequestHashes({ model: "deepseek-flash", reasoning_effort: "high", tools: [{ name: "a" }], messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "changed" }] });
+assert.equal(classifyCacheDropCause(h1, h2Tools), "tools_changed");
+assert.equal(classifyCacheDropCause(h1, h2Effort), "effort_changed");
+assert.equal(classifyCacheDropCause(h1, h2Msg), "msg[1]_mutated");
+assert.equal(classifyCacheDropCause(h1, h1), "ttl_eviction");
+
+const handlers = new Map();
+const emitted = [];
+const mockPi = {
+  on: (name, fn) => handlers.set(name, fn),
+  registerTool: () => {},
+  registerCommand: () => {},
+  registerShortcut: () => {},
+  registerMessageRenderer: () => {},
+  registerProvider: () => {},
+  events: { emit: (ch, data) => emitted.push({ ch, data }) },
+};
+registerExt(mockPi);
+let capturedOpts = null;
+const treeRes = await handlers.get("session_before_tree")(
+  { preparation: { entriesToSummarize: [{ message: { role: "user", content: "debug race" } }] } },
+  {
+    model: { provider: "deepseek", id: "deepseek-flash" },
+    sessionManager: { getBranch: () => [{ type: "custom", customType: "codemode-store", data: { set: { my_key: 1 } } }] },
+    modelRegistry: {
+      streamSimple: (_m, _c, opts) => {
+        capturedOpts = opts;
+        return {
+          result: async () => ({
+            stopReason: "stop",
+            content: [{ type: "text", text: "## Goal & Constraints\nInvestigate race cleanly without regression." }],
+          }),
+        };
+      },
+    },
+  }
+);
+assert.equal(capturedOpts.reasoning, "low");
+assert.equal(capturedOpts.cacheRetention, "none");
+assert.ok(treeRes.summary.includes("<codemode-store-keys>") && treeRes.summary.includes("my_key"));
+"###;
+        let run = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                node_script,
+            ])
+            .env("ACCEL_TS", &ts_file)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node v2.73 runtime check failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

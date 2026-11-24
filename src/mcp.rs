@@ -274,17 +274,18 @@ fn mcp_tools_schema() -> Value {
     },
     {
         "name": "ap_trace",
-        "description": "Multi-hop Tree-sitter call-chain, source-to-sink reachability & guard-placement tracer (<30ms) across Py/TS/JS/Go/Rust/C/C++.",
+        "description": "Multi-hop Tree-sitter call-chain, reachability, guard-placement & sibling guard-asymmetry (`variants_sink`) tracer across Py/TS/JS/Go/Rust/C/C++.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": { "type": "string", "description": "Source/target function or method name" },
-                "path": { "type": "string", "description": "Workspace root (default: '.')" },
-                "depth": { "type": "integer", "description": "Max traversal hops (default: 3)" },
-                "to": { "type": "string", "description": "Optional sink/callee name for shortest-path reachability + GUARD_BEFORE/GUARD_AFTER/UNGUARDED check" },
-                "sinks": { "type": "boolean", "description": "Find shortest paths to all notable I/O/exec/DOM/SQL sinks" }
-            },
-            "required": ["symbol"]
+                "symbol": { "type": "string" },
+                "path": { "type": "string" },
+                "depth": { "type": "integer" },
+                "to": { "type": "string" },
+                "sinks": { "type": "boolean" },
+                "variants_sink": { "type": "string", "description": "Sweep sibling fns calling this sink for guard asymmetry (omit symbol to sweep)" },
+                "guard": { "type": "string", "description": "Custom guard regex for variants_sink" }
+            }
         }
     },
     {
@@ -330,6 +331,7 @@ fn mcp_tools_schema() -> Value {
                 "select": { "type": "string", "description": "Dot-path JSON extractor e.g. 'data.items[*].id'" },
                 "audit_headers": { "type": "boolean", "description": "Audit security/CORS/CSP/cookie headers" },
                 "race": { "type": "integer", "description": "Barrier TOCTOU burst threads (2..=32)" },
+                "flow": { "type": "string", "description": "Stateful multi-step HTTP flow JSON file or '-' stdin with {{var}} extraction" },
                 "sentinels": { "type": "array", "description": "Sentinel strings flagged if leaked", "items": { "type": "string" } },
                 "timeout": { "type": "integer", "description": "Timeout sec (default: 15)" },
                 "insecure": { "type": "boolean", "description": "Skip TLS verify (-k)" },
@@ -1063,6 +1065,30 @@ fn tool_output_schema_for(name: &str) -> Value {
     }
 }
 
+fn compact_input_schema_props(val: &mut Value) {
+    let Some(obj) = val.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::Object(props)) = obj.get_mut("properties") {
+        for prop_val in props.values_mut() {
+            if let Some(p_obj) = prop_val.as_object_mut() {
+                // Keep Pi codemode TypeScript declarations single-line by stripping verbose per-property prose
+                p_obj.remove("description");
+                if let Some(items) = p_obj.get_mut("items") {
+                    compact_input_schema_props(items);
+                }
+                if p_obj.contains_key("properties") {
+                    let mut nested = Value::Object(p_obj.clone());
+                    compact_input_schema_props(&mut nested);
+                    if let Value::Object(nm) = nested {
+                        *p_obj = nm;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn annotate_mcp_tools(mut tools: Value) -> Value {
     if let Value::Array(ref mut arr) = tools {
         for item in arr.iter_mut() {
@@ -1085,6 +1111,9 @@ fn annotate_mcp_tools(mut tools: Value) -> Value {
                         "openWorldHint": open
                     }),
                 );
+                if let Some(input_schema) = obj.get_mut("inputSchema") {
+                    compact_input_schema_props(input_schema);
+                }
                 obj.insert("outputSchema".to_string(), tool_output_schema_for(&name));
             }
         }
@@ -2051,13 +2080,37 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim();
-            if sym.is_empty() {
-                return (false, "Pass non-empty `symbol` to `ap_trace`.".to_string());
-            }
+            let variants_sink = args
+                .get("variants_sink")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let guard = args
+                .get("guard")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             let root_p = std::path::Path::new(path);
             if !root_p.exists() {
                 return (false, format!("[atlas] path not found: {path}"));
+            }
+            if variants_sink.is_some() {
+                let rep = ap_atlas::variants::analyze_variants(
+                    root_p,
+                    variants_sink,
+                    (!sym.is_empty()).then_some(sym),
+                    guard,
+                );
+                let out = ap_atlas::variants::render_variants_md(&rep);
+                crate::stats::record_event("trace", 0, out.len() as u64, 0, 1, "mcp-variants");
+                return (true, out);
+            }
+            if sym.is_empty() {
+                return (
+                    false,
+                    "Pass non-empty `symbol` or `variants_sink` to `ap_trace`.".to_string(),
+                );
             }
             let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(3) as usize;
             let to_sink = args
@@ -2278,6 +2331,21 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         cli.push(s.trim().to_string());
                     }
                 }
+            }
+            if let Some(fl) = args
+                .get("flow")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if fl.starts_with('[') || fl.starts_with('{') {
+                    cli.push("--flow".into());
+                    cli.push("-".into());
+                    return run_self_captured(&cli, Some(fl));
+                }
+                cli.push("--flow".into());
+                cli.push(fl.to_string());
+                return run_self_captured(&cli, None);
             }
             let batch_lines: Vec<&str> = args
                 .get("batch_requests")
@@ -3963,4 +4031,48 @@ pub fn run_mcp_stdio_with_profile(cli_profile: &str) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod mcp_schema_tests {
+    use super::*;
+
+    fn estimate_pi_codemode_tokens(tools: &[Value]) -> usize {
+        // Approximate Pi `pi-codemode` `declarations.js` output:
+        // per tool: `/** <desc> */\n<name>(input: { <fields> }): Promise<...>;`
+        // When properties have no `description`, fields emit on compact single lines (~22 chars each)
+        // vs multi-line JSDoc blocks (~110+ chars each).
+        let mut chars = 0usize;
+        for t in tools {
+            let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+            let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
+            chars += name.len() + desc.len() + 36;
+            if let Some(Value::Object(props)) = t.pointer("/inputSchema/properties") {
+                for (k, pv) in props {
+                    chars += k.len() + 18;
+                    if let Some(pd) = pv.get("description").and_then(Value::as_str) {
+                        chars += pd.len() + 16;
+                    }
+                }
+            }
+        }
+        chars.div_ceil(4)
+    }
+
+    #[test]
+    fn full_37_tool_mcp_catalog_fits_within_pi_inline_budget() {
+        let catalog = mcp_tools_schema();
+        let arr = catalog.as_array().unwrap();
+        assert_eq!(arr.len(), 37);
+        let est_tokens = estimate_pi_codemode_tokens(arr);
+        assert!(
+            est_tokens < 7000,
+            "37-tool Pi codemode declaration estimate too large: {est_tokens} tokens (expected <7000)"
+        );
+        let raw_bytes = catalog.to_string().len();
+        assert!(
+            raw_bytes < 36_000,
+            "raw 37-tool catalog payload too large: {raw_bytes}B"
+        );
+    }
 }

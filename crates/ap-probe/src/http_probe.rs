@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpProbeResult {
@@ -1881,7 +1883,139 @@ pub fn run_http_auth_matrix(
     0
 }
 
+fn fnv1a_hash_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn parse_plain_http_target(url: &str) -> Option<(SocketAddr, String, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (host_port, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let connect_target = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    let sa = connect_target
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())?;
+    Some((sa, host_port.to_string(), path.to_string()))
+}
+
+fn build_raw_http11_request(
+    method: &str,
+    host_port: &str,
+    path: &str,
+    headers: &[String],
+    body: Option<&str>,
+) -> Vec<u8> {
+    let mut req = format!("{method} {path} HTTP/1.1\r\n");
+    if !has_header_name(headers, "host") {
+        req.push_str(&format!("Host: {host_port}\r\n"));
+    }
+    if !has_header_name(headers, "connection") {
+        req.push_str("Connection: close\r\n");
+    }
+    for h in headers {
+        let t = h.trim();
+        if !t.is_empty() {
+            req.push_str(t);
+            req.push_str("\r\n");
+        }
+    }
+    if let Some(b) = body {
+        if !has_header_name(headers, "content-length") {
+            req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+        if !has_header_name(headers, "content-type") && b.trim_start().starts_with('{') {
+            req.push_str("Content-Type: application/json\r\n");
+        }
+        req.push_str("\r\n");
+        req.push_str(b);
+    } else {
+        req.push_str("\r\n");
+    }
+    req.into_bytes()
+}
+
+fn parse_http_wire_response(
+    method: &str,
+    url: &str,
+    raw_bytes: &[u8],
+    elapsed_ms: f64,
+) -> (HttpProbeResult, String) {
+    let raw = String::from_utf8_lossy(raw_bytes).to_string();
+    let mut rest = raw.as_str();
+    let mut hdr_block = "";
+    while rest.starts_with("HTTP/") {
+        if let Some(idx) = rest.find("\r\n\r\n") {
+            hdr_block = &rest[..idx];
+            rest = &rest[idx + 4..];
+        } else if let Some(idx) = rest.find("\n\n") {
+            hdr_block = &rest[..idx];
+            rest = &rest[idx + 2..];
+        } else {
+            break;
+        }
+    }
+    let body_raw = rest;
+    let mut status = 0u16;
+    let mut ct = String::new();
+    let mut hdrs = Vec::new();
+    for (idx, ln) in hdr_block.lines().enumerate() {
+        let t = ln.trim();
+        if idx == 0 {
+            status = t
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+        } else if !t.is_empty() {
+            if let Some((k, v)) = t.split_once(':') {
+                if k.eq_ignore_ascii_case("content-type") {
+                    ct = v.trim().to_string();
+                }
+            }
+            if hdrs.len() < 24 {
+                hdrs.push(t.to_string());
+            }
+        }
+    }
+    let preview: String = if body_raw.len() > 2400 {
+        format!(
+            "{}...\n[truncated: {}B total]",
+            body_raw.chars().take(2400).collect::<String>(),
+            body_raw.len()
+        )
+    } else {
+        body_raw.to_string()
+    };
+    (
+        HttpProbeResult {
+            method: method.to_string(),
+            url: url.to_string(),
+            status,
+            elapsed_ms,
+            content_type: ct,
+            headers: hdrs,
+            body_preview: preview,
+            error: String::new(),
+        },
+        body_raw.to_string(),
+    )
+}
+
 /// Synchronized Barrier HTTP Race / TOCTOU concurrency burst (`--race N`, 2..=32 threads firing simultaneously).
+/// Uses low-jitter raw TCP pre-connect + synchronized `write_all` barrier for plain `http://` targets when `!follow`,
+/// falling back to `curl` for `https://` or redirects, plus body clustering, `--select` uniqueness & latency spread.
 #[allow(clippy::too_many_arguments)]
 pub fn run_http_race(
     req_file: Option<&std::path::Path>,
@@ -1891,6 +2025,7 @@ pub fn run_http_race(
     body: Option<&str>,
     race_n: usize,
     cdp_cookies_port: Option<u16>,
+    select_expr: Option<&str>,
     timeout_sec: u64,
     insecure: bool,
     follow: bool,
@@ -1930,63 +2065,165 @@ pub fn run_http_race(
     }
 
     let n = race_n.clamp(2, 32);
+    let raw_target = if !follow {
+        parse_plain_http_target(&u)
+    } else {
+        None
+    };
+    let transport_mode = if raw_target.is_some() {
+        "tcp_barrier"
+    } else {
+        "curl_barrier"
+    };
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
     let mut handles = Vec::with_capacity(n);
-    for idx in 0..n {
-        let bar = std::sync::Arc::clone(&barrier);
-        let m_c = m.clone();
-        let u_c = u.clone();
-        let h_c = hdrs.clone();
-        let b_c = b.clone();
-        handles.push(std::thread::spawn(move || {
-            bar.wait();
-            let res = execute_http_probe(
-                &m_c,
-                &u_c,
-                &h_c,
-                b_c.as_deref(),
-                timeout_sec,
-                insecure,
-                follow,
-            );
-            (idx, res)
-        }));
+
+    if let Some((sa, host_port, path)) = raw_target {
+        let req_bytes = std::sync::Arc::new(build_raw_http11_request(
+            &m,
+            &host_port,
+            &path,
+            &hdrs,
+            b.as_deref(),
+        ));
+        for idx in 0..n {
+            let bar = std::sync::Arc::clone(&barrier);
+            let req_c = std::sync::Arc::clone(&req_bytes);
+            let m_c = m.clone();
+            let u_c = u.clone();
+            handles.push(std::thread::spawn(move || {
+                let to = Duration::from_secs(timeout_sec.clamp(1, 30));
+                let mut stream_opt = TcpStream::connect_timeout(&sa, to).ok();
+                if let Some(ref s) = stream_opt {
+                    let _ = s.set_read_timeout(Some(to));
+                    let _ = s.set_write_timeout(Some(to));
+                    let _ = s.set_nodelay(true);
+                }
+                bar.wait();
+                let t0 = Instant::now();
+                let pair = match stream_opt.as_mut() {
+                    Some(s) => {
+                        if let Err(e) = s.write_all(&req_c) {
+                            (
+                                HttpProbeResult {
+                                    method: m_c,
+                                    url: u_c,
+                                    status: 0,
+                                    elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                                    content_type: String::new(),
+                                    headers: Vec::new(),
+                                    body_preview: String::new(),
+                                    error: format!("write failed: {e}"),
+                                },
+                                String::new(),
+                            )
+                        } else {
+                            let mut buf = Vec::new();
+                            let _ = s.take(262_144).read_to_end(&mut buf);
+                            let el = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+                            parse_http_wire_response(&m_c, &u_c, &buf, el)
+                        }
+                    }
+                    None => (
+                        HttpProbeResult {
+                            method: m_c,
+                            url: u_c,
+                            status: 0,
+                            elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                            content_type: String::new(),
+                            headers: Vec::new(),
+                            body_preview: String::new(),
+                            error: format!("connect timeout/refused: {sa}"),
+                        },
+                        String::new(),
+                    ),
+                };
+                (idx, pair.0, pair.1)
+            }));
+        }
+    } else {
+        for idx in 0..n {
+            let bar = std::sync::Arc::clone(&barrier);
+            let m_c = m.clone();
+            let u_c = u.clone();
+            let h_c = hdrs.clone();
+            let b_c = b.clone();
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                let (res, raw_b) = execute_http_probe_with_raw(
+                    &m_c,
+                    &u_c,
+                    &h_c,
+                    b_c.as_deref(),
+                    timeout_sec,
+                    insecure,
+                    follow,
+                );
+                (idx, res, raw_b)
+            }));
+        }
     }
 
     let mut results = Vec::with_capacity(n);
     for h in handles {
-        if let Ok(pair) = h.join() {
-            results.push(pair);
+        if let Ok(triple) = h.join() {
+            results.push(triple);
         }
     }
-    results.sort_by_key(|(i, _)| *i);
+    results.sort_by_key(|(i, _, _)| *i);
 
-    let mut status_counts: std::collections::BTreeMap<u16, usize> =
-        std::collections::BTreeMap::new();
+    let mut status_counts: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut body_clusters: BTreeMap<String, usize> = BTreeMap::new();
+    let mut selected_set: BTreeSet<String> = BTreeSet::new();
+    let mut latencies: Vec<f64> = Vec::with_capacity(results.len());
     let mut ok_2xx = 0usize;
     let mut err_5xx = 0usize;
-    for (_, r) in &results {
+    let sel_clean = select_expr.map(str::trim).filter(|s| !s.is_empty());
+
+    for (_, r, raw_b) in &results {
         *status_counts.entry(r.status).or_insert(0) += 1;
         if (200..300).contains(&r.status) {
             ok_2xx += 1;
         } else if r.status >= 500 {
             err_5xx += 1;
         }
+        let bkey = format!("{:016x}", fnv1a_hash_str(raw_b.trim()));
+        *body_clusters.entry(bkey).or_insert(0) += 1;
+        latencies.push(r.elapsed_ms);
+        if let Some(sel) = sel_clean {
+            if let Some(val) = extract_json_select(raw_b, sel) {
+                selected_set.insert(val.to_string());
+            }
+        }
     }
+
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lat_min = latencies.first().copied().unwrap_or(0.0);
+    let lat_max = latencies.last().copied().unwrap_or(0.0);
+    let lat_p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0.0);
+    let lat_spread = ((lat_max - lat_min) * 10.0).round() / 10.0;
+
+    let unique_body_count = body_clusters.len();
     let is_mutating = matches!(m.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     let mixed_statuses = status_counts.len() > 1;
-    let race_anomaly =
-        (is_mutating && ok_2xx >= 2) || (mixed_statuses && ok_2xx >= 1) || err_5xx >= 1;
+    let distinct_selected_count = selected_set.len();
+    let race_anomaly = (is_mutating && ok_2xx >= 2)
+        || (mixed_statuses && ok_2xx >= 1)
+        || err_5xx >= 1
+        || (sel_clean.is_some() && ok_2xx >= 2 && distinct_selected_count < ok_2xx);
 
     if as_json {
         let rows: Vec<Value> = results
             .iter()
-            .map(|(idx, r)| {
+            .map(|(idx, r, raw_b)| {
+                let sel_val = sel_clean.and_then(|s| extract_json_select(raw_b, s));
                 json!({
                     "thread": idx,
                     "status": r.status,
                     "elapsed_ms": r.elapsed_ms,
-                    "body_len": r.body_preview.len(),
+                    "body_len": raw_b.len(),
+                    "body_hash": format!("{:016x}", fnv1a_hash_str(raw_b.trim())),
+                    "selected": sel_val,
                     "error": r.error,
                     "body_preview": r.body_preview.chars().take(240).collect::<String>(),
                 })
@@ -1998,9 +2235,19 @@ pub fn run_http_race(
                 "ok": true,
                 "method": m,
                 "url": u,
+                "transport": transport_mode,
                 "threads": n,
                 "ok_2xx": ok_2xx,
                 "err_5xx": err_5xx,
+                "unique_body_count": unique_body_count,
+                "distinct_selected_count": distinct_selected_count,
+                "distinct_selected": selected_set.iter().take(16).collect::<Vec<_>>(),
+                "latency_ms": {
+                    "min": lat_min,
+                    "p50": lat_p50,
+                    "max": lat_max,
+                    "spread": lat_spread,
+                },
                 "status_histogram": status_counts,
                 "race_anomaly": race_anomaly,
                 "results": rows,
@@ -2014,10 +2261,10 @@ pub fn run_http_race(
             "[UNIFORM]"
         };
         println!(
-            "[probe http race] {} {} x{n} {badge} | 2xx={ok_2xx} 5xx={err_5xx} hist={:?}",
+            "[probe http race] {} {} x{n} ({transport_mode}) {badge} | 2xx={ok_2xx} 5xx={err_5xx} bodies={unique_body_count} spread={lat_spread}ms hist={:?}",
             m, u, status_counts
         );
-        for (idx, r) in results.iter().take(12) {
+        for (idx, r, _) in results.iter().take(12) {
             let prev: String = r
                 .body_preview
                 .replace(['\r', '\n'], " ")
@@ -2034,6 +2281,268 @@ pub fn run_http_race(
         }
     }
     0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FlowStepSpec {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_get")]
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    cdp_cookies: Option<u16>,
+    #[serde(default)]
+    extract: HashMap<String, String>,
+    #[serde(default)]
+    expect_status: Option<u16>,
+    #[serde(default)]
+    sentinels: Vec<String>,
+    #[serde(default)]
+    compare_step: Option<usize>,
+}
+
+fn default_get() -> String {
+    "GET".to_string()
+}
+
+fn substitute_flow_vars(tmpl: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = tmpl.to_string();
+    for (k, v) in vars {
+        let needle = format!("{{{{{k}}}}}");
+        if out.contains(&needle) {
+            out = out.replace(&needle, v);
+        }
+    }
+    out
+}
+
+fn extract_flow_value(res: &HttpProbeResult, raw_body: &str, expr: &str) -> Option<String> {
+    let e = expr.trim();
+    if e.eq_ignore_ascii_case("status") {
+        return Some(res.status.to_string());
+    }
+    if let Some(hname) = e.strip_prefix("header:") {
+        let target = hname.trim();
+        for h in &res.headers {
+            if let Some((k, v)) = h.split_once(':') {
+                if k.trim().eq_ignore_ascii_case(target) {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+        return None;
+    }
+    extract_json_select(raw_body, e).map(|v| match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    })
+}
+
+/// Ordered stateful multi-step HTTP runner (`--flow <path_or_dash>`) supporting `{{var}}`
+/// propagation, per-step `cdp_cookies`, sentinel checks, and cross-step differential comparison.
+pub fn run_http_flow(
+    flow_spec: &str,
+    base_headers: &[String],
+    global_sentinels: &[String],
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+    as_json: bool,
+) -> i32 {
+    let raw_txt = if flow_spec.trim() == "-" {
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            eprintln!("[probe http flow] failed reading stdin");
+            return 2;
+        }
+        buf
+    } else {
+        match std::fs::read_to_string(flow_spec) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[probe http flow] failed reading `{flow_spec}`: {e}");
+                return 2;
+            }
+        }
+    };
+    let parsed: Value = match serde_json::from_str(raw_txt.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[probe http flow] invalid JSON flow spec: {e}");
+            return 2;
+        }
+    };
+
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut flow_sentinels: Vec<String> = global_sentinels.to_vec();
+    let steps_val = if parsed.is_array() {
+        parsed
+    } else {
+        if let Some(vmap) = parsed.get("vars").and_then(Value::as_object) {
+            for (k, v) in vmap {
+                let s = match v {
+                    Value::String(st) => st.clone(),
+                    other => other.to_string(),
+                };
+                vars.insert(k.clone(), s);
+            }
+        }
+        if let Some(sarr) = parsed.get("sentinels").and_then(Value::as_array) {
+            for s in sarr.iter().filter_map(Value::as_str) {
+                flow_sentinels.push(s.to_string());
+            }
+        }
+        parsed.get("steps").cloned().unwrap_or(Value::Null)
+    };
+    let steps: Vec<FlowStepSpec> = match serde_json::from_value(steps_val) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[probe http flow] invalid steps schema: {e}");
+            return 2;
+        }
+    };
+    if steps.is_empty() {
+        eprintln!("[probe http flow] flow contains 0 steps");
+        return 2;
+    }
+
+    let mut step_results: Vec<HttpProbeResult> = Vec::with_capacity(steps.len());
+    let mut json_steps: Vec<Value> = Vec::with_capacity(steps.len());
+    let mut failed_count = 0usize;
+    let mut sentinel_leak_count = 0usize;
+
+    for (idx, step) in steps.iter().enumerate() {
+        let label = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("step_{}", idx + 1));
+        let m = step.method.to_ascii_uppercase();
+        let u = substitute_flow_vars(&step.url, &vars);
+        let mut hdrs: Vec<String> = base_headers
+            .iter()
+            .map(|h| substitute_flow_vars(h, &vars))
+            .collect();
+        hdrs.extend(step.headers.iter().map(|h| substitute_flow_vars(h, &vars)));
+        let body_sub = step.body.as_deref().map(|b| substitute_flow_vars(b, &vars));
+
+        if let Some(port) = step.cdp_cookies {
+            if !has_header_name(&hdrs, "cookie") {
+                if let Ok((Some(ch), _)) = resolve_cdp_cookie_header(port, &u) {
+                    hdrs.push(ch);
+                }
+            }
+        }
+
+        let (res, raw_b) = execute_http_probe_with_raw(
+            &m,
+            &u,
+            &hdrs,
+            body_sub.as_deref(),
+            timeout_sec,
+            insecure,
+            follow,
+        );
+
+        let mut extracted_here = serde_json::Map::new();
+        for (k, expr) in &step.extract {
+            if let Some(val) = extract_flow_value(&res, &raw_b, expr) {
+                vars.insert(k.clone(), val.clone());
+                extracted_here.insert(k.clone(), Value::String(val));
+            }
+        }
+
+        let mut step_sents = flow_sentinels.clone();
+        step_sents.extend(step.sentinels.iter().cloned());
+        let sentinel_hits: Vec<String> = step_sents
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && raw_b.contains(*s))
+            .map(str::to_string)
+            .collect();
+        if !sentinel_hits.is_empty() {
+            sentinel_leak_count += 1;
+        }
+
+        let expectation_ok = step
+            .expect_status
+            .map(|exp| res.status == exp)
+            .unwrap_or_else(|| res.error.is_empty() && res.status != 0);
+        if !expectation_ok {
+            failed_count += 1;
+        }
+
+        let diff_rep = step
+            .compare_step
+            .and_then(|base_i| step_results.get(base_i))
+            .map(|base_res| classify_auth_matrix_diff_deep(base_res, &res, &step_sents));
+
+        let non_json = summarize_non_json_body(&res.content_type, &res.body_preview);
+        let mut obj = json!({
+            "step": idx,
+            "name": label,
+            "method": res.method,
+            "url": res.url,
+            "status": res.status,
+            "elapsed_ms": res.elapsed_ms,
+            "expectation_ok": expectation_ok,
+            "extracted": extracted_here,
+            "sentinel_hits": sentinel_hits,
+            "error": res.error,
+            "body_preview": res.body_preview.chars().take(360).collect::<String>(),
+        });
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(ref d) = diff_rep {
+                map.insert("diff".to_string(), json!(d));
+            }
+            if let Some(ref nj) = non_json {
+                map.insert("body_diagnostic".to_string(), json!(nj));
+            }
+        }
+        step_results.push(res);
+        json_steps.push(obj);
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": failed_count == 0,
+                "step_count": steps.len(),
+                "failed_steps": failed_count,
+                "sentinel_leak_steps": sentinel_leak_count,
+                "vars": vars,
+                "steps": json_steps,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "[probe http flow] {} step(s), failed={failed_count}, sentinel_leaks={sentinel_leak_count}:",
+            steps.len()
+        );
+        for s in &json_steps {
+            println!(
+                "  #{}. {} {} {} -> HTTP {} ({}ms) [ok={}]",
+                s["step"].as_u64().unwrap_or(0) + 1,
+                s["name"].as_str().unwrap_or("?"),
+                s["method"].as_str().unwrap_or("GET"),
+                s["url"].as_str().unwrap_or(""),
+                s["status"].as_u64().unwrap_or(0),
+                s["elapsed_ms"].as_f64().unwrap_or(0.0),
+                s["expectation_ok"].as_bool().unwrap_or(false),
+            );
+        }
+    }
+    if failed_count == 0 {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]

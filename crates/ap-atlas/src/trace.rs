@@ -25,7 +25,7 @@ const SKIP_DIRS: &[&str] = &[
     "vendor",
 ];
 
-const NOTABLE_SINKS: &[&str] = &[
+pub(crate) const NOTABLE_SINKS: &[&str] = &[
     "exec",
     "execSync",
     "execFile",
@@ -150,7 +150,7 @@ fn extract_guard_lines(
     out
 }
 
-fn clean_fn_name(raw: &str) -> String {
+pub(crate) fn clean_fn_name(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Some(idx) = trimmed.rfind("::") {
         let tail = trimmed[idx + 2..].trim();
@@ -357,7 +357,7 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
     }
 }
 
-fn classify_hop_guard(caller: &FnDef, call_line: usize) -> (String, String) {
+pub(crate) fn classify_hop_guard(caller: &FnDef, call_line: usize) -> (String, String) {
     if let Some((ln, snippet)) = caller.guard_lines.iter().rfind(|(ln, _)| *ln < call_line) {
         return ("GUARD_BEFORE".to_string(), format!("L{ln}: {snippet}"));
     }
@@ -504,16 +504,7 @@ pub fn trace_symbol_chain(root: &Path, target: &str, max_depth: usize) -> TraceR
     trace_symbol_chain_to(root, target, None, false, max_depth)
 }
 
-pub fn trace_symbol_chain_to(
-    root: &Path,
-    target: &str,
-    to_sink: Option<&str>,
-    include_sinks: bool,
-    max_depth: usize,
-) -> TraceReport {
-    let t0 = Instant::now();
-    let target_clean = clean_fn_name(target);
-    let target_ref = target_clean.as_str();
+pub(crate) fn collect_project_fns(root: &Path) -> Vec<FnDef> {
     let mut all_fns: Vec<FnDef> = Vec::new();
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
@@ -555,6 +546,20 @@ pub fn trace_symbol_chain_to(
             extract_cpp_fallback_fns(&src, &src_lines, &rel, &mut all_fns);
         }
     }
+    all_fns
+}
+
+pub fn trace_symbol_chain_to(
+    root: &Path,
+    target: &str,
+    to_sink: Option<&str>,
+    include_sinks: bool,
+    max_depth: usize,
+) -> TraceReport {
+    let t0 = Instant::now();
+    let target_clean = clean_fn_name(target);
+    let target_ref = target_clean.as_str();
+    let all_fns = collect_project_fns(root);
 
     let defined_names: HashSet<&str> = all_fns.iter().map(|f| f.name.as_str()).collect();
     let mut callers_of: HashMap<&str, Vec<(&FnDef, usize)>> = HashMap::new();

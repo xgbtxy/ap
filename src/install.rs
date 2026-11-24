@@ -1241,6 +1241,80 @@ export function resolveSafeShellTimeout(cmd: string, currentTimeout: unknown): n
  * (inspired by pi-deepseek-cache): prevents DeepSeek KV-cache prefix invalidation from
  * tool-list order jitter across MCP reconnects or reloads while preserving Anthropic `cache_control`.
  */
+export interface ProviderRequestHashes {{
+	model: string;
+	effort: string;
+	toolsHash: number;
+	msgHashes: number[];
+}}
+
+function fnv1a32(text: string): number {{
+	let h = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {{
+		h ^= text.charCodeAt(i);
+		h = Math.imul(h, 0x01000193) >>> 0;
+	}}
+	return h >>> 0;
+}}
+
+/**
+ * Compute deterministic wire-level hashes across `model`, `reasoning_effort`, `tools`, and
+ * `messages[]` before provider send (<0.4ms) so `turn_end` can classify unexpected KV-cache drops.
+ */
+export function snapshotProviderRequestHashes(payload: unknown): ProviderRequestHashes | null {{
+	if (!payload || typeof payload !== "object") return null;
+	const p = payload as {{
+		model?: unknown;
+		reasoning_effort?: unknown;
+		reasoningEffort?: unknown;
+		tools?: unknown;
+		messages?: unknown;
+	}};
+	const model = String(p.model ?? "");
+	const effort = String(p.reasoning_effort ?? p.reasoningEffort ?? "");
+	let toolsHash = 0;
+	if (Array.isArray(p.tools)) {{
+		try {{
+			toolsHash = fnv1a32(JSON.stringify(p.tools));
+		}} catch {{
+			toolsHash = p.tools.length;
+		}}
+	}}
+	const msgHashes: number[] = [];
+	if (Array.isArray(p.messages)) {{
+		const cap = Math.min(p.messages.length, 400);
+		for (let i = 0; i < cap; i++) {{
+			try {{
+				msgHashes.push(fnv1a32(JSON.stringify(p.messages[i])));
+			}} catch {{
+				msgHashes.push(i);
+			}}
+		}}
+	}}
+	return {{ model, effort, toolsHash, msgHashes }};
+}}
+
+/**
+ * Pinpoint the exact diverging prefix boundary when DeepSeek KV-cache drops unexpectedly.
+ */
+export function classifyCacheDropCause(
+	prev: ProviderRequestHashes | null,
+	curr: ProviderRequestHashes | null,
+): string {{
+	if (!prev || !curr) return "ttl_eviction";
+	if (prev.model !== curr.model) return "model_changed";
+	if (prev.effort !== curr.effort) return "effort_changed";
+	if (prev.toolsHash !== curr.toolsHash) return "tools_changed";
+	const common = Math.min(prev.msgHashes.length, curr.msgHashes.length);
+	for (let i = 0; i < common; i++) {{
+		if (prev.msgHashes[i] !== curr.msgHashes[i]) {{
+			return `msg[${{i}}]_mutated`;
+		}}
+	}}
+	if (curr.msgHashes.length < prev.msgHashes.length) return "prefix_truncated";
+	return "ttl_eviction";
+}}
+
 export function stabilizeProviderTools(payload: unknown): unknown {{
 	if (!payload || typeof payload !== "object") return undefined;
 	const p = payload as {{ tools?: unknown }};
@@ -5577,6 +5651,9 @@ export default function (pi: ExtensionAPI) {{
 	let sessionCacheReadTokens = 0;
 	let lastKnownPromptTokens = 0;
 	let lastCacheDropPct: number | null = null;
+	let lastCacheDropCause = "";
+	let prevRequestHashes: ProviderRequestHashes | null = null;
+	let currRequestHashes: ProviderRequestHashes | null = null;
 	let sievedCount = 0;
 	let maskedCount = 0;
 	let guardsTriggered = 0;
@@ -5610,6 +5687,9 @@ export default function (pi: ExtensionAPI) {{
 		lastMaskTurn = -MASK_COOLDOWN_TURNS;
 		lastKnownPromptTokens = 0;
 		lastCacheDropPct = null;
+		lastCacheDropCause = "";
+		prevRequestHashes = null;
+		currRequestHashes = null;
 	}};
 
 	// Opt-in Pi v1.5 virtual model: `deepseek/flash-auto` (same physical deepseek-flash, dynamic low/high/max effort)
@@ -5690,7 +5770,11 @@ export default function (pi: ExtensionAPI) {{
 		const parts: string[] = [];
 		const totalPrompt = sessionInputTokens + sessionCacheReadTokens;
 		if (lastCacheDropPct !== null) {{
-			parts.push(`CACHE DROP ${{lastCacheDropPct}}%`);
+			parts.push(
+				lastCacheDropCause
+					? `CACHE DROP ${{lastCacheDropPct}}% [${{lastCacheDropCause}}]`
+					: `CACHE DROP ${{lastCacheDropPct}}%`,
+			);
 		}} else if (totalPrompt >= 10000) {{
 			const hitPct = Math.round((sessionCacheReadTokens / totalPrompt) * 100);
 			parts.push(`cache ${{hitPct}}%`);
@@ -5784,7 +5868,14 @@ export default function (pi: ExtensionAPI) {{
 	}});
 
 	pi.on("before_provider_request", (event) => {{
-		return stabilizeProviderTools(event?.payload);
+		const nextPayload = stabilizeProviderTools(event?.payload);
+		const inspected = nextPayload ?? event?.payload;
+		const nextHashes = snapshotProviderRequestHashes(inspected);
+		if (nextHashes) {{
+			prevRequestHashes = currRequestHashes;
+			currRequestHashes = nextHashes;
+		}}
+		return nextPayload;
 	}});
 
 	pi.on("agent_start", () => {{
@@ -5903,48 +5994,13 @@ export default function (pi: ExtensionAPI) {{
 			const extraInstr = event.customInstructions?.trim()
 				? `\n\n## Additional Focus\n${{event.customInstructions.trim()}}`
 				: "";
-			const compCtx = {{
-				systemPrompt:
-					"You are a context compaction summarizer for a coding agent. Output ONLY a crisp, structured handoff summary with these exact headings: ## Goal & Constraints, ## Verified Facts & Progress, ## Falsified Dead-Ends (DO NOT RETRY), ## Key Decisions & File Map, ## Next Immediate Action. Preserve exact file paths, symbol names, build/test commands, and error signatures. Do NOT continue the conversation.",
-				messages: [
-					{{
-						role: "user" as const,
-						content: [
-							{{
-								type: "text" as const,
-								text: `${{serialized}}${{batonBrief}}${{extraInstr}}`,
-							}},
-						],
-						timestamp: Date.now(),
-					}},
-				],
-			}};
-			const compOpts = {{
-				reasoning: "low" as const,
-				maxTokens: 6144,
-				cacheRetention: "none" as const,
-				signal: event.signal,
-			}};
-			// Use `streamSimple().result()` (NOT `complete()`): in Pi v1.5+, `complete()` bypasses
-			// `streamSimple`, dropping `reasoning` effort mapping and rejecting virtual models like `flash-auto`.
-			const response =
-				typeof ctx.modelRegistry.streamSimple === "function"
-					? await ctx.modelRegistry.streamSimple(model, compCtx, compOpts).result()
-					: await ctx.modelRegistry.complete(model, compCtx, compOpts as never);
-			if (
-				!response ||
-				response.stopReason === "error" ||
-				response.stopReason === "aborted" ||
-				response.stopReason === "length"
-			) {{
-				return undefined;
-			}}
-			let summary = (response.content ?? [])
-				.filter((c): c is {{ type: "text"; text: string }} => c?.type === "text" && typeof c.text === "string")
-				.map((c) => c.text)
-				.join("\n")
-				.trim();
-			if (summary.length < 40) return undefined;
+			let summary = await summarizeTranscriptLowReasoning(
+				ctx,
+				model,
+				`${{serialized}}${{batonBrief}}${{extraInstr}}`,
+				event.signal,
+			);
+			if (!summary || summary.length < 40) return undefined;
 			if (readFiles.length > 0) {{
 				summary += `\n\n<read-files>\n${{readFiles.join("\n")}}\n</read-files>`;
 			}}
@@ -5959,7 +6015,6 @@ export default function (pi: ExtensionAPI) {{
 					summary,
 					firstKeptEntryId: prep.firstKeptEntryId,
 					tokensBefore: prep.tokensBefore,
-					usage: response.usage,
 					details: {{ readFiles, modifiedFiles }},
 				}},
 			}};
@@ -5969,18 +6024,110 @@ export default function (pi: ExtensionAPI) {{
 		}}
 	}});
 
-	pi.on("session_before_tree", (_event, ctx) => {{
-		// Keep branch-switch summaries sharp by preserving verified facts, dead-ends & active codemode-store keys
+	async function summarizeTranscriptLowReasoning(
+		ctx: ExtensionContext,
+		model: NonNullable<ExtensionContext["model"]>,
+		promptText: string,
+		signal?: AbortSignal,
+	): Promise<string | undefined> {{
+		const compCtx = {{
+			systemPrompt:
+				"You are a context compaction summarizer for a coding agent. Output ONLY a crisp, structured handoff summary with these exact headings: ## Goal & Constraints, ## Verified Facts & Progress, ## Falsified Dead-Ends (DO NOT RETRY), ## Key Decisions & File Map, ## Next Immediate Action. Preserve exact file paths, symbol names, build/test commands, and error signatures. Do NOT continue the conversation.",
+			messages: [
+				{{
+					role: "user" as const,
+					content: [{{ type: "text" as const, text: promptText }}],
+					timestamp: Date.now(),
+				}},
+			],
+		}};
+		const compOpts = {{
+			reasoning: "low" as const,
+			maxTokens: 6144,
+			cacheRetention: "none" as const,
+			signal,
+		}};
+		// Use `streamSimple().result()` (NOT `complete()`): in Pi v1.5+, `complete()` bypasses
+		// `streamSimple`, dropping `reasoning` effort mapping and rejecting virtual models like `flash-auto`.
+		const response =
+			typeof ctx.modelRegistry.streamSimple === "function"
+				? await ctx.modelRegistry.streamSimple(model, compCtx, compOpts).result()
+				: await ctx.modelRegistry.complete(model, compCtx, compOpts as never);
+		if (
+			!response ||
+			response.stopReason === "error" ||
+			response.stopReason === "aborted" ||
+			response.stopReason === "length"
+		) {{
+			return undefined;
+		}}
+		return (response.content ?? [])
+			.filter((c): c is {{ type: "text"; text: string }} => c?.type === "text" && typeof c.text === "string")
+			.map((c) => c.text)
+			.join("\n")
+			.trim();
+	}}
+
+	pi.on("session_before_tree", async (event, ctx) => {{
+		// Keep branch-switch summaries fast & sharp (reasoning: "low" summary when DeepSeek + modelRegistry exist,
+		// falling back cleanly to customInstructions with verified facts, dead-ends & active codemode-store keys)
 		const branch = ctx?.sessionManager?.getBranch?.() ?? [];
 		const storeKeys = listCodemodeStoreKeys(branch as unknown as Array<Record<string, unknown>>);
 		const storeAnchor =
 			storeKeys.length > 0
 				? ` Note active codemode-store keys recoverable via load(key): [${{storeKeys.slice(0, 12).join(", ")}}].`
 				: "";
-		return {{
+		const fallback = {{
 			customInstructions:
 				`Preserve exact file paths, symbol names, verified facts, falsified hypotheses/dead-ends, and exact failing error signatures so the target branch never repeats failed attempts.${{storeAnchor}}`,
 		}};
+		const prep = (event as {{ preparation?: {{ entriesToSummarize?: Array<Record<string, unknown>>; customInstructions?: string; userWantsSummary?: boolean }}; signal?: AbortSignal }} | undefined)?.preparation;
+		const signal = (event as {{ signal?: AbortSignal }} | undefined)?.signal;
+		const model = ctx?.model;
+		const isDeepSeek = Boolean(
+			model &&
+				(String(model.provider ?? "").toLowerCase().includes("deepseek") ||
+					String(model.id ?? "").toLowerCase().includes("deepseek") ||
+					String(model.id ?? "").toLowerCase().includes("flash-auto")),
+		);
+		const hasSimpleComplete =
+			typeof ctx?.modelRegistry?.streamSimple === "function" ||
+			typeof ctx?.modelRegistry?.complete === "function";
+		if (
+			prep?.userWantsSummary === false ||
+			!isDeepSeek ||
+			!model ||
+			!hasSimpleComplete ||
+			signal?.aborted
+		) {{
+			return fallback;
+		}}
+		const entries = Array.isArray(prep?.entriesToSummarize) && prep.entriesToSummarize.length > 0
+			? prep.entriesToSummarize
+			: (branch as unknown as Array<Record<string, unknown>>);
+		const rawMsgs = entries
+			.map((e) => ((e as {{ message?: Record<string, unknown> }})?.message ?? e))
+			.filter((m) => m && typeof m === "object");
+		if (rawMsgs.length === 0) return fallback;
+		try {{
+			const serialized = serializeMessagesForCompaction(rawMsgs, undefined, [], [], storeKeys);
+			const extra = prep?.customInstructions?.trim()
+				? `\n\n## Additional Focus\n${{prep.customInstructions.trim()}}`
+				: "";
+			let summary = await summarizeTranscriptLowReasoning(
+				ctx,
+				model,
+				`${{serialized}}${{extra}}`,
+				signal,
+			);
+			if (!summary || summary.length < 40) return fallback;
+			if (storeKeys.length > 0) {{
+				summary += `\n\n<codemode-store-keys>\n${{storeKeys.join(", ")}}\n</codemode-store-keys>`;
+			}}
+			return {{ summary }};
+		}} catch {{
+			return fallback;
+		}}
 	}});
 
 	// Zero-prompt-token interactive `/ap` command inside Pi (`/ap`, `status`, `doctor`, `compact`, `handoff <goal>`)
@@ -6399,8 +6546,19 @@ export default function (pi: ExtensionAPI) {{
 				const turnHitPct = Math.round((uCache / turnPrompt) * 100);
 				if (turnPrompt >= 20000 && turnHitPct < 45 && !expectedCacheReset) {{
 					lastCacheDropPct = turnHitPct;
+					lastCacheDropCause = classifyCacheDropCause(prevRequestHashes, currRequestHashes);
+					const evBus = (pi as {{ events?: {{ emit?: (ch: string, d: unknown) => void }} }}).events;
+					if (typeof evBus?.emit === "function") {{
+						evBus.emit("ap:cache_drop", {{
+							turn: sessionTurnCount,
+							hitPct: turnHitPct,
+							promptTokens: turnPrompt,
+							cause: lastCacheDropCause,
+						}});
+					}}
 				}} else if (turnHitPct >= 60) {{
 					lastCacheDropPct = null;
+					lastCacheDropCause = "";
 				}}
 				if (turnPrompt >= FREE_MASK_MIN_TOKENS && turnHitPct < 55 && !expectedCacheReset) {{
 					justRebuiltColdCache = true;

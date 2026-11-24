@@ -8,6 +8,7 @@ pub mod locate;
 pub mod product;
 pub mod surface;
 pub mod trace;
+pub mod variants;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -203,6 +204,22 @@ enum SubCmd {
         /// Also compute multi-hop reachability paths to all notable I/O/exec/DOM/SQL sinks
         #[arg(long)]
         sinks: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// AST structural sibling & guard-asymmetry sweeper: ranks unguarded sibling functions calling a sink or seeded pattern
+    Variants {
+        #[arg(default_value = ".")]
+        root: String,
+        /// Sink identifier or regex pattern to sweep across all project functions
+        #[arg(long)]
+        sink: Option<String>,
+        /// Seed function/method symbol whose sinks are swept automatically
+        #[arg(long)]
+        seed: Option<String>,
+        /// Optional custom guard regex in addition to built-in auth/bounds patterns
+        #[arg(long)]
+        guard: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1527,6 +1544,31 @@ pub fn run_cli(args: &[String]) -> i32 {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
             } else {
                 println!("{}", trace::render_trace_md(&rep));
+            }
+            return 0;
+        }
+        Some(SubCmd::Variants {
+            root,
+            sink,
+            seed,
+            guard,
+            json,
+        }) => {
+            let root_p = PathBuf::from(&root);
+            if !root_p.exists() {
+                eprintln!("[atlas] path not found: {root}");
+                return 1;
+            }
+            let rep = variants::analyze_variants(
+                &root_p,
+                sink.as_deref(),
+                seed.as_deref(),
+                guard.as_deref(),
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+            } else {
+                println!("{}", variants::render_variants_md(&rep));
             }
             return 0;
         }
