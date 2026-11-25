@@ -97,6 +97,21 @@ enum SubCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Bounded maintenance: prune oldest/expired archives & VACUUM SQLite FTS5 store
+    Prune {
+        /// Maximum retained raw+meta store size per directory in MiB (default: 64)
+        #[arg(long = "max-mb", default_value_t = 64)]
+        max_mb: u64,
+        /// Optional maximum age in hours (archives older than this are removed)
+        #[arg(long = "max-age-hours")]
+        max_age_hours: Option<u64>,
+        /// Run SQLite WAL checkpoint + VACUUM after deleting pruned rows
+        #[arg(long)]
+        vacuum: bool,
+        /// Emit structured JSON summary
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn log_regexes() -> &'static (Regex, Regex, Regex) {
@@ -228,6 +243,120 @@ fn prune_ring_buffer(store: &Path, max_bytes: u64) {
         total = total.saturating_sub(sz);
         idx += 1;
     }
+}
+
+pub fn prune_store(
+    store: &Path,
+    max_bytes: u64,
+    max_age_hours: Option<u64>,
+    vacuum: bool,
+) -> Value {
+    let Ok(rd) = fs::read_dir(store) else {
+        return json!({
+            "store": store.display().to_string(),
+            "exists": false,
+            "removed_entries": 0,
+            "freed_bytes": 0,
+            "remaining_bytes": 0,
+            "vacuumed": false,
+        });
+    };
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cutoff_secs = max_age_hours.map(|h| now_secs.saturating_sub(h.saturating_mul(3600)));
+
+    let mut items: Vec<(u64, u64, String, PathBuf)> = Vec::new();
+    let mut total_bytes = 0u64;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("raw") {
+            continue;
+        }
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let meta_p = store.join(format!("{stem}.meta.json"));
+        let Ok(raw_meta) = entry.metadata() else {
+            continue;
+        };
+        let mtime_secs = raw_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let meta_len = fs::metadata(&meta_p).map(|m| m.len()).unwrap_or(0);
+        let entry_bytes = raw_meta.len().saturating_add(meta_len);
+        total_bytes = total_bytes.saturating_add(entry_bytes);
+        items.push((mtime_secs, entry_bytes, stem, p));
+    }
+
+    items.sort_by_key(|x| x.0);
+    let mut removed_ids: Vec<String> = Vec::new();
+    let mut freed_bytes = 0u64;
+    let mut kept_bytes = 0u64;
+
+    let mut remaining: Vec<(u64, u64, String, PathBuf)> = Vec::new();
+    for (mt, sz, id, raw_p) in items {
+        let expired = cutoff_secs.map(|c| mt < c).unwrap_or(false);
+        if expired {
+            let _ = fs::remove_file(&raw_p);
+            let _ = fs::remove_file(store.join(format!("{id}.meta.json")));
+            freed_bytes = freed_bytes.saturating_add(sz);
+            removed_ids.push(id);
+        } else {
+            kept_bytes = kept_bytes.saturating_add(sz);
+            remaining.push((mt, sz, id, raw_p));
+        }
+    }
+
+    // Evict oldest non-expired items until kept_bytes <= max_bytes (or empty if max_bytes == 0)
+    for (_, sz, id, raw_p) in remaining {
+        if kept_bytes <= max_bytes {
+            break;
+        }
+        let _ = fs::remove_file(&raw_p);
+        let _ = fs::remove_file(store.join(format!("{id}.meta.json")));
+        kept_bytes = kept_bytes.saturating_sub(sz);
+        freed_bytes = freed_bytes.saturating_add(sz);
+        removed_ids.push(id);
+    }
+
+    let db_path = store.join("index.sqlite");
+    let db_bytes_before = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let mut vacuumed = false;
+    if db_path.is_file() {
+        if let Ok(conn) = open_sieve_db(&db_path) {
+            for chunk in removed_ids.chunks(64) {
+                if let Ok(tx) = conn.unchecked_transaction() {
+                    for id in chunk {
+                        let _ = tx.execute("DELETE FROM chunks WHERE id = ?1", params![id]);
+                    }
+                    let _ = tx.commit();
+                }
+            }
+            if vacuum || db_bytes_before > max_bytes.max(1) {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+                vacuumed = true;
+            }
+        }
+    }
+    let db_bytes_after = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+    json!({
+        "store": store.display().to_string(),
+        "exists": true,
+        "before_bytes": total_bytes,
+        "removed_entries": removed_ids.len(),
+        "freed_bytes": freed_bytes,
+        "remaining_bytes": kept_bytes,
+        "db_bytes_before": db_bytes_before,
+        "db_bytes_after": db_bytes_after,
+        "vacuumed": vacuumed,
+    })
 }
 
 fn archive_stream(
@@ -2073,6 +2202,59 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             0
         }
+        SubCmd::Prune {
+            max_mb,
+            max_age_hours,
+            vacuum,
+            json: as_json,
+        } => {
+            let max_bytes = max_mb.saturating_mul(1024).saturating_mul(1024);
+            let mut targets = Vec::new();
+            let primary = store_dir_readonly(&cwd);
+            let has_explicit_home = std::env::var("SIEVE_HOME")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            targets.push(primary.clone());
+            if !has_explicit_home {
+                if let Some(g) = global_sieve_dir() {
+                    if g != primary && g.is_dir() {
+                        targets.push(g);
+                    }
+                }
+            }
+            let mut reports = Vec::new();
+            let mut total_removed = 0u64;
+            let mut total_freed = 0u64;
+            for dir in &targets {
+                if dir.is_dir() {
+                    let rep = prune_store(dir, max_bytes, max_age_hours, vacuum);
+                    total_removed += rep["removed_entries"].as_u64().unwrap_or(0);
+                    total_freed += rep["freed_bytes"].as_u64().unwrap_or(0);
+                    reports.push(rep);
+                }
+            }
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "max_mb": max_mb,
+                        "max_age_hours": max_age_hours,
+                        "vacuum": vacuum,
+                        "removed_entries": total_removed,
+                        "freed_bytes": total_freed,
+                        "stores": reports,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "[sieve prune] removed={total_removed} entries freed={total_freed} B across {} store(s) (max_mb={max_mb}, vacuum={vacuum})",
+                    reports.len()
+                );
+            }
+            0
+        }
     }
 }
 
@@ -2178,5 +2360,31 @@ mod tests {
             "{}",
             res_part.rendered
         );
+    }
+
+    #[test]
+    fn prune_store_removes_oversized_and_vacuums_db() {
+        let td = std::env::temp_dir().join(format!("ap_sieve_prune_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&td);
+        fs::create_dir_all(&td).unwrap();
+
+        for idx in 0..5usize {
+            let payload = format!("item-{idx}-{}", "A".repeat(4000));
+            let _ = compress_stream_in(&td, &payload, &format!("lbl-{idx}"), 0, 2.0);
+            std::thread::sleep(Duration::from_millis(8));
+        }
+
+        // Retain at most ~9 KiB of raw+meta files and VACUUM SQLite
+        let rep = prune_store(&td, 9000, None, true);
+        let _ = fs::remove_dir_all(&td);
+        assert!(
+            rep["removed_entries"].as_u64().unwrap_or(0) >= 2,
+            "expected >=2 pruned entries: {rep}"
+        );
+        assert!(
+            rep["remaining_bytes"].as_u64().unwrap_or(u64::MAX) <= 9000,
+            "{rep}"
+        );
+        assert_eq!(rep["vacuumed"], Value::Bool(true), "{rep}");
     }
 }

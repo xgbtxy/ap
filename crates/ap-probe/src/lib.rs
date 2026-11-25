@@ -180,9 +180,21 @@ struct HttpArgs {
     /// Ordered stateful multi-step HTTP flow JSON file (or `-` for stdin) with `{{var}}` extraction & cross-step assertions
     #[arg(long)]
     flow: Option<String>,
-    /// Optional sensitive sentinel token(s) to flag immediately if leaked in any auth-matrix candidate response body
+    /// Sentinels to flag if leaked in auth-matrix candidate responses
     #[arg(long = "sentinel")]
     sentinels: Vec<String>,
+    /// Multi-role differential matrix spec (`roles_matrix.json`, `-` stdin, or inline JSON)
+    #[arg(long = "roles-matrix")]
+    roles_matrix: Option<String>,
+    /// Per-role template variables (`role:key=value`, e.g. `owner:id=101`), repeatable
+    #[arg(long = "role-var")]
+    role_vars: Vec<String>,
+    /// Comma-separated HTTP methods for `--roles-matrix` (e.g. `GET,POST,DELETE`)
+    #[arg(long)]
+    methods: Option<String>,
+    /// Expand cross-tenant `(actor, target_owner)` combinations when `--role-var` values differ
+    #[arg(long = "cross-id")]
+    cross_id: bool,
     #[arg(long)]
     json: bool,
 }
@@ -413,7 +425,19 @@ enum SubCmd {
         /// Inspect PE Authenticode signature & Windows catalog trust (`subject`, `issuer`, `valid`, `sha256`)
         #[arg(long)]
         sig: Option<PathBuf>,
-        /// Case-insensitive substring filter for pipes, registry values/subkeys, or services
+        /// Audit non-admin writable pipes/services/dirs (`--weak-acl` for OS sweep or `--weak-acl <PATH>`)
+        #[arg(long = "weak-acl", num_args = 0..=1, default_missing_value = "")]
+        weak_acl: Option<String>,
+        /// Scan services for unquoted ImagePaths containing spaces & check intermediate directory ACLs
+        #[arg(long)]
+        unquoted: bool,
+        /// Audit HKLM\SOFTWARE\Classes\CLSID COM LocalServer/InprocServer hijacks & AutoElevation
+        #[arg(long)]
+        com: bool,
+        /// Enumerate live Windows RPC Endpoint Mapper bindings via rpcrt4.dll
+        #[arg(long)]
+        rpc: bool,
+        /// Case-insensitive substring filter for pipes, registry values/subkeys, services, COM, or RPC
         #[arg(long)]
         filter: Option<String>,
         /// Maximum entries to return (1..=200)
@@ -717,8 +741,35 @@ pub fn run_cli(args: &[String]) -> i32 {
                 mutate_matrix,
                 flow,
                 sentinels,
+                roles_matrix,
+                role_vars,
+                methods,
+                cross_id,
                 json,
             } = *boxed;
+            if roles_matrix.is_some() || !role_vars.is_empty() || methods.is_some() || cross_id {
+                return http_probe::run_http_roles_matrix(
+                    roles_matrix.as_deref(),
+                    vary_request.as_deref(),
+                    url.as_deref(),
+                    &method,
+                    methods.as_deref(),
+                    &headers,
+                    body.as_deref(),
+                    &principals,
+                    &principal_cdps,
+                    &role_vars,
+                    cross_id,
+                    rate_ms,
+                    max_variants,
+                    dry_run,
+                    &sentinels,
+                    timeout,
+                    insecure,
+                    follow,
+                    json,
+                );
+            }
             if let Some(fl) = flow.as_deref().filter(|s| !s.trim().is_empty()) {
                 return http_probe::run_http_flow(
                     fl, &headers, &sentinels, timeout, insecure, follow, json,
@@ -903,6 +954,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             services,
             whoami,
             sig,
+            weak_acl,
+            unquoted,
+            com,
+            rpc,
             filter,
             max,
             json,
@@ -913,6 +968,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             services,
             whoami,
             sig.as_deref(),
+            weak_acl.as_deref(),
+            unquoted,
+            com,
+            rpc,
             filter.as_deref(),
             max,
             json,

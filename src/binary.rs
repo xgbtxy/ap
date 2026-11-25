@@ -1290,78 +1290,436 @@ fn scan_dotnet_clr_meta(bytes: &[u8]) -> Option<(String, Vec<String>)> {
     Some((ver, notable))
 }
 
-/// Pure-Rust Binary & Archive Patch-Diff Engine (`ap read <new> --diff <old>`).
-/// Supports PE/DLL/SYS, ELF/SO, Go binaries, Electron `.asar`, and `.zip`/`.jar`/`.vsix`/`.war`.
-pub fn diff_binaries_or_archives_md(
+/// Compact bounded line diff hunk between two UTF-8 text snippets (<= `max_lines` lines).
+pub fn compact_text_hunk(old_txt: &str, new_txt: &str, max_lines: usize) -> String {
+    let old_lines: Vec<&str> = old_txt.lines().collect();
+    let new_lines: Vec<&str> = new_txt.lines().collect();
+    let old_set: std::collections::HashSet<&str> = old_lines.iter().copied().collect();
+    let new_set: std::collections::HashSet<&str> = new_lines.iter().copied().collect();
+    let mut out = Vec::new();
+    for (idx, line) in old_lines.iter().enumerate() {
+        if !new_set.contains(line) && !line.trim().is_empty() {
+            let clipped: String = line.chars().take(180).collect();
+            out.push(format!("- L{}: {clipped}", idx + 1));
+            if out.len() >= max_lines / 2 {
+                break;
+            }
+        }
+    }
+    for (idx, line) in new_lines.iter().enumerate() {
+        if !old_set.contains(line) && !line.trim().is_empty() {
+            let clipped: String = line.chars().take(180).collect();
+            out.push(format!("+ L{}: {clipped}", idx + 1));
+            if out.len() >= max_lines {
+                break;
+            }
+        }
+    }
+    out.join("\n")
+}
+
+fn scan_electron_ipc_flags(text: &str) -> std::collections::BTreeSet<String> {
+    let mut flags = std::collections::BTreeSet::new();
+    let pats = electron_flag_patterns();
+    for (name, sev, re) in &pats.rules {
+        if re.is_match(text) {
+            flags.insert(format!("[{sev}] {name}"));
+        }
+    }
+    flags
+}
+
+fn extract_pe_exports_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+    let mut exports = std::collections::BTreeSet::new();
+    if !bytes.starts_with(b"MZ") || bytes.len() <= 0x44 {
+        return exports;
+    }
+    let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
+    if bytes.get(pe_off..pe_off + 4) != Some(b"PE\0\0") {
+        return exports;
+    }
+    let n_sec = read_u16_le(bytes, pe_off + 6).unwrap_or(0) as usize;
+    let opt_sz = read_u16_le(bytes, pe_off + 20).unwrap_or(0) as usize;
+    let opt_off = pe_off + 24;
+    let is_pe64 = opt_sz >= 2 && read_u16_le(bytes, opt_off).unwrap_or(0) == 0x020B;
+    let dd_off = opt_off + if is_pe64 { 112 } else { 96 };
+    if opt_sz < if is_pe64 { 120 } else { 104 } {
+        return exports;
+    }
+    let mut secs = Vec::new();
+    let sec_base = opt_off + opt_sz;
+    for s in 0..n_sec.min(32) {
+        let off = sec_base + s * 40;
+        if off + 40 > bytes.len() {
+            break;
+        }
+        secs.push(PeSection {
+            name: String::new(),
+            vsize: read_u32_le(bytes, off + 8).unwrap_or(0),
+            vaddr: read_u32_le(bytes, off + 12).unwrap_or(0),
+            raw_size: read_u32_le(bytes, off + 16).unwrap_or(0),
+            raw_ptr: read_u32_le(bytes, off + 20).unwrap_or(0),
+            chars: read_u32_le(bytes, off + 36).unwrap_or(0),
+        });
+    }
+    let exp_rva = read_u32_le(bytes, dd_off).unwrap_or(0);
+    if let Some(exp_off) = rva_to_file_offset(exp_rva, &secs) {
+        let n_names = read_u32_le(bytes, exp_off + 24).unwrap_or(0) as usize;
+        let names_rva = read_u32_le(bytes, exp_off + 32).unwrap_or(0);
+        if let Some(names_off) = rva_to_file_offset(names_rva, &secs) {
+            for idx in 0..n_names.min(2000) {
+                if let Some(nrva) = read_u32_le(bytes, names_off + idx * 4) {
+                    if let Some(noff) = rva_to_file_offset(nrva, &secs) {
+                        if let Some(nm) = read_cstr(bytes, noff, 128) {
+                            exports.insert(nm);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    exports
+}
+
+fn extract_elf_dynsyms_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+    let mut syms = std::collections::BTreeSet::new();
+    if !bytes.starts_with(b"\x7FELF") || bytes.len() < 64 || bytes[4] != 2 {
+        return syms;
+    }
+    let shoff = read_u64_le(bytes, 40).unwrap_or(0) as usize;
+    let shentsize = read_u16_le(bytes, 58).unwrap_or(0) as usize;
+    let shnum = read_u16_le(bytes, 60).unwrap_or(0) as usize;
+    let shstrndx = read_u16_le(bytes, 62).unwrap_or(0) as usize;
+    if shoff == 0 || shentsize < 64 || shnum == 0 {
+        return syms;
+    }
+    let strtab_hdr = shoff.saturating_add(shstrndx.saturating_mul(shentsize));
+    let shstr_off = read_u64_le(bytes, strtab_hdr + 24).unwrap_or(0) as usize;
+    let mut dynstr_slice: Option<(usize, usize)> = None;
+    let mut dynsym_slice: Option<(usize, usize, usize)> = None;
+    for i in 0..shnum.min(64) {
+        let h = shoff.saturating_add(i.saturating_mul(shentsize));
+        if h + 64 > bytes.len() {
+            break;
+        }
+        let nm_off = read_u32_le(bytes, h).unwrap_or(0) as usize;
+        let sh_type = read_u32_le(bytes, h + 4).unwrap_or(0);
+        let s_off = read_u64_le(bytes, h + 24).unwrap_or(0) as usize;
+        let s_sz = read_u64_le(bytes, h + 32).unwrap_or(0) as usize;
+        let entsz = read_u64_le(bytes, h + 56).unwrap_or(0) as usize;
+        let sname = read_cstr(bytes, shstr_off.saturating_add(nm_off), 64).unwrap_or_default();
+        if sname == ".dynstr" {
+            dynstr_slice = Some((s_off, s_sz));
+        } else if sh_type == 11 || sname == ".dynsym" {
+            dynsym_slice = Some((s_off, s_sz, entsz.max(24)));
+        }
+    }
+    if let (Some((dstr_off, _)), Some((sym_off, sym_sz, entsz))) = (dynstr_slice, dynsym_slice) {
+        for k in 0..(sym_sz / entsz).min(3000) {
+            let p = sym_off + k * entsz;
+            if p + 24 > bytes.len() {
+                break;
+            }
+            let st_name = read_u32_le(bytes, p).unwrap_or(0) as usize;
+            if st_name > 0 {
+                if let Some(nm) = read_cstr(bytes, dstr_off.saturating_add(st_name), 128) {
+                    syms.insert(nm);
+                }
+            }
+        }
+    }
+    syms
+}
+
+fn is_code_member_ext(path: &str) -> bool {
+    let low = path.to_ascii_lowercase();
+    [
+        ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".json", ".html", ".htm",
+    ]
+    .iter()
+    .any(|ext| low.ends_with(ext))
+}
+
+fn is_js_like_member(path: &str) -> bool {
+    let low = path.to_ascii_lowercase();
+    [
+        ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".htm",
+    ]
+    .iter()
+    .any(|ext| low.ends_with(ext))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_archive_member_bytes(
+    out: &mut Vec<String>,
+    new_members: &std::collections::BTreeMap<String, Vec<u8>>,
+    old_members: &std::collections::BTreeMap<String, Vec<u8>>,
+    kind_label: &str,
+    new_label: &str,
+    old_label: &str,
+    h_new: &str,
+    h_old: &str,
+    size_delta: i64,
+    deep: bool,
+    max_items: usize,
+) -> (String, Value) {
+    let mut added: Vec<(String, usize)> = Vec::new();
+    let mut removed: Vec<(String, usize)> = Vec::new();
+    let mut changed: Vec<(String, i64, usize, bool)> = Vec::new();
+    let mut unchanged = 0usize;
+
+    for (path, nb) in new_members {
+        match old_members.get(path) {
+            None => added.push((path.clone(), nb.len())),
+            Some(ob) => {
+                if sha256_hex(nb) != sha256_hex(ob) {
+                    changed.push((
+                        path.clone(),
+                        (nb.len() as i64) - (ob.len() as i64),
+                        nb.len(),
+                        is_code_member_ext(path),
+                    ));
+                } else {
+                    unchanged += 1;
+                }
+            }
+        }
+    }
+    for (path, ob) in old_members {
+        if !new_members.contains_key(path) {
+            removed.push((path.clone(), ob.len()));
+        }
+    }
+
+    added.sort_by(|a, b| {
+        is_code_member_ext(&b.0)
+            .cmp(&is_code_member_ext(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    removed.sort_by(|a, b| {
+        is_code_member_ext(&b.0)
+            .cmp(&is_code_member_ext(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    changed.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| b.1.abs().cmp(&a.1.abs())));
+
+    out.push(format!(
+        "### Archive Member Diff ({kind_label}): +{} added, -{} removed, ~{} hash-changed ({unchanged} identical)",
+        added.len(),
+        removed.len(),
+        changed.len()
+    ));
+    for (p, sz) in added.iter().take(max_items) {
+        out.push(format!("- [ADDED] `{p}` ({sz} B)"));
+    }
+    for (p, sz) in removed.iter().take(max_items) {
+        out.push(format!("- [REMOVED] `{p}` ({sz} B)"));
+    }
+    for (p, d, sz, _) in changed.iter().take(max_items) {
+        out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)"));
+    }
+
+    let mut changed_code_members = Vec::new();
+    let mut security_signals = Vec::new();
+    if deep {
+        let mut inspect_targets: Vec<(String, bool)> = Vec::new();
+        for (p, d, _, is_code) in &changed {
+            if *is_code && inspect_targets.len() < 12 {
+                let _ = d;
+                inspect_targets.push((p.clone(), false));
+            }
+        }
+        for (p, _) in &added {
+            if is_code_member_ext(p) && inspect_targets.len() < 12 {
+                inspect_targets.push((p.clone(), true));
+            }
+        }
+        for (mpath, is_added) in inspect_targets {
+            let Some(nb) = new_members.get(&mpath) else {
+                continue;
+            };
+            if nb.len() > 2 * 1024 * 1024 {
+                continue;
+            }
+            let new_txt = String::from_utf8_lossy(nb);
+            let old_txt = old_members
+                .get(&mpath)
+                .map(|ob| String::from_utf8_lossy(ob))
+                .unwrap_or_default();
+            let mut routes_added = Vec::new();
+            let mut removed_routes_count = 0u64;
+            let mut ipc_sinks_added = Vec::new();
+            if is_js_like_member(&mpath) {
+                let (_, jv) = crate::inspect::extract_js_routes_diff_md(
+                    &new_txt, &mpath, None, &old_txt, &mpath,
+                );
+                removed_routes_count = jv
+                    .pointer("/diff/removed_routes_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(ra) = jv.pointer("/diff/new_routes").and_then(Value::as_array) {
+                    routes_added = ra
+                        .iter()
+                        .take(12)
+                        .filter_map(|item| {
+                            if let Some(s) = item.as_str() {
+                                Some(s.to_string())
+                            } else {
+                                let meth = item.get("method").and_then(Value::as_str).unwrap_or("");
+                                let path = item.get("path").and_then(Value::as_str)?;
+                                Some(if meth.is_empty() {
+                                    path.to_string()
+                                } else {
+                                    format!("{meth} {path}")
+                                })
+                            }
+                        })
+                        .collect();
+                }
+                if let Some(ni) = jv.pointer("/diff/new_ipc_sinks").and_then(Value::as_array) {
+                    for item in ni.iter().take(12) {
+                        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("ipc");
+                        let snip = item.get("snippet").and_then(Value::as_str).unwrap_or("");
+                        let tag = format!("{kind}: {snip}");
+                        if !ipc_sinks_added.contains(&tag) {
+                            ipc_sinks_added.push(tag.clone());
+                            security_signals.push(format!("{mpath}: added {tag}"));
+                        }
+                    }
+                }
+                let old_ipc = scan_electron_ipc_flags(&old_txt);
+                let new_ipc = scan_electron_ipc_flags(&new_txt);
+                for f in new_ipc.difference(&old_ipc) {
+                    if !ipc_sinks_added.contains(f) {
+                        ipc_sinks_added.push(f.clone());
+                        security_signals.push(format!("{mpath}: added {f}"));
+                    }
+                }
+                for r in &routes_added {
+                    security_signals.push(format!("{mpath}: added route {r}"));
+                }
+            }
+            let hunk_preview = if is_added {
+                new_txt.lines().take(12).collect::<Vec<_>>().join("\n")
+            } else {
+                compact_text_hunk(&old_txt, &new_txt, 14)
+            };
+            changed_code_members.push(json!({
+                "path": mpath,
+                "status": if is_added { "added" } else { "modified" },
+                "size_delta": (nb.len() as i64) - (old_members.get(&mpath).map(|v| v.len() as i64).unwrap_or(0)),
+                "routes_added": routes_added,
+                "removed_routes_count": removed_routes_count,
+                "ipc_sinks_added": ipc_sinks_added,
+                "hunk_preview": hunk_preview,
+            }));
+        }
+    }
+    if !changed_code_members.is_empty() {
+        out.push("\n### Deep Code Member Deltas".to_string());
+        for cm in &changed_code_members {
+            out.push(format!(
+                "- `{}` ({}, {:+} B) routes+={:?} ipc+={:?}",
+                cm["path"].as_str().unwrap_or(""),
+                cm["status"].as_str().unwrap_or(""),
+                cm["size_delta"].as_i64().unwrap_or(0),
+                cm["routes_added"],
+                cm["ipc_sinks_added"],
+            ));
+        }
+    }
+
+    let jv = json!({
+        "ok": true,
+        "mode": "version-diff",
+        "kind": kind_label,
+        "old_target": old_label,
+        "new_target": new_label,
+        "old_sha256": h_old,
+        "new_sha256": h_new,
+        "size_delta": size_delta,
+        "archive_summary": {
+            "added": added.len(),
+            "removed": removed.len(),
+            "modified_hash": changed.len(),
+            "unchanged": unchanged,
+        },
+        "members_added": added.iter().take(max_items).map(|(p, sz)| json!({"path": p, "bytes": sz})).collect::<Vec<_>>(),
+        "members_removed": removed.iter().take(max_items).map(|(p, sz)| json!({"path": p, "bytes": sz})).collect::<Vec<_>>(),
+        "members_changed": changed.iter().take(max_items).map(|(p, d, sz, _)| json!({"path": p, "delta_bytes": d, "bytes": sz})).collect::<Vec<_>>(),
+        "changed_code_members": changed_code_members,
+        "security_signals": security_signals,
+    });
+    (out.join("\n"), jv)
+}
+
+/// Pure-Rust Binary & Archive Patch-Diff Engine (`ap diff` & `ap read <new> --diff <old>`).
+/// Supports PE/DLL/SYS, ELF/SO, Go binaries, Electron `.asar`, and `.zip`/`.jar`/`.vsix`/`.war`/`.whl`.
+pub fn diff_binaries_or_archives(
     new_bytes: &[u8],
     old_bytes: &[u8],
     new_label: &str,
     old_label: &str,
     ext: &str,
-) -> String {
+    deep: bool,
+    max_items: usize,
+) -> (String, Value) {
+    let size_delta = (new_bytes.len() as i64) - (old_bytes.len() as i64);
     let mut out = vec![format!(
-        "## Binary/Archive Patch Diff: `{new_label}` ({} B) vs `{old_label}` ({} B, delta={:+} B)",
+        "## Binary/Archive Patch Diff: `{new_label}` ({} B) vs `{old_label}` ({} B, delta={size_delta:+} B)",
         new_bytes.len(),
         old_bytes.len(),
-        (new_bytes.len() as i64) - (old_bytes.len() as i64)
     )];
     let h_new = sha256_hex(new_bytes);
     let h_old = sha256_hex(old_bytes);
     if h_new == h_old {
         out.push(format!("- **IDENTICAL** (SHA-256 `{h_new}`)"));
-        return out.join("\n");
+        return (
+            out.join("\n"),
+            json!({
+                "ok": true,
+                "mode": "version-diff",
+                "identical": true,
+                "kind": if ext.is_empty() { "binary" } else { ext },
+                "old_target": old_label,
+                "new_target": new_label,
+                "old_sha256": h_old,
+                "new_sha256": h_new,
+                "size_delta": 0,
+            }),
+        );
     }
     out.push(format!("- New SHA-256: `{h_new}` | Old SHA-256: `{h_old}`"));
 
-    // 1. Archive diff (.asar / .zip / .jar / .vsix / .war)
+    // 1. Archive diff (.asar / .zip / .jar / .vsix / .war / .whl) with SHA-256 + deep code inspection
     if ext == "asar" {
-        if let (Ok((_, en_new)), Ok((_, en_old))) =
+        if let (Ok((base_new, en_new)), Ok((base_old, en_old))) =
             (parse_asar_index(new_bytes), parse_asar_index(old_bytes))
         {
-            let m_new: std::collections::HashMap<String, usize> =
-                en_new.into_iter().map(|e| (e.path, e.size)).collect();
-            let m_old: std::collections::HashMap<String, usize> =
-                en_old.into_iter().map(|e| (e.path, e.size)).collect();
-            let mut added: Vec<(String, usize)> = m_new
-                .iter()
-                .filter(|(k, _)| !m_old.contains_key(*k))
-                .map(|(k, &v)| (k.clone(), v))
-                .collect();
-            let mut removed: Vec<(String, usize)> = m_old
-                .iter()
-                .filter(|(k, _)| !m_new.contains_key(*k))
-                .map(|(k, &v)| (k.clone(), v))
-                .collect();
-            let mut changed: Vec<(String, i64, usize)> = m_new
-                .iter()
-                .filter_map(|(k, &v)| {
-                    let ov = *m_old.get(k)?;
-                    if ov != v {
-                        Some((k.clone(), (v as i64) - (ov as i64), v))
-                    } else {
-                        None
+            let mut m_new = std::collections::BTreeMap::new();
+            let mut m_old = std::collections::BTreeMap::new();
+            for e in en_new {
+                if !e.unpacked {
+                    let s = base_new.saturating_add(e.offset);
+                    let end = s.saturating_add(e.size).min(new_bytes.len());
+                    if s <= end {
+                        m_new.insert(e.path, new_bytes[s..end].to_vec());
                     }
-                })
-                .collect();
-            added.sort_by_key(|a| std::cmp::Reverse(a.1));
-            removed.sort_by_key(|a| std::cmp::Reverse(a.1));
-            changed.sort_by_key(|a| std::cmp::Reverse(a.1.abs()));
-            out.push(format!(
-                "### ASAR Member Diff: +{} added, -{} removed, ~{} size-changed",
-                added.len(),
-                removed.len(),
-                changed.len()
-            ));
-            for (p, sz) in added.iter().take(20) {
-                out.push(format!("- [ADDED] `{p}` ({sz} B)"));
+                }
             }
-            for (p, sz) in removed.iter().take(15) {
-                out.push(format!("- [REMOVED] `{p}` ({sz} B)"));
+            for e in en_old {
+                if !e.unpacked {
+                    let s = base_old.saturating_add(e.offset);
+                    let end = s.saturating_add(e.size).min(old_bytes.len());
+                    if s <= end {
+                        m_old.insert(e.path, old_bytes[s..end].to_vec());
+                    }
+                }
             }
-            for (p, d, sz) in changed.iter().take(25) {
-                out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)"));
-            }
-            return out.join("\n");
+            return diff_archive_member_bytes(
+                &mut out, &m_new, &m_old, "asar", new_label, old_label, &h_new, &h_old, size_delta,
+                deep, max_items,
+            );
         }
     }
     if matches!(ext, "zip" | "jar" | "vsix" | "war" | "apk" | "whl") {
@@ -1369,66 +1727,138 @@ pub fn diff_binaries_or_archives_md(
             ZipArchive::new(Cursor::new(new_bytes)),
             ZipArchive::new(Cursor::new(old_bytes)),
         ) {
-            let mut m_new = std::collections::HashMap::<String, u64>::new();
-            let mut m_old = std::collections::HashMap::<String, u64>::new();
-            for i in 0..zn.len() {
-                if let Ok(f) = zn.by_index(i) {
-                    if !f.is_dir() {
-                        m_new.insert(f.name().to_string(), f.size());
+            let mut m_new = std::collections::BTreeMap::new();
+            let mut m_old = std::collections::BTreeMap::new();
+            for i in 0..zn.len().min(3000) {
+                if let Ok(mut f) = zn.by_index(i) {
+                    if !f.is_dir() && f.size() <= 4 * 1024 * 1024 {
+                        let nm = f.name().to_string();
+                        let mut buf = Vec::with_capacity(f.size() as usize);
+                        if f.read_to_end(&mut buf).is_ok() {
+                            m_new.insert(nm, buf);
+                        }
                     }
                 }
             }
-            for i in 0..zo.len() {
-                if let Ok(f) = zo.by_index(i) {
-                    if !f.is_dir() {
-                        m_old.insert(f.name().to_string(), f.size());
+            for i in 0..zo.len().min(3000) {
+                if let Ok(mut f) = zo.by_index(i) {
+                    if !f.is_dir() && f.size() <= 4 * 1024 * 1024 {
+                        let nm = f.name().to_string();
+                        let mut buf = Vec::with_capacity(f.size() as usize);
+                        if f.read_to_end(&mut buf).is_ok() {
+                            m_old.insert(nm, buf);
+                        }
                     }
                 }
             }
-            let mut added: Vec<(String, u64)> = m_new
-                .iter()
-                .filter(|(k, _)| !m_old.contains_key(*k))
-                .map(|(k, &v)| (k.clone(), v))
-                .collect();
-            let mut removed: Vec<(String, u64)> = m_old
-                .iter()
-                .filter(|(k, _)| !m_new.contains_key(*k))
-                .map(|(k, &v)| (k.clone(), v))
-                .collect();
-            let mut changed: Vec<(String, i64, u64)> = m_new
-                .iter()
-                .filter_map(|(k, &v)| {
-                    let ov = *m_old.get(k)?;
-                    if ov != v {
-                        Some((k.clone(), (v as i64) - (ov as i64), v))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            added.sort_by_key(|a| std::cmp::Reverse(a.1));
-            removed.sort_by_key(|a| std::cmp::Reverse(a.1));
-            changed.sort_by_key(|a| std::cmp::Reverse(a.1.abs()));
-            out.push(format!(
-                "### Archive Member Diff: +{} added, -{} removed, ~{} size-changed",
-                added.len(),
-                removed.len(),
-                changed.len()
-            ));
-            for (p, sz) in added.iter().take(20) {
-                out.push(format!("- [ADDED] `{p}` ({sz} B)"));
-            }
-            for (p, sz) in removed.iter().take(15) {
-                out.push(format!("- [REMOVED] `{p}` ({sz} B)"));
-            }
-            for (p, d, sz) in changed.iter().take(25) {
-                out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)"));
-            }
-            return out.join("\n");
+            return diff_archive_member_bytes(
+                &mut out, &m_new, &m_old, ext, new_label, old_label, &h_new, &h_old, size_delta,
+                deep, max_items,
+            );
         }
     }
 
-    // 2. Native Binary Diff (PE / ELF / Go): diff extracted strings + Go funcs + RPC interfaces
+    // 2. Native Binary Diff (PE / ELF / Go): mitigations, exports, risky IAT imports, ELF .dynsym, Go funcs, RPC, strings
+    let surf_new = inspect_binary_surface(new_bytes);
+    let surf_old = inspect_binary_surface(old_bytes);
+    let kind = surf_new["format"].as_str().unwrap_or("binary").to_string();
+
+    let extract_mits = |s: &Value| -> String {
+        s["header_summary"]
+            .as_array()
+            .and_then(|arr| {
+                arr.iter().filter_map(Value::as_str).find_map(|ln| {
+                    ln.split("Mitigations:")
+                        .nth(1)
+                        .map(|r| r.trim().to_string())
+                })
+            })
+            .unwrap_or_default()
+    };
+    let mit_old = extract_mits(&surf_old);
+    let mit_new = extract_mits(&surf_new);
+    let mut mitigations_changed = Vec::new();
+    if mit_old != mit_new && (!mit_old.is_empty() || !mit_new.is_empty()) {
+        out.push(format!("- Mitigations changed: `{mit_old}` -> `{mit_new}`"));
+        mitigations_changed.push(json!({ "old": mit_old, "new": mit_new }));
+    }
+
+    let collect_imports = |s: &Value| -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        if let Some(obj) = s["import_risk_buckets"].as_object() {
+            for (bkt, arr) in obj {
+                if let Some(items) = arr.as_array() {
+                    for sym in items.iter().filter_map(Value::as_str) {
+                        set.insert(format!("[{bkt}] {sym}"));
+                    }
+                }
+            }
+        }
+        set
+    };
+    let imp_new = collect_imports(&surf_new);
+    let imp_old = collect_imports(&surf_old);
+    let imports_added: Vec<String> = imp_new
+        .difference(&imp_old)
+        .take(max_items)
+        .cloned()
+        .collect();
+    let imports_removed: Vec<String> = imp_old
+        .difference(&imp_new)
+        .take(max_items)
+        .cloned()
+        .collect();
+    if !imports_added.is_empty() || !imports_removed.is_empty() {
+        out.push(format!(
+            "### Risky Import Diff: +{} added, -{} removed",
+            imports_added.len(),
+            imports_removed.len()
+        ));
+        for s in &imports_added {
+            out.push(format!("- [IMP+] {s}"));
+        }
+        for s in &imports_removed {
+            out.push(format!("- [IMP-] {s}"));
+        }
+    }
+
+    let (sym_new, sym_old) = if kind == "pe" {
+        (
+            extract_pe_exports_set(new_bytes),
+            extract_pe_exports_set(old_bytes),
+        )
+    } else if kind == "elf" {
+        (
+            extract_elf_dynsyms_set(new_bytes),
+            extract_elf_dynsyms_set(old_bytes),
+        )
+    } else {
+        (Default::default(), Default::default())
+    };
+    let symbols_added: Vec<String> = sym_new
+        .difference(&sym_old)
+        .take(max_items)
+        .cloned()
+        .collect();
+    let symbols_removed: Vec<String> = sym_old
+        .difference(&sym_new)
+        .take(max_items)
+        .cloned()
+        .collect();
+    if !symbols_added.is_empty() || !symbols_removed.is_empty() {
+        out.push(format!(
+            "### Export/Symbol Diff: +{} added, -{} removed",
+            symbols_added.len(),
+            symbols_removed.len()
+        ));
+        for s in &symbols_added {
+            out.push(format!("- [SYM+] {s}"));
+        }
+        for s in &symbols_removed {
+            out.push(format!("- [SYM-] {s}"));
+        }
+    }
+
     let extract_set = |b: &[u8]| -> std::collections::BTreeSet<String> {
         let mut set = std::collections::BTreeSet::new();
         let lim = b.len().min(12 * 1024 * 1024);
@@ -1493,8 +1923,12 @@ pub fn diff_binaries_or_archives_md(
 
     let s_new = extract_set(new_bytes);
     let s_old = extract_set(old_bytes);
-    let added_s: Vec<&String> = s_new.difference(&s_old).take(35).collect();
-    let removed_s: Vec<&String> = s_old.difference(&s_new).take(25).collect();
+    let added_s: Vec<String> = s_new
+        .difference(&s_old)
+        .take(max_items.max(35))
+        .cloned()
+        .collect();
+    let removed_s: Vec<String> = s_old.difference(&s_new).take(max_items).cloned().collect();
 
     let g_new: std::collections::BTreeSet<String> = scan_go_pclntab_funcs(new_bytes, None, 2000)
         .into_iter()
@@ -1504,18 +1938,18 @@ pub fn diff_binaries_or_archives_md(
         .into_iter()
         .map(|s| s.split(" (pc=").next().unwrap_or(&s).to_string())
         .collect();
-    if !g_new.is_empty() || !g_old.is_empty() {
-        let ga: Vec<&String> = g_new.difference(&g_old).take(20).collect();
-        let gr: Vec<&String> = g_old.difference(&g_new).take(15).collect();
+    let go_added: Vec<String> = g_new.difference(&g_old).take(max_items).cloned().collect();
+    let go_removed: Vec<String> = g_old.difference(&g_new).take(max_items).cloned().collect();
+    if !go_added.is_empty() || !go_removed.is_empty() {
         out.push(format!(
             "### Go Function Diff: +{} added, -{} removed",
-            ga.len(),
-            gr.len()
+            go_added.len(),
+            go_removed.len()
         ));
-        for f in ga {
+        for f in &go_added {
             out.push(format!("- [GO+] {f}"));
         }
-        for f in gr {
+        for f in &go_removed {
             out.push(format!("- [GO-] {f}"));
         }
     }
@@ -1528,12 +1962,14 @@ pub fn diff_binaries_or_archives_md(
         .into_iter()
         .map(|s| s.split(" (").next().unwrap_or(&s).to_string())
         .collect();
-    if r_new != r_old {
+    let rpc_added: Vec<String> = r_new.difference(&r_old).take(max_items).cloned().collect();
+    let rpc_removed: Vec<String> = r_old.difference(&r_new).take(max_items).cloned().collect();
+    if !rpc_added.is_empty() || !rpc_removed.is_empty() {
         out.push("### MS-RPC Interface Diff".to_string());
-        for r in r_new.difference(&r_old) {
+        for r in &rpc_added {
             out.push(format!("- [RPC+] {r}"));
         }
-        for r in r_old.difference(&r_new) {
+        for r in &rpc_removed {
             out.push(format!("- [RPC-] {r}"));
         }
     }
@@ -1543,13 +1979,55 @@ pub fn diff_binaries_or_archives_md(
         added_s.len(),
         removed_s.len()
     ));
-    for s in added_s {
+    for s in &added_s {
         out.push(format!("+ {s}"));
     }
-    for s in removed_s {
+    for s in &removed_s {
         out.push(format!("- {s}"));
     }
-    out.join("\n")
+
+    let mut security_signals = Vec::new();
+    for i in &imports_added {
+        security_signals.push(format!("Added risky import {i}"));
+    }
+    for r in &rpc_added {
+        security_signals.push(format!("Added RPC interface {r}"));
+    }
+    let jv = json!({
+        "ok": true,
+        "mode": "version-diff",
+        "kind": kind,
+        "old_target": old_label,
+        "new_target": new_label,
+        "old_sha256": h_old,
+        "new_sha256": h_new,
+        "size_delta": size_delta,
+        "mitigations_changed": mitigations_changed,
+        "exports_added": if kind == "pe" { symbols_added.clone() } else { Vec::new() },
+        "exports_removed": if kind == "pe" { symbols_removed.clone() } else { Vec::new() },
+        "symbols_added": symbols_added,
+        "symbols_removed": symbols_removed,
+        "imports_added": imports_added,
+        "imports_removed": imports_removed,
+        "go_funcs_added": go_added,
+        "go_funcs_removed": go_removed,
+        "rpc_added": rpc_added,
+        "rpc_removed": rpc_removed,
+        "strings_added": added_s,
+        "strings_removed": removed_s,
+        "security_signals": security_signals,
+    });
+    (out.join("\n"), jv)
+}
+
+pub fn diff_binaries_or_archives_md(
+    new_bytes: &[u8],
+    old_bytes: &[u8],
+    new_label: &str,
+    old_label: &str,
+    ext: &str,
+) -> String {
+    diff_binaries_or_archives(new_bytes, old_bytes, new_label, old_label, ext, true, 25).0
 }
 
 pub fn is_binary_magic(bytes: &[u8]) -> bool {

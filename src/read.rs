@@ -1428,8 +1428,8 @@ fn read_single_target(
                     }
                 }
             }
-            let rendered = crate::binary::diff_binaries_or_archives_md(
-                &raw_bytes, &old_bytes, &label, &norm_old, &ext,
+            let (rendered, mut diff_jv) = crate::binary::diff_binaries_or_archives(
+                &raw_bytes, &old_bytes, &label, &norm_old, &ext, true, 25,
             );
             record_event(
                 "read",
@@ -1439,14 +1439,12 @@ fn read_single_target(
                 1,
                 "binary-diff",
             );
-            let jv = json!({
-                "ok": true,
-                "target": label,
-                "old_target": norm_old,
-                "format": "binary-diff",
-                "content": rendered,
-            });
-            return Ok((rendered, jv));
+            if let Some(obj) = diff_jv.as_object_mut() {
+                obj.insert("format".to_string(), json!("binary-diff"));
+                obj.insert("target".to_string(), json!(label));
+                obj.insert("content".to_string(), json!(rendered));
+            }
+            return Ok((rendered, diff_jv));
         }
     }
 

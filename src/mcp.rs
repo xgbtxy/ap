@@ -336,6 +336,10 @@ fn mcp_tools_schema() -> Value {
                 "race": { "type": "integer", "description": "Barrier TOCTOU burst threads (2..=32)" },
                 "flow": { "type": "string", "description": "Stateful multi-step HTTP flow JSON file or '-' stdin with {{var}} extraction" },
                 "mutate_matrix": { "type": "boolean", "description": "Run bounded semantic mutation & parser diff matrix vs baseline" },
+                "roles_matrix": { "type": "string", "description": "Multi-role AuthZ/IDOR matrix JSON string or file path" },
+                "role_vars": { "type": "array", "description": "Per-role vars e.g. ['owner:id=101','other:id=102']", "items": { "type": "string" } },
+                "methods": { "type": "string", "description": "Comma-separated methods for roles_matrix (e.g. 'GET,POST,DELETE')" },
+                "cross_id": { "type": "boolean", "description": "Expand cross-tenant (actor, target_owner) matrix cells" },
                 "sentinels": { "type": "array", "description": "Sentinel strings flagged if leaked", "items": { "type": "string" } },
                 "timeout": { "type": "integer", "description": "Timeout sec (default: 15)" },
                 "insecure": { "type": "boolean", "description": "Skip TLS verify (-k)" },
@@ -377,7 +381,11 @@ fn mcp_tools_schema() -> Value {
                 "services": { "type": "boolean", "description": "Enumerate Windows services (state, PID, start_type, bin_path, account)" },
                 "whoami": { "type": "boolean", "description": "Inspect current process token user, SID, elevation, integrity level & privileges" },
                 "sig": { "type": "string", "description": "Inspect PE Authenticode signature & Windows catalog trust (signed, valid, subject, issuer, sha256)" },
-                "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services" },
+                "weak_acl": { "type": "string", "description": "Audit non-admin writable pipes/services/dirs (pass '' for OS sweep or a path)" },
+                "unquoted": { "type": "boolean", "description": "Audit services for unquoted space paths + writable hop dirs" },
+                "com": { "type": "boolean", "description": "Audit HKLM\\SOFTWARE\\Classes\\CLSID COM hijacks & AutoElevation" },
+                "rpc": { "type": "boolean", "description": "Enumerate live Windows RPC Endpoint Mapper bindings" },
+                "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services/COM/RPC" },
                 "max": { "type": "integer", "description": "Max entries to return (default: 60)" }
             }
         }
@@ -521,7 +529,9 @@ fn mcp_tools_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
-                    "command": { "type": "string", "description": "Shell command string to execute safely" },
+                    "command": { "type": "string", "description": "Shell command string (or script body when `lang` is set)" },
+                    "lang": { "type": "string", "description": "Direct interpreter via stdin ('py', 'js', 'mjs', 'pwsh', 'bash') — zero quoting layers" },
+                    "base64": { "type": "string", "description": "Optional base64 UTF-8 payload instead of `command`" },
                     "timeout": { "type": "integer", "description": "Timeout in seconds (default: 120)" },
                     "free_port": { "type": "integer", "description": "Optional local TCP port to free before running" },
                     "scrub": { "type": "boolean", "description": "Scrub leaked secrets (API keys/tokens/PEM/URI creds) and defang indirect prompt-injection payloads from command output" }
@@ -569,7 +579,7 @@ fn mcp_tools_schema() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "description": "'peek' or 'search'" },
+                    "action": { "type": "string", "description": "'peek', 'search', or 'prune'" },
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
                     "id": { "type": "string", "description": "Archive ID prefix for `peek`" },
                     "lines": { "type": "string", "description": "Line range 'START-END' or 'START:END' for `peek`" },
@@ -580,7 +590,10 @@ fn mcp_tools_schema() -> Value {
                     "raw": { "type": "boolean", "description": "Emit raw lines without L<n>: prefixes for `peek`" },
                     "pretty": { "type": "boolean", "description": "Pretty-print valid JSON before slicing for `peek`" },
                     "query": { "type": "string", "description": "FTS5 search query for `search`" },
-                    "limit": { "type": "integer", "description": "Max FTS5 hits (default: 8)" }
+                    "limit": { "type": "integer", "description": "Max FTS5 hits (default: 8)" },
+                    "max_mb": { "type": "integer", "description": "Retained size cap in MiB for `prune` (default: 64)" },
+                    "max_age_hours": { "type": "integer", "description": "Optional max age in hours for `prune`" },
+                    "vacuum": { "type": "boolean", "description": "VACUUM SQLite store after `prune`" }
                 },
                 "required": ["action"]
             }
@@ -2051,16 +2064,41 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim();
-            if cmd.is_empty() {
-                return (false, "Pass non-empty `command` to `ap_exec`.".to_string());
+            let b64 = args
+                .get("base64")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let lang = args
+                .get("lang")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if cmd.is_empty() && b64.is_none() {
+                return (
+                    false,
+                    "Pass non-empty `command` or `base64` to `ap_exec`.".to_string(),
+                );
             }
-            let mut cli = vec![
-                "exec".to_string(),
-                "--cwd".to_string(),
-                cwd.to_string(),
-                "-c".to_string(),
-                cmd.to_string(),
-            ];
+            let mut cli = vec!["exec".to_string(), "--cwd".to_string(), cwd.to_string()];
+            let mut stdin_payload: Option<&str> = None;
+            if let Some(l) = lang {
+                cli.push("--lang".to_string());
+                cli.push(l.to_string());
+                if let Some(b) = b64 {
+                    cli.push("--base64".to_string());
+                    cli.push(b.to_string());
+                } else {
+                    cli.push("--run-stdin".to_string());
+                    stdin_payload = Some(cmd);
+                }
+            } else if let Some(b) = b64 {
+                cli.push("--base64".to_string());
+                cli.push(b.to_string());
+            } else {
+                cli.push("-c".to_string());
+                cli.push(cmd.to_string());
+            }
             if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
                 cli.push("--timeout".to_string());
                 cli.push(t.to_string());
@@ -2072,7 +2110,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("scrub").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--scrub".to_string());
             }
-            run_self_captured(&cli, None)
+            run_self_captured(&cli, stdin_payload)
         }
         "ap_smoke" => {
             let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
@@ -2378,6 +2416,45 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     }
                 }
             }
+            if let Some(rvs) = args.get("role_vars").and_then(Value::as_array) {
+                for rv in rvs.iter().filter_map(Value::as_str) {
+                    if !rv.trim().is_empty() {
+                        cli.push("--role-var".into());
+                        cli.push(rv.trim().to_string());
+                    }
+                }
+            }
+            if let Some(ms) = args
+                .get("methods")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                cli.push("--methods".into());
+                cli.push(ms.to_string());
+            }
+            if args
+                .get("cross_id")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--cross-id".into());
+            }
+            if let Some(rm) = args
+                .get("roles_matrix")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if rm.starts_with('{') {
+                    cli.push("--roles-matrix".into());
+                    cli.push("-".into());
+                    return run_self_captured(&cli, Some(rm));
+                }
+                cli.push("--roles-matrix".into());
+                cli.push(rm.to_string());
+                return run_self_captured(&cli, None);
+            }
             if let Some(fl) = args
                 .get("flow")
                 .and_then(Value::as_str)
@@ -2468,6 +2545,23 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             {
                 cli.push("--sig".into());
                 cli.push(sg.to_string());
+            }
+            if let Some(wa) = args.get("weak_acl").and_then(Value::as_str) {
+                cli.push("--weak-acl".into());
+                if !wa.trim().is_empty() {
+                    cli.push(wa.trim().to_string());
+                }
+            } else if args.get("weak_acl").and_then(Value::as_bool) == Some(true) {
+                cli.push("--weak-acl".into());
+            }
+            if args.get("unquoted").and_then(Value::as_bool) == Some(true) {
+                cli.push("--unquoted".into());
+            }
+            if args.get("com").and_then(Value::as_bool) == Some(true) {
+                cli.push("--com".into());
+            }
+            if args.get("rpc").and_then(Value::as_bool) == Some(true) {
+                cli.push("--rpc".into());
             }
             if let Some(fl) = args
                 .get("filter")
@@ -3049,9 +3143,24 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     .unwrap_or_default();
                     (true, js)
                 }
+                "prune" => {
+                    let mut cli = vec!["sieve".into(), "prune".into(), "--json".into()];
+                    if let Some(mb) = args.get("max_mb").and_then(Value::as_u64) {
+                        cli.push("--max-mb".into());
+                        cli.push(mb.to_string());
+                    }
+                    if let Some(ah) = args.get("max_age_hours").and_then(Value::as_u64) {
+                        cli.push("--max-age-hours".into());
+                        cli.push(ah.to_string());
+                    }
+                    if args.get("vacuum").and_then(Value::as_bool) == Some(true) {
+                        cli.push("--vacuum".into());
+                    }
+                    run_self_captured_in(cwd, &cli, None)
+                }
                 _ => (
                     false,
-                    "Pass `action`: 'peek' or 'search' to `ap_sieve`.".to_string(),
+                    "Pass `action`: 'peek', 'search', or 'prune' to `ap_sieve`.".to_string(),
                 ),
             }
         }

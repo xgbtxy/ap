@@ -2,9 +2,127 @@ use crate::now_iso_utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static FRONTIER_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+mod win_replace {
+    use std::path::Path;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            lp_existing_file_name: *const u16,
+            lp_new_file_name: *const u16,
+            dw_flags: u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    pub fn replace_atomic(src: &Path, dst: &Path) -> Result<(), String> {
+        let mut src_w: Vec<u16> = src
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dst_w: Vec<u16> = dst
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        for attempt in 0..16u64 {
+            let ok = unsafe {
+                MoveFileExW(
+                    src_w.as_mut_ptr(),
+                    dst_w.as_mut_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if ok != 0 {
+                return Ok(());
+            }
+            let err = unsafe { GetLastError() };
+            // Retry on transient ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32)
+            if (err == 5 || err == 32) && attempt < 15 {
+                std::thread::sleep(std::time::Duration::from_millis(8 + attempt * 4));
+                continue;
+            }
+            return Err(format!("MoveFileExW failed (win32_err={err})"));
+        }
+        Err("MoveFileExW failed after retries".to_string())
+    }
+}
+
+#[cfg(not(windows))]
+mod win_replace {
+    use std::path::Path;
+
+    pub fn replace_atomic(src: &Path, dst: &Path) -> Result<(), String> {
+        std::fs::rename(src, dst).map_err(|e| e.to_string())
+    }
+}
+
+struct FrontierLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for FrontierLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_frontier_lock(store_path: &Path) -> Result<FrontierLockGuard, String> {
+    let lock_path = store_path.with_extension("json.lock");
+    let deadline = SystemTime::now() + Duration::from_secs(4);
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                let _ = writeln!(f, "pid={}", std::process::id());
+                return Ok(FrontierLockGuard { lock_path });
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || (cfg!(windows)
+                        && (e.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(5) | Some(32)))) =>
+            {
+                if let Ok(meta) = fs::metadata(&lock_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(age) = SystemTime::now().duration_since(mtime) {
+                            if age > Duration::from_secs(15) {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if SystemTime::now() >= deadline {
+                    return Err(format!(
+                        "Timed out waiting for frontier lock {}: {e}",
+                        lock_path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -104,37 +222,40 @@ pub fn load_frontier(store_path: &Path) -> FrontierState {
     if !store_path.exists() {
         return FrontierState::default();
     }
-    fs::read_to_string(store_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<FrontierState>(&s).ok())
-        .unwrap_or_default()
+    for attempt in 0..4u64 {
+        if let Ok(s) = fs::read_to_string(store_path) {
+            if let Ok(parsed) = serde_json::from_str::<FrontierState>(&s) {
+                return parsed;
+            }
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    FrontierState::default()
 }
 
 pub fn save_frontier(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
-    state.updated_at = now_iso_utc();
     if let Some(parent) = store_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let tmp = store_path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let _lock = acquire_frontier_lock(store_path)?;
+    state.updated_at = now_iso_utc();
+    let seq = FRONTIER_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = store_path.with_extension(format!("json.{}.{nanos}.{seq}.tmp", std::process::id()));
     let body = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    if fs::rename(&tmp, store_path).is_err() {
-        let bak = store_path.with_extension(format!("json.{}.bak", std::process::id()));
-        let had_bak = store_path.exists() && fs::rename(store_path, &bak).is_ok();
-        match fs::rename(&tmp, store_path) {
-            Ok(()) => {
-                if had_bak {
-                    let _ = fs::remove_file(&bak);
-                }
-            }
-            Err(e) => {
-                if had_bak {
-                    let _ = fs::rename(&bak, store_path);
-                }
-                let _ = fs::remove_file(&tmp);
-                return Err(e.to_string());
-            }
-        }
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        let _ = f.sync_all();
+    }
+    if let Err(e) = win_replace::replace_atomic(&tmp, store_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     Ok(())
 }
@@ -2652,6 +2773,76 @@ mod tests {
         save_frontier(&fp, &mut st).unwrap();
         save_frontier(&fp, &mut st).unwrap();
         assert!(fp.is_file());
+        let _ = fs::remove_dir_all(&td);
+    }
+
+    #[test]
+    fn save_frontier_concurrent_threads_zero_enoent_or_corruption() {
+        let td = std::env::temp_dir().join(format!(
+            "ap_frontier_conc_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&td);
+        let fp = td.join("frontier.json");
+
+        let mut init_state = FrontierState::default();
+        init_state.items.push(FrontierItem {
+            id: "seed:1".to_string(),
+            axis: "web_api_route".to_string(),
+            module: "src".to_string(),
+            target: "src/app.ts".to_string(),
+            line: 10,
+            symbol: "init".to_string(),
+            snippet: String::new(),
+            guard_hint: String::new(),
+            score: 80,
+            status: FrontierStatus::Unvisited,
+            reason: String::new(),
+            evidence_ref: String::new(),
+            updated_at: String::new(),
+        });
+        save_frontier(&fp, &mut init_state).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for wid in 0..8usize {
+                let fp_ref = &fp;
+                let bar = std::sync::Arc::clone(&barrier);
+                s.spawn(move || {
+                    bar.wait();
+                    for round in 0..10usize {
+                        let mut st = FrontierState::default();
+                        st.items.push(FrontierItem {
+                            id: format!("w{wid}:r{round}"),
+                            axis: "exec_spawn".to_string(),
+                            module: "src".to_string(),
+                            target: format!("src/f{wid}.rs"),
+                            line: round + 1,
+                            symbol: "run".to_string(),
+                            snippet: String::new(),
+                            guard_hint: String::new(),
+                            score: 90,
+                            status: FrontierStatus::Probed,
+                            reason: "concurrent test".to_string(),
+                            evidence_ref: String::new(),
+                            updated_at: String::new(),
+                        });
+                        save_frontier(fp_ref, &mut st).expect("atomic save must not fail");
+                        // Concurrent reader must ALWAYS observe the file on disk & valid JSON
+                        assert!(fp_ref.is_file(), "frontier.json disappeared during replace");
+                        let raw = fs::read_to_string(fp_ref).expect("readable during atomic swap");
+                        let parsed: FrontierState =
+                            serde_json::from_str(&raw).expect("valid JSON during atomic swap");
+                        assert!(!parsed.items.is_empty());
+                    }
+                });
+            }
+        });
+        assert!(!fp.with_extension("json.lock").exists(), "lock leaked");
         let _ = fs::remove_dir_all(&td);
     }
 }

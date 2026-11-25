@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod bench;
 pub mod binary;
+pub mod diff_bin;
 pub mod exec;
 pub mod inspect;
 pub mod install;
@@ -133,7 +134,30 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
     let from_mcp = std::env::var("AP_MCP_CHILD").ok().as_deref() == Some("1");
     let code = match name {
         "read" => return Some(read::run_cli(&sub_argv)),
-        "ls" => return Some(ls::run_cli(&sub_argv)),
+        "diff" => return Some(diff_bin::run_cli(&sub_argv)),
+        "ls" | "files" => {
+            sub_argv[0] = "ls".to_string();
+            return Some(ls::run_cli(&sub_argv));
+        }
+        "rg" => {
+            sub_argv[0] = "search".to_string();
+            return Some(search::run_cli(&sub_argv));
+        }
+        "bin_surface" | "objdump" | "re" => {
+            let mut surf_argv = Vec::with_capacity(tail_args.len() + 2);
+            surf_argv.push("read".to_string());
+            let has_mode = tail_args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--surface" | "--xref" | "--strings" | "--hex" | "--rva" | "--va" | "--diff"
+                )
+            });
+            if !is_help && !has_mode {
+                surf_argv.push("--surface".to_string());
+            }
+            surf_argv.extend_from_slice(tail_args);
+            return Some(read::run_cli(&surf_argv));
+        }
         "bin" | "pe_info" | "pe" => {
             sub_argv[0] = "read".to_string();
             return Some(read::run_cli(&sub_argv));
@@ -242,7 +266,15 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
         "recall" => Some(ap_recall::run_cli(&sub_argv)),
         "guard" => Some(ap_guard::run_cli(&sub_argv)),
         "atlas" => Some(ap_atlas::run_cli(&sub_argv)),
-        "probe" => Some(ap_probe::run_cli(&sub_argv)),
+        "probe" => {
+            if tail_args.first().map(String::as_str) == Some("archive-diff") {
+                let mut diff_argv = Vec::with_capacity(tail_args.len());
+                diff_argv.push("archive-diff".to_string());
+                diff_argv.extend_from_slice(&tail_args[1..]);
+                return Some(diff_bin::run_cli(&diff_argv));
+            }
+            Some(ap_probe::run_cli(&sub_argv))
+        }
         "splice" => Some(ap_splice::run_cli(&sub_argv)),
         "audit" => return Some(audit::run_cli(&sub_argv)),
         _ => None,

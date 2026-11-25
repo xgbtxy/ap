@@ -71,6 +71,90 @@ pub fn parse_sddl_aces(sddl: &str) -> (bool, Vec<AceEntry>) {
     (protected, aces)
 }
 
+/// Extracts the normalized executable path from a Windows service `ImagePath` / `lpBinaryPathName`.
+pub fn extract_service_exe_path(bin_path: &str) -> String {
+    let s = bin_path.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let clean = if let Some(rest) = s.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("").trim().to_string()
+    } else if let Some(rest) = s.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or("").trim().to_string()
+    } else {
+        let low = s.to_ascii_lowercase();
+        let mut end = s.len();
+        for ext in [".exe", ".sys", ".dll", ".bat", ".cmd"] {
+            if let Some(pos) = low.find(ext) {
+                let candidate_end = pos + ext.len();
+                let next_ch = s.as_bytes().get(candidate_end).copied();
+                if next_ch.is_none() || next_ch == Some(b' ') || next_ch == Some(b'\t') {
+                    end = candidate_end;
+                    break;
+                }
+            }
+        }
+        if end == s.len() {
+            s.split_whitespace().next().unwrap_or("").to_string()
+        } else {
+            s[..end].trim().to_string()
+        }
+    };
+    let unprefixed = clean
+        .strip_prefix(r"\??\")
+        .or_else(|| clean.strip_prefix(r"\\?\"))
+        .unwrap_or(&clean);
+    let low = unprefixed.to_ascii_lowercase();
+    if let Some(rest) = low.strip_prefix(r"\systemroot\") {
+        let orig_rest = &unprefixed[r"\systemroot\".len()..];
+        let _ = rest;
+        return format!(r"C:\Windows\{orig_rest}");
+    }
+    if low.starts_with(r"system32\") {
+        return format!(r"C:\Windows\{unprefixed}");
+    }
+    if low.starts_with("%systemroot%") {
+        let orig_rest = &unprefixed["%systemroot%".len()..];
+        return format!(r"C:\Windows{orig_rest}");
+    }
+    unprefixed.to_string()
+}
+
+/// Returns candidate Windows binary hijack paths (`C:\Program.exe`, etc.) for an unquoted `ImagePath`
+/// containing spaces before `.exe`. Empty if the path is properly quoted or contains no spaces.
+pub fn find_unquoted_space_prefixes(bin_path: &str) -> Vec<(String, String)> {
+    let trimmed = bin_path.trim();
+    if trimmed.is_empty() || trimmed.starts_with('"') || trimmed.starts_with('\'') {
+        return Vec::new();
+    }
+    let exe = extract_service_exe_path(trimmed);
+    if exe.is_empty() || !exe.contains(' ') {
+        return Vec::new();
+    }
+    let norm_exe = exe.replace('/', "\\");
+    let low = norm_exe.to_ascii_lowercase();
+    if low.starts_with(r"c:\windows\system32\") || low.starts_with(r"c:\windows\syswow64\") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (idx, ch) in norm_exe.char_indices() {
+        if ch == ' ' && idx > 2 {
+            let prefix = &norm_exe[..idx];
+            if prefix.contains('\\') {
+                let cand = format!("{prefix}.exe");
+                let parent = std::path::Path::new(&cand)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if !parent.is_empty() {
+                    out.push((cand, parent));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Normalizes MSYS2 `/c/...` and POSIX `/tmp/...` paths on Windows when the literal path is absent.
 pub fn normalize_win_input_path(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -288,8 +372,13 @@ mod imp {
     const HKEY_USERS: isize = 0x8000_0003u32 as i32 as isize;
     const HKEY_CURRENT_CONFIG: isize = 0x8000_0005u32 as i32 as isize;
     const KEY_READ: u32 = 0x0002_0019;
+    const READ_CONTROL: u32 = 0x0002_0000;
     const ERROR_MORE_DATA: i32 = 234;
     const ERROR_NO_MORE_ITEMS: i32 = 259;
+    const RPC_C_EP_ALL_ELTS: u32 = 0;
+    const RPC_C_VERS_ALL: u32 = 1;
+    const RPC_S_OK: i32 = 0;
+    const RPC_X_NO_MORE_ENTRIES: i32 = 1772;
 
     const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
     const SERVICE_QUERY_CONFIG: u32 = 0x0001;
@@ -548,6 +637,20 @@ mod imp {
             lp_data: *mut u8,
             lpcb_data: *mut u32,
         ) -> i32;
+        fn RegQueryValueExW(
+            h_key: isize,
+            lp_value_name: *const u16,
+            lp_reserved: *mut u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> i32;
+        fn RegGetKeySecurity(
+            h_key: isize,
+            security_information: u32,
+            p_security_descriptor: *mut c_void,
+            lpcb_security_descriptor: *mut u32,
+        ) -> i32;
         fn RegCloseKey(h_key: isize) -> i32;
         fn OpenSCManagerW(
             lp_machine_name: *const u16,
@@ -578,6 +681,38 @@ mod imp {
             pcb_bytes_needed: *mut u32,
         ) -> Bool;
         fn CloseServiceHandle(h_sc_object: Handle) -> Bool;
+    }
+
+    #[link(name = "rpcrt4")]
+    extern "system" {
+        fn RpcMgmtEpEltInqBegin(
+            ep_binding: Handle,
+            inquiry_type: u32,
+            if_id: *const c_void,
+            vers_option: u32,
+            object_uuid: *const c_void,
+            inquiry_context: *mut Handle,
+        ) -> i32;
+        fn RpcMgmtEpEltInqNextW(
+            inquiry_context: Handle,
+            if_id: *mut RpcIfId,
+            binding: *mut Handle,
+            object_uuid: *mut Guid,
+            annotation: *mut *mut u16,
+        ) -> i32;
+        fn RpcMgmtEpEltInqDone(inquiry_context: *mut Handle) -> i32;
+        fn RpcBindingToStringBindingW(binding: Handle, string_binding: *mut *mut u16) -> i32;
+        fn RpcBindingFree(binding: *mut Handle) -> i32;
+        fn UuidToStringW(uuid: *const Guid, string_uuid: *mut *mut u16) -> i32;
+        fn RpcStringFreeW(string: *mut *mut u16) -> i32;
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct RpcIfId {
+        uuid: Guid,
+        vers_major: u16,
+        vers_minor: u16,
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -701,7 +836,7 @@ mod imp {
         all_names.dedup();
         let total_matched = all_names.len();
         let cap = max.clamp(1, 200);
-        let inspect_sddl = total_matched <= 30 || filter.is_some();
+        let inspect_sddl = true;
         let mut entries = Vec::new();
         for nm in all_names.into_iter().take(cap) {
             let full = format!(r"\\.\pipe\{nm}");
@@ -1628,6 +1763,735 @@ mod imp {
         }
         out
     }
+
+    fn path_non_admin_write_summary(raw_path: &str) -> (bool, Option<String>, Vec<String>) {
+        let info = query_acl(raw_path);
+        if info.get("ok").and_then(Value::as_bool) != Some(true) {
+            return (false, None, Vec::new());
+        }
+        let non_adm = info
+            .get("non_admin_writable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sddl = info.get("sddl").and_then(Value::as_str).map(str::to_string);
+        let trustees: Vec<String> = info
+            .get("aces")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter(|a| a.get("non_admin_write").and_then(Value::as_bool) == Some(true))
+                    .filter_map(|a| {
+                        let t = a.get("trustee").and_then(Value::as_str)?;
+                        let r = a.get("rights").and_then(Value::as_str).unwrap_or("");
+                        Some(format!("{t}:{r}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (non_adm, sddl, trustees)
+    }
+
+    fn query_reg_key_non_admin_write(raw_subkey: &str) -> (bool, Option<String>) {
+        let sub_w = to_wide(raw_subkey);
+        let mut hk: isize = 0;
+        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_w.as_ptr(), 0, READ_CONTROL, &mut hk) }
+            != 0
+        {
+            return (false, None);
+        }
+        let mut needed = 0u32;
+        let rc = unsafe {
+            RegGetKeySecurity(hk, DACL_SECURITY_INFORMATION, ptr::null_mut(), &mut needed)
+        };
+        let mut res = (false, None);
+        if (rc == 0 || rc == 122) && needed > 0 && needed <= 65_536 {
+            let mut buf = vec![0u8; needed as usize + 16];
+            if unsafe {
+                RegGetKeySecurity(
+                    hk,
+                    DACL_SECURITY_INFORMATION,
+                    buf.as_mut_ptr() as *mut c_void,
+                    &mut needed,
+                )
+            } == 0
+            {
+                if let Some(sddl) =
+                    unsafe { sd_to_sddl(buf.as_ptr() as *const c_void, DACL_SECURITY_INFORMATION) }
+                {
+                    let (_prot, aces) = parse_sddl_aces(&sddl);
+                    res = (aces.iter().any(|a| a.non_admin_write), Some(sddl));
+                }
+            }
+        }
+        unsafe {
+            RegCloseKey(hk);
+        }
+        res
+    }
+
+    fn read_reg_default_str(root: isize, subkey: &str, value_name: Option<&str>) -> Option<String> {
+        let sub_w = to_wide(subkey);
+        let mut hk: isize = 0;
+        if unsafe { RegOpenKeyExW(root, sub_w.as_ptr(), 0, KEY_READ, &mut hk) } != 0 {
+            return None;
+        }
+        let val_w = value_name.map(to_wide);
+        let val_ptr = val_w.as_ref().map(|v| v.as_ptr()).unwrap_or(ptr::null());
+        let mut ty = 0u32;
+        let mut dlen = 1024u32;
+        let mut dbuf = vec![0u8; dlen as usize];
+        let mut rc = unsafe {
+            RegQueryValueExW(
+                hk,
+                val_ptr,
+                ptr::null_mut(),
+                &mut ty,
+                dbuf.as_mut_ptr(),
+                &mut dlen,
+            )
+        };
+        if rc == ERROR_MORE_DATA && dlen <= 32_768 {
+            dbuf.resize(dlen as usize, 0);
+            rc = unsafe {
+                RegQueryValueExW(
+                    hk,
+                    val_ptr,
+                    ptr::null_mut(),
+                    &mut ty,
+                    dbuf.as_mut_ptr(),
+                    &mut dlen,
+                )
+            };
+        }
+        unsafe {
+            RegCloseKey(hk);
+        }
+        if rc != 0 || dlen == 0 {
+            return None;
+        }
+        let (_k, v) = decode_reg_value(ty, &dbuf[..dlen as usize]);
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    fn read_reg_dword(root: isize, subkey: &str, value_name: &str) -> Option<u32> {
+        let sub_w = to_wide(subkey);
+        let mut hk: isize = 0;
+        if unsafe { RegOpenKeyExW(root, sub_w.as_ptr(), 0, KEY_READ, &mut hk) } != 0 {
+            return None;
+        }
+        let val_w = to_wide(value_name);
+        let mut ty = 0u32;
+        let mut buf = [0u8; 8];
+        let mut dlen = buf.len() as u32;
+        let rc = unsafe {
+            RegQueryValueExW(
+                hk,
+                val_w.as_ptr(),
+                ptr::null_mut(),
+                &mut ty,
+                buf.as_mut_ptr(),
+                &mut dlen,
+            )
+        };
+        unsafe {
+            RegCloseKey(hk);
+        }
+        if rc == 0 && ty == 4 && dlen >= 4 {
+            Some(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+        } else {
+            None
+        }
+    }
+
+    type ServiceRawTuple = (String, String, &'static str, u32, String, String, String);
+
+    fn collect_all_services_raw() -> Result<Vec<ServiceRawTuple>, String> {
+        let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ENUMERATE_SERVICE) };
+        if scm.is_null() {
+            return Err(format!("OpenSCManagerW failed (err={})", unsafe {
+                GetLastError()
+            }));
+        }
+        let mut needed = 0u32;
+        let mut count = 0u32;
+        let mut resume = 0u32;
+        unsafe {
+            EnumServicesStatusExW(
+                scm,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_WIN32,
+                SERVICE_STATE_ALL,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+                &mut count,
+                &mut resume,
+                ptr::null(),
+            );
+        }
+        let mut buf = vec![0u8; needed as usize + 8192];
+        let mut count2 = 0u32;
+        let mut resume2 = 0u32;
+        let ok = unsafe {
+            EnumServicesStatusExW(
+                scm,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_WIN32,
+                SERVICE_STATE_ALL,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut needed,
+                &mut count2,
+                &mut resume2,
+                ptr::null(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                CloseServiceHandle(scm);
+            }
+            return Err(format!("EnumServicesStatusExW failed (err={err})"));
+        }
+        let mut out = Vec::with_capacity(count2 as usize);
+        let ptr_base = buf.as_ptr() as *const EnumServiceStatusProcessW;
+        for i in 0..(count2 as usize) {
+            let item = unsafe { &*ptr_base.add(i) };
+            let name = unsafe { read_wide_cstr(item.lp_service_name) };
+            let display_name = unsafe { read_wide_cstr(item.lp_display_name) };
+            let mut bin_path = String::new();
+            let mut account = String::new();
+            let mut start_type = "Unknown".to_string();
+            let hs = unsafe { OpenServiceW(scm, item.lp_service_name, SERVICE_QUERY_CONFIG) };
+            if !hs.is_null() {
+                let mut cfg_need = 0u32;
+                unsafe { QueryServiceConfigW(hs, ptr::null_mut(), 0, &mut cfg_need) };
+                if cfg_need > 0 && cfg_need <= 65536 {
+                    let mut cbuf = vec![0u8; cfg_need as usize + 64];
+                    if unsafe {
+                        QueryServiceConfigW(hs, cbuf.as_mut_ptr(), cbuf.len() as u32, &mut cfg_need)
+                    } != 0
+                    {
+                        let cfg = unsafe { &*(cbuf.as_ptr() as *const QueryServiceConfigWHeader) };
+                        start_type = start_type_str(cfg.dw_start_type).to_string();
+                        bin_path = unsafe { read_wide_cstr(cfg.lp_binary_path_name) };
+                        account = unsafe { read_wide_cstr(cfg.lp_service_start_name) };
+                    }
+                }
+                unsafe {
+                    CloseServiceHandle(hs);
+                }
+            }
+            out.push((
+                name,
+                display_name,
+                state_str(item.service_status_process.dw_current_state),
+                item.service_status_process.dw_process_id,
+                start_type,
+                bin_path,
+                account,
+            ));
+        }
+        unsafe {
+            CloseServiceHandle(scm);
+        }
+        Ok(out)
+    }
+
+    pub fn query_unquoted_services(filter: Option<&str>, max: usize) -> Value {
+        let services = match collect_all_services_raw() {
+            Ok(s) => s,
+            Err(e) => return json!({ "ok": false, "mode": "unquoted", "error": e }),
+        };
+        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let cap = max.clamp(1, 200);
+        let mut findings = Vec::new();
+        let mut exploitable_count = 0usize;
+        for (name, display_name, state, pid, start_type, bin_path, account) in services {
+            if let Some(ref fl) = f_low {
+                if !name.to_ascii_lowercase().contains(fl)
+                    && !display_name.to_ascii_lowercase().contains(fl)
+                    && !bin_path.to_ascii_lowercase().contains(fl)
+                {
+                    continue;
+                }
+            }
+            let hops = super::find_unquoted_space_prefixes(&bin_path);
+            if hops.is_empty() {
+                continue;
+            }
+            let mut writable_hops = Vec::new();
+            let mut candidate_bins = Vec::new();
+            for (cand_exe, parent_dir) in hops {
+                candidate_bins.push(cand_exe.clone());
+                let (w, _sddl, trustees) = path_non_admin_write_summary(&parent_dir);
+                if w {
+                    writable_hops.push(json!({
+                        "hijack_exe": cand_exe,
+                        "writable_dir": parent_dir,
+                        "trustees": trustees,
+                    }));
+                }
+            }
+            let exploitable = !writable_hops.is_empty();
+            if exploitable {
+                exploitable_count += 1;
+            }
+            if findings.len() < cap {
+                findings.push(json!({
+                    "service": name,
+                    "display_name": display_name,
+                    "state": state,
+                    "pid": pid,
+                    "start_type": start_type,
+                    "account": account,
+                    "bin_path": bin_path,
+                    "candidate_hijack_paths": candidate_bins,
+                    "writable_hops": writable_hops,
+                    "exploitable": exploitable,
+                }));
+            }
+        }
+        findings.sort_by_key(|v| !v["exploitable"].as_bool().unwrap_or(false));
+        json!({
+            "ok": true,
+            "mode": "unquoted",
+            "returned": findings.len(),
+            "exploitable_count": exploitable_count,
+            "findings": findings,
+        })
+    }
+
+    pub fn query_weak_acl(
+        target_or_empty: Option<&str>,
+        filter: Option<&str>,
+        max: usize,
+    ) -> Value {
+        let cap = max.clamp(1, 200);
+        let raw_tgt = target_or_empty.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(tgt) = raw_tgt {
+            let norm = normalize_win_input_path(tgt);
+            let p = std::path::Path::new(&norm);
+            if p.exists() {
+                let mut weak_paths = Vec::new();
+                let mut scanned = 0usize;
+                let walker = ignore::WalkBuilder::new(p)
+                    .max_depth(Some(3))
+                    .hidden(false)
+                    .git_ignore(false)
+                    .build();
+                let f_low = filter.map(|s| s.to_ascii_lowercase());
+                for entry in walker.flatten() {
+                    if scanned >= 1500 {
+                        break;
+                    }
+                    let ep = entry.path();
+                    let ps = ep.to_string_lossy().to_string();
+                    if let Some(ref fl) = f_low {
+                        if !ps.to_ascii_lowercase().contains(fl) {
+                            continue;
+                        }
+                    }
+                    scanned += 1;
+                    let (w, sddl, trustees) = path_non_admin_write_summary(&ps);
+                    if w {
+                        weak_paths.push(json!({
+                            "path": ps,
+                            "is_dir": ep.is_dir(),
+                            "trustees": trustees,
+                            "sddl": sddl,
+                        }));
+                        if weak_paths.len() >= cap {
+                            break;
+                        }
+                    }
+                }
+                return json!({
+                    "ok": true,
+                    "mode": "weak_acl_path",
+                    "root": norm,
+                    "scanned": scanned,
+                    "weak_count": weak_paths.len(),
+                    "findings": weak_paths,
+                });
+            }
+        }
+
+        // OS-wide non-admin write attack-surface sweep (pipes + services/bins/regkeys + unquoted)
+        let eff_filter = filter.or(raw_tgt);
+        let f_low = eff_filter.map(|s| s.to_ascii_lowercase());
+        let pipe_res = query_pipes(eff_filter, 200);
+        let mut weak_pipes = Vec::new();
+        if let Some(arr) = pipe_res.get("pipes").and_then(Value::as_array) {
+            for p in arr {
+                if p.get("non_admin_write").and_then(Value::as_bool) == Some(true) {
+                    weak_pipes.push(p.clone());
+                    if weak_pipes.len() >= cap {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut weak_services = Vec::new();
+        let mut unquoted_services = Vec::new();
+        let mut checked_dirs: std::collections::HashMap<String, (bool, Vec<String>)> =
+            std::collections::HashMap::new();
+        if let Ok(svcs) = collect_all_services_raw() {
+            for (name, _disp, state, _pid, start_type, bin_path, account) in svcs {
+                if let Some(ref fl) = f_low {
+                    if !name.to_ascii_lowercase().contains(fl)
+                        && !bin_path.to_ascii_lowercase().contains(fl)
+                    {
+                        continue;
+                    }
+                }
+                let exe = super::extract_service_exe_path(&bin_path);
+                if exe.is_empty() {
+                    continue;
+                }
+                let exe_low = exe.to_ascii_lowercase();
+                let is_sys_exe = exe_low.starts_with(r"c:\windows\system32\")
+                    || exe_low.starts_with(r"c:\windows\syswow64\");
+                let mut issues = Vec::new();
+                if !is_sys_exe && std::path::Path::new(&exe).exists() {
+                    let (ew, _esddl, et) = path_non_admin_write_summary(&exe);
+                    if ew {
+                        issues
+                            .push(json!({ "kind": "service_binary", "path": exe, "trustees": et }));
+                    }
+                    if let Some(pdir) = std::path::Path::new(&exe).parent() {
+                        let pds = pdir.to_string_lossy().to_string();
+                        let (dw, dt) = checked_dirs.entry(pds.clone()).or_insert_with(|| {
+                            let (w, _s, t) = path_non_admin_write_summary(&pds);
+                            (w, t)
+                        });
+                        if *dw {
+                            issues.push(
+                                json!({ "kind": "service_dir", "path": pds, "trustees": dt }),
+                            );
+                        }
+                    }
+                }
+                let svc_reg = format!(r"SYSTEM\CurrentControlSet\Services\{name}");
+                let (rw, rsddl) = query_reg_key_non_admin_write(&svc_reg);
+                if rw {
+                    issues.push(json!({ "kind": "service_regkey", "key": format!("HKLM\\{svc_reg}"), "sddl": rsddl }));
+                }
+                if !issues.is_empty() && weak_services.len() < cap {
+                    weak_services.push(json!({
+                        "service": name,
+                        "state": state,
+                        "start_type": start_type,
+                        "account": account,
+                        "bin_path": bin_path,
+                        "issues": issues,
+                    }));
+                }
+                let hops = super::find_unquoted_space_prefixes(&bin_path);
+                if !hops.is_empty() && unquoted_services.len() < cap {
+                    let writable_hops: Vec<Value> = hops
+                        .into_iter()
+                        .filter_map(|(ce, pd)| {
+                            let (w, dt) = checked_dirs.entry(pd.clone()).or_insert_with(|| {
+                                let (w, _s, t) = path_non_admin_write_summary(&pd);
+                                (w, t)
+                            });
+                            if *w {
+                                Some(
+                                    json!({ "hijack_exe": ce, "writable_dir": pd, "trustees": dt }),
+                                )
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !writable_hops.is_empty() {
+                        unquoted_services.push(json!({
+                            "service": name,
+                            "account": account,
+                            "bin_path": bin_path,
+                            "writable_hops": writable_hops,
+                        }));
+                    }
+                }
+            }
+        }
+
+        json!({
+            "ok": true,
+            "mode": "weak_acl",
+            "weak_pipes_count": weak_pipes.len(),
+            "weak_services_count": weak_services.len(),
+            "exploitable_unquoted_count": unquoted_services.len(),
+            "weak_pipes": weak_pipes,
+            "weak_services": weak_services,
+            "exploitable_unquoted": unquoted_services,
+        })
+    }
+
+    pub fn query_com_audit(filter: Option<&str>, max: usize) -> Value {
+        let root_sub = r"SOFTWARE\Classes\CLSID";
+        let root_w = to_wide(root_sub);
+        let mut h_clsid: isize = 0;
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                root_w.as_ptr(),
+                0,
+                KEY_READ,
+                &mut h_clsid,
+            )
+        } != 0
+        {
+            return json!({ "ok": false, "mode": "com", "error": "Failed to open HKLM\\SOFTWARE\\Classes\\CLSID" });
+        }
+        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let cap = max.clamp(1, 200);
+        let mut scanned = 0usize;
+        let mut findings = Vec::new();
+        let mut idx = 0u32;
+        while scanned < 2500 && findings.len() < cap {
+            let mut kbuf = [0u16; 128];
+            let mut klen = kbuf.len() as u32;
+            let rc = unsafe {
+                RegEnumKeyExW(
+                    h_clsid,
+                    idx,
+                    kbuf.as_mut_ptr(),
+                    &mut klen,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            if rc == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            idx += 1;
+            if rc != 0 {
+                continue;
+            }
+            scanned += 1;
+            let clsid = String::from_utf16_lossy(&kbuf[..klen as usize]);
+            let base = format!(r"{root_sub}\{clsid}");
+            let label = read_reg_default_str(HKEY_LOCAL_MACHINE, &base, None).unwrap_or_default();
+            let local_srv =
+                read_reg_default_str(HKEY_LOCAL_MACHINE, &format!(r"{base}\LocalServer32"), None);
+            let inproc_srv =
+                read_reg_default_str(HKEY_LOCAL_MACHINE, &format!(r"{base}\InprocServer32"), None);
+            if local_srv.is_none() && inproc_srv.is_none() {
+                continue;
+            }
+            let auto_elev =
+                read_reg_dword(HKEY_LOCAL_MACHINE, &format!(r"{base}\Elevation"), "Enabled")
+                    == Some(1);
+            let target_raw = local_srv.as_deref().or(inproc_srv.as_deref()).unwrap_or("");
+            if let Some(ref fl) = f_low {
+                if !clsid.to_ascii_lowercase().contains(fl)
+                    && !label.to_ascii_lowercase().contains(fl)
+                    && !target_raw.to_ascii_lowercase().contains(fl)
+                {
+                    continue;
+                }
+            }
+            let target_exe = super::extract_service_exe_path(target_raw);
+            let low_exe = target_exe.to_ascii_lowercase();
+            let is_sys = low_exe.starts_with(r"c:\windows\system32\")
+                || low_exe.starts_with(r"c:\windows\syswow64\");
+            let missing = !target_exe.is_empty()
+                && !target_exe.contains('%')
+                && !std::path::Path::new(&target_exe).exists();
+            let (writable, _sddl, trustees) = if !is_sys && !target_exe.is_empty() && !missing {
+                path_non_admin_write_summary(&target_exe)
+            } else {
+                (false, None, Vec::new())
+            };
+            if f_low.is_some() || missing || writable || auto_elev {
+                findings.push(json!({
+                    "clsid": clsid,
+                    "name": label,
+                    "server_kind": if local_srv.is_some() { "LocalServer32" } else { "InprocServer32" },
+                    "target_raw": target_raw,
+                    "target_path": target_exe,
+                    "missing_target": missing,
+                    "non_admin_writable": writable,
+                    "writable_trustees": trustees,
+                    "auto_elevate": auto_elev,
+                }));
+            }
+        }
+        unsafe {
+            RegCloseKey(h_clsid);
+        }
+        json!({
+            "ok": true,
+            "mode": "com",
+            "scanned_clsids": scanned,
+            "returned": findings.len(),
+            "findings": findings,
+        })
+    }
+
+    pub fn query_rpc_endpoints(filter: Option<&str>, max: usize) -> Value {
+        let mut inq: Handle = ptr::null_mut();
+        let rc = unsafe {
+            RpcMgmtEpEltInqBegin(
+                ptr::null_mut(),
+                RPC_C_EP_ALL_ELTS,
+                ptr::null(),
+                RPC_C_VERS_ALL,
+                ptr::null(),
+                &mut inq,
+            )
+        };
+        if rc != RPC_S_OK {
+            return json!({
+                "ok": false,
+                "mode": "rpc",
+                "error": format!("RpcMgmtEpEltInqBegin failed (rpc_status={rc})"),
+            });
+        }
+
+        // Cross-link named pipes for `ncacn_np` weak-ACL visibility
+        let mut weak_pipe_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(arr) = query_pipes(None, 200)
+            .get("pipes")
+            .and_then(Value::as_array)
+        {
+            for p in arr {
+                if p.get("non_admin_write").and_then(Value::as_bool) == Some(true) {
+                    if let Some(nm) = p.get("name").and_then(Value::as_str) {
+                        weak_pipe_set.insert(nm.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+
+        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let cap = max.clamp(1, 200);
+        let mut endpoints = Vec::new();
+        let mut total_matched = 0usize;
+        let mut seen = std::collections::HashSet::new();
+
+        for _ in 0..4000 {
+            let mut if_id = RpcIfId {
+                uuid: Guid {
+                    data1: 0,
+                    data2: 0,
+                    data3: 0,
+                    data4: [0; 8],
+                },
+                vers_major: 0,
+                vers_minor: 0,
+            };
+            let mut binding: Handle = ptr::null_mut();
+            let mut obj_uuid = Guid {
+                data1: 0,
+                data2: 0,
+                data3: 0,
+                data4: [0; 8],
+            };
+            let mut ann_ptr: *mut u16 = ptr::null_mut();
+            let nrc = unsafe {
+                RpcMgmtEpEltInqNextW(inq, &mut if_id, &mut binding, &mut obj_uuid, &mut ann_ptr)
+            };
+            if nrc == RPC_X_NO_MORE_ENTRIES || nrc != RPC_S_OK {
+                if !ann_ptr.is_null() {
+                    unsafe { RpcStringFreeW(&mut ann_ptr) };
+                }
+                if !binding.is_null() {
+                    unsafe { RpcBindingFree(&mut binding) };
+                }
+                break;
+            }
+            let annotation = if !ann_ptr.is_null() {
+                let s = unsafe { read_wide_cstr(ann_ptr) };
+                unsafe { RpcStringFreeW(&mut ann_ptr) };
+                s
+            } else {
+                String::new()
+            };
+
+            let mut uuid_ptr: *mut u16 = ptr::null_mut();
+            let uuid_str = if unsafe { UuidToStringW(&if_id.uuid, &mut uuid_ptr) } == RPC_S_OK
+                && !uuid_ptr.is_null()
+            {
+                let s = unsafe { read_wide_cstr(uuid_ptr) };
+                unsafe { RpcStringFreeW(&mut uuid_ptr) };
+                s
+            } else {
+                String::new()
+            };
+
+            let mut sb_ptr: *mut u16 = ptr::null_mut();
+            let str_binding = if !binding.is_null()
+                && unsafe { RpcBindingToStringBindingW(binding, &mut sb_ptr) } == RPC_S_OK
+                && !sb_ptr.is_null()
+            {
+                let s = unsafe { read_wide_cstr(sb_ptr) };
+                unsafe { RpcStringFreeW(&mut sb_ptr) };
+                s
+            } else {
+                String::new()
+            };
+            if !binding.is_null() {
+                unsafe { RpcBindingFree(&mut binding) };
+            }
+
+            let protseq = str_binding.split(':').next().unwrap_or("").to_string();
+            let endpoint = str_binding
+                .split('[')
+                .nth(1)
+                .and_then(|r| r.split(']').next())
+                .unwrap_or("")
+                .to_string();
+            let key = format!("{uuid_str}|{}|{str_binding}", if_id.vers_major);
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(ref fl) = f_low {
+                if !uuid_str.to_ascii_lowercase().contains(fl)
+                    && !str_binding.to_ascii_lowercase().contains(fl)
+                    && !annotation.to_ascii_lowercase().contains(fl)
+                {
+                    continue;
+                }
+            }
+            total_matched += 1;
+            if endpoints.len() < cap {
+                let pipe_short = endpoint
+                    .trim_start_matches(r"\pipe\")
+                    .trim_start_matches(r"\\.\pipe\")
+                    .to_ascii_lowercase();
+                let weak_pipe =
+                    protseq.eq_ignore_ascii_case("ncacn_np") && weak_pipe_set.contains(&pipe_short);
+                endpoints.push(json!({
+                    "uuid": uuid_str,
+                    "version": format!("{}.{}", if_id.vers_major, if_id.vers_minor),
+                    "protseq": protseq,
+                    "endpoint": endpoint,
+                    "binding": str_binding,
+                    "annotation": annotation,
+                    "weak_pipe_acl": weak_pipe,
+                }));
+            }
+        }
+        unsafe {
+            RpcMgmtEpEltInqDone(&mut inq);
+        }
+        json!({
+            "ok": true,
+            "mode": "rpc",
+            "total_matched": total_matched,
+            "returned": endpoints.len(),
+            "endpoints": endpoints,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1638,13 +2502,19 @@ pub fn run_win_cli(
     services: bool,
     whoami: bool,
     sig: Option<&std::path::Path>,
+    weak_acl: Option<&str>,
+    unquoted: bool,
+    com: bool,
+    rpc: bool,
     filter: Option<&str>,
     max: usize,
     as_json: bool,
 ) -> i32 {
     #[cfg(not(windows))]
     {
-        let _ = (pipes, reg, acl, services, whoami, sig, filter, max);
+        let _ = (
+            pipes, reg, acl, services, whoami, sig, weak_acl, unquoted, com, rpc, filter, max,
+        );
         let out = json!({
             "ok": false,
             "os": std::env::consts::OS,
@@ -1667,9 +2537,13 @@ pub fn run_win_cli(
             + usize::from(acl.is_some())
             + usize::from(services)
             + usize::from(whoami)
-            + usize::from(sig.is_some());
+            + usize::from(sig.is_some())
+            + usize::from(weak_acl.is_some())
+            + usize::from(unquoted)
+            + usize::from(com)
+            + usize::from(rpc);
         if mode_count == 0 {
-            let msg = "[ap probe win] Pass one of --pipes, --reg <KEY>, --acl <PATH>, --services, --whoami, or --sig <PATH>";
+            let msg = "[ap probe win] Pass one of --pipes, --reg <KEY>, --acl <PATH>, --services, --whoami, --sig <PATH>, --weak-acl [PATH], --unquoted, --com, or --rpc";
             if as_json {
                 println!(
                     "{}",
@@ -1681,7 +2555,15 @@ pub fn run_win_cli(
             }
             return 2;
         }
-        let val = if let Some(sp) = sig {
+        let val = if let Some(wa) = weak_acl {
+            imp::query_weak_acl(Some(wa), filter, max)
+        } else if unquoted {
+            imp::query_unquoted_services(filter, max)
+        } else if com {
+            imp::query_com_audit(filter, max)
+        } else if rpc {
+            imp::query_rpc_endpoints(filter, max)
+        } else if let Some(sp) = sig {
             imp::query_signature(&sp.to_string_lossy())
         } else if let Some(rk) = reg {
             imp::query_registry(rk, filter, max)
@@ -1725,6 +2607,29 @@ mod tests {
         assert_eq!(aces[2].trustee, "AU");
     }
 
+    #[test]
+    fn unquoted_path_and_service_exe_extraction_work_cleanly() {
+        assert_eq!(
+            extract_service_exe_path(r#""C:\Program Files\Acme\svc.exe" --daemon"#),
+            r"C:\Program Files\Acme\svc.exe"
+        );
+        assert_eq!(
+            extract_service_exe_path(r"C:\Program Files\Vendor App\agent.exe -k run"),
+            r"C:\Program Files\Vendor App\agent.exe"
+        );
+        let hops = find_unquoted_space_prefixes(r"C:\Program Files\Vendor App\agent.exe -k run");
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].0, r"C:\Program.exe");
+        assert_eq!(hops[1].0, r"C:\Program Files\Vendor.exe");
+        assert!(
+            find_unquoted_space_prefixes(r#""C:\Program Files\Vendor App\agent.exe" -k"#)
+                .is_empty()
+        );
+        assert!(
+            find_unquoted_space_prefixes(r"C:\Windows\System32\svchost.exe -k netsvcs").is_empty()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn win32_native_queries_whoami_pipes_reg_acl_and_services() {
@@ -1756,6 +2661,23 @@ mod tests {
         assert_eq!(sig_ok["ok"], Value::Bool(true));
         assert_eq!(sig_ok["signed"], Value::Bool(true));
         assert_eq!(sig_ok["valid"], Value::Bool(true));
+
+        let wa_os = imp::query_weak_acl(None, Some("EventLog"), 10);
+        assert_eq!(wa_os["ok"], Value::Bool(true), "{wa_os}");
+        assert_eq!(wa_os["mode"], "weak_acl");
+
+        let unq = imp::query_unquoted_services(None, 10);
+        assert_eq!(unq["ok"], Value::Bool(true), "{unq}");
+        assert_eq!(unq["mode"], "unquoted");
+
+        let com = imp::query_com_audit(None, 5);
+        assert_eq!(com["ok"], Value::Bool(true), "{com}");
+        assert_eq!(com["mode"], "com");
+
+        let rpc = imp::query_rpc_endpoints(None, 10);
+        assert_eq!(rpc["ok"], Value::Bool(true), "{rpc}");
+        assert_eq!(rpc["mode"], "rpc");
+        assert!(rpc["returned"].as_u64().unwrap_or(0) >= 1, "{rpc}");
         assert!(
             !sig_ok["subject"].as_str().unwrap_or("").is_empty(),
             "expected non-empty subject: {sig_ok}"

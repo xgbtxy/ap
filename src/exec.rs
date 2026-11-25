@@ -30,9 +30,15 @@ struct ExecCli {
     /// Shell command string to execute safely
     #[arg(short = 'c', long = "cmd")]
     cmd: Option<String>,
-    /// Base64-encoded UTF-8 shell command (zero-quoting hook transport)
+    /// Base64-encoded UTF-8 shell command or script payload (zero-quoting hook transport)
     #[arg(long)]
     base64: Option<String>,
+    /// Execute `--base64` or `--run-stdin` directly under interpreter (`py`, `js`/`node`, `pwsh`, `bash`) without outer shell quoting
+    #[arg(long)]
+    lang: Option<String>,
+    /// Read script/command payload directly from stdin (composable with `--lang`)
+    #[arg(long = "run-stdin")]
+    run_stdin: bool,
     /// Working directory
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
@@ -2334,6 +2340,13 @@ pub fn run_cli(args: &[String]) -> i32 {
                 return 2;
             }
         }
+    } else if cli.run_stdin {
+        let mut buf = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+            eprintln!("[ap exec] failed reading --run-stdin: {e}");
+            return 2;
+        }
+        Some(buf)
     } else {
         cli.cmd.clone()
     };
@@ -2375,7 +2388,52 @@ pub fn run_cli(args: &[String]) -> i32 {
         return 2;
     }
 
-    let (mut child_cmd, heals) = if let Some(ref s) = shell_str {
+    let mut stdin_bytes: Option<Vec<u8>> = None;
+    let (mut child_cmd, heals) = if let Some(ref lang_raw) = cli.lang {
+        let Some(ref code) = shell_str else {
+            eprintln!("[ap exec] `--lang` requires `--base64` or `--run-stdin`");
+            return 2;
+        };
+        let lang_low = lang_raw.trim().to_ascii_lowercase();
+        let mut c = match lang_low.as_str() {
+            "py" | "python" | "python3" => {
+                let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
+                cmd.args(["-u", "-"]);
+                cmd
+            }
+            "js" | "node" | "mjs" => {
+                let mut cmd = Command::new("node");
+                if lang_low == "mjs" {
+                    cmd.arg("--input-type=module");
+                }
+                cmd.arg("-");
+                cmd
+            }
+            "pwsh" | "ps1" | "powershell" => {
+                let mut cmd = Command::new(if cfg!(windows) {
+                    "powershell.exe"
+                } else {
+                    "pwsh"
+                });
+                cmd.args(["-NoProfile", "-Command", "-"]);
+                cmd
+            }
+            "bash" | "sh" => {
+                let mut cmd = Command::new("bash");
+                cmd.arg("-s");
+                cmd
+            }
+            other => {
+                eprintln!(
+                    "[ap exec] unsupported `--lang {other}` (expected py|js|node|mjs|pwsh|bash)"
+                );
+                return 2;
+            }
+        };
+        let _ = &mut c;
+        stdin_bytes = Some(code.as_bytes().to_vec());
+        (c, vec!["lang-stdin-transport"])
+    } else if let Some(ref s) = shell_str {
         build_shell_command(s)
     } else {
         let mut c = Command::new(&clean_argv[0]);
@@ -2406,7 +2464,11 @@ pub fn run_cli(args: &[String]) -> i32 {
         .env("NPM_CONFIG_YES", "true")
         .env("PIP_NO_INPUT", "1")
         .env("NEXT_TELEMETRY_DISABLED", "1")
-        .stdin(Stdio::null());
+        .stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2439,6 +2501,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 127;
         }
     };
+    if let (Some(bytes), Some(mut sin)) = (stdin_bytes.take(), child.stdin.take()) {
+        use std::io::Write;
+        thread::spawn(move || {
+            let _ = sin.write_all(&bytes);
+            drop(sin);
+        });
+    }
     let mut job_guard = crate::win_job::WinJobGuard::attach(&child);
 
     let deadline = Duration::from_secs(cli.timeout.max(1));

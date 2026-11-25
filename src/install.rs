@@ -2589,7 +2589,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 export const AP_DEEPSEEK_GUIDELINES: readonly string[] = [
 	"Parallel-first execution: batch 2+ independent reads/searches/checks in parallel tool calls OR one codemode script via `const res = await Promise.allSettled([tools.read({{path}}), tools.bash({{command}})]);` (cuts latency & thinking tokens ~40%); persist cross-turn state via `store(key, val)`/`load(key)`.",
 	"In codemode (QuickJS sandbox — NO Node fs/path/require/process/fetch; `await sleep(ms)` is available): prefer typed MCP primitives `tools.mcp__agent_primitives__ap_search({{pattern, path, only_matching: true, unique: true, json: true}})`, `ap_read({{target, routes: true, section, json: true}})`, `ap_http`, `ap_cdp` over bash python/grep one-liners; `tools.bash({{command}})` returns `{{ output, exit_code }}`.",
-	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--xref`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>`, `ap atlas map .`.',
+	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--xref`, `ap diff <old> <new> --json`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>|--weak-acl|--unquoted|--com|--rpc`, `ap http --roles-matrix`, `ap atlas map .`.',
 ];
 
 export function injectDeepSeekGuidelines(guidelines: string[]): boolean {{
@@ -5139,6 +5139,57 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 					const mFlag = limNum > 0 ? ` --max ${{limNum}}` : "";
 					return `${{cdLead}}"${{AP_BIN}}" probe win --services${{fFlag}}${{mFlag}}`;
 				}}
+
+				// 5. PE Authenticode signature (`Get-AuthenticodeSignature '<path>'`)
+				const sigMatch = core.match(
+					/^Get-AuthenticodeSignature(?:\s+-FilePath)?\s+(?:'([^']+)'|"([^"]+)"|([^\s;|'"`$]+))(?:\s*\|\s*Select-Object\b[^|]*)?$/i,
+				);
+				if (sigMatch) {{
+					const rawP = (sigMatch[1] || sigMatch[2] || sigMatch[3] || "").trim();
+					if (rawP && !/[`$]/.test(rawP)) {{
+						return `${{cdLead}}"${{AP_BIN}}" probe win --sig "${{rawP.replace(/\\/g, "/").replace(/"/g, '\\"')}}"`;
+					}}
+				}}
+
+				// 6. File/dir ACL (`Get-Acl '<path>'`)
+				const aclMatch = core.match(
+					/^\(?\s*Get-Acl(?:\s+-(?:Literal)?Path)?\s+(?:'([^']+)'|"([^"]+)"|([^\s;|'"`$)]+))\s*\)?(?:\.(?:Sddl|AccessToString))?(?:\s*\|\s*Select-Object\b[^|]*)?$/i,
+				);
+				if (aclMatch) {{
+					const rawP = (aclMatch[1] || aclMatch[2] || aclMatch[3] || "").trim();
+					if (rawP && !/[`$]/.test(rawP)) {{
+						return `${{cdLead}}"${{AP_BIN}}" probe win --acl "${{rawP.replace(/\\/g, "/").replace(/"/g, '\\"')}}"`;
+					}}
+				}}
+
+				// 7. Windows registry key (`Get-ItemProperty 'HKLM:\...'`)
+				const regMatch = core.match(
+					/^Get-ItemProperty(?:\s+-(?:Literal)?Path)?\s+['"]?(HKEY_[A-Z_]+|HKLM|HKCU|HKCR|HKU|HKCC):?\\([^'"]+)['"]?(?:\s*\|\s*Select-Object\b[^|]*)?$/i,
+				);
+				if (regMatch) {{
+					const hive = regMatch[1].trim();
+					const sub = regMatch[2].trim();
+					if (hive && sub && !/[`$]/.test(sub)) {{
+						return `${{cdLead}}"${{AP_BIN}}" probe win --reg "${{hive}}\\${{sub.replace(/"/g, '\\"')}}"`;
+					}}
+				}}
+			}}
+		}}
+	}}
+
+	// Read-only `icacls "<path>"` in Git Bash -> pure-Rust `ap probe win --acl "<path>"`
+	if (
+		toolName === "bash" &&
+		/^\s*(?:cd(?:\s+\/d)?\s+\S+\s*(?:&&|;)\s*)?icacls(?:\.exe)?\s+/i.test(seg) &&
+		!/\/(?:grant|deny|remove|setowner|inheritance|reset|restore|save|substitute|t)\b/i.test(seg)
+	) {{
+		const icM = seg.match(
+			/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?icacls(?:\.exe)?\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&>]+))(?:\s+2>\s*(?:\/dev\/null|NUL))?\s*$/i,
+		);
+		if (icM) {{
+			const rawP = (icM[2] || icM[3] || icM[4] || "").trim();
+			if (rawP && !/[`$]/.test(rawP)) {{
+				return `${{icM[1] || ""}}"${{AP_BIN}}" probe win --acl "${{rawP.replace(/\\/g, "/").replace(/"/g, '\\"')}}"`;
 			}}
 		}}
 	}}
@@ -5470,7 +5521,118 @@ export function healCommand(
 		changed = true;
 	}}
 
+	// 11. Repair hallucinated `ap` CLI subcommands seen in live logs (`ap bin_surface|objdump|re|files|rg`)
+	if (toolName === "bash") {{
+		const apAliasM = cmd.match(
+			/^(\s*(?:cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:"[^"]*[/\\]ap(?:\.exe)?"|ap(?:\.exe)?)\s+)(bin_surface|objdump|re|files|rg)\b([\s\S]*)$/,
+		);
+		if (apAliasM) {{
+			const lead = apAliasM[1];
+			const badSub = apAliasM[2];
+			const rest = apAliasM[3] || "";
+			if (badSub === "files") {{
+				cmd = `${{lead}}ls${{rest}}`;
+				changed = true;
+			}} else if (badSub === "rg") {{
+				cmd = `${{lead}}search${{rest}}`;
+				changed = true;
+			}} else {{
+				const hasMode = /\s--(?:surface|xref|strings|hex|rva|va|diff)\b/.test(rest);
+				cmd = `${{lead}}read${{rest}}${{hasMode ? "" : " --surface"}}`;
+				changed = true;
+			}}
+		}}
+	}}
+
+	// 12. Auto-transport broken nested/unterminated inline `python -c` scripts via `ap exec --lang py --base64`
+	if (toolName === "bash") {{
+		const pyBroken = healBrokenInlinePythonCommand(cmd);
+		if (pyBroken) {{
+			cmd = pyBroken;
+			changed = true;
+		}}
+	}}
+
+	// 13. Normalize benign empty-match exit code 1 on unaccelerated standalone/tail `grep`/`rg`/`findstr`
+	//     (strictly preserves exit >= 2 syntax/ENOENT errors and compound &&/|| condition semantics)
+	if (toolName === "bash") {{
+		const wrappedEmpty = wrapBenignSearchExit1(cmd);
+		if (wrappedEmpty) {{
+			cmd = wrappedEmpty;
+			changed = true;
+		}}
+	}}
+
 	return changed ? cmd : undefined;
+}}
+
+function healBrokenInlinePythonCommand(cmd: string): string | undefined {{
+	if (/[<>]|<<|\|\||&&[\s\S]*&&/.test(cmd.replace(/'[^']*'|"[^"]*"/g, ""))) return undefined;
+	const m = cmd.match(
+		/^(\s*(?:export\s+PYTHONUTF8=1\s+PYTHONIOENCODING=utf-8\s*;\s*)?(?:cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*&&\s*)?)(python3?|py)(?:\.exe)?\s+(?:-[uBE]+\s+)*-c\s+([\s\S]+)$/,
+	);
+	if (!m) return undefined;
+	const lead = (m[1] || "").replace(/^export\s+PYTHONUTF8=1\s+PYTHONIOENCODING=utf-8\s*;\s*/, "");
+	const argTail = m[3].trim();
+	if (!argTail || (!argTail.startsWith('"') && !argTail.startsWith("'"))) return undefined;
+
+	// Check whether outer bash quoting is cleanly balanced AND free of single-backslash inner trap
+	const outerQ = argTail[0];
+	let quoteOk = false;
+	let consumedEnd = -1;
+	if (outerQ === "'") {{
+		const closeIdx = argTail.indexOf("'", 1);
+		if (closeIdx > 0 && argTail.slice(closeIdx + 1).trim() === "") {{
+			quoteOk = true;
+			consumedEnd = closeIdx;
+		}}
+	}} else {{
+		let esc = false;
+		for (let i = 1; i < argTail.length; i++) {{
+			const ch = argTail[i];
+			if (esc) {{ esc = false; continue; }}
+			if (ch === "\\") {{ esc = true; continue; }}
+			if (ch === '"') {{
+				if (argTail.slice(i + 1).trim() === "") {{
+					quoteOk = true;
+					consumedEnd = i;
+				}}
+				break;
+			}}
+		}}
+	}}
+	// Valid balanced single-line command with no trailing pipe/broken inner quotes -> leave untouched!
+	if (quoteOk && consumedEnd > 0) {{
+		const inner = argTail.slice(1, consumedEnd);
+		const hasInnerTrap =
+			/(?<![rR\\])'\\'/.test(inner) ||
+			(outerQ === '"' && /[\r\n]/.test(inner) && /"[^"\r\n]*"/.test(inner));
+		if (!hasInnerTrap) return undefined;
+	}}
+	// Reject if unrelated shell chaining appears clearly after a quoted token
+	if (quoteOk && consumedEnd > 0 && consumedEnd < argTail.length - 1) return undefined;
+
+	let rawBody = argTail.slice(1);
+	if (rawBody.endsWith(outerQ) && !rawBody.endsWith("\\" + outerQ)) {{
+		rawBody = rawBody.slice(0, -1);
+	}}
+	if (!rawBody.trim() || rawBody.length > 32_000) return undefined;
+	const b64 = Buffer.from(rawBody, "utf8").toString("base64");
+	return `${{lead}}"${{AP_BIN}}" exec --lang py --base64 ${{b64}}`;
+}}
+
+function wrapBenignSearchExit1(cmd: string): string | undefined {{
+	if (cmd.includes("_ap_ec=") || cmd.includes("[ap-empty]")) return undefined;
+	const cdM = cmd.match(/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$/);
+	const lead = cdM ? cdM[1] : "";
+	const tail = (cdM ? cdM[2] : cmd).trim();
+	const stripped = tail.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
+	if (/[;&><{{}}`]|\$\(|\|\||&&|\b(?:if|then|while|for)\b/.test(stripped)) return undefined;
+	const stages = splitUnquotedPipes(tail);
+	if (!stages || stages.length === 0) return undefined;
+	const lastStage = stages[stages.length - 1].trim();
+	if (!/^(?:grep|egrep|fgrep|rg|findstr)(?:\.exe)?\b/i.test(lastStage)) return undefined;
+	return `${{lead}}{{ ${{tail}}; }}; _ap_ec=$?; if [ $_ap_ec -eq 1 ]; then printf '[ap-empty] 0 matches (exit 1)\\n'; exit 0; fi; exit $_ap_ec`;
 }}
 
 const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{

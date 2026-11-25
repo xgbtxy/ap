@@ -1268,3 +1268,439 @@ assert.ok(AP_DEEPSEEK_GUIDELINES.join("\n").includes("--sig"));
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+#[test]
+fn corpus_10_version_diff_and_sieve_prune_invariants() {
+    use zip::write::SimpleFileOptions;
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. Two zip archives where dist/main.js has identical byte length but changed content (SHA-256 detects!)
+    let old_zip = root.join("app_v1.zip");
+    let new_zip = root.join("app_v2.zip");
+
+    let js_v1 =
+        r#"app.get('/api/v1/health', ok); ipcMain.on('ping', h); // padding_same_len_123456"#;
+    let js_v2 = r#"app.post('/api/v2/run', go); ipcMain.handle('exec', h); // pad_123"#;
+    let js_v2_padded = format!(
+        "{js_v2}{}",
+        " ".repeat(js_v1.len().saturating_sub(js_v2.len()))
+    );
+    assert_eq!(js_v1.len(), js_v2_padded.len(), "same-size invariant");
+
+    let write_zip = |path: &Path, js_body: &str, py_body: &str| {
+        let f = fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = SimpleFileOptions::default();
+        zw.start_file("dist/main.js", opts).unwrap();
+        zw.write_all(js_body.as_bytes()).unwrap();
+        zw.start_file("pkg/handler.py", opts).unwrap();
+        zw.write_all(py_body.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    };
+    write_zip(&old_zip, js_v1, "def check(x):\n    return x == 'a'\n");
+    write_zip(
+        &new_zip,
+        &js_v2_padded,
+        "def check(x):\n    return x == 'a' and is_admin(x)\n",
+    );
+
+    let d_out = run_ap(
+        root,
+        &[
+            "diff",
+            old_zip.to_str().unwrap(),
+            new_zip.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        d_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&d_out.stderr)
+    );
+    assert!(
+        d_out.stdout.len() <= 16_384,
+        "version-diff JSON must stay compact <=16KB (got {})",
+        d_out.stdout.len()
+    );
+    let dj: Value = serde_json::from_slice(&d_out.stdout).unwrap();
+    assert_eq!(dj["ok"], true, "{dj}");
+    assert_eq!(dj["archive_summary"]["modified_hash"], 2, "{dj}");
+    let members_s = dj["changed_code_members"].to_string();
+    assert!(members_s.contains("/api/v2/run"), "{dj}");
+    assert!(members_s.contains("ipcMain.handle"), "{dj}");
+
+    // Same engine works via `ap probe archive-diff` and `ap read --diff --json`
+    let p_out = run_ap(
+        root,
+        &[
+            "probe",
+            "archive-diff",
+            old_zip.to_str().unwrap(),
+            new_zip.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(p_out.status.success());
+    let pj: Value = serde_json::from_slice(&p_out.stdout).unwrap();
+    assert_eq!(pj["archive_summary"]["modified_hash"], 2, "{pj}");
+
+    let r_out = run_ap(
+        root,
+        &[
+            "read",
+            new_zip.to_str().unwrap(),
+            "--diff",
+            old_zip.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(r_out.status.success());
+    let rj: Value = serde_json::from_slice(&r_out.stdout).unwrap();
+    assert_eq!(rj["archive_summary"]["modified_hash"], 2, "{rj}");
+
+    // 2. Bounded `ap sieve prune --max-mb 0 --vacuum --json`
+    let sieve_home = root.join("sieve_c10");
+    fs::create_dir_all(&sieve_home).unwrap();
+    let envs = [("SIEVE_HOME", sieve_home.as_path())];
+    for idx in 0..4usize {
+        let payload = format!("row-{idx}-{}", "B".repeat(2500));
+        let pr = run_ap(
+            root,
+            &["sieve", "pipe", "--label", "c10", "--json"],
+            Some(&payload),
+            &envs,
+        );
+        assert!(pr.status.success());
+    }
+    let prune_out = run_ap(
+        root,
+        &["sieve", "prune", "--max-mb", "0", "--vacuum", "--json"],
+        None,
+        &envs,
+    );
+    assert!(
+        prune_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prune_out.stderr)
+    );
+    let prj: Value = serde_json::from_slice(&prune_out.stdout).unwrap();
+    assert_eq!(prj["ok"], true, "{prj}");
+    assert_eq!(prj["removed_entries"], 4, "{prj}");
+    assert_eq!(prj["vacuum"], true, "{prj}");
+}
+
+#[test]
+fn corpus_11_probe_http_roles_matrix_and_win_surface_invariants() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. Live mock HTTP server testing cross-tenant IDOR + write-AuthZ bypass + volatile scrubbing
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        for _ in 0..16 {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let first = req.lines().next().unwrap_or("");
+            let mut ps = first.split_whitespace();
+            let method = ps.next().unwrap_or("GET");
+            let path = ps.next().unwrap_or("/");
+            let auth = req
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let (code, body) = if !auth.contains("bearer ") {
+                ("401 Unauthorized", r#"{"error":"unauthorized"}"#)
+            } else if path.ends_with("/101") && method == "DELETE" && auth.contains("other") {
+                ("200 OK", r#"{"ok":true,"deleted":101,"requestId":"r-99"}"#)
+            } else if path.ends_with("/101") {
+                (
+                    "200 OK",
+                    r#"{"id":101,"owner":"alice","secret":"SECRET_ALPHA","requestId":"r-1"}"#,
+                )
+            } else if path.ends_with("/102") && auth.contains("other") {
+                (
+                    "200 OK",
+                    r#"{"id":102,"owner":"bob","secret":"SECRET_BOB","requestId":"r-2"}"#,
+                )
+            } else {
+                ("403 Forbidden", r#"{"error":"denied"}"#)
+            };
+            let resp = format!(
+                "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+
+    let spec = json!({
+        "url": format!("http://127.0.0.1:{port}/api/doc/{{{{id}}}}"),
+        "methods": ["GET", "DELETE"],
+        "cross_id": true,
+        "roles": [
+            { "name": "owner", "headers": ["Authorization: Bearer owner_tok"], "vars": { "id": "101" } },
+            { "name": "other", "headers": ["Authorization: Bearer other_tok"], "vars": { "id": "102" } },
+            { "name": "anon", "headers": [] }
+        ]
+    });
+
+    // Dry-run fires 0 HTTP requests
+    let dry = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            "--roles-matrix",
+            "-",
+            "--dry-run",
+            "--json",
+        ],
+        Some(&spec.to_string()),
+        &[],
+    );
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dj: Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dj["mode"], "roles_matrix_dry_run", "{dj}");
+    assert_eq!(dj["cells_total"], 12, "{dj}");
+
+    let live = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            "--roles-matrix",
+            "-",
+            "--sentinel",
+            "SECRET_ALPHA",
+            "--json",
+        ],
+        Some(&spec.to_string()),
+        &[],
+    );
+    drop(handle);
+    assert!(
+        live.status.success(),
+        "{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    let lj: Value = serde_json::from_slice(&live.stdout).unwrap();
+    assert_eq!(lj["ok"], true, "{lj}");
+    let anom = lj["anomalies"].as_array().unwrap();
+    assert!(
+        anom.iter().any(|a| a["verdict"] == "WRITE_AUTHZ_BYPASS"
+            && a["method"] == "DELETE"
+            && a["actor"] == "other"),
+        "{lj}"
+    );
+    assert!(
+        anom.iter()
+            .any(|a| a["method"] == "GET" && a["actor"] == "other" && a["target_owner"] == "owner"),
+        "{lj}"
+    );
+
+    // 2. Pure-Rust `ap probe win --weak-acl / --unquoted / --com / --rpc`
+    let scan_dir = root.join("win_acl_dir");
+    fs::create_dir_all(&scan_dir).unwrap();
+    let sample_exe = scan_dir.join("helper.exe");
+    fs::write(&sample_exe, b"MZ").unwrap();
+
+    for flag_args in [
+        vec![
+            "probe",
+            "win",
+            "--weak-acl",
+            scan_dir.to_str().unwrap(),
+            "--max",
+            "5",
+            "--json",
+        ],
+        vec!["probe", "win", "--unquoted", "--max", "5", "--json"],
+        vec!["probe", "win", "--com", "--max", "5", "--json"],
+        vec!["probe", "win", "--rpc", "--max", "5", "--json"],
+    ] {
+        let out = run_ap(root, &flag_args, None, &[]);
+        #[cfg(windows)]
+        {
+            assert!(
+                out.status.success(),
+                "{flag_args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["ok"], true, "{v}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(out.status.code(), Some(2));
+        }
+    }
+}
+
+#[test]
+fn corpus_12_atomic_frontier_exec_lang_and_accel_v2_invariants() {
+    use base64::Engine;
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. Multi-process concurrent `ap baton` writes -> frontier.json must never disappear or corrupt
+    let mut handles = Vec::new();
+    for wid in 0..4usize {
+        let cwd = root.to_path_buf();
+        handles.push(thread::spawn(move || {
+            for r in 0..5usize {
+                let res = run_ap(
+                    &cwd,
+                    &[
+                        "baton",
+                        "fact",
+                        &format!("worker-{wid}-round-{r}"),
+                        "--ref",
+                        "src/lib.rs:1",
+                    ],
+                    None,
+                    &[],
+                );
+                assert!(
+                    res.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&res.stderr)
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let st_out = run_ap(root, &["baton", "resume", "--json"], None, &[]);
+    assert!(st_out.status.success());
+
+    // 2. `ap exec --lang py --base64` and `--run-stdin` UTF-8 + zero shell quoting
+    let py_code = "import json\nprint(json.dumps({'ok': True, 'msg': 'hello_\"world\"_UTF8_测试'}, ensure_ascii=False))";
+    let b64 = base64::engine::general_purpose::STANDARD.encode(py_code.as_bytes());
+    let ex_b64 = run_ap(
+        root,
+        &["exec", "--lang", "py", "--base64", &b64, "--json"],
+        None,
+        &[],
+    );
+    assert!(
+        ex_b64.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ex_b64.stderr)
+    );
+    let exj: Value = serde_json::from_slice(&ex_b64.stdout).unwrap();
+    assert_eq!(exj["exit_code"], 0, "{exj}");
+    let py_out: Value = serde_json::from_str(exj["output"].as_str().unwrap().trim()).unwrap();
+    assert_eq!(py_out["msg"], "hello_\"world\"_UTF8_测试", "{py_out}");
+
+    // 3. `zz-ap-accelerator.ts` v2 checks via Node
+    if !Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let fake_home = root.join("home_c12");
+    let ap_home = root.join("ap_home_c12");
+    fs::create_dir_all(fake_home.join(".pi").join("agent")).unwrap();
+    let init_out = run_ap(
+        root,
+        &["init", "-a", "pi", "--with-hooks", "--no-rules"],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("AP_HOME", ap_home.as_path()),
+        ],
+    );
+    assert!(init_out.status.success());
+    let accel_ts = fake_home
+        .join(".pi")
+        .join("agent")
+        .join("extensions")
+        .join("zz-ap-accelerator.ts");
+
+    let node_check = r###"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const { healCommand, AP_DEEPSEEK_GUIDELINES } = mod;
+
+// A. Benign exit-1 normalization for standalone searches (preserving exit >=2 & && / | sort)
+const rgMiss = healCommand('rg "nonexistent_needle" src', "bash");
+assert.ok(rgMiss && rgMiss.includes("_ap_ec=$?") && rgMiss.includes("[ap-empty]"), rgMiss);
+assert.equal(healCommand('grep -rn "pat" src && echo found', "bash"), undefined);
+assert.equal(healCommand("grep -n 'foo' app.js | sort", "bash"), undefined);
+
+// B. PS & icacls security discovery auto-routing
+const psSig = healCommand('powershell -NoProfile -Command "Get-AuthenticodeSignature \'C:\\App\\bin.exe\'"', "bash");
+assert.ok(psSig && psSig.includes('probe win --sig "C:/App/bin.exe"'), psSig);
+const psAcl = healCommand('powershell -NoProfile -Command "(Get-Acl \'C:\\App\\bin.exe\').Sddl"', "bash");
+assert.ok(psAcl && psAcl.includes('probe win --acl "C:/App/bin.exe"'), psAcl);
+const psReg = healCommand('powershell -NoProfile -Command "Get-ItemProperty \'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\'"', "bash");
+assert.ok(psReg && psReg.includes('probe win --reg "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip"'), psReg);
+const icRo = healCommand('icacls "C:\\App\\dir"', "bash");
+assert.ok(icRo && icRo.includes('probe win --acl "C:/App/dir"'), icRo);
+const icWr = healCommand('icacls "C:\\App\\dir" /grant Everyone:F', "bash");
+assert.ok(!icWr || !icWr.includes("probe win"), icWr);
+
+// C. Hallucinated `ap` subcommand aliases
+const apSurf = healCommand("ap bin_surface app.exe", "bash");
+assert.equal(apSurf, "ap read app.exe --surface");
+const apFiles = healCommand("ap files src", "bash");
+assert.equal(apFiles, "ap ls src");
+const apRg = healCommand("ap rg foo src", "bash");
+assert.equal(apRg, "ap search foo src");
+
+// D. Broken inline `python -c` quoting transport vs clean one-liner preservation
+const pyOk = healCommand('python3 -c "print(1)"', "bash");
+assert.ok(pyOk && pyOk.includes("PYTHONUTF8=1") && !pyOk.includes("--base64"), pyOk);
+const pyBroken = healCommand('python3 -c "print(\'a\\\' + \'b\')"', "bash");
+const pyBroken2 = healCommand('python3 -c "print(p.split(\'\\\'))"'.replace("\\\\", "\\"), "bash");
+const pyUnclosed = healCommand('python3 -c "print(\'unclosed)', "bash");
+assert.ok(pyUnclosed && pyUnclosed.includes("exec --lang py --base64 "), pyUnclosed);
+assert.ok(pyBroken2 && pyBroken2.includes("exec --lang py --base64 "), pyBroken2);
+
+// E. Updated guidelines include Wave-15 primitives
+const g = AP_DEEPSEEK_GUIDELINES.join("\n");
+assert.ok(g.includes("ap diff") && g.includes("--weak-acl") && g.includes("--roles-matrix"), g);
+"###;
+
+    let run = Command::new("node")
+        .args([
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            node_check,
+        ])
+        .env("ACCEL_TS", &accel_ts)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "Node corpus_12 check failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}

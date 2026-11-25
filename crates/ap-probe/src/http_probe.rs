@@ -1915,6 +1915,724 @@ pub fn run_http_auth_matrix(
     0
 }
 
+fn is_volatile_json_path(path: &str) -> bool {
+    let seg = path
+        .rsplit('.')
+        .next()
+        .unwrap_or(path)
+        .split('[')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        seg.as_str(),
+        "timestamp"
+            | "time"
+            | "ts"
+            | "requestid"
+            | "request_id"
+            | "reqid"
+            | "req_id"
+            | "traceid"
+            | "trace_id"
+            | "spanid"
+            | "span_id"
+            | "nonce"
+            | "csrftoken"
+            | "csrf_token"
+            | "expiresat"
+            | "expires_at"
+            | "date"
+    )
+}
+
+fn scrub_volatile_json_paths(
+    v: &Value,
+    prefix: &str,
+    out: &mut std::collections::BTreeMap<String, Value>,
+) {
+    let mut raw = std::collections::BTreeMap::new();
+    flatten_json_paths(v, prefix, 0, &mut raw);
+    for (k, val) in raw {
+        if !is_volatile_json_path(&k) {
+            out.insert(k, val);
+        }
+    }
+}
+
+fn render_template_vars(raw: &str, vars: &std::collections::BTreeMap<String, String>) -> String {
+    let mut s = raw.to_string();
+    for (k, v) in vars {
+        s = s.replace(&format!("{{{{{k}}}}}"), v);
+        s = s.replace(&format!("{{{k}}}"), v);
+    }
+    s
+}
+
+fn is_write_method(m: &str) -> bool {
+    matches!(
+        m.trim().to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    )
+}
+
+fn parse_role_var_arg(raw: &str) -> Option<(String, String, String)> {
+    let (role_part, kv_part) = raw.split_once(':')?;
+    let (k, v) = kv_part.split_once('=')?;
+    let role = role_part.trim().to_string();
+    let key = k.trim().to_string();
+    if role.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((role, key, v.trim().to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_http_roles_matrix(
+    roles_matrix_spec: Option<&str>,
+    req_file: Option<&std::path::Path>,
+    url_opt: Option<&str>,
+    default_method: &str,
+    methods_opt: Option<&str>,
+    headers: &[String],
+    body: Option<&str>,
+    principals: &[String],
+    principal_cdps: &[String],
+    role_vars: &[String],
+    cross_id: bool,
+    rate_ms: u64,
+    max_variants: usize,
+    dry_run: bool,
+    sentinels: &[String],
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+) -> Result<Value, String> {
+    #[derive(Clone)]
+    struct RoleSpec {
+        headers: Vec<String>,
+        vars: std::collections::BTreeMap<String, String>,
+        cookie_count: Option<usize>,
+        resolve_err: Option<String>,
+    }
+
+    fn ensure_role_slot<'a>(
+        role_map: &'a mut std::collections::BTreeMap<String, RoleSpec>,
+        role_order: &mut Vec<String>,
+        nm: &str,
+    ) -> &'a mut RoleSpec {
+        if !role_map.contains_key(nm) {
+            role_order.push(nm.to_string());
+            role_map.insert(
+                nm.to_string(),
+                RoleSpec {
+                    headers: Vec::new(),
+                    vars: std::collections::BTreeMap::new(),
+                    cookie_count: None,
+                    resolve_err: None,
+                },
+            );
+        }
+        role_map.get_mut(nm).expect("role inserted")
+    }
+
+    let mut base_url = url_opt.map(str::trim).unwrap_or("").to_string();
+    let mut base_method = default_method.trim().to_ascii_uppercase();
+    if base_method.is_empty() {
+        base_method = "GET".to_string();
+    }
+    let mut base_hdrs: Vec<String> = Vec::new();
+    let mut base_body: Option<String> = body.map(str::to_string);
+    if let Some(rf) = req_file {
+        let (m, u, h, b) = load_saved_request(rf)?;
+        base_method = m;
+        if base_url.is_empty() {
+            base_url = u;
+        }
+        base_hdrs.extend(h);
+        if base_body.is_none() {
+            base_body = b;
+        }
+    }
+    base_hdrs.extend(headers.iter().cloned());
+
+    let mut spec_json: Option<Value> = None;
+    if let Some(raw_spec) = roles_matrix_spec.map(str::trim).filter(|s| !s.is_empty()) {
+        let txt = if raw_spec == "-" {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| format!("failed reading --roles-matrix stdin: {e}"))?;
+            buf
+        } else if raw_spec.starts_with('{') {
+            raw_spec.to_string()
+        } else {
+            std::fs::read_to_string(raw_spec)
+                .map_err(|e| format!("failed reading --roles-matrix `{raw_spec}`: {e}"))?
+        };
+        let v: Value = serde_json::from_str(txt.trim())
+            .map_err(|e| format!("invalid --roles-matrix JSON: {e}"))?;
+        spec_json = Some(v);
+    }
+
+    let mut method_list: Vec<String> = methods_opt
+        .map(|s| {
+            s.split(',')
+                .map(|m| m.trim().to_ascii_uppercase())
+                .filter(|m| !m.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut role_map: std::collections::BTreeMap<String, RoleSpec> =
+        std::collections::BTreeMap::new();
+    let mut role_order: Vec<String> = Vec::new();
+
+    if let Some(ref sj) = spec_json {
+        if base_url.is_empty() {
+            if let Some(u) = sj
+                .get("url")
+                .or_else(|| sj.get("template").and_then(|t| t.get("url")))
+                .and_then(Value::as_str)
+            {
+                base_url = u.trim().to_string();
+            }
+        }
+        if base_body.is_none() {
+            if let Some(b) = sj
+                .get("body")
+                .or_else(|| sj.get("template").and_then(|t| t.get("body")))
+            {
+                base_body = Some(if let Some(s) = b.as_str() {
+                    s.to_string()
+                } else {
+                    b.to_string()
+                });
+            }
+        }
+        if method_list.is_empty() {
+            if let Some(arr) = sj.get("methods").and_then(Value::as_array) {
+                for m in arr {
+                    if let Some(ms) = m.as_str() {
+                        let up = ms.trim().to_ascii_uppercase();
+                        if !up.is_empty() {
+                            method_list.push(up);
+                        }
+                    }
+                }
+            } else if let Some(ms) = sj
+                .get("method")
+                .or_else(|| sj.get("template").and_then(|t| t.get("method")))
+                .and_then(Value::as_str)
+            {
+                let up = ms.trim().to_ascii_uppercase();
+                if !up.is_empty() {
+                    method_list.push(up);
+                }
+            }
+        }
+        if let Some(harr) = sj
+            .get("headers")
+            .or_else(|| sj.get("template").and_then(|t| t.get("headers")))
+            .and_then(Value::as_array)
+        {
+            for h in harr {
+                if let Some(hs) = h.as_str() {
+                    base_hdrs.push(hs.to_string());
+                }
+            }
+        }
+        if let Some(rarr) = sj.get("roles").and_then(Value::as_array) {
+            for r in rarr {
+                let Some(nm) = r.get("name").and_then(Value::as_str).map(str::trim) else {
+                    continue;
+                };
+                if nm.is_empty() {
+                    continue;
+                }
+                let rs = ensure_role_slot(&mut role_map, &mut role_order, nm);
+                {
+                    if let Some(harr) = r.get("headers").and_then(Value::as_array) {
+                        for h in harr {
+                            if let Some(hs) = h.as_str() {
+                                rs.headers.push(hs.to_string());
+                            }
+                        }
+                    } else if let Some(hobj) = r.get("headers").and_then(Value::as_object) {
+                        for (hk, hv) in hobj {
+                            if let Some(hvs) = hv.as_str() {
+                                rs.headers.push(format!("{hk}: {hvs}"));
+                            }
+                        }
+                    }
+                    if let Some(vobj) = r.get("vars").and_then(Value::as_object) {
+                        for (vk, vv) in vobj {
+                            let val_s = vv
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| vv.to_string());
+                            rs.vars.insert(vk.clone(), val_s);
+                        }
+                    }
+                    if let Some(port) = r.get("cdp_port").and_then(Value::as_u64) {
+                        if port <= u16::MAX as u64 && !base_url.is_empty() {
+                            match resolve_cdp_cookie_header(port as u16, &base_url) {
+                                Ok((Some(ch), cnt)) => {
+                                    rs.headers.push(ch);
+                                    rs.cookie_count = Some(cnt);
+                                }
+                                Ok((None, cnt)) => rs.cookie_count = Some(cnt),
+                                Err(e) => rs.resolve_err = Some(format!("cdp:{port}: {e}")),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if base_url.is_empty() {
+        return Err(
+            "Provide a URL, `--vary-request <file>`, or `url` inside `--roles-matrix`".to_string(),
+        );
+    }
+    if method_list.is_empty() {
+        method_list.push(base_method);
+    }
+    method_list.truncate(5);
+
+    for raw_cdp in principal_cdps {
+        let (label, port) = parse_principal_cdp_spec(raw_cdp)?;
+        let rs = ensure_role_slot(&mut role_map, &mut role_order, &label);
+        {
+            match resolve_cdp_cookie_header(port, &base_url) {
+                Ok((Some(ch), cnt)) => {
+                    rs.headers.push(ch);
+                    rs.cookie_count = Some(cnt);
+                }
+                Ok((None, cnt)) => rs.cookie_count = Some(cnt),
+                Err(e) => rs.resolve_err = Some(format!("cdp:{port}: {e}")),
+            }
+        }
+    }
+    for p in principals {
+        let (label, phdrs) = parse_principal_spec(p);
+        let rs = ensure_role_slot(&mut role_map, &mut role_order, &label);
+        rs.headers.extend(phdrs);
+    }
+    for rv in role_vars {
+        let Some((rn, k, v)) = parse_role_var_arg(rv) else {
+            return Err(format!(
+                "Invalid --role-var `{rv}` (expected role:key=value)"
+            ));
+        };
+        let rs = ensure_role_slot(&mut role_map, &mut role_order, &rn);
+        rs.vars.insert(k, v);
+    }
+
+    if role_order.is_empty() {
+        return Err(
+            "Provide `--principal`, `--principal-cdp`, or `roles` inside `--roles-matrix`"
+                .to_string(),
+        );
+    }
+
+    let do_cross = cross_id
+        || spec_json
+            .as_ref()
+            .and_then(|v| v.get("cross_id"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || role_map.values().filter(|r| !r.vars.is_empty()).count() >= 2;
+
+    #[derive(Clone)]
+    struct MatrixCell {
+        method: String,
+        actor: String,
+        target_owner: String,
+        url: String,
+        body: Option<String>,
+        headers: Vec<String>,
+        resolve_err: Option<String>,
+    }
+
+    let owner_roles: Vec<String> = if do_cross {
+        let with_vars: Vec<String> = role_order
+            .iter()
+            .filter(|n| !role_map[*n].vars.is_empty())
+            .cloned()
+            .collect();
+        if with_vars.is_empty() {
+            vec![role_order[0].clone()]
+        } else {
+            with_vars
+        }
+    } else {
+        vec![role_order[0].clone()]
+    };
+
+    let cap = max_variants.clamp(1, 48);
+    let mut cells: Vec<MatrixCell> = Vec::new();
+    'outer: for m in &method_list {
+        for target_owner in &owner_roles {
+            let tvars = &role_map[target_owner].vars;
+            let cell_url = render_template_vars(&base_url, tvars);
+            let cell_body = base_body.as_ref().map(|b| render_template_vars(b, tvars));
+            for actor in &role_order {
+                let rspec = &role_map[actor];
+                let strip_auth = rspec.headers.is_empty();
+                let req_hdrs = merge_principal_headers(&base_hdrs, &rspec.headers, strip_auth);
+                cells.push(MatrixCell {
+                    method: m.clone(),
+                    actor: actor.clone(),
+                    target_owner: target_owner.clone(),
+                    url: cell_url.clone(),
+                    body: cell_body.clone(),
+                    headers: req_hdrs,
+                    resolve_err: rspec.resolve_err.clone(),
+                });
+                if cells.len() >= cap {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    if dry_run {
+        let preview: Vec<Value> = cells
+            .iter()
+            .map(|c| {
+                json!({
+                    "method": c.method,
+                    "actor": c.actor,
+                    "target_owner": c.target_owner,
+                    "url": c.url,
+                    "write": is_write_method(&c.method),
+                })
+            })
+            .collect();
+        return Ok(json!({
+            "ok": true,
+            "mode": "roles_matrix_dry_run",
+            "cells_total": preview.len(),
+            "cells": preview,
+        }));
+    }
+
+    #[derive(Clone)]
+    struct ExecutedCell {
+        cell: MatrixCell,
+        result: HttpProbeResult,
+        raw_body: String,
+    }
+
+    let n_cells = cells.len();
+    let mut outcomes: Vec<Option<ExecutedCell>> = vec![None; n_cells];
+    if rate_ms > 0 {
+        for (idx, cell) in cells.iter().enumerate() {
+            if idx > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(rate_ms.min(5000)));
+            }
+            let (res, raw_b) = if let Some(ref err_msg) = cell.resolve_err {
+                (
+                    HttpProbeResult {
+                        method: cell.method.clone(),
+                        url: cell.url.clone(),
+                        status: 0,
+                        elapsed_ms: 0.0,
+                        content_type: String::new(),
+                        headers: Vec::new(),
+                        body_preview: String::new(),
+                        error: err_msg.clone(),
+                    },
+                    String::new(),
+                )
+            } else {
+                execute_http_probe_with_raw(
+                    &cell.method,
+                    &cell.url,
+                    &cell.headers,
+                    cell.body.as_deref(),
+                    timeout_sec,
+                    insecure,
+                    follow,
+                )
+            };
+            outcomes[idx] = Some(ExecutedCell {
+                cell: cell.clone(),
+                result: res,
+                raw_body: raw_b,
+            });
+        }
+    } else {
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let worker_cnt = n_cells.clamp(1, 8);
+        let out_mtx = std::sync::Mutex::new(&mut outcomes);
+        std::thread::scope(|s| {
+            for _ in 0..worker_cnt {
+                s.spawn(|| loop {
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= n_cells {
+                        break;
+                    }
+                    let cell = &cells[idx];
+                    let (res, raw_b) = if let Some(ref err_msg) = cell.resolve_err {
+                        (
+                            HttpProbeResult {
+                                method: cell.method.clone(),
+                                url: cell.url.clone(),
+                                status: 0,
+                                elapsed_ms: 0.0,
+                                content_type: String::new(),
+                                headers: Vec::new(),
+                                body_preview: String::new(),
+                                error: err_msg.clone(),
+                            },
+                            String::new(),
+                        )
+                    } else {
+                        execute_http_probe_with_raw(
+                            &cell.method,
+                            &cell.url,
+                            &cell.headers,
+                            cell.body.as_deref(),
+                            timeout_sec,
+                            insecure,
+                            follow,
+                        )
+                    };
+                    if let Ok(mut guard) = out_mtx.lock() {
+                        guard[idx] = Some(ExecutedCell {
+                            cell: cell.clone(),
+                            result: res,
+                            raw_body: raw_b,
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    let exec_rows: Vec<ExecutedCell> = outcomes.into_iter().flatten().collect();
+    let mut baselines: std::collections::HashMap<(String, String), (&HttpProbeResult, &str)> =
+        std::collections::HashMap::new();
+    for ex in &exec_rows {
+        if ex.cell.actor == ex.cell.target_owner {
+            baselines.insert(
+                (ex.cell.method.clone(), ex.cell.target_owner.clone()),
+                (&ex.result, ex.raw_body.as_str()),
+            );
+        }
+    }
+    for ex in &exec_rows {
+        baselines
+            .entry((ex.cell.method.clone(), ex.cell.target_owner.clone()))
+            .or_insert((&ex.result, ex.raw_body.as_str()));
+    }
+
+    let mut anomalies = Vec::new();
+    let mut matrix_rows = Vec::new();
+    for ex in &exec_rows {
+        let is_self = ex.cell.actor == ex.cell.target_owner;
+        let (base_res, base_raw) = baselines
+            .get(&(ex.cell.method.clone(), ex.cell.target_owner.clone()))
+            .copied()
+            .unwrap_or((&ex.result, ex.raw_body.as_str()));
+        let mut diff_rep = if is_self {
+            HttpDiffReport {
+                verdict: "OWNER_BASELINE".to_string(),
+                possible_bypass: false,
+                reason: "owner baseline".to_string(),
+                shared_nonempty_paths: Vec::new(),
+                added_paths: Vec::new(),
+                removed_paths: Vec::new(),
+                changed_paths: Vec::new(),
+                sentinel_hits: Vec::new(),
+            }
+        } else {
+            let mut d = classify_auth_matrix_diff_deep_bodies(
+                base_res,
+                base_raw,
+                &ex.result,
+                &ex.raw_body,
+                sentinels,
+            );
+            // Scrub volatile timestamps/requestIds before finalizing changed_paths
+            if let (Ok(bv), Ok(cv)) = (
+                serde_json::from_str::<Value>(base_raw.trim()),
+                serde_json::from_str::<Value>(ex.raw_body.trim()),
+            ) {
+                let mut bm = std::collections::BTreeMap::new();
+                let mut cm = std::collections::BTreeMap::new();
+                scrub_volatile_json_paths(&bv, "", &mut bm);
+                scrub_volatile_json_paths(&cv, "", &mut cm);
+                d.changed_paths = bm
+                    .iter()
+                    .filter_map(|(k, bval)| (cm.get(k) != Some(bval)).then_some(k.clone()))
+                    .take(24)
+                    .collect();
+            }
+            d
+        };
+
+        let is_mut = is_write_method(&ex.cell.method);
+        let mut severity = "INFO";
+        if !is_self && (200..300).contains(&ex.result.status) {
+            let low_body = ex.raw_body.to_ascii_lowercase();
+            let app_denied = diff_rep.verdict == "PSEUDO_DENIAL_200"
+                || low_body.contains("\"success\":false")
+                || low_body.contains("\"ok\":false")
+                || low_body.contains("\"code\":401")
+                || low_body.contains("\"code\":403");
+            if is_mut && !app_denied {
+                diff_rep.verdict = "WRITE_AUTHZ_BYPASS".to_string();
+                diff_rep.possible_bypass = true;
+                diff_rep.reason = format!(
+                    "Mutating {} by `{}` targeting `{}` succeeded with HTTP {}",
+                    ex.cell.method, ex.cell.actor, ex.cell.target_owner, ex.result.status
+                );
+                severity = if ex.cell.actor.eq_ignore_ascii_case("anon") {
+                    "CRITICAL"
+                } else {
+                    "HIGH"
+                };
+            } else if diff_rep.possible_bypass && !app_denied {
+                if role_map
+                    .get(&ex.cell.actor)
+                    .map(|r| !r.vars.is_empty())
+                    .unwrap_or(false)
+                {
+                    diff_rep.verdict = "CROSS_TENANT_IDOR".to_string();
+                    severity = "HIGH";
+                } else {
+                    diff_rep.verdict = "PRIVILEGE_ESCALATION".to_string();
+                    severity = "HIGH";
+                }
+            }
+        } else if !diff_rep.sentinel_hits.is_empty() {
+            severity = "CRITICAL";
+        }
+
+        if diff_rep.possible_bypass {
+            anomalies.push(json!({
+                "severity": severity,
+                "verdict": diff_rep.verdict,
+                "method": ex.cell.method,
+                "actor": ex.cell.actor,
+                "target_owner": ex.cell.target_owner,
+                "url": ex.cell.url,
+                "status": ex.result.status,
+                "baseline_status": base_res.status,
+                "sentinel_hits": diff_rep.sentinel_hits,
+                "shared_nonempty_paths": diff_rep.shared_nonempty_paths,
+                "reason": diff_rep.reason,
+            }));
+        }
+
+        matrix_rows.push(json!({
+            "method": ex.cell.method,
+            "actor": ex.cell.actor,
+            "target_owner": ex.cell.target_owner,
+            "url": ex.cell.url,
+            "status": ex.result.status,
+            "elapsed_ms": ex.result.elapsed_ms,
+            "verdict": diff_rep.verdict,
+            "possible_bypass": diff_rep.possible_bypass,
+            "reason": diff_rep.reason,
+            "changed_paths": diff_rep.changed_paths,
+            "error": ex.result.error,
+        }));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "mode": "roles_matrix",
+        "cells_total": exec_rows.len(),
+        "anomalies_count": anomalies.len(),
+        "anomalies": anomalies,
+        "matrix": matrix_rows,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_http_roles_matrix(
+    roles_matrix_spec: Option<&str>,
+    req_file: Option<&std::path::Path>,
+    url_opt: Option<&str>,
+    default_method: &str,
+    methods_opt: Option<&str>,
+    headers: &[String],
+    body: Option<&str>,
+    principals: &[String],
+    principal_cdps: &[String],
+    role_vars: &[String],
+    cross_id: bool,
+    rate_ms: u64,
+    max_variants: usize,
+    dry_run: bool,
+    sentinels: &[String],
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+    as_json: bool,
+) -> i32 {
+    let report = match evaluate_http_roles_matrix(
+        roles_matrix_spec,
+        req_file,
+        url_opt,
+        default_method,
+        methods_opt,
+        headers,
+        body,
+        principals,
+        principal_cdps,
+        role_vars,
+        cross_id,
+        rate_ms,
+        max_variants,
+        dry_run,
+        sentinels,
+        timeout_sec,
+        insecure,
+        follow,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[probe http roles-matrix] {e}");
+            return 2;
+        }
+    };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        let total = report["cells_total"].as_u64().unwrap_or(0);
+        let anom_cnt = report["anomalies_count"].as_u64().unwrap_or(0);
+        println!("[probe http roles-matrix] {total} cell(s), {anom_cnt} anomaly(s):");
+        if let Some(arr) = report["matrix"].as_array() {
+            for r in arr {
+                let flag = if r["possible_bypass"].as_bool().unwrap_or(false) {
+                    "[BYPASS]"
+                } else {
+                    "[ok]"
+                };
+                println!(
+                    "  - {:<6} actor={:<10} owner={:<10} HTTP {} {} — {}",
+                    r["method"].as_str().unwrap_or("?"),
+                    r["actor"].as_str().unwrap_or("?"),
+                    r["target_owner"].as_str().unwrap_or("?"),
+                    r["status"].as_u64().unwrap_or(0),
+                    flag,
+                    r["verdict"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
+    0
+}
+
 fn fnv1a_hash_str(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
@@ -3780,5 +4498,104 @@ mod tests {
         assert_eq!(raw_b.trim(), r#"{"id":"ok_1","n":1}"#);
         let sel = extract_json_select(&raw_b, "id").expect("select json from decoded chunk");
         assert_eq!(sel, "ok_1");
+    }
+
+    #[test]
+    fn roles_matrix_detects_cross_tenant_idor_and_write_bypass() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..16 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first_line = req.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                let auth = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let (code, body) = if auth.contains("anon") || !auth.contains("bearer ") {
+                    ("401 Unauthorized", r#"{"error":"unauthorized"}"#)
+                } else if path.ends_with("/1001") {
+                    if method == "DELETE" && auth.contains("other") {
+                        // Intentional write AuthZ bypass on DELETE for other
+                        ("200 OK", r#"{"ok":true,"deleted":1001,"traceId":"t-w1"}"#)
+                    } else if method == "GET" {
+                        // Intentional IDOR: `other` can read owner's 1001 record!
+                        (
+                            "200 OK",
+                            r#"{"id":1001,"secret":"owner_secret_tok","traceId":"t-g1"}"#,
+                        )
+                    } else {
+                        ("200 OK", r#"{"ok":true,"id":1001}"#)
+                    }
+                } else if path.ends_with("/1002") && auth.contains("other") {
+                    (
+                        "200 OK",
+                        r#"{"id":1002,"secret":"other_secret_tok","traceId":"t-g2"}"#,
+                    )
+                } else {
+                    ("403 Forbidden", r#"{"error":"forbidden"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/api/items/{{{{id}}}}");
+        let principals = vec![
+            "owner=Authorization: Bearer owner_tok".to_string(),
+            "other=Authorization: Bearer other_tok".to_string(),
+            "anon=".to_string(),
+        ];
+        let role_vars = vec!["owner:id=1001".to_string(), "other:id=1002".to_string()];
+        let report = evaluate_http_roles_matrix(
+            None,
+            None,
+            Some(&url),
+            "GET",
+            Some("GET,DELETE"),
+            &[],
+            None,
+            &principals,
+            &[],
+            &role_vars,
+            true,
+            0,
+            24,
+            false,
+            &["owner_secret_tok".to_string()],
+            5,
+            false,
+            false,
+        )
+        .expect("matrix evaluation should succeed");
+        drop(handle);
+
+        let anomalies = report["anomalies"].as_array().unwrap();
+        assert!(
+            anomalies.iter().any(|a| a["verdict"] == "CROSS_TENANT_IDOR"
+                && a["actor"] == "other"
+                && a["target_owner"] == "owner"),
+            "expected CROSS_TENANT_IDOR in {report}"
+        );
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a["verdict"] == "WRITE_AUTHZ_BYPASS"
+                    && a["method"] == "DELETE"
+                    && a["actor"] == "other"),
+            "expected WRITE_AUTHZ_BYPASS in {report}"
+        );
     }
 }
