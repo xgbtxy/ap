@@ -100,6 +100,9 @@ struct CdpArgs {
     target: Option<String>,
     #[arg(short = 'e', long)]
     eval: Option<String>,
+    /// Read raw JavaScript expression/statements from stdin and evaluate via CDP
+    #[arg(long)]
+    eval_stdin: bool,
     #[arg(long)]
     audit: bool,
     #[arg(long)]
@@ -596,12 +599,35 @@ pub fn run_cli(args: &[String]) -> i32 {
                 list,
                 target,
                 eval,
+                eval_stdin,
                 audit,
                 screenshot,
                 stdin,
                 watch_ms,
                 json,
             } = *boxed;
+            let mut eval_owned = eval;
+            if eval_stdin {
+                let mut js_buf = String::new();
+                let _ = std::io::stdin().read_to_string(&mut js_buf);
+                let trimmed = js_buf.trim();
+                if trimmed.is_empty() {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": "--eval-stdin received empty stdin"
+                            }))
+                            .unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("[probe cdp] --eval-stdin received empty stdin");
+                    }
+                    return 2;
+                }
+                eval_owned = Some(trimmed.to_string());
+            }
             if let Some(dp) = diff_ports.as_deref().filter(|s| !s.trim().is_empty()) {
                 let parts: Vec<u16> = dp
                     .split(',')
@@ -611,8 +637,8 @@ pub fn run_cli(args: &[String]) -> i32 {
                     eprintln!("[probe cdp] --diff-ports requires two comma-separated ports, e.g. `9222,9223`");
                     return 2;
                 }
-                let Some(expr) = eval.as_deref().filter(|s| !s.trim().is_empty()) else {
-                    eprintln!("[probe cdp] --diff-ports requires `--eval <JS>`");
+                let Some(expr) = eval_owned.as_deref().filter(|s| !s.trim().is_empty()) else {
+                    eprintln!("[probe cdp] --diff-ports requires `--eval <JS>` or `--eval-stdin`");
                     return 2;
                 };
                 let (ta, tb) = if let Some(tids) = target_ids.as_deref() {
@@ -626,15 +652,30 @@ pub fn run_cli(args: &[String]) -> i32 {
                 return cdp::run_cdp_diff_ports(&host, parts[0], parts[1], ta, tb, expr, json);
             }
             let mut steps = String::new();
-            if stdin {
+            if stdin && !eval_stdin {
                 let _ = std::io::stdin().read_to_string(&mut steps);
+                if steps.trim().is_empty() {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": "--stdin received empty input (pass DSL steps, JSON {\"steps\": [...]}, or use --eval-stdin)"
+                            }))
+                            .unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("[probe cdp] --stdin received empty input (use --eval-stdin for raw JS)");
+                    }
+                    return 2;
+                }
             }
             cdp::run_cdp_attach(
                 &host,
                 port,
                 list,
                 target.as_deref(),
-                eval.as_deref(),
+                eval_owned.as_deref(),
                 audit,
                 screenshot.as_deref(),
                 &steps,

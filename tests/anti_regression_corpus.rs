@@ -791,3 +791,207 @@ fn corpus_06_guard_diff_audit_and_mcp_ai_surface_invariants() {
     let ai_rep: Value = serde_json::from_str(body_txt).unwrap();
     assert!(ai_rep["findings"].is_array(), "{ai_rep}");
 }
+
+#[test]
+fn corpus_07_probe_cdp_eval_stdin_and_invalid_stdin_guard() {
+    let td = TempDir::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_c = Arc::clone(&stop);
+
+    fn read_client_ws_frame(s: &mut std::net::TcpStream) -> Option<(u8, String)> {
+        let mut hdr = [0u8; 2];
+        s.read_exact(&mut hdr).ok()?;
+        let op = hdr[0] & 0x0F;
+        let masked = (hdr[1] & 0x80) != 0;
+        let mut len = (hdr[1] & 0x7F) as usize;
+        if len == 126 {
+            let mut b = [0u8; 2];
+            s.read_exact(&mut b).ok()?;
+            len = u16::from_be_bytes(b) as usize;
+        }
+        let mut mask = [0u8; 4];
+        if masked {
+            s.read_exact(&mut mask).ok()?;
+        }
+        let mut data = vec![0u8; len];
+        if len > 0 {
+            s.read_exact(&mut data).ok()?;
+        }
+        if masked {
+            for (i, b) in data.iter_mut().enumerate() {
+                *b ^= mask[i & 3];
+            }
+        }
+        Some((op, String::from_utf8_lossy(&data).into_owned()))
+    }
+
+    fn write_server_ws_text(s: &mut std::net::TcpStream, txt: &str) {
+        let b = txt.as_bytes();
+        let mut fr = vec![0x81u8];
+        if b.len() <= 125 {
+            fr.push(b.len() as u8);
+        } else {
+            fr.push(126);
+            fr.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        }
+        fr.extend_from_slice(b);
+        let _ = s.write_all(&fr);
+    }
+
+    let srv = thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        while !stop_c.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    let _ = s.set_nonblocking(false);
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    let req = read_http_req_wire(&mut s);
+                    let first = req.lines().next().unwrap_or("");
+                    if first.contains("/json") {
+                        let list = json!([{
+                            "id": "page-1",
+                            "type": "page",
+                            "title": "MockPage",
+                            "url": "http://127.0.0.1/",
+                            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/1")
+                        }])
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{list}",
+                            list.len()
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                        continue;
+                    }
+                    if first.contains("/devtools/page/1") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        );
+                        while let Some((op, txt)) = read_client_ws_frame(&mut s) {
+                            if op == 8 {
+                                break;
+                            }
+                            if let Ok(msg) = serde_json::from_str::<Value>(&txt) {
+                                let id = msg["id"].as_u64().unwrap_or(1);
+                                let method = msg["method"].as_str().unwrap_or("");
+                                if method == "Runtime.evaluate" {
+                                    let expr = msg["params"]["expression"].as_str().unwrap_or("");
+                                    let val = if expr.contains("const x = 40") {
+                                        "42"
+                                    } else if expr.contains("2+2") {
+                                        "4"
+                                    } else {
+                                        "ok"
+                                    };
+                                    let reply = json!({"id": id, "result": {"result": {"type": "string", "value": val}}});
+                                    write_server_ws_text(&mut s, &reply.to_string());
+                                } else {
+                                    let reply = json!({"id": id, "result": {}});
+                                    write_server_ws_text(&mut s, &reply.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 1. --eval-stdin with `2+2` returns real `"4"` instead of `null`
+    let out_add = run_ap(
+        td.path(),
+        &[
+            "probe",
+            "cdp",
+            "--port",
+            &port.to_string(),
+            "--eval-stdin",
+            "--json",
+        ],
+        Some("2+2"),
+        &[],
+    );
+    assert!(
+        out_add.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_add.stderr)
+    );
+    let j_add: Value = serde_json::from_slice(&out_add.stdout).unwrap();
+    assert_eq!(j_add["ok"], true);
+    assert_eq!(j_add["eval"], "4");
+
+    // 2. --eval-stdin with multiline JS preserves newlines & returns `"42"`
+    let out_multi = run_ap(
+        td.path(),
+        &[
+            "probe",
+            "cdp",
+            "--port",
+            &port.to_string(),
+            "--eval-stdin",
+            "--json",
+        ],
+        Some("const x = 40;\nconst y = 2;\nx + y"),
+        &[],
+    );
+    assert!(out_multi.status.success());
+    let j_multi: Value = serde_json::from_slice(&out_multi.stdout).unwrap();
+    assert_eq!(j_multi["eval"], "42");
+
+    // 3. --stdin with raw JS or JSON missing `steps` must fail cleanly (exit 2, ok=false)
+    let out_bad_raw = run_ap(
+        td.path(),
+        &[
+            "probe",
+            "cdp",
+            "--port",
+            &port.to_string(),
+            "--stdin",
+            "--json",
+        ],
+        Some("2+2"),
+        &[],
+    );
+    assert!(!out_bad_raw.status.success());
+    let j_bad_raw: Value = serde_json::from_slice(&out_bad_raw.stdout).unwrap();
+    assert_eq!(j_bad_raw["ok"], false);
+
+    let out_bad_json = run_ap(
+        td.path(),
+        &[
+            "probe",
+            "cdp",
+            "--port",
+            &port.to_string(),
+            "--stdin",
+            "--json",
+        ],
+        Some(r#"{"expr":"2+2"}"#),
+        &[],
+    );
+    assert!(!out_bad_json.status.success());
+    let j_bad_json: Value = serde_json::from_slice(&out_bad_json.stdout).unwrap();
+    assert_eq!(j_bad_json["ok"], false);
+
+    // 4. MCP `ap_cdp({ port, eval: "2+2" })` uses `--eval-stdin` cleanly
+    let rpc = format!(
+        "{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ap_cdp","arguments":{"port":port,"eval":"2+2"}}})
+    );
+    let mcp_out = run_ap(td.path(), &["mcp", "--profile", "full"], Some(&rpc), &[]);
+    assert!(mcp_out.status.success());
+    let mcp_s = String::from_utf8_lossy(&mcp_out.stdout);
+    let resp2: Value = serde_json::from_str(mcp_s.lines().nth(1).unwrap()).unwrap();
+    let txt = resp2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(txt.contains("eval: 4"), "{txt}");
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+}

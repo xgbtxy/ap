@@ -45,7 +45,7 @@ fn extract_origin_prefix(url: &str) -> String {
     String::new()
 }
 
-fn read_exact_bytes(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), String> {
+fn read_exact_bytes<R: Read>(stream: &mut R, buf: &mut [u8]) -> Result<(), String> {
     stream.read_exact(buf).map_err(|e| format!("ws read: {e}"))
 }
 
@@ -75,7 +75,7 @@ fn ws_write_text(stream: &mut TcpStream, text: &str) -> Result<(), String> {
 
 const MAX_CDP_WS_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-fn ws_read_message(stream: &mut TcpStream) -> Result<String, String> {
+fn ws_read_message<S: Read + Write>(stream: &mut S) -> Result<String, String> {
     let mut msg_bytes = Vec::new();
     loop {
         let mut hdr = [0u8; 2];
@@ -783,6 +783,69 @@ impl CdpSession {
     }
 }
 
+fn parse_cdp_stdin_steps(steps_text: &str) -> Result<Vec<(String, String)>, String> {
+    let trimmed = steps_text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let val: Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("--stdin JSON parse failed: {e} (use --eval-stdin for raw JS)"))?;
+        let arr = val.get("steps").and_then(Value::as_array).ok_or_else(|| {
+            "--stdin JSON object must contain a `steps` array (use --eval-stdin for raw JS)"
+                .to_string()
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            if let Some(line) = item.as_str() {
+                let ln = line.trim();
+                if ln.is_empty() || ln.starts_with('#') {
+                    continue;
+                }
+                let mut parts = ln.splitn(2, char::is_whitespace);
+                let kw = parts.next().unwrap_or("").to_ascii_uppercase();
+                let rest = parts.next().unwrap_or("").trim().to_string();
+                if !matches!(
+                    kw.as_str(),
+                    "EVAL" | "FILL" | "CLICK" | "WAIT_MS" | "EXPECT"
+                ) {
+                    return Err(format!(
+                        "Unrecognized CDP step keyword `{kw}` in `steps` (expected EVAL|FILL|CLICK|WAIT_MS|EXPECT)"
+                    ));
+                }
+                out.push((kw, rest));
+            } else {
+                return Err(
+                    "Each entry in `--stdin` JSON `steps` array must be a command string (e.g. `EVAL 2+2`)"
+                        .to_string(),
+                );
+            }
+        }
+        return Ok(out);
+    }
+
+    let mut out = Vec::new();
+    for raw_ln in trimmed.lines() {
+        let ln = raw_ln.trim();
+        if ln.is_empty() || ln.starts_with('#') {
+            continue;
+        }
+        let mut parts = ln.splitn(2, char::is_whitespace);
+        let kw = parts.next().unwrap_or("").to_ascii_uppercase();
+        let rest = parts.next().unwrap_or("").trim().to_string();
+        if !matches!(
+            kw.as_str(),
+            "EVAL" | "FILL" | "CLICK" | "WAIT_MS" | "EXPECT"
+        ) {
+            return Err(format!(
+                "Unrecognized CDP step line `{ln}` (expected EVAL|FILL|CLICK|WAIT_MS|EXPECT or JSON {{\"steps\":[...]}}; pass --eval-stdin for raw JS)"
+            ));
+        }
+        out.push((kw, rest));
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_cdp_attach(
     host: &str,
@@ -797,6 +860,21 @@ pub fn run_cdp_attach(
     as_json: bool,
 ) -> i32 {
     let t0 = Instant::now();
+    let parsed_steps = match parse_cdp_stdin_steps(steps_text) {
+        Ok(s) => s,
+        Err(e) => {
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "ok": false, "error": e }))
+                        .unwrap_or_default()
+                );
+            } else {
+                eprintln!("[probe cdp] {e}");
+            }
+            return 2;
+        }
+    };
     let targets = match CdpSession::list_targets(host, port) {
         Ok(ts) => ts,
         Err(e) => {
@@ -915,14 +993,7 @@ pub fn run_cdp_attach(
     }
 
     let mut last_body = eval_out.clone().unwrap_or_default();
-    for raw_ln in steps_text.lines() {
-        let ln = raw_ln.trim();
-        if ln.is_empty() || ln.starts_with('#') {
-            continue;
-        }
-        let mut parts = ln.splitn(2, char::is_whitespace);
-        let kw = parts.next().unwrap_or("").to_ascii_uppercase();
-        let rest = parts.next().unwrap_or("").trim();
+    for (kw, rest) in &parsed_steps {
         match kw.as_str() {
             "EVAL" => match sess.eval_js(rest) {
                 Ok(v) => {
@@ -1210,5 +1281,33 @@ pub fn run_cdp_diff_ports(
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod cdp_tests {
+    use super::*;
+
+    #[test]
+    fn cdp_stdin_steps_validator_accepts_dsl_and_json_steps_but_rejects_raw_js() {
+        assert!(parse_cdp_stdin_steps("").unwrap().is_empty());
+        let dsl = parse_cdp_stdin_steps("# comment\nEVAL 2+2\nWAIT_MS 50\n").unwrap();
+        assert_eq!(dsl.len(), 2);
+        assert_eq!(dsl[0], ("EVAL".to_string(), "2+2".to_string()));
+
+        let json_steps =
+            parse_cdp_stdin_steps(r#"{"steps":["EVAL 1+1","EXPECT CONTAINS 2"]}"#).unwrap();
+        assert_eq!(json_steps.len(), 2);
+
+        let err_raw = parse_cdp_stdin_steps("2+2").unwrap_err();
+        assert!(err_raw.contains("--eval-stdin"), "{err_raw}");
+
+        let err_json = parse_cdp_stdin_steps(r#"{"expr":"2+2"}"#).unwrap_err();
+        assert!(err_json.contains("steps"), "{err_json}");
+
+        let mut oversize = vec![0x81u8, 127u8];
+        oversize.extend_from_slice(&(64u64 * 1024 * 1024).to_be_bytes());
+        let cap_err = ws_read_message(&mut std::io::Cursor::new(oversize));
+        assert!(cap_err.is_err());
     }
 }

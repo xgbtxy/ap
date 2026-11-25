@@ -2199,13 +2199,14 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push("--target".into());
                 cli.push(t.into());
             }
+            let mut eval_stdin_payload: Option<&str> = None;
             if let Some(ev) = args
                 .get("eval")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                cli.push("--eval".into());
-                cli.push(ev.into());
+                cli.push("--eval-stdin".into());
+                eval_stdin_payload = Some(ev);
             }
             if args.get("audit").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--audit".into());
@@ -2224,7 +2225,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     cli.push(wm.to_string());
                 }
             }
-            run_self_captured(&cli, None)
+            run_self_captured(&cli, eval_stdin_payload)
         }
         "ap_http" => {
             let mut cli = vec!["probe".into(), "http".into()];

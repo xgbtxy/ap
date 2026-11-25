@@ -11904,13 +11904,17 @@ assert.ok(gciNoFilter && gciNoFilter.includes('rg --files --no-ignore --max-dept
 const psGci = healCommand('Get-ChildItem -Recurse | Where-Object { $_.Name -like "*.ts" }', 'powershell');
 assert.ok(psGci && psGci.includes('-Recurse -Depth 5'), psGci);
 
-// 5. Context-size-adaptive auto-sieve for KV-cache tail protection (<45k tok)
-const multiline9k = ("a".repeat(100) + "\n").repeat(90);
+// 5. Progressive context-size-adaptive auto-sieve (generous at low ctx <60K, tightens >=80K/>=120K, core docs <=32KB exempt)
 const multiline11k = ("a".repeat(100) + "\n").repeat(110);
-assert.equal(shouldAutoSieveShellOutput(multiline9k, false, 16000, 32000), true);
-assert.equal(shouldAutoSieveShellOutput(multiline9k, false, 16000, 80000), false);
-assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log' }, false, 16000, 30000), true);
-assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log', offset: 1, limit: 100 }, false, 16000, 30000), false);
+assert.equal(shouldAutoSieveShellOutput(multiline11k, true, undefined, 25000), false);
+assert.equal(shouldAutoSieveShellOutput(multiline11k, false, 16000, 32000), false);
+assert.equal(shouldAutoSieveShellOutput(multiline11k, false, 16000, 125000), true);
+assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log' }, false, 16000, 30000), false);
+assert.equal(shouldAutoSieveUnboundedRead("x".repeat(25000), { path: 'big.log' }, false, undefined, 30000), true);
+assert.equal(shouldAutoSieveUnboundedRead("x".repeat(14000), { path: 'skills/j/SKILL.md' }, true, undefined, 20000), false);
+assert.equal(shouldAutoSieveUnboundedRead("x".repeat(28000), { path: 'AGENTS.md' }, true, undefined, 130000), false);
+assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log' }, false, 16000, 125000), true);
+assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log', offset: 1, limit: 100 }, false, 16000, 125000), false);
 "#;
         let run = Command::new("node")
             .args([

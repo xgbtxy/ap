@@ -2288,13 +2288,7 @@ function tryCompactJsonUnderLimit(
 	) {{
 		return undefined;
 	}}
-	let effHard = isFastModel ? 12000 : SIEVE_HARD_CHARS;
-	if (typeof hardLimitOverride === "number" && hardLimitOverride > 0) {{
-		effHard = hardLimitOverride;
-	}}
-	if (typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 45000) {{
-		effHard = Math.min(effHard, 8500);
-	}}
+	let effHard = resolveProgressiveHardLimit(isFastModel ? 12000 : SIEVE_HARD_CHARS, hardLimitOverride, contextTokens, 18000);
 	try {{
 		const compacted = JSON.stringify(JSON.parse(trimmed));
 		// Exempt valid compacted single-line JSON < effHard from SIEVE_GIANT_LINE_CHARS (4.5KB) fallback
@@ -2615,6 +2609,26 @@ export function serializeMessagesForCompaction(
 	return parts.join("\n\n");
 }}
 
+function resolveProgressiveHardLimit(
+	baseLimit: number,
+	hardLimitOverride?: number,
+	contextTokens?: number,
+	lowCtxFloor = 18000,
+): number {{
+	let limit =
+		typeof hardLimitOverride === "number" && hardLimitOverride > 0 ? hardLimitOverride : baseLimit;
+	if (typeof contextTokens === "number" && contextTokens > 0) {{
+		if (contextTokens < 60000) {{
+			limit = Math.max(limit, lowCtxFloor);
+		}} else if (contextTokens >= 120000) {{
+			limit = Math.min(limit, 8500);
+		}} else if (contextTokens >= 80000) {{
+			limit = Math.min(limit, 12000);
+		}}
+	}}
+	return limit;
+}}
+
 export function shouldAutoSieveShellOutput(
 	text: string,
 	isFastModel = false,
@@ -2623,17 +2637,20 @@ export function shouldAutoSieveShellOutput(
 ): boolean {{
 	if (!text) return false;
 	let hardLimit = isFastModel ? 12000 : SIEVE_HARD_CHARS;
-	if (typeof hardLimitOverride === "number" && hardLimitOverride > 0) {{
-		hardLimit = hardLimitOverride;
-	}}
-	// Protect KV-cache tail (p05/p01) on small/medium post-rotation contexts (<45k tok)
-	if (typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 45000) {{
-		hardLimit = Math.min(hardLimit, 8500);
-	}}
+	hardLimit = resolveProgressiveHardLimit(
+		hardLimit,
+		hardLimitOverride,
+		contextTokens,
+		18000,
+	);
 	if (text.length >= hardLimit) return true;
 	const lines = text.split("\n");
 	if (lines.some((l) => l.length > SIEVE_GIANT_LINE_CHARS)) return true;
-	if (text.length >= SIEVE_STRUCTURED_CHARS) {{
+	const structuredMin =
+		typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 60000
+			? 18000
+			: SIEVE_STRUCTURED_CHARS;
+	if (text.length >= structuredMin) {{
 		if (lines.length >= SIEVE_STRUCTURED_LINES) return true;
 		if (text.includes("\x1b[")) return true;
 		if (text.includes("{{") && text.split('":').length >= 21) return true;
@@ -3731,7 +3748,11 @@ export function shouldAutoSieveUnboundedRead(
 	contextTokens?: number,
 ): boolean {{
 	if (!outText || outText.includes("[sieve id=")) return false;
-	const rec = input && typeof input === "object" ? (input as {{ offset?: unknown; limit?: unknown }}) : undefined;
+	const rec = input && typeof input === "object" ? (input as {{ path?: unknown; offset?: unknown; limit?: unknown }}) : undefined;
+	const readPath = typeof rec?.path === "string" ? rec.path.trim() : "";
+	if (/(?:^|[\\/])(?:SKILL|AGENTS|AGENTS\.override)\.md$/i.test(readPath) && outText.length <= 32_768) {{
+		return false;
+	}}
 	if ((rec?.offset !== undefined && rec?.offset !== null) || (rec?.limit !== undefined && rec?.limit !== null)) {{
 		return outText.length >= 32_000 && outText.split("\n").some((l) => l.length > SIEVE_GIANT_LINE_CHARS);
 	}}
@@ -3741,8 +3762,14 @@ export function shouldAutoSieveUnboundedRead(
 			: isFastModel
 				? SIEVE_STRUCTURED_CHARS
 				: 24_000;
-	if (typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 45_000) {{
-		thr = Math.min(thr, 10_000);
+	if (typeof contextTokens === "number" && contextTokens > 0) {{
+		if (contextTokens < 60_000) {{
+			thr = Math.max(thr, 24_000);
+		}} else if (contextTokens >= 120_000) {{
+			thr = Math.min(thr, 10_000);
+		}} else if (contextTokens >= 80_000) {{
+			thr = Math.min(thr, 14_000);
+		}}
 	}}
 	return outText.length >= thr;
 }}
@@ -7381,7 +7408,7 @@ export default function (pi: ExtensionAPI) {{
 					}}
 				}}
 			}}
-			const boundedApMax = effContextTokens > 0 && effContextTokens < 45000 ? 12000 : 24000;
+			const boundedApMax = effContextTokens >= 120_000 ? 12000 : effContextTokens >= 80_000 ? 18000 : 24000;
 			const skipSieve = isSieveSelf || (isBoundedApCmd && maxShellBlockLen < boundedApMax && !hasGiantShellLine);
 			if (!skipSieve) {{
 				const sievedShell = sieveShellContentBlocks(
