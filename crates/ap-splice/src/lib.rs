@@ -438,6 +438,68 @@ pub fn apply_spec_str(
     )
 }
 
+fn lexical_normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn resolve_tx_path(cwd_canon: &Path, raw_path: &str) -> PathBuf {
+    let rel_p = Path::new(raw_path);
+    let joined = if rel_p.is_absolute() {
+        rel_p.to_path_buf()
+    } else {
+        cwd_canon.join(rel_p)
+    };
+    let clean = lexical_normalize_path(&joined);
+    if clean.exists() {
+        return fs::canonicalize(&clean).unwrap_or(clean);
+    }
+    // Canonicalize the deepest existing ancestor so symlinks / Windows drive-letter casing match.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = clean.as_path();
+    while let Some(name) = probe.file_name() {
+        tail.push(name.to_os_string());
+        let Some(parent) = probe.parent() else {
+            break;
+        };
+        if parent.exists() {
+            let mut base = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            for seg in tail.into_iter().rev() {
+                base.push(seg);
+            }
+            return base;
+        }
+        probe = parent;
+    }
+    clean
+}
+
+fn tx_path_key(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        s.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
+}
+
 fn apply_spec_inner(
     cwd: &Path,
     raw_spec: &str,
@@ -469,6 +531,7 @@ fn apply_spec_inner(
     };
 
     let mut touched_paths: Vec<PathBuf> = Vec::new();
+    let mut key_to_path: HashMap<String, PathBuf> = HashMap::new();
     let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
     let mut working_text: HashMap<PathBuf, (String, &'static str)> = HashMap::new();
     let mut staged_bytes: HashMap<PathBuf, Vec<u8>> = HashMap::new();
@@ -476,12 +539,9 @@ fn apply_spec_inner(
 
     let tx_res: Result<(), String> = (|| {
         for (idx, item) in ops.iter().enumerate() {
-            let rel_p = Path::new(&item.path);
-            let p = if rel_p.is_absolute() {
-                rel_p.to_path_buf()
-            } else {
-                cwd_canon.join(rel_p)
-            };
+            let resolved = resolve_tx_path(&cwd_canon, &item.path);
+            let pkey = tx_path_key(&resolved);
+            let p = key_to_path.entry(pkey).or_insert(resolved).clone();
             if !backups.contains_key(&p) {
                 if p.exists() {
                     let raw_b = fs::read(&p).map_err(|e| e.to_string())?;
@@ -1256,5 +1316,37 @@ pub fn run_cli(args: &[String]) -> i32 {
                 1
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_op_transaction_merges_aliased_paths_without_clobbering() {
+        let dir = std::env::temp_dir().join(format!("ap_splice_alias_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let fp = dir.join("src/sample.rs");
+        fs::write(&fp, "pub fn a() -> i32 { 1 }\npub fn b() -> i32 { 2 }\n").unwrap();
+
+        let alias_second = if cfg!(windows) {
+            "src/Sample.rs"
+        } else {
+            "src/../src/sample.rs"
+        };
+        let spec = serde_json::json!([
+            {"op": "replace", "path": "./src/sample.rs", "old": "pub fn a() -> i32 { 1 }", "new": "pub fn a() -> i32 { 10 }"},
+            {"op": "replace", "path": alias_second, "old": "pub fn b() -> i32 { 2 }", "new": "pub fn b() -> i32 { 20 }"}
+        ])
+        .to_string();
+
+        let rc = apply_spec_silent(&dir, &spec);
+        assert_eq!(rc, 0);
+        let after = fs::read_to_string(&fp).unwrap();
+        assert!(after.contains("10"), "first edit lost: {after}");
+        assert!(after.contains("20"), "second edit lost: {after}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

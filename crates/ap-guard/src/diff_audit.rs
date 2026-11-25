@@ -43,20 +43,41 @@ fn is_test_path(p: &str) -> bool {
         || low.ends_with("_test.rs")
 }
 
-fn strip_comments_and_strings(s: &str) -> String {
-    let trim = s.trim();
-    if trim.starts_with("//")
-        || (trim.starts_with('#') && !trim.starts_with("#["))
-        || trim.starts_with('*')
-        || trim.starts_with("/*")
-    {
-        return String::new();
-    }
+fn strip_comments_and_strings_stateful(s: &str, in_block_comment: &mut bool) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
     let mut quote: Option<u8> = None;
+    let mut raw_hashes: Option<usize> = None;
+
     while i < bytes.len() {
+        if *in_block_comment {
+            if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                *in_block_comment = false;
+                i += 2;
+            } else {
+                let ch = s[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        if let Some(nhash) = raw_hashes {
+            if bytes[i] == b'"' {
+                let mut h = 0usize;
+                while h < nhash && i + 1 + h < bytes.len() && bytes[i + 1 + h] == b'#' {
+                    h += 1;
+                }
+                if h == nhash {
+                    raw_hashes = None;
+                    out.push('"');
+                    i += 1 + nhash;
+                    continue;
+                }
+            }
+            let ch = s[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            continue;
+        }
         let b = bytes[i];
         if let Some(q) = quote {
             if b == b'\\' && i + 1 < bytes.len() {
@@ -73,6 +94,36 @@ fn strip_comments_and_strings(s: &str) -> String {
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             break;
         }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            *in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'#' && out.trim().is_empty() && !s[i..].trim_start().starts_with("#[") {
+            break;
+        }
+        if b == b'r' || b == b'b' {
+            let mut j = i + 1;
+            if b == b'b' && j < bytes.len() && bytes[j] == b'r' {
+                j += 1;
+            }
+            if j > i + usize::from(b == b'b') || b == b'r' {
+                let prev_ok =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if prev_ok {
+                    let mut h = 0usize;
+                    while j + h < bytes.len() && bytes[j + h] == b'#' {
+                        h += 1;
+                    }
+                    if j + h < bytes.len() && bytes[j + h] == b'"' && (b == b'r' || j > i + 1) {
+                        raw_hashes = Some(h);
+                        out.push('"');
+                        i = j + h + 1;
+                        continue;
+                    }
+                }
+            }
+        }
         if b == b'"' || b == b'\'' || b == b'`' {
             quote = Some(b);
             out.push('"');
@@ -86,9 +137,15 @@ fn strip_comments_and_strings(s: &str) -> String {
     out
 }
 
-fn is_assertion_line(s: &str) -> bool {
-    let code = strip_comments_and_strings(s);
-    if code.is_empty() {
+#[cfg(test)]
+fn strip_comments_and_strings(s: &str) -> String {
+    let mut in_block = false;
+    strip_comments_and_strings_stateful(s, &mut in_block)
+}
+
+fn is_assertion_line_in(s: &str, in_block: &mut bool) -> bool {
+    let code = strip_comments_and_strings_stateful(s, in_block);
+    if code.trim().is_empty() {
         return false;
     }
     let low = code.to_ascii_lowercase();
@@ -99,9 +156,14 @@ fn is_assertion_line(s: &str) -> bool {
         || low.contains("t.fatal")
 }
 
-fn is_parameterized_loop_line(s: &str) -> bool {
-    let code = strip_comments_and_strings(s);
-    if code.is_empty() {
+#[cfg(test)]
+fn is_assertion_line(s: &str) -> bool {
+    is_assertion_line_in(s, &mut false)
+}
+
+fn is_parameterized_loop_line_in(s: &str, in_block: &mut bool) -> bool {
+    let code = strip_comments_and_strings_stateful(s, in_block);
+    if code.trim().is_empty() {
         return false;
     }
     let low = code.to_ascii_lowercase();
@@ -111,8 +173,8 @@ fn is_parameterized_loop_line(s: &str) -> bool {
         || low.contains("@pytest.mark.parametrize")
 }
 
-fn has_debug_leftover(s: &str) -> Option<&'static str> {
-    let code = strip_comments_and_strings(s);
+fn has_debug_leftover_in(s: &str, in_block: &mut bool) -> Option<&'static str> {
+    let code = strip_comments_and_strings_stateful(s, in_block);
     let trim = code.trim();
     if trim.is_empty() {
         return None;
@@ -132,8 +194,8 @@ fn has_debug_leftover(s: &str) -> Option<&'static str> {
     None
 }
 
-fn has_test_skip_marker(s: &str) -> Option<&'static str> {
-    let code = strip_comments_and_strings(s);
+fn has_test_skip_marker_in(s: &str, in_block: &mut bool) -> Option<&'static str> {
+    let code = strip_comments_and_strings_stateful(s, in_block);
     let trim = code.trim();
     if trim.is_empty() {
         return None;
@@ -156,8 +218,8 @@ fn has_test_skip_marker(s: &str) -> Option<&'static str> {
     None
 }
 
-fn has_incomplete_stub(s: &str) -> Option<&'static str> {
-    let code = strip_comments_and_strings(s);
+fn has_incomplete_stub_in(s: &str, in_block: &mut bool) -> Option<&'static str> {
+    let code = strip_comments_and_strings_stateful(s, in_block);
     let trim = code.trim();
     if !trim.is_empty() {
         if trim.contains("todo!(") {
@@ -170,13 +232,15 @@ fn has_incomplete_stub(s: &str) -> Option<&'static str> {
             return Some("raise NotImplementedError");
         }
     }
-    let raw_trim = s.trim();
-    if !raw_trim.starts_with("//") && !raw_trim.starts_with('#') && !raw_trim.starts_with('*') {
-        let low = raw_trim.to_ascii_lowercase();
-        if low.contains("throw new error(\"not implemented")
-            || low.contains("throw new error('not implemented")
-        {
-            return Some("throw new Error('not implemented')");
+    if !trim.is_empty() {
+        let raw_trim = s.trim();
+        if !raw_trim.starts_with("//") && !raw_trim.starts_with('#') {
+            let low = raw_trim.to_ascii_lowercase();
+            if low.contains("throw new error(\"not implemented")
+                || low.contains("throw new error('not implemented")
+            {
+                return Some("throw new Error('not implemented')");
+            }
         }
     }
     None
@@ -304,31 +368,44 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
     let mut total_add = 0usize;
     let mut total_del = 0usize;
 
+    let mut in_block_add = false;
+    let mut in_block_del = false;
+
     for ln in diff_txt.lines() {
         if let Some(rest) = ln.strip_prefix("+++ b/") {
             cur_file = rest.trim().to_string();
+            in_block_add = false;
+            in_block_del = false;
             per_file_add.entry(cur_file.clone()).or_insert(0);
             per_file_del.entry(cur_file.clone()).or_insert(0);
             continue;
         }
-        if cur_file.is_empty()
-            || ln.starts_with("+++")
-            || ln.starts_with("---")
-            || ln.starts_with("@@")
-        {
+        if cur_file.is_empty() || ln.starts_with("+++") || ln.starts_with("---") {
+            continue;
+        }
+        if ln.starts_with("@@") {
+            in_block_add = false;
+            in_block_del = false;
+            continue;
+        }
+        if let Some(ctx) = ln.strip_prefix(' ') {
+            let _ = strip_comments_and_strings_stateful(ctx, &mut in_block_add);
+            let _ = strip_comments_and_strings_stateful(ctx, &mut in_block_del);
             continue;
         }
         if let Some(added) = ln.strip_prefix('+') {
             total_add += 1;
             *per_file_add.entry(cur_file.clone()).or_insert(0) += 1;
             if is_test_path(&cur_file) {
-                if is_assertion_line(added) {
+                if is_assertion_line_in(added, &mut in_block_add) {
                     *per_file_assert_add.entry(cur_file.clone()).or_insert(0) += 1;
                 }
-                if is_parameterized_loop_line(added) {
+                let mut loop_block = false;
+                if is_parameterized_loop_line_in(added, &mut loop_block) {
                     per_file_param_loop_add.insert(cur_file.clone(), true);
                 }
-                if let Some(tok) = has_test_skip_marker(added) {
+                let mut skip_block = false;
+                if let Some(tok) = has_test_skip_marker_in(added, &mut skip_block) {
                     findings.push(DiffFinding {
                         kind: "TEST-SKIPPED".to_string(),
                         file: cur_file.clone(),
@@ -346,7 +423,8 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
                         .or_default()
                         .insert(sym, params);
                 }
-                if let Some(tok) = has_debug_leftover(added) {
+                let mut dbg_block = in_block_add;
+                if let Some(tok) = has_debug_leftover_in(added, &mut dbg_block) {
                     findings.push(DiffFinding {
                         kind: "DEBUG-LEFTOVER".to_string(),
                         file: cur_file.clone(),
@@ -357,7 +435,7 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
                         ),
                     });
                 }
-                if let Some(tok) = has_incomplete_stub(added) {
+                if let Some(tok) = has_incomplete_stub_in(added, &mut in_block_add) {
                     findings.push(DiffFinding {
                         kind: "INCOMPLETE-STUB".to_string(),
                         file: cur_file.clone(),
@@ -382,14 +460,17 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
             total_del += 1;
             *per_file_del.entry(cur_file.clone()).or_insert(0) += 1;
             if is_test_path(&cur_file) {
-                if is_assertion_line(deleted) {
+                if is_assertion_line_in(deleted, &mut in_block_del) {
                     *per_file_assert_del.entry(cur_file.clone()).or_insert(0) += 1;
                 }
-            } else if let Some((sym, params)) = extract_public_decl(&cur_file, deleted) {
-                per_file_del_decls
-                    .entry(cur_file.clone())
-                    .or_default()
-                    .insert(sym, params);
+            } else {
+                let _ = strip_comments_and_strings_stateful(deleted, &mut in_block_del);
+                if let Some((sym, params)) = extract_public_decl(&cur_file, deleted) {
+                    per_file_del_decls
+                        .entry(cur_file.clone())
+                        .or_default()
+                        .insert(sym, params);
+                }
             }
         }
     }
@@ -599,5 +680,24 @@ mod tests {
             rep.findings
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catches_deref_dbg_while_ignoring_multiline_block_comment_and_raw_strings() {
+        assert!(!is_assertion_line("let _ = r#\"foo\"assert!(false)\"#;"));
+        let mut blk = false;
+        assert!(has_debug_leftover_in("/* start", &mut blk).is_none());
+        assert!(blk);
+        assert!(has_debug_leftover_in("   dbg!(secret);", &mut blk).is_none());
+        assert!(has_debug_leftover_in("*/", &mut blk).is_none());
+        assert!(!blk);
+        assert_eq!(
+            has_debug_leftover_in("*ptr = dbg!(val);", &mut blk),
+            Some("dbg!(")
+        );
+        assert_eq!(
+            strip_comments_and_strings("let s = r#\"a\"dbg!(1)\"#; let y = 1;"),
+            "let s = \"\"; let y = 1;"
+        );
     }
 }

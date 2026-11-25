@@ -76,6 +76,8 @@ pub struct CallArgInfo {
     pub arg_param_masks: Vec<u32>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub arg_const_mask: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_call_deps: Vec<(usize, String, Vec<u32>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +95,10 @@ pub struct FnDef {
     pub params: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub return_param_mask: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub direct_return_param_mask: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_calls: Vec<(String, Vec<u32>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +106,29 @@ pub(crate) struct FnSummary {
     pub param_to_return: u32,
     pub param_to_sinks: HashMap<String, u32>,
     pub any_sink_mask: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SummaryIndex {
+    pub by_file_fn: HashMap<(String, String), FnSummary>,
+    pub by_name_files: HashMap<String, Vec<String>>,
+}
+
+impl SummaryIndex {
+    pub(crate) fn resolve(&self, caller_file: &str, callee: &str) -> Option<&FnSummary> {
+        if let Some(exact) = self
+            .by_file_fn
+            .get(&(caller_file.to_string(), callee.to_string()))
+        {
+            return Some(exact);
+        }
+        if let Some(files) = self.by_name_files.get(callee) {
+            if files.len() == 1 {
+                return self.by_file_fn.get(&(files[0].clone(), callee.to_string()));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +196,60 @@ fn parser_for_ext(ext: &str) -> Option<Parser> {
     Some(p)
 }
 
+pub(crate) fn strip_guard_comment_line(raw: &str, in_block: &mut bool) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        if *in_block {
+            if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                *in_block = false;
+                i += 2;
+            } else {
+                let ch = raw[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = raw[i..].chars().next().unwrap();
+            out.push(ch);
+            if b == b'\\' && i + 1 < bytes.len() {
+                if let Some(next_ch) = raw[i + 1..].chars().next() {
+                    out.push(next_ch);
+                    i += 1 + next_ch.len_utf8();
+                    continue;
+                }
+            }
+            if b == q {
+                quote = None;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            break;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            *in_block = true;
+            i += 2;
+            continue;
+        }
+        if b == b'#' && out.trim().is_empty() && !raw[i..].trim_start().starts_with("#[") {
+            break;
+        }
+        if b == b'"' || b == b'\'' || b == b'`' {
+            quote = Some(b);
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn extract_guard_lines(
     src_lines: &[&str],
     start_line: usize,
@@ -179,9 +262,11 @@ fn extract_guard_lines(
         start_line
     };
     let mut out = Vec::new();
+    let mut in_block = false;
     for ln in scan_start..=end_line {
         if let Some(raw) = src_lines.get(ln.saturating_sub(1)) {
-            let trimmed = raw.trim();
+            let code = strip_guard_comment_line(raw, &mut in_block);
+            let trimmed = code.trim();
             if !trimmed.is_empty() && gre.is_match(trimmed) {
                 out.push((ln, trimmed.chars().take(90).collect()));
             }
@@ -425,12 +510,92 @@ fn extract_callee_short_name(fn_expr: Node, src: &[u8]) -> Option<String> {
     last
 }
 
+type CallDepList = Vec<(String, Vec<u32>)>;
+
+fn collect_expr_call_deps(
+    node: Node,
+    src: &[u8],
+    params: &[String],
+    tainted_vars: &HashMap<String, u32>,
+    var_call_deps: &HashMap<String, (CallDepList, u32)>,
+    out_calls: &mut CallDepList,
+    direct_mask: &mut u32,
+) {
+    let k = node.kind();
+    if k.contains("comment") || (k.contains("string") && k != "template_string") {
+        return;
+    }
+    if matches!(k, "call_expression" | "call") {
+        if let Some(fn_node) = node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0))
+        {
+            if let Some(nm) = extract_callee_short_name(fn_node, src) {
+                if is_sanitizer_callee(&nm) {
+                    return;
+                }
+                if let Some(an) = node
+                    .child_by_field_name("arguments")
+                    .or_else(|| node.child_by_field_name("argument_list"))
+                {
+                    let mut dep_masks = Vec::new();
+                    let mut acur = an.walk();
+                    for ch in an.children(&mut acur) {
+                        if !matches!(ch.kind(), "(" | ")" | "," | ";")
+                            && !ch.kind().contains("comment")
+                        {
+                            dep_masks.push(expr_param_mask(ch, src, params, tainted_vars));
+                        }
+                    }
+                    out_calls.push((nm, dep_masks));
+                    return;
+                }
+            }
+        }
+    }
+    if matches!(
+        k,
+        "identifier" | "shorthand_property_identifier" | "field_identifier" | "property_identifier"
+    ) {
+        if let Ok(s) = node.utf8_text(src) {
+            let trimmed = s.trim();
+            let pb = param_bit(trimmed, params);
+            if pb != 0 {
+                *direct_mask |= pb;
+                return;
+            }
+            if let Some((calls, dir_m)) = var_call_deps.get(trimmed) {
+                out_calls.extend(calls.iter().cloned());
+                *direct_mask |= *dir_m;
+                return;
+            }
+            if let Some(&tb) = tainted_vars.get(trimmed) {
+                *direct_mask |= tb;
+            }
+        }
+        return;
+    }
+    let mut cur = node.walk();
+    for ch in node.children(&mut cur) {
+        collect_expr_call_deps(
+            ch,
+            src,
+            params,
+            tainted_vars,
+            var_call_deps,
+            out_calls,
+            direct_mask,
+        );
+    }
+}
+
 fn update_local_bindings(
     node: Node,
     src: &[u8],
     params: &[String],
     const_vars: &mut HashSet<String>,
     tainted_vars: &mut HashMap<String, u32>,
+    var_call_deps: &mut HashMap<String, (CallDepList, u32)>,
 ) {
     let k = node.kind();
     let (lhs, rhs) = if matches!(
@@ -459,8 +624,25 @@ fn update_local_bindings(
                 if is_const_literal_expr(rn, src, const_vars) {
                     const_vars.insert(id.to_string());
                     tainted_vars.remove(id);
+                    var_call_deps.remove(id);
                 } else {
                     const_vars.remove(id);
+                    let mut deps = Vec::new();
+                    let mut dir_m = 0u32;
+                    collect_expr_call_deps(
+                        rn,
+                        src,
+                        params,
+                        tainted_vars,
+                        var_call_deps,
+                        &mut deps,
+                        &mut dir_m,
+                    );
+                    if deps.is_empty() {
+                        var_call_deps.remove(id);
+                    } else {
+                        var_call_deps.insert(id.to_string(), (deps, dir_m));
+                    }
                     let m = expr_param_mask(rn, src, params, tainted_vars);
                     if m != 0 {
                         tainted_vars.insert(id.to_string(), m);
@@ -477,7 +659,10 @@ struct FnBodyState<'a> {
     params: &'a [String],
     const_vars: HashSet<String>,
     tainted_vars: HashMap<String, u32>,
+    var_call_deps: HashMap<String, (CallDepList, u32)>,
     return_param_mask: u32,
+    direct_return_param_mask: u32,
+    return_calls: CallDepList,
     idents: Vec<(String, usize)>,
     call_args: Vec<CallArgInfo>,
 }
@@ -493,9 +678,19 @@ fn collect_called_idents(node: Node, src: &[u8], st: &mut FnBodyState<'_>) {
         st.params,
         &mut st.const_vars,
         &mut st.tainted_vars,
+        &mut st.var_call_deps,
     );
     if matches!(k, "return_statement" | "return_expression") {
         st.return_param_mask |= expr_param_mask(node, src, st.params, &st.tainted_vars);
+        collect_expr_call_deps(
+            node,
+            src,
+            st.params,
+            &st.tainted_vars,
+            &st.var_call_deps,
+            &mut st.return_calls,
+            &mut st.direct_return_param_mask,
+        );
     }
 
     if matches!(k, "call_expression" | "call" | "new_expression") {
@@ -519,12 +714,29 @@ fn collect_called_idents(node: Node, src: &[u8], st: &mut FnBodyState<'_>) {
                 let mut arg_param_masks = Vec::with_capacity(value_args.len().min(32));
                 let mut arg_const_mask = 0u32;
                 let mut combined_param_mask = 0u32;
+                let mut arg_call_deps: Vec<(usize, String, Vec<u32>)> = Vec::new();
                 for (idx, arg) in value_args.iter().enumerate() {
                     let pm = expr_param_mask(*arg, src, st.params, &st.tainted_vars);
                     if idx < 32 {
                         arg_param_masks.push(pm);
                         if pm == 0 && is_const_literal_expr(*arg, src, &st.const_vars) {
                             arg_const_mask |= 1u32 << idx;
+                        }
+                        let mut deps = Vec::new();
+                        let mut dir_m = 0u32;
+                        collect_expr_call_deps(
+                            *arg,
+                            src,
+                            st.params,
+                            &st.tainted_vars,
+                            &st.var_call_deps,
+                            &mut deps,
+                            &mut dir_m,
+                        );
+                        if dir_m == 0 {
+                            for (dc, dm) in deps {
+                                arg_call_deps.push((idx, dc, dm));
+                            }
                         }
                     }
                     combined_param_mask |= pm;
@@ -559,6 +771,7 @@ fn collect_called_idents(node: Node, src: &[u8], st: &mut FnBodyState<'_>) {
                     arg_preview,
                     arg_param_masks,
                     arg_const_mask,
+                    arg_call_deps,
                 });
             }
         }
@@ -579,11 +792,18 @@ fn collect_called_idents(node: Node, src: &[u8], st: &mut FnBodyState<'_>) {
     }
 }
 
-pub(crate) fn compute_callee_summaries(all_fns: &[FnDef]) -> HashMap<String, FnSummary> {
-    let mut summaries: HashMap<String, FnSummary> = HashMap::new();
+pub(crate) fn compute_callee_summaries(all_fns: &[FnDef]) -> SummaryIndex {
+    let mut index = SummaryIndex::default();
     for f in all_fns {
-        let entry = summaries.entry(f.name.clone()).or_default();
-        entry.param_to_return |= f.return_param_mask;
+        let key = (f.file.clone(), f.name.clone());
+        index
+            .by_name_files
+            .entry(f.name.clone())
+            .or_default()
+            .push(f.file.clone());
+        let entry = index.by_file_fn.entry(key).or_default();
+        // Initialize return mask from direct returns or calls to external (non-defined) functions
+        entry.param_to_return |= f.direct_return_param_mask;
         for c in &f.call_args {
             if NOTABLE_SINKS.contains(&c.callee.as_str()) {
                 let m = c.arg_param_masks.iter().copied().fold(0u32, |a, b| a | b);
@@ -594,12 +814,45 @@ pub(crate) fn compute_callee_summaries(all_fns: &[FnDef]) -> HashMap<String, FnS
             }
         }
     }
-    // 2-pass bottom-up interprocedural propagation (entry -> mid -> leaf -> sink)
+    for files in index.by_name_files.values_mut() {
+        files.sort();
+        files.dedup();
+    }
+    // Seed return_param_mask for external return calls (callees not defined in project)
+    for f in all_fns {
+        let mut ext_ret = 0u32;
+        for (rc_callee, rc_args) in &f.return_calls {
+            if index.resolve(&f.file, rc_callee).is_none() {
+                ext_ret |= rc_args.iter().copied().fold(0u32, |a, b| a | b);
+            }
+        }
+        if ext_ret != 0 {
+            if let Some(entry) = index.by_file_fn.get_mut(&(f.file.clone(), f.name.clone())) {
+                entry.param_to_return |= ext_ret;
+            }
+        }
+    }
+    // 2-pass bottom-up interprocedural propagation for BOTH param_to_sinks and param_to_return
     for _ in 0..2 {
-        let prev = summaries.clone();
+        let prev = index.clone();
         for f in all_fns {
+            let mut add_ret_mask = 0u32;
+            for (rc_callee, rc_args) in &f.return_calls {
+                if let Some(callee_sum) = prev.resolve(&f.file, rc_callee) {
+                    for (idx, &arg_pm) in rc_args.iter().enumerate() {
+                        if idx < 32 && (callee_sum.param_to_return & (1u32 << idx)) != 0 {
+                            add_ret_mask |= arg_pm;
+                        }
+                    }
+                }
+            }
+            if add_ret_mask != 0 {
+                if let Some(s) = index.by_file_fn.get_mut(&(f.file.clone(), f.name.clone())) {
+                    s.param_to_return |= add_ret_mask;
+                }
+            }
             for c in &f.call_args {
-                let Some(callee_sum) = prev.get(&c.callee) else {
+                let Some(callee_sum) = prev.resolve(&f.file, &c.callee) else {
                     continue;
                 };
                 if callee_sum.param_to_sinks.is_empty() && callee_sum.param_to_return == 0 {
@@ -613,15 +866,17 @@ pub(crate) fn compute_callee_summaries(all_fns: &[FnDef]) -> HashMap<String, FnS
                         }
                     }
                     if caller_pm != 0 {
-                        let s = summaries.entry(f.name.clone()).or_default();
-                        *s.param_to_sinks.entry(sink.clone()).or_insert(0) |= caller_pm;
-                        s.any_sink_mask |= caller_pm;
+                        if let Some(s) = index.by_file_fn.get_mut(&(f.file.clone(), f.name.clone()))
+                        {
+                            *s.param_to_sinks.entry(sink.clone()).or_insert(0) |= caller_pm;
+                            s.any_sink_mask |= caller_pm;
+                        }
                     }
                 }
             }
         }
     }
-    summaries
+    index
 }
 
 pub(crate) fn lookup_call_arg<'a>(
@@ -640,7 +895,7 @@ pub(crate) fn lookup_call_taint_with_summary(
     callee: &str,
     line: usize,
     sink_filter: Option<&str>,
-    summaries: &HashMap<String, FnSummary>,
+    summaries: &SummaryIndex,
     active_param_mask: Option<u32>,
     active_dynamic_mask: Option<u32>,
 ) -> (String, String, bool) {
@@ -650,15 +905,63 @@ pub(crate) fn lookup_call_taint_with_summary(
 
     let mut via_summary = false;
     let mut taint = hit.arg_taint.clone();
+    let mut eff_arg_masks = hit.arg_param_masks.clone();
+    let mut eff_const_mask = hit.arg_const_mask;
+
+    if !hit.arg_call_deps.is_empty() && !eff_arg_masks.is_empty() {
+        let mut by_slot: HashMap<usize, Vec<(&str, &[u32])>> = HashMap::new();
+        for (slot, dc, dm) in &hit.arg_call_deps {
+            by_slot
+                .entry(*slot)
+                .or_default()
+                .push((dc.as_str(), dm.as_slice()));
+        }
+        let mut resolved_any = false;
+        for (slot, deps) in by_slot {
+            if slot >= eff_arg_masks.len() || slot >= 32 {
+                continue;
+            }
+            if deps
+                .iter()
+                .all(|(dc, _)| summaries.resolve(&f.file, dc).is_some())
+            {
+                let mut ret_pm = 0u32;
+                for (dc, dm) in deps {
+                    if let Some(dsum) = summaries.resolve(&f.file, dc) {
+                        for (di, &arg_pm) in dm.iter().enumerate() {
+                            if di < 32 && (dsum.param_to_return & (1u32 << di)) != 0 {
+                                ret_pm |= arg_pm;
+                            }
+                        }
+                    }
+                }
+                eff_arg_masks[slot] = ret_pm;
+                if ret_pm == 0 {
+                    eff_const_mask |= 1u32 << slot;
+                }
+                resolved_any = true;
+            }
+        }
+        if resolved_any {
+            via_summary = true;
+            if eff_arg_masks.iter().any(|&m| m != 0) {
+                taint = "PARAM_TAINTED".to_string();
+            } else if !eff_arg_masks.is_empty()
+                && (0..eff_arg_masks.len().min(32)).all(|i| (eff_const_mask & (1u32 << i)) != 0)
+            {
+                taint = "CONST_LITERAL".to_string();
+            }
+        }
+    }
 
     if let Some(active_pm) = active_param_mask {
         let dyn_pm = active_dynamic_mask.unwrap_or(0);
-        if !hit.arg_param_masks.is_empty() {
+        if !eff_arg_masks.is_empty() {
             let mut relevant_pm = 0u32;
             let mut relevant_dyn = 0u32;
             let mut all_slots_known_safe = true;
-            for (i, &pm) in hit.arg_param_masks.iter().enumerate() {
-                let is_const_slot = i < 32 && (hit.arg_const_mask & (1u32 << i)) != 0;
+            for (i, &pm) in eff_arg_masks.iter().enumerate() {
+                let is_const_slot = i < 32 && (eff_const_mask & (1u32 << i)) != 0;
                 if is_const_slot {
                     continue;
                 }
@@ -685,7 +988,7 @@ pub(crate) fn lookup_call_taint_with_summary(
         }
     }
 
-    if let Some(sum) = summaries.get(callee) {
+    if let Some(sum) = summaries.resolve(&f.file, callee) {
         let sink_param_mask = if let Some(sq) = sink_filter {
             let sq_norm = clean_fn_name(sq);
             if sink_matches_query(callee, &sq_norm) {
@@ -699,14 +1002,14 @@ pub(crate) fn lookup_call_taint_with_summary(
         } else {
             sum.any_sink_mask
         };
-        if sink_param_mask != 0 && !hit.arg_param_masks.is_empty() {
+        if sink_param_mask != 0 && !eff_arg_masks.is_empty() {
             let gate = active_param_mask.unwrap_or(u32::MAX);
             let dyn_gate = active_dynamic_mask.unwrap_or(0);
             let mut taint_hits = 0u32;
             let mut dyn_hits = 0u32;
             let mut all_sinking_const = true;
             let mut any_sinking_checked = false;
-            for (i, &pm) in hit.arg_param_masks.iter().enumerate() {
+            for (i, &pm) in eff_arg_masks.iter().enumerate() {
                 if i >= 32 || (sink_param_mask & (1u32 << i)) == 0 {
                     continue;
                 }
@@ -715,8 +1018,8 @@ pub(crate) fn lookup_call_taint_with_summary(
                 let eff_dyn = pm & dyn_gate;
                 taint_hits |= eff_pm;
                 dyn_hits |= eff_dyn;
-                let is_const = (hit.arg_const_mask & (1u32 << i)) != 0
-                    || (pm != 0 && eff_pm == 0 && eff_dyn == 0);
+                let is_const =
+                    (eff_const_mask & (1u32 << i)) != 0 || (pm != 0 && eff_pm == 0 && eff_dyn == 0);
                 if !is_const {
                     all_sinking_const = false;
                 }
@@ -825,6 +1128,8 @@ fn extract_cpp_fallback_fns(src: &str, src_lines: &[&str], rel: &str, out: &mut 
                             call_args: Vec::new(),
                             params: Vec::new(),
                             return_param_mask: 0,
+                            direct_return_param_mask: 0,
+                            return_calls: Vec::new(),
                         });
                     }
                     i = end_idx + 1;
@@ -842,6 +1147,8 @@ struct FnBodyFacts {
     idents: Vec<(String, usize)>,
     call_args: Vec<CallArgInfo>,
     return_param_mask: u32,
+    direct_return_param_mask: u32,
+    return_calls: CallDepList,
 }
 
 fn collect_fn_body_facts(fn_node: Node, src: &[u8]) -> FnBodyFacts {
@@ -850,7 +1157,10 @@ fn collect_fn_body_facts(fn_node: Node, src: &[u8]) -> FnBodyFacts {
         params: &params,
         const_vars: HashSet::new(),
         tainted_vars: HashMap::new(),
+        var_call_deps: HashMap::new(),
         return_param_mask: 0,
+        direct_return_param_mask: 0,
+        return_calls: Vec::new(),
         idents: Vec::new(),
         call_args: Vec::new(),
     };
@@ -862,15 +1172,28 @@ fn collect_fn_body_facts(fn_node: Node, src: &[u8]) -> FnBodyFacts {
             .is_some_and(|b| b.kind() != "statement_block")
     {
         st.return_param_mask |= expr_param_mask(target, src, st.params, &st.tainted_vars);
+        collect_expr_call_deps(
+            target,
+            src,
+            st.params,
+            &st.tainted_vars,
+            &st.var_call_deps,
+            &mut st.return_calls,
+            &mut st.direct_return_param_mask,
+        );
     }
     let idents = st.idents;
     let call_args = st.call_args;
     let return_param_mask = st.return_param_mask;
+    let direct_return_param_mask = st.direct_return_param_mask;
+    let return_calls = st.return_calls;
     FnBodyFacts {
         params,
         idents,
         call_args,
         return_param_mask,
+        direct_return_param_mask,
+        return_calls,
     }
 }
 
@@ -898,6 +1221,8 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                 call_args: facts.call_args,
                 params: facts.params,
                 return_param_mask: facts.return_param_mask,
+                direct_return_param_mask: facts.direct_return_param_mask,
+                return_calls: facts.return_calls,
             });
         }
     } else if node.kind() == "variable_declarator" {
@@ -925,6 +1250,8 @@ fn extract_fns(node: Node, src: &str, src_lines: &[&str], rel: &str, out: &mut V
                             call_args: facts.call_args,
                             params: facts.params,
                             return_param_mask: facts.return_param_mask,
+                            direct_return_param_mask: facts.direct_return_param_mask,
+                            return_calls: facts.return_calls,
                         });
                     }
                 }
@@ -961,7 +1288,7 @@ fn sink_matches_query(ident: &str, query_norm: &str) -> bool {
 
 fn compute_reachability_paths(
     all_fns: &[FnDef],
-    summaries: &HashMap<String, FnSummary>,
+    summaries: &SummaryIndex,
     target_norm: &str,
     to_sink: Option<&str>,
     include_sinks: bool,
@@ -1081,6 +1408,18 @@ fn compute_reachability_paths(
 
             if hops.len() + 1 < limit {
                 if let Some(callees) = by_name.get(id_s) {
+                    let same_file_callees: Vec<usize> = callees
+                        .iter()
+                        .copied()
+                        .filter(|&idx| all_fns[idx].file == cur_fn.file)
+                        .collect();
+                    let scoped_callees: Vec<usize> = if !same_file_callees.is_empty() {
+                        same_file_callees
+                    } else if callees.len() == 1 {
+                        callees.clone()
+                    } else {
+                        Vec::new()
+                    };
                     let call_info = lookup_call_arg(cur_fn, id_s, *ln);
                     let (next_pm, next_dyn) = if let Some(ci) = call_info {
                         let mut pm = 0u32;
@@ -1100,10 +1439,10 @@ fn compute_reachability_paths(
                     } else {
                         (u32::MAX, 0)
                     };
-                    for &next_idx in callees {
-                        let already_in_chain =
-                            hops.iter().any(|h| h.caller == all_fns[next_idx].name)
-                                || next_idx == cur_idx;
+                    for next_idx in scoped_callees {
+                        let already_in_chain = hops.iter().any(|h| {
+                            h.caller == all_fns[next_idx].name && h.file == all_fns[next_idx].file
+                        }) || next_idx == cur_idx;
                         if already_in_chain {
                             continue;
                         }
@@ -1206,20 +1545,45 @@ pub fn trace_symbol_chain_to_opts(
     let target_ref = target_clean.as_str();
     let all_fns = collect_project_fns(root);
 
-    let defined_names: HashSet<&str> = all_fns.iter().map(|f| f.name.as_str()).collect();
-    let mut callers_of: HashMap<&str, Vec<(&FnDef, usize)>> = HashMap::new();
-    let mut callees_of: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, f) in all_fns.iter().enumerate() {
+        by_name.entry(f.name.as_str()).or_default().push(idx);
+    }
+    let mut callers_of: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    let mut callees_of: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
 
-    for f in &all_fns {
-        let mut seen_callee: HashSet<&str> = HashSet::new();
+    for (caller_idx, f) in all_fns.iter().enumerate() {
+        let mut seen_callee: HashSet<usize> = HashSet::new();
         for (ident, ln) in &f.called_idents {
             let id_s = ident.as_str();
-            if id_s != f.name.as_str() && defined_names.contains(id_s) && seen_callee.insert(id_s) {
-                callers_of.entry(id_s).or_default().push((f, *ln));
-                callees_of
-                    .entry(f.name.as_str())
-                    .or_default()
-                    .push((id_s, *ln));
+            if id_s == f.name.as_str() {
+                continue;
+            }
+            if let Some(cands) = by_name.get(id_s) {
+                let same_file: Vec<usize> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&i| all_fns[i].file == f.file)
+                    .collect();
+                let resolved: Vec<usize> = if !same_file.is_empty() {
+                    same_file
+                } else if cands.len() == 1 {
+                    cands.clone()
+                } else {
+                    Vec::new()
+                };
+                for target_idx in resolved {
+                    if target_idx != caller_idx && seen_callee.insert(target_idx) {
+                        callers_of
+                            .entry(target_idx)
+                            .or_default()
+                            .push((caller_idx, *ln));
+                        callees_of
+                            .entry(caller_idx)
+                            .or_default()
+                            .push((target_idx, *ln));
+                    }
+                }
             }
         }
     }
@@ -1232,27 +1596,31 @@ pub fn trace_symbol_chain_to_opts(
 
     // Upstream BFS (callers -> callers of callers)
     let mut upstream = Vec::new();
-    let mut visited_up: HashSet<String> = HashSet::from([target_clean.clone()]);
-    let mut frontier: Vec<(String, Vec<String>)> =
-        vec![(target_clean.clone(), vec![target_clean.clone()])];
+    let target_indices: Vec<usize> = by_name.get(target_ref).cloned().unwrap_or_default();
+    let mut visited_up: HashSet<usize> = target_indices.iter().copied().collect();
+    let mut frontier: Vec<(usize, Vec<String>)> = target_indices
+        .iter()
+        .map(|&idx| (idx, vec![all_fns[idx].name.clone()]))
+        .collect();
     for d in 1..=max_depth.clamp(1, 5) {
         let mut next_frontier = Vec::new();
-        for (cur, chain) in frontier {
-            if let Some(cands) = callers_of.get(cur.as_str()) {
-                for (caller_fn, call_ln) in cands {
-                    if !visited_up.insert(caller_fn.name.clone()) {
+        for (cur_idx, chain) in frontier {
+            if let Some(cands) = callers_of.get(&cur_idx) {
+                for &(caller_idx, call_ln) in cands {
+                    if !visited_up.insert(caller_idx) {
                         continue;
                     }
+                    let caller_fn = &all_fns[caller_idx];
                     let mut p = vec![caller_fn.name.clone()];
                     p.extend(chain.clone());
                     upstream.push(TraceEdge {
                         depth: d,
                         symbol: caller_fn.name.clone(),
                         file: caller_fn.file.clone(),
-                        line: *call_ln,
+                        line: call_ln,
                         path: p.clone(),
                     });
-                    next_frontier.push((caller_fn.name.clone(), p));
+                    next_frontier.push((caller_idx, p));
                 }
             }
         }
@@ -1264,32 +1632,30 @@ pub fn trace_symbol_chain_to_opts(
 
     // Downstream callees (depth 1..2) + notable I/O/exec/DOM/SQL sinks inside target
     let mut downstream = Vec::new();
-    let mut visited_dn: HashSet<String> = HashSet::from([target_clean.clone()]);
-    let mut dn_front: Vec<(String, Vec<String>)> =
-        vec![(target_clean.clone(), vec![target_clean.clone()])];
+    let mut visited_dn: HashSet<usize> = target_indices.iter().copied().collect();
+    let mut dn_front: Vec<(usize, Vec<String>)> = target_indices
+        .iter()
+        .map(|&idx| (idx, vec![all_fns[idx].name.clone()]))
+        .collect();
     for d in 1..=2 {
         let mut next_dn = Vec::new();
-        for (cur, chain) in dn_front {
-            if let Some(cands) = callees_of.get(cur.as_str()) {
-                for (callee_nm, ln) in cands {
-                    if !visited_dn.insert((*callee_nm).to_string()) {
+        for (cur_idx, chain) in dn_front {
+            if let Some(cands) = callees_of.get(&cur_idx) {
+                for &(callee_idx, ln) in cands {
+                    if !visited_dn.insert(callee_idx) {
                         continue;
                     }
-                    let f_file = all_fns
-                        .iter()
-                        .find(|f| f.name == *callee_nm)
-                        .map(|f| f.file.clone())
-                        .unwrap_or_default();
+                    let callee_fn = &all_fns[callee_idx];
                     let mut p = chain.clone();
-                    p.push((*callee_nm).to_string());
+                    p.push(callee_fn.name.clone());
                     downstream.push(TraceEdge {
                         depth: d,
-                        symbol: (*callee_nm).to_string(),
-                        file: f_file,
-                        line: *ln,
+                        symbol: callee_fn.name.clone(),
+                        file: callee_fn.file.clone(),
+                        line: ln,
                         path: p.clone(),
                     });
-                    next_dn.push(((*callee_nm).to_string(), p));
+                    next_dn.push((callee_idx, p));
                 }
             }
         }
@@ -1664,6 +2030,66 @@ mod tests {
             sanitized.reachability_paths[0].hops[0].arg_taint,
             "PARAM_TAINTED"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_propagates_param_to_return_and_isolates_same_named_helpers_by_file() {
+        let dir = std::env::temp_dir().join(format!("ap_trace_ret_qual_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("wrap.ts"),
+            "export function passFirst(a: string, _tag: string) { return a; }\n\
+             export function midPass(x: string) { return passFirst(x, 'ok'); }\n\
+             export function midDrop(x: string) { return passFirst('fixed', x); }\n\
+             export function callPass(req: any) { const c = midPass(req.cmd); return execSync(c); }\n\
+             export function callDrop(req: any) { const c = midDrop(req.cmd); return execSync(c); }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("safe.ts"),
+            "function handleSame(x: string) { return execSync('status'); }\n\
+             export function entrySafe(req: any) { return handleSame(req.cmd); }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("vuln.ts"),
+            "function handleSame(x: string) { return execSync(x); }\n\
+             export function entryVuln(req: any) { return handleSame(req.cmd); }\n",
+        )
+        .unwrap();
+
+        let p_pass = trace_symbol_chain_to_opts(&dir, "callPass", Some("execSync"), false, true, 3);
+        assert_eq!(p_pass.reachability_paths.len(), 1);
+        assert_eq!(
+            p_pass.reachability_paths[0].hops[0].arg_taint,
+            "PARAM_TAINTED"
+        );
+        assert!(p_pass.reachability_paths[0].hops[0].taint_via_summary);
+
+        let p_drop = trace_symbol_chain_to_opts(&dir, "callDrop", Some("execSync"), false, true, 3);
+        assert!(
+            p_drop.reachability_paths.is_empty(),
+            "midDrop dropped tainted param, expected filtered: {:?}",
+            p_drop.reachability_paths
+        );
+
+        let p_safe =
+            trace_symbol_chain_to_opts(&dir, "entrySafe", Some("execSync"), false, true, 3);
+        assert!(
+            p_safe.reachability_paths.is_empty(),
+            "safe.ts handleSame must stay isolated from vuln.ts: {:?}",
+            p_safe.reachability_paths
+        );
+
+        let p_vuln =
+            trace_symbol_chain_to_opts(&dir, "entryVuln", Some("execSync"), false, true, 3);
+        assert_eq!(p_vuln.reachability_paths.len(), 1);
+        assert!(p_vuln.reachability_paths[0]
+            .hops
+            .iter()
+            .all(|h| h.file == "vuln.ts"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

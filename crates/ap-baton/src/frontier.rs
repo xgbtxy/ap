@@ -550,6 +550,9 @@ fn strip_contrast_and_dedup_lines(text: &str) -> Vec<String> {
         let trim = raw_ln.trim();
         let low = trim.to_ascii_lowercase();
         if trim.is_empty() {
+            continue;
+        }
+        if trim == "---" || trim == "===" {
             in_contrast_block = false;
             continue;
         }
@@ -2616,8 +2619,10 @@ mod tests {
         let noisy_and_contrast = "\
             Differentiate: not duplicate of src/auth/jwt_guard.ts verifyJwtAdmin\n\
             ## 去重核对\n\
-            src/auth/jwt_guard.ts verifyJwtAdmin checked earlier\n\
             \n\
+            - src/auth/jwt_guard.ts verifyJwtAdmin checked earlier\n\
+            \n\
+            ## Findings\n\
             server.js handle admin token auth route port http listen params\n\
             pkg/worker/runner.ts dispatchWorkerJob verified clean\n";
         let stopped = sync_stopped_from_text(&mut st, "notes.md", noisy_and_contrast);

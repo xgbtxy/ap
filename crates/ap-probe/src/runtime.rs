@@ -1,11 +1,12 @@
 use regex::Regex;
 use serde_json::{json, Value};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::smoke::run_cmd_with_timeout;
 
 const NODE_PREAMBLE: &str = include_str!("harnesses/node_runtime.txt");
 const PY_HARNESS: &str = include_str!("harnesses/py_runtime.txt");
@@ -245,18 +246,10 @@ fn run_py_bridge(cwd: &Path, req: &Value) -> Result<Value, String> {
     let Some(py) = find_python(cwd) else {
         return Err("Python interpreter not found on PATH for Python target tracing".to_string());
     };
-    let mut child = Command::new(&py)
-        .args(["-c", PY_HARNESS])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn `{py}`: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(serde_json::to_string(req).unwrap_or_default().as_bytes());
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let payload = serde_json::to_string(req).unwrap_or_default();
+    let mut cmd = Command::new(&py);
+    cmd.args(["-c", PY_HARNESS]).current_dir(cwd);
+    let out = run_cmd_with_timeout(&mut cmd, Duration::from_secs(15), Some(payload.as_bytes()))?;
     let stdout_s = String::from_utf8_lossy(&out.stdout);
     let last_json = stdout_s
         .lines()
@@ -645,9 +638,17 @@ pub fn run_diff_dispatch(
             let _ = fs::remove_dir_all(&tmp_dir);
             return 2;
         }
-        let ro = Command::new(&bin_p).current_dir(&cwd_canon).output();
+        let mut bin_cmd = Command::new(&bin_p);
+        bin_cmd.current_dir(&cwd_canon);
+        let ro = run_cmd_with_timeout(&mut bin_cmd, Duration::from_secs(10), None);
         let _ = fs::remove_dir_all(&tmp_dir);
-        let Ok(run_o) = ro else { return 2 };
+        let run_o = match ro {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[probe diff (RUST)] {e}");
+                return 2;
+            }
+        };
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
         let out_s = String::from_utf8_lossy(&run_o.stdout);
         let mut cases = 0usize;
@@ -730,7 +731,14 @@ function __snap(v, d = 0) {{
   for (const k of Object.keys(v).sort()) o[k] = __snap(v[k], d + 1);
   return {{ t: "obj", o }};
 }}
-function __clone(v) {{ return v === undefined ? undefined : structuredClone(v); }}
+function __clone(v) {{
+  if (v === undefined || v === null || typeof v !== "object") return v;
+  try {{ return structuredClone(v); }} catch {{
+    try {{ return JSON.parse(JSON.stringify(v)); }} catch {{
+      return Array.isArray(v) ? [...v] : {{ ...v }};
+    }}
+  }}
+}}
 function __call(fn, x) {{
   try {{ return {{ ok: true, s: __snap(fn(x)) }}; }}
   catch (e) {{ return {{ ok: false, err: (e && e.name ? e.name : "Error") }}; }}
@@ -770,12 +778,17 @@ console.log(JSON.stringify({{ cases: __corpus.length, divs: __divs, muts: __muts
             node_args.push("--experimental-strip-types".to_string());
         }
         node_args.push(tmp_runner.to_string_lossy().to_string());
-        let out = Command::new("node")
-            .args(&node_args)
-            .current_dir(&cwd_canon)
-            .output();
+        let mut node_cmd = Command::new("node");
+        node_cmd.args(&node_args).current_dir(&cwd_canon);
+        let out = run_cmd_with_timeout(&mut node_cmd, Duration::from_secs(15), None);
         let _ = fs::remove_file(&tmp_runner);
-        let Ok(proc_out) = out else { return 2 };
+        let proc_out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[probe diff] {e}");
+                return 2;
+            }
+        };
         let stdout_s = String::from_utf8_lossy(&proc_out.stdout);
         let Some((_, jpart)) = stdout_s.split_once("__PROBE_DIFF_JSON__") else {
             eprintln!(

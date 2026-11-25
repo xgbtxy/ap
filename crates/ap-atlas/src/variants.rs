@@ -1,7 +1,7 @@
 use crate::surface::guard_re;
 use crate::trace::{
     classify_hop_guard, clean_fn_name, collect_project_fns, compute_callee_summaries,
-    lookup_call_taint_with_summary, FnDef, NOTABLE_SINKS,
+    lookup_call_taint_with_summary, strip_guard_comment_line, FnDef, NOTABLE_SINKS,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -74,10 +74,16 @@ fn extra_guard_placement(
     } else {
         f.start_line
     };
+    let mut stripped_lines: Vec<Option<String>> = Vec::with_capacity(lines.len());
+    let mut in_block = false;
+    for raw in &lines {
+        let code = strip_guard_comment_line(raw, &mut in_block);
+        let t = code.trim();
+        stripped_lines.push((!t.is_empty()).then(|| t.to_string()));
+    }
     for ln in (scan_start..sink_line).rev() {
-        if let Some(txt) = lines.get(ln.saturating_sub(1)) {
-            let trimmed = txt.trim();
-            if !trimmed.is_empty() && re.is_match(trimmed) {
+        if let Some(Some(trimmed)) = stripped_lines.get(ln.saturating_sub(1)) {
+            if re.is_match(trimmed) {
                 return (
                     "GUARD_BEFORE".to_string(),
                     format!("L{ln}: {}", trimmed.chars().take(90).collect::<String>()),
@@ -89,9 +95,8 @@ fn extra_guard_placement(
         return (base_cls, base_note);
     }
     for ln in (sink_line + 1)..=f.end_line {
-        if let Some(txt) = lines.get(ln.saturating_sub(1)) {
-            let trimmed = txt.trim();
-            if !trimmed.is_empty() && re.is_match(trimmed) {
+        if let Some(Some(trimmed)) = stripped_lines.get(ln.saturating_sub(1)) {
+            if re.is_match(trimmed) {
                 return (
                     "GUARD_AFTER".to_string(),
                     format!("L{ln}: {}", trimmed.chars().take(90).collect::<String>()),
@@ -189,7 +194,7 @@ pub fn analyze_variants_with_opts(
     };
 
     let mut raw_hits: Vec<VariantFinding> = Vec::new();
-    let mut seen_fn_sink: HashSet<(String, String, usize)> = HashSet::new();
+    let mut seen_fn_sink: HashSet<(String, String, String, usize)> = HashSet::new();
 
     for f in &all_fns {
         for (ident, ln) in &f.called_idents {
@@ -206,7 +211,7 @@ pub fn analyze_variants_with_opts(
             if !matched {
                 continue;
             }
-            if !seen_fn_sink.insert((f.file.clone(), f.name.clone(), *ln)) {
+            if !seen_fn_sink.insert((f.file.clone(), f.name.clone(), ident.clone(), *ln)) {
                 continue;
             }
             let (guard_placement, guard_note) =
@@ -447,6 +452,38 @@ mod tests {
             .unwrap();
         assert_eq!(safe_hit.arg_taint, "CONST_LITERAL");
         assert!(safe_hit.taint_via_summary);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn variants_ignores_comment_guards_and_keeps_same_line_distinct_sinks() {
+        let dir = std::env::temp_dir().join(format!("ap_variants_cmt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("edge.ts"),
+            "export function commentedSink(req: any) {\n\
+               // requireAdmin check was removed\n\
+               /* authorize(req.user) */\n\
+               db.execute(req.id);\n\
+             }\n\
+             export function dualSameLine(req: any) { return [execSync(req.a), query(req.b)]; }\n",
+        )
+        .unwrap();
+
+        let rep = analyze_variants(&dir, Some("execute"), None, Some(r"requireAdmin"));
+        assert_eq!(rep.total_siblings, 1);
+        assert_eq!(rep.siblings[0].guard_placement, "UNGUARDED");
+
+        let dual = analyze_variants(&dir, None, None, None);
+        let same_line_sinks: Vec<&str> = dual
+            .siblings
+            .iter()
+            .filter(|s| s.function == "dualSameLine")
+            .map(|s| s.sink.as_str())
+            .collect();
+        assert!(same_line_sinks.contains(&"execSync"), "{same_line_sinks:?}");
+        assert!(same_line_sinks.contains(&"query"), "{same_line_sinks:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

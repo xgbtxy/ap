@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{Read, Write};
@@ -5,6 +6,8 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::smoke::run_cmd_with_timeout;
 
 fn unescape_payload(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
@@ -417,7 +420,96 @@ pub fn run_listen_cli(
     }
 }
 
-fn ws_write_text_frame(stream: &mut TcpStream, text: &str) -> Result<(), String> {
+const MAX_WS_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+fn parse_ws_target(url: &str) -> Result<(bool, String, String, u16, String), String> {
+    let (is_tls, default_port, rest) = if let Some(r) = url.strip_prefix("ws://") {
+        (false, 80u16, r)
+    } else if let Some(r) = url.strip_prefix("wss://") {
+        (true, 443u16, r)
+    } else {
+        return Err("URL must start with `ws://` or `wss://`".to_string());
+    };
+    let (host_port_raw, req_path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    if host_port_raw.is_empty() {
+        return Err("missing host in WebSocket URL".to_string());
+    }
+    let (host_only, port, host_port_hdr) = if host_port_raw.starts_with('[') {
+        if let Some(end_br) = host_port_raw.find(']') {
+            let h = &host_port_raw[1..end_br];
+            let after = &host_port_raw[end_br + 1..];
+            if let Some(p_str) = after.strip_prefix(':') {
+                let p = p_str
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port `{p_str}`"))?;
+                (h.to_string(), p, host_port_raw.to_string())
+            } else {
+                (h.to_string(), default_port, host_port_raw.to_string())
+            }
+        } else {
+            return Err("unclosed IPv6 bracket in host".to_string());
+        }
+    } else if let Some((h, p_str)) = host_port_raw.rsplit_once(':') {
+        let p = p_str
+            .parse::<u16>()
+            .map_err(|_| format!("invalid port `{p_str}`"))?;
+        (h.to_string(), p, host_port_raw.to_string())
+    } else {
+        (
+            host_port_raw.to_string(),
+            default_port,
+            host_port_raw.to_string(),
+        )
+    };
+    Ok((is_tls, host_port_hdr, host_only, port, req_path.to_string()))
+}
+
+fn ws_connect_addr_str(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn extract_ws_origin_host(origin: &str) -> String {
+    let low = origin.trim().to_ascii_lowercase();
+    let after_scheme = low
+        .strip_prefix("http://")
+        .or_else(|| low.strip_prefix("https://"))
+        .unwrap_or(low.as_str());
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.starts_with('[') {
+        authority
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .to_string()
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    }
+}
+
+fn is_untrusted_ws_origin(origin: Option<&str>) -> bool {
+    let Some(o) = origin else {
+        return false;
+    };
+    let low = o.trim().to_ascii_lowercase();
+    if low == "null" {
+        return true;
+    }
+    if !(low.starts_with("http://") || low.starts_with("https://")) {
+        return true;
+    }
+    let host = extract_ws_origin_host(&low);
+    !matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+fn ws_encode_text_frame(text: &str) -> Vec<u8> {
     let payload = text.as_bytes();
     let len = payload.len();
     let mask = [0x42u8, 0x9a, 0x11, 0x7e];
@@ -436,16 +528,37 @@ fn ws_write_text_frame(stream: &mut TcpStream, text: &str) -> Result<(), String>
     for (i, b) in payload.iter().enumerate() {
         frame.push(b ^ mask[i & 3]);
     }
+    frame
+}
+
+fn ws_write_text_frame<W: Write>(stream: &mut W, text: &str) -> Result<(), String> {
+    let frame = ws_encode_text_frame(text);
     stream
         .write_all(&frame)
         .map_err(|e| format!("ws write failed: {e}"))
 }
 
-fn ws_read_one_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
+fn ws_write_pong_frame<W: Write>(stream: &mut W, payload: &[u8]) -> Result<(), String> {
+    let body = &payload[..payload.len().min(125)];
+    let mask = [0x42u8, 0x9a, 0x11, 0x7e];
+    let mut frame = Vec::with_capacity(body.len() + 6);
+    frame.push(0x8A); // FIN + Pong
+    frame.push(0x80 | (body.len() as u8));
+    frame.extend_from_slice(&mask);
+    for (i, b) in body.iter().enumerate() {
+        frame.push(b ^ mask[i & 3]);
+    }
+    stream
+        .write_all(&frame)
+        .map_err(|e| format!("ws pong write failed: {e}"))
+}
+
+fn ws_read_one_frame<R: Read>(stream: &mut R) -> Result<(bool, u8, Vec<u8>), String> {
     let mut hdr = [0u8; 2];
     stream
         .read_exact(&mut hdr)
         .map_err(|e| format!("ws hdr: {e}"))?;
+    let fin = (hdr[0] & 0x80) != 0;
     let opcode = hdr[0] & 0x0F;
     let masked = (hdr[1] & 0x80) != 0;
     let mut len = (hdr[1] & 0x7F) as usize;
@@ -460,7 +573,13 @@ fn ws_read_one_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
         stream
             .read_exact(&mut b)
             .map_err(|e| format!("ws len64: {e}"))?;
-        len = (u64::from_be_bytes(b) as usize).min(2 * 1024 * 1024);
+        let raw_len = u64::from_be_bytes(b);
+        if raw_len > MAX_WS_FRAME_BYTES as u64 {
+            return Err(format!(
+                "ws frame too large ({raw_len} bytes > {MAX_WS_FRAME_BYTES})"
+            ));
+        }
+        len = raw_len as usize;
     }
     let mut mask = [0u8; 4];
     if masked {
@@ -479,10 +598,293 @@ fn ws_read_one_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
             *b ^= mask[i & 3];
         }
     }
-    Ok((opcode, data))
+    Ok((fin, opcode, data))
 }
 
-/// Deadline-bounded non-CDP RFC 6455 WebSocket (`ws://`) send/recv diagnostic client (zero hangs).
+fn build_ws_upgrade_req(
+    host_port: &str,
+    req_path: &str,
+    headers: &[String],
+    origin: Option<&str>,
+) -> String {
+    let mut req = format!(
+        "GET {req_path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+    );
+    if let Some(orig) = origin {
+        req.push_str(&format!("Origin: {orig}\r\n"));
+    }
+    for h in headers {
+        let t = h.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if origin.is_some() && t.to_ascii_lowercase().starts_with("origin:") {
+            continue;
+        }
+        req.push_str(t);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
+    req
+}
+
+#[allow(unused_variables)]
+fn run_wss_exchange(
+    host: &str,
+    port: u16,
+    req_str: &str,
+    send_msgs: &[String],
+    wait_ms: u64,
+) -> Result<serde_json::Value, String> {
+    let clamped_wait = wait_ms.clamp(80, 12_000);
+    let mut send_frames = Vec::new();
+    for m in send_msgs {
+        send_frames.extend_from_slice(&ws_encode_text_frame(m));
+    }
+
+    #[cfg(windows)]
+    {
+        let h_esc = host.replace('\'', "''");
+        let req_b64 = base64::engine::general_purpose::STANDARD.encode(req_str.as_bytes());
+        let send_b64 = base64::engine::general_purpose::STANDARD.encode(&send_frames);
+        let ps_code = format!(
+            "$ErrorActionPreference='Stop'; \
+$reqB=[Convert]::FromBase64String('{req_b64}'); \
+$sendB=[Convert]::FromBase64String('{send_b64}'); \
+$c=New-Object System.Net.Sockets.TcpClient; \
+$ar=$c.BeginConnect('{h_esc}',{port},$null,$null); \
+if(-not $ar.AsyncWaitHandle.WaitOne(4000,$false)){{ throw 'TCP connect timeout' }}; \
+$c.EndConnect($ar); \
+$s=New-Object System.Net.Security.SslStream($c.GetStream(),$false,({{param($a,$b,$ce,$e)$true}})); \
+$s.ReadTimeout=3000; $s.WriteTimeout=3000; \
+$s.AuthenticateAsClient('{h_esc}'); \
+$s.Write($reqB,0,$reqB.Length); $s.Flush(); \
+$hb=New-Object System.Collections.Generic.List[byte]; \
+while($hb.Count -lt 8192){{ $x=$s.ReadByte(); if($x -lt 0){{break}}; [void]$hb.Add([byte]$x); $n=$hb.Count; if($n -ge 4 -and $hb[$n-4] -eq 13 -and $hb[$n-3] -eq 10 -and $hb[$n-2] -eq 13 -and $hb[$n-1] -eq 10){{break}} }}; \
+$ht=[Text.Encoding]::UTF8.GetString($hb.ToArray()); \
+$lines=$ht -split \"`r?`n\"; \
+$sl=if($lines.Length -gt 0){{$lines[0].Trim()}}else{{''}}; \
+$hp=($lines | Where-Object {{$_.Trim() -ne ''}} | Select-Object -First 6) -join ' | '; \
+$acc=($sl -like '*101*'); \
+$msgs=New-Object System.Collections.Generic.List[string]; \
+$cr='handshake_rejected'; $cc=$null; $cm=$null; \
+if($acc){{ \
+  $cr='idle_timeout'; \
+  if($sendB.Length -gt 0){{ $s.Write($sendB,0,$sendB.Length); $s.Flush() }}; \
+  $s.ReadTimeout=60; \
+  $sw=[Diagnostics.Stopwatch]::StartNew(); \
+  $frag=New-Object System.Collections.Generic.List[byte]; $inFrag=$false; \
+  while($sw.ElapsedMilliseconds -lt {clamped_wait} -and $msgs.Count -lt 40){{ \
+    try {{ \
+      $b0=$s.ReadByte(); if($b0 -lt 0){{ $cr='eof'; break }}; \
+      $s.ReadTimeout=1500; \
+      $b1=$s.ReadByte(); if($b1 -lt 0){{ $cr='eof'; break }}; \
+      $fin=($b0 -band 128) -ne 0; $op=$b0 -band 15; $mk=($b1 -band 128) -ne 0; \
+      [long]$ln=$b1 -band 127; \
+      if($ln -eq 126){{ $lb=New-Object byte[] 2; $r=0; while($r -lt 2){{$n=$s.Read($lb,$r,2-$r);if($n -le 0){{throw 'eof'}};$r+=$n}}; $ln=([int]$lb[0] -shl 8) -bor [int]$lb[1] }} \
+      elseif($ln -eq 127){{ $lb=New-Object byte[] 8; $r=0; while($r -lt 8){{$n=$s.Read($lb,$r,8-$r);if($n -le 0){{throw 'eof'}};$r+=$n}}; [uint64]$u=0; for($k=0;$k -lt 8;$k++){{$u=($u -shl 8) -bor [uint64]$lb[$k]}}; if($u -gt 8388608){{ throw 'ws frame too large' }}; $ln=[long]$u }}; \
+      $mb=New-Object byte[] 4; if($mk){{ $r=0; while($r -lt 4){{$n=$s.Read($mb,$r,4-$r);if($n -le 0){{throw 'eof'}};$r+=$n}} }}; \
+      $pl=New-Object byte[] $ln; $r=0; while($r -lt $ln){{ $n=$s.Read($pl,$r,[int]($ln-$r)); if($n -le 0){{throw 'eof'}}; $r+=$n }}; \
+      if($mk){{ for($k=0;$k -lt $ln;$k++){{ $pl[$k]=$pl[$k] -bxor $mb[$k -band 3] }} }}; \
+      $s.ReadTimeout=60; \
+      if($op -eq 8){{ if($pl.Length -ge 2){{$cc=([int]$pl[0] -shl 8) -bor [int]$pl[1]; if($pl.Length -gt 2){{$cm=[Text.Encoding]::UTF8.GetString($pl,2,$pl.Length-2).Trim()}}}}; $cr=if($cc -ne $null){{\"close_frame_$cc\"}}else{{'close_frame'}}; break }} \
+      elseif($op -eq 9){{ $pn=[Math]::Min($pl.Length,125); $pf=New-Object byte[] (6+$pn); $pf[0]=0x8A; $pf[1]=(0x80 -bor $pn); $pf[2]=0x42; $pf[3]=0x9A; $pf[4]=0x11; $pf[5]=0x7E; for($k=0;$k -lt $pn;$k++){{$pf[6+$k]=$pl[$k] -bxor $pf[2+($k -band 3)]}}; $s.Write($pf,0,$pf.Length); $s.Flush(); continue }} \
+      elseif($op -eq 1 -or $op -eq 2){{ if($fin){{ $t=[Text.Encoding]::UTF8.GetString($pl); if($t.Length -gt 2000){{$t=$t.Substring(0,2000)}}; [void]$msgs.Add($t); $frag.Clear(); $inFrag=$false }} else {{ $frag.Clear(); $frag.AddRange($pl); $inFrag=$true }} }} \
+      elseif($op -eq 0 -and $inFrag){{ if(($frag.Count + $pl.Length) -gt 8388608){{ throw 'ws fragmented message too large' }}; $frag.AddRange($pl); if($fin){{ $t=[Text.Encoding]::UTF8.GetString($frag.ToArray()); if($t.Length -gt 2000){{$t=$t.Substring(0,2000)}}; [void]$msgs.Add($t); $frag.Clear(); $inFrag=$false }} }} \
+    }} catch [System.IO.IOException] {{ \
+      if($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.SocketErrorCode -eq 'TimedOut'){{ $s.ReadTimeout=60; continue }} else {{ $cr='eof'; break }} \
+    }} \
+  }} \
+}}; \
+try{{$s.Close();$c.Close()}}catch{{}}; \
+[ordered]@{{accepted=$acc;status_line=$sl;headers_preview=$hp;close_reason=$cr;close_code=$cc;close_message=$cm;messages=$msgs.ToArray()}} | ConvertTo-Json -Compress"
+        );
+        let timeout = Duration::from_millis(clamped_wait + 8000);
+        let mut last_err = "PowerShell unavailable for wss://".to_string();
+        for bin in ["pwsh.exe", "powershell.exe"] {
+            let mut cmd = Command::new(bin);
+            cmd.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &ps_code,
+            ]);
+            match run_cmd_with_timeout(&mut cmd, timeout, None) {
+                Ok(o) if o.status.success() => {
+                    return serde_json::from_slice(&o.stdout)
+                        .map_err(|e| format!("wss JSON parse error: {e}"));
+                }
+                Ok(o) => {
+                    last_err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    break;
+                }
+                Err(e) if e.starts_with("spawn failed:") => {
+                    last_err = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut child = Command::new("openssl")
+            .args([
+                "s_client",
+                "-quiet",
+                "-servername",
+                host,
+                "-connect",
+                &format!("{host}:{port}"),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("openssl s_client spawn failed: {e}"))?;
+        let mut sin = child.stdin.take().ok_or("missing stdin")?;
+        let mut sout = child.stdout.take().ok_or("missing stdout")?;
+        sin.write_all(req_str.as_bytes())
+            .map_err(|e| format!("wss write failed: {e}"))?;
+        let _ = sin.flush();
+        let mut hbuf = Vec::new();
+        let mut b1 = [0u8; 1];
+        while hbuf.len() < 8192 {
+            match sout.read(&mut b1) {
+                Ok(1) => {
+                    hbuf.push(b1[0]);
+                    if hbuf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let htxt = String::from_utf8_lossy(&hbuf).to_string();
+        let status_line = htxt.lines().next().unwrap_or("").trim().to_string();
+        let headers_preview: String = htxt
+            .lines()
+            .take(6)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let accepted = status_line.contains("101");
+        let mut messages: Vec<String> = Vec::new();
+        let mut close_reason = if accepted {
+            "idle_timeout".to_string()
+        } else {
+            "handshake_rejected".to_string()
+        };
+        let mut close_code: Option<u16> = None;
+        let mut close_message: Option<String> = None;
+        if accepted {
+            if !send_frames.is_empty() {
+                let _ = sin.write_all(&send_frames);
+                let _ = sin.flush();
+            }
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(bool, u8, Vec<u8>), String>>();
+            std::thread::spawn(move || loop {
+                let fr = ws_read_one_frame(&mut sout);
+                let done = fr.is_err();
+                if tx.send(fr).is_err() || done {
+                    break;
+                }
+            });
+            let deadline = Instant::now() + Duration::from_millis(clamped_wait);
+            let mut frag_buf: Vec<u8> = Vec::new();
+            let mut in_frag = false;
+            while Instant::now() < deadline && messages.len() < 40 {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(rem.min(Duration::from_millis(80))) {
+                    Ok(Ok((fin, opcode, data))) => match opcode {
+                        8 => {
+                            if data.len() >= 2 {
+                                close_code = Some(u16::from_be_bytes([data[0], data[1]]));
+                                if data.len() > 2 {
+                                    let msg = String::from_utf8_lossy(&data[2..])
+                                        .trim()
+                                        .chars()
+                                        .take(240)
+                                        .collect::<String>();
+                                    if !msg.is_empty() {
+                                        close_message = Some(msg);
+                                    }
+                                }
+                            }
+                            close_reason = match close_code {
+                                Some(c) => format!("close_frame_{c}"),
+                                None => "close_frame".to_string(),
+                            };
+                            break;
+                        }
+                        9 => {
+                            let _ = ws_write_pong_frame(&mut sin, &data);
+                            let _ = sin.flush();
+                        }
+                        1 | 2 => {
+                            if fin {
+                                messages.push(
+                                    String::from_utf8_lossy(&data).chars().take(2000).collect(),
+                                );
+                                frag_buf.clear();
+                                in_frag = false;
+                            } else {
+                                frag_buf = data;
+                                in_frag = true;
+                            }
+                        }
+                        0 if in_frag => {
+                            if frag_buf.len().saturating_add(data.len()) > MAX_WS_FRAME_BYTES {
+                                close_reason = "read_error: fragmented message too large".into();
+                                break;
+                            }
+                            frag_buf.extend_from_slice(&data);
+                            if fin {
+                                messages.push(
+                                    String::from_utf8_lossy(&frag_buf)
+                                        .chars()
+                                        .take(2000)
+                                        .collect(),
+                                );
+                                frag_buf.clear();
+                                in_frag = false;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(Err(e)) => {
+                        close_reason = if e.contains("eof") {
+                            "eof".to_string()
+                        } else {
+                            format!("read_error: {e}")
+                        };
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        close_reason = "eof".to_string();
+                        break;
+                    }
+                }
+            }
+        }
+        crate::smoke::kill_process_tree(&mut child);
+        Ok(json!({
+            "accepted": accepted,
+            "status_line": status_line,
+            "headers_preview": headers_preview,
+            "close_reason": close_reason,
+            "close_code": close_code,
+            "close_message": close_message,
+            "messages": messages,
+        }))
+    }
+}
+
+/// Deadline-bounded non-CDP RFC 6455 WebSocket (`ws://` / `wss://`) send/recv diagnostic client (zero hangs).
 pub fn run_ws_cli(
     url: &str,
     send_msgs: &[String],
@@ -491,19 +893,87 @@ pub fn run_ws_cli(
     as_json: bool,
 ) -> i32 {
     let t0 = Instant::now();
-    let Some(rest) = url.strip_prefix("ws://") else {
-        eprintln!("[probe ws] Only plaintext `ws://host:port/path` is supported natively (pass `ws://...`)");
-        return 2;
+    let (is_tls, host_port, host_only, port, req_path) = match parse_ws_target(url) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[probe ws] Invalid URL `{url}`: {e}");
+            return 2;
+        }
     };
-    let (host_port, req_path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let connect_target = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:80")
-    };
+    let req = build_ws_upgrade_req(&host_port, &req_path, headers, None);
+    let clamped_wait = wait_ms.clamp(100, 12_000);
+
+    if is_tls {
+        let res = match run_wss_exchange(&host_only, port, &req, send_msgs, clamped_wait) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[probe ws] wss:// connect/exchange failed (`{url}`): {e}");
+                return 1;
+            }
+        };
+        let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0).round();
+        let accepted = res["accepted"].as_bool().unwrap_or(false);
+        let status_line = res["status_line"].as_str().unwrap_or("");
+        if !accepted {
+            let rej_preview = res["headers_preview"].as_str().unwrap_or("");
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "url": url,
+                        "handshake": status_line,
+                        "close_reason": "handshake_rejected",
+                        "headers_preview": rej_preview,
+                        "elapsed_ms": elapsed_ms,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("[probe ws] Handshake rejected: `{status_line}` ({rej_preview})");
+            }
+            return 1;
+        }
+        let messages: Vec<String> = res["messages"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let close_reason = res["close_reason"].as_str().unwrap_or("idle_timeout");
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "url": url,
+                    "handshake": status_line,
+                    "elapsed_ms": elapsed_ms,
+                    "wait_ms": clamped_wait,
+                    "close_reason": close_reason,
+                    "close_code": res["close_code"],
+                    "close_message": res["close_message"],
+                    "received_count": messages.len(),
+                    "messages": messages,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            println!(
+                "[probe ws] CONNECTED `{url}` ({status_line} | {elapsed_ms}ms | close={close_reason} | {} msg(s)):",
+                messages.len()
+            );
+            for (i, m) in messages.iter().enumerate() {
+                println!("  {}. {m}", i + 1);
+            }
+        }
+        return 0;
+    }
+
+    let connect_target = ws_connect_addr_str(&host_only, port);
     let Ok(mut addrs) = connect_target.to_socket_addrs() else {
         eprintln!("[probe ws] Failed to resolve `{connect_target}`");
         return 2;
@@ -522,14 +992,6 @@ pub fn run_ws_cli(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
 
-    let mut req = format!(
-        "GET {req_path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
-    );
-    for h in headers {
-        req.push_str(h.trim());
-        req.push_str("\r\n");
-    }
-    req.push_str("\r\n");
     if let Err(e) = stream.write_all(req.as_bytes()) {
         eprintln!("[probe ws] Handshake write error: {e}");
         return 1;
@@ -584,10 +1046,11 @@ pub fn run_ws_cli(
         }
     }
 
-    let clamped_wait = wait_ms.clamp(100, 12_000);
     let deadline = Instant::now() + Duration::from_millis(clamped_wait);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(60)));
     let mut messages: Vec<String> = Vec::new();
+    let mut frag_buf: Vec<u8> = Vec::new();
+    let mut in_frag = false;
     let mut close_reason = "idle_timeout".to_string();
     let mut close_code: Option<u16> = None;
     let mut close_message: Option<String> = None;
@@ -608,7 +1071,7 @@ pub fn run_ws_cli(
                 let fr = ws_read_one_frame(&mut stream);
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(60)));
                 match fr {
-                    Ok((8, data)) => {
+                    Ok((_, 8, data)) => {
                         if data.len() >= 2 {
                             close_code = Some(u16::from_be_bytes([data[0], data[1]]));
                             if data.len() > 2 {
@@ -628,8 +1091,36 @@ pub fn run_ws_cli(
                         };
                         break;
                     }
-                    Ok((1 | 2, data)) => {
-                        messages.push(String::from_utf8_lossy(&data).chars().take(2000).collect());
+                    Ok((_, 9, data)) => {
+                        let _ = ws_write_pong_frame(&mut stream, &data);
+                    }
+                    Ok((fin, 1 | 2, data)) => {
+                        if fin {
+                            messages
+                                .push(String::from_utf8_lossy(&data).chars().take(2000).collect());
+                            frag_buf.clear();
+                            in_frag = false;
+                        } else {
+                            frag_buf = data;
+                            in_frag = true;
+                        }
+                    }
+                    Ok((fin, 0, data)) if in_frag => {
+                        if frag_buf.len().saturating_add(data.len()) > MAX_WS_FRAME_BYTES {
+                            close_reason = "read_error: fragmented message too large".to_string();
+                            break;
+                        }
+                        frag_buf.extend_from_slice(&data);
+                        if fin {
+                            messages.push(
+                                String::from_utf8_lossy(&frag_buf)
+                                    .chars()
+                                    .take(2000)
+                                    .collect(),
+                            );
+                            frag_buf.clear();
+                            in_frag = false;
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -692,25 +1183,42 @@ fn ws_handshake_one_origin(
 ) -> serde_json::Value {
     let t0 = Instant::now();
     let label = origin.unwrap_or("(none)");
-    let Some(rest) = url.strip_prefix("ws://") else {
-        return json!({
-            "origin": label,
-            "accepted": false,
-            "status_line": "",
-            "error": "only ws:// supported natively",
-            "elapsed_ms": 0.0,
-            "messages": [],
-        });
+    let (is_tls, host_port, host_only, port, req_path) = match parse_ws_target(url) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({
+                "origin": label,
+                "accepted": false,
+                "status_line": "",
+                "error": e,
+                "elapsed_ms": 0.0,
+                "messages": [],
+            });
+        }
     };
-    let (host_port, req_path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let connect_target = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:80")
-    };
+    let req = build_ws_upgrade_req(&host_port, &req_path, base_headers, origin);
+    if is_tls {
+        return match run_wss_exchange(&host_only, port, &req, send_msgs, wait_ms.clamp(80, 3000)) {
+            Ok(v) => json!({
+                "origin": label,
+                "accepted": v["accepted"].as_bool().unwrap_or(false),
+                "status_line": v["status_line"].as_str().unwrap_or(""),
+                "error": "",
+                "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                "messages": v["messages"],
+            }),
+            Err(e) => json!({
+                "origin": label,
+                "accepted": false,
+                "status_line": "",
+                "error": e,
+                "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+                "messages": [],
+            }),
+        };
+    }
+
+    let connect_target = ws_connect_addr_str(&host_only, port);
     let Some(sa) = connect_target
         .to_socket_addrs()
         .ok()
@@ -741,21 +1249,6 @@ fn ws_handshake_one_origin(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-    let mut req = format!(
-        "GET {req_path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
-    );
-    if let Some(orig) = origin {
-        req.push_str(&format!("Origin: {orig}\r\n"));
-    }
-    for h in base_headers {
-        let low = h.trim().to_ascii_lowercase();
-        if low.starts_with("origin:") {
-            continue;
-        }
-        req.push_str(h.trim());
-        req.push_str("\r\n");
-    }
-    req.push_str("\r\n");
     if let Err(e) = stream.write_all(req.as_bytes()) {
         return json!({
             "origin": label,
@@ -792,6 +1285,8 @@ fn ws_handshake_one_origin(
         }
         let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(80, 3000));
         let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let mut frag_buf: Vec<u8> = Vec::new();
+        let mut in_frag = false;
         while Instant::now() < deadline && messages.len() < 10 {
             let mut pb = [0u8; 1];
             match stream.peek(&mut pb) {
@@ -801,15 +1296,41 @@ fn ws_handshake_one_origin(
                     let fr = ws_read_one_frame(&mut stream);
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
                     match fr {
-                        Ok((1 | 2, data)) => {
-                            messages.push(
-                                String::from_utf8_lossy(&data)
-                                    .chars()
-                                    .take(600)
-                                    .collect::<String>(),
-                            );
+                        Ok((_, 9, data)) => {
+                            let _ = ws_write_pong_frame(&mut stream, &data);
                         }
-                        Ok((8, _)) | Err(_) => break,
+                        Ok((fin, 1 | 2, data)) => {
+                            if fin {
+                                messages.push(
+                                    String::from_utf8_lossy(&data)
+                                        .chars()
+                                        .take(600)
+                                        .collect::<String>(),
+                                );
+                                frag_buf.clear();
+                                in_frag = false;
+                            } else {
+                                frag_buf = data;
+                                in_frag = true;
+                            }
+                        }
+                        Ok((fin, 0, data)) if in_frag => {
+                            if frag_buf.len().saturating_add(data.len()) > MAX_WS_FRAME_BYTES {
+                                break;
+                            }
+                            frag_buf.extend_from_slice(&data);
+                            if fin {
+                                messages.push(
+                                    String::from_utf8_lossy(&frag_buf)
+                                        .chars()
+                                        .take(600)
+                                        .collect::<String>(),
+                                );
+                                frag_buf.clear();
+                                in_frag = false;
+                            }
+                        }
+                        Ok((_, 8, _)) | Err(_) => break,
                         _ => {}
                     }
                 }
@@ -870,17 +1391,7 @@ pub fn run_ws_origin_matrix(
     for spec in &origin_specs {
         let row = ws_handshake_one_origin(url, spec.as_deref(), send_msgs, headers, wait_ms);
         let acc = row["accepted"].as_bool().unwrap_or(false);
-        let is_untrusted = match spec.as_deref() {
-            None => false,
-            Some(o) => {
-                let low = o.to_ascii_lowercase();
-                low == "null"
-                    || (!low.starts_with("http://localhost")
-                        && !low.starts_with("http://127.0.0.1")
-                        && !low.starts_with("https://localhost")
-                        && !low.starts_with("https://127.0.0.1"))
-            }
-        };
+        let is_untrusted = is_untrusted_ws_origin(spec.as_deref());
         if acc && is_untrusted {
             untrusted_accepted.push(row["origin"].as_str().unwrap_or("?").to_string());
         }
@@ -1067,5 +1578,65 @@ mod ws_tests {
         let _ = srv.join();
         assert_eq!(evil["accepted"], true);
         assert_eq!(null_o["accepted"], false);
+    }
+
+    #[test]
+    fn cswsh_origin_host_parse_and_ws_ping_frag_frame_guards() {
+        assert!(is_untrusted_ws_origin(Some("http://localhost.evil.com")));
+        assert!(is_untrusted_ws_origin(Some(
+            "https://127.0.0.1.attacker.test:8443"
+        )));
+        assert!(is_untrusted_ws_origin(Some("null")));
+        assert!(!is_untrusted_ws_origin(Some("http://localhost:3000")));
+        assert!(!is_untrusted_ws_origin(Some("https://127.0.0.1")));
+        assert!(!is_untrusted_ws_origin(None));
+
+        let (tls, hp, host, port, path) = parse_ws_target("wss://[::1]:8443/ws/chat").unwrap();
+        assert!(tls);
+        assert_eq!(hp, "[::1]:8443");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8443);
+        assert_eq!(path, "/ws/chat");
+
+        let mut oversize = vec![0x82u8, 127u8];
+        oversize.extend_from_slice(&(16u64 * 1024 * 1024).to_be_bytes());
+        let err = ws_read_one_frame(&mut std::io::Cursor::new(oversize)).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+
+        // Loopback WS server sends Ping then two fragmented text frames before Close
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let lport = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            );
+            // Send Ping("hi")
+            let _ = s.write_all(&[0x89, 2, b'h', b'i']);
+            // Read client text("probe") + Pong(0x8A) + send fragmented "hello " + "world"
+            let (_, op1, txt_data) = ws_read_one_frame(&mut s).unwrap();
+            assert_eq!(op1, 1);
+            assert_eq!(txt_data, b"probe");
+            let (_, op2, pong_data) = ws_read_one_frame(&mut s).unwrap();
+            assert_eq!(op2, 10);
+            assert_eq!(pong_data, b"hi");
+            let _ = s.write_all(&[0x01, 6, b'h', b'e', b'l', b'l', b'o', b' ']);
+            let _ = s.write_all(&[0x80, 5, b'w', b'o', b'r', b'l', b'd']);
+            let _ = s.write_all(&[0x88, 2, 0x03, 0xE8]);
+        });
+        let row = ws_handshake_one_origin(
+            &format!("ws://127.0.0.1:{lport}/stream"),
+            Some("http://localhost:3000"),
+            &["probe".to_string()],
+            &[],
+            800,
+        );
+        let _ = srv.join();
+        assert_eq!(row["accepted"], true);
+        let msgs = row["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], "hello world");
     }
 }

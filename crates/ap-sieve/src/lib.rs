@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_STORE_BYTES: u64 = 50 * 1024 * 1024;
@@ -144,19 +144,46 @@ pub fn store_dir(cwd: &Path) -> PathBuf {
     base
 }
 
+fn open_sieve_db(db_path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    let _ = conn.busy_timeout(Duration::from_millis(2000));
+    Ok(conn)
+}
+
+fn backfilled_cache() -> &'static Mutex<HashMap<PathBuf, u128>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, u128>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_dir_mtime_nanos(store: &Path) -> Option<u128> {
+    fs::metadata(store)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+}
+
 fn index_archive(store: &Path, item_id: &str, label: &str, raw_text: &str) {
     let db_path = store.join("index.sqlite");
-    if let Ok(conn) = Connection::open(db_path) {
-        let _ = conn.busy_timeout(Duration::from_millis(2000));
+    if let Ok(conn) = open_sieve_db(&db_path) {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(id UNINDEXED, label, content);",
         );
         let _ = conn.execute("DELETE FROM chunks WHERE id = ?1", params![item_id]);
-        let _ = conn.execute(
-            "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
-            params![item_id, label, raw_text],
-        );
+        if conn
+            .execute(
+                "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
+                params![item_id, label, raw_text],
+            )
+            .is_ok()
+        {
+            if let Some(mt) = store_dir_mtime_nanos(store) {
+                if let Ok(mut guard) = backfilled_cache().lock() {
+                    guard.insert(store.to_path_buf(), mt);
+                }
+            }
+        }
     }
 }
 
@@ -1400,9 +1427,19 @@ fn resolve_json_path<'a>(mut cur: &'a Value, path: &str) -> Option<&'a Value> {
 
 fn ensure_backfilled(store: &Path) {
     let db_path = store.join("index.sqlite");
+    let dir_mt = store_dir_mtime_nanos(store);
+    if db_path.exists() {
+        if let Some(mt) = dir_mt {
+            if let Ok(guard) = backfilled_cache().lock() {
+                if guard.get(store) == Some(&mt) {
+                    return;
+                }
+            }
+        }
+    }
     let mut existing: HashSet<String> = HashSet::new();
     if db_path.exists() {
-        if let Ok(conn) = Connection::open(&db_path) {
+        if let Ok(conn) = open_sieve_db(&db_path) {
             if let Ok(mut st) = conn.prepare("SELECT id FROM chunks") {
                 if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
                     existing.extend(rows.flatten());
@@ -1430,6 +1467,13 @@ fn ensure_backfilled(store: &Path) {
             }
         }
     }
+    if db_path.exists() {
+        if let Some(mt) = store_dir_mtime_nanos(store) {
+            if let Ok(mut guard) = backfilled_cache().lock() {
+                guard.insert(store.to_path_buf(), mt);
+            }
+        }
+    }
 }
 
 pub fn search_archives(store: &Path, query: &str, limit: usize) -> (Vec<SearchHit>, f64) {
@@ -1439,7 +1483,7 @@ pub fn search_archives(store: &Path, query: &str, limit: usize) -> (Vec<SearchHi
     let mut hits = Vec::new();
     let q = query.trim();
     if db_path.exists() && !q.is_empty() {
-        if let Ok(conn) = Connection::open(db_path) {
+        if let Ok(conn) = open_sieve_db(&db_path) {
             let fts_q = q
                 .split_whitespace()
                 .filter(|t| !t.is_empty())

@@ -489,8 +489,7 @@ fn mcp_tools_schema() -> Value {
                 "max_lines": { "type": "integer", "description": "Optional max non-empty narrative lines budget" },
                 "require_headers": { "type": "array", "items": { "type": "string" }, "description": "Optional required header prefixes" },
                 "ai_surface": { "type": "boolean", "description": "Audit AI-agent, IDE extension & MCP trust-boundary surfaces instead of pack" }
-            },
-            "required": ["dir"]
+            }
         }
     },
     {
@@ -2690,12 +2689,17 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             run_self_captured(&cli, None)
         }
         "ap_guard_pack" => {
-            let dir = args.get("dir").and_then(Value::as_str).unwrap_or(".");
+            let raw_dir = args
+                .get("dir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
             if args
                 .get("ai_surface")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
+                let dir = if raw_dir.is_empty() { "." } else { raw_dir };
                 let cli = vec![
                     "guard".into(),
                     "ai-surface".into(),
@@ -2704,7 +2708,13 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 ];
                 return run_self_captured(&cli, None);
             }
-            let mut cli = vec!["guard".into(), "pack".into(), dir.to_string()];
+            if raw_dir.is_empty() {
+                return (
+                    false,
+                    "Pass non-empty `dir` to `ap_guard_pack` (or set `ai_surface: true`).".into(),
+                );
+            }
+            let mut cli = vec!["guard".into(), "pack".into(), raw_dir.to_string()];
             if let Some(ml) = args.get("max_lines").and_then(Value::as_u64) {
                 cli.extend(["--max-lines".into(), ml.to_string()]);
             }

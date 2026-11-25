@@ -178,6 +178,7 @@ pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
         let _ = fs::create_dir_all(parent);
     }
     let conn = Connection::open(db_path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS rules (

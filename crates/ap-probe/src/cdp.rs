@@ -73,6 +73,8 @@ fn ws_write_text(stream: &mut TcpStream, text: &str) -> Result<(), String> {
         .map_err(|e| format!("ws write: {e}"))
 }
 
+const MAX_CDP_WS_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
 fn ws_read_message(stream: &mut TcpStream) -> Result<String, String> {
     let mut msg_bytes = Vec::new();
     loop {
@@ -89,7 +91,14 @@ fn ws_read_message(stream: &mut TcpStream) -> Result<String, String> {
         } else if len == 127 {
             let mut b = [0u8; 8];
             read_exact_bytes(stream, &mut b)?;
-            len = u64::from_be_bytes(b) as usize;
+            let raw_len = u64::from_be_bytes(b);
+            if raw_len > MAX_CDP_WS_FRAME_BYTES as u64 {
+                return Err(format!("CDP websocket frame too large ({raw_len} bytes)"));
+            }
+            len = raw_len as usize;
+        }
+        if msg_bytes.len().saturating_add(len) > MAX_CDP_WS_FRAME_BYTES {
+            return Err("CDP websocket message exceeded 32 MiB cap".to_string());
         }
         let mut mask = [0u8; 4];
         if masked {

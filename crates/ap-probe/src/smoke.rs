@@ -179,6 +179,71 @@ pub(crate) fn find_headless_browser() -> Option<PathBuf> {
     None
 }
 
+pub(crate) fn run_cmd_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+) -> Result<std::process::Output, String> {
+    if stdin_bytes.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    if let Some(bytes) = stdin_bytes {
+        if let Some(mut sin) = child.stdin.take() {
+            let _ = sin.write_all(bytes);
+        }
+    }
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stdout_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stderr_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = out_handle.join().unwrap_or_default();
+                let stderr = err_handle.join().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_tree(&mut child);
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(format!("command timed out after {}ms", timeout.as_millis()));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                kill_process_tree(&mut child);
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(format!("wait failed: {e}"));
+            }
+        }
+    }
+}
+
 fn dump_browser_dom(url: &str, budget_ms: u64) -> Result<(u16, String), String> {
     let Some(bin) = find_headless_browser() else {
         let (st, _, body) = http_request(
@@ -197,20 +262,20 @@ fn dump_browser_dom(url: &str, budget_ms: u64) -> Result<(u16, String), String> 
     };
     let profile_dir = std::env::temp_dir().join(format!("ap_smoke_browser_{}", std::process::id()));
     let _ = fs::create_dir_all(&profile_dir);
-    let out = Command::new(&bin)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--disable-extensions",
-            "--log-level=3",
-            "--no-first-run",
-            &format!("--user-data-dir={}", profile_dir.display()),
-            &format!("--virtual-time-budget={}", budget_ms.max(800)),
-            "--dump-dom",
-            url,
-        ])
-        .stdin(Stdio::null())
-        .output();
+    let mut cmd = Command::new(&bin);
+    cmd.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--log-level=3",
+        "--no-first-run",
+        &format!("--user-data-dir={}", profile_dir.display()),
+        &format!("--virtual-time-budget={}", budget_ms.max(800)),
+        "--dump-dom",
+        url,
+    ]);
+    let timeout = Duration::from_millis((budget_ms.max(800) + 5000).clamp(4000, 20_000));
+    let out = run_cmd_with_timeout(&mut cmd, timeout, None);
     let _ = fs::remove_dir_all(&profile_dir);
     match out {
         Ok(o) => {

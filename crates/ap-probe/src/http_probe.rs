@@ -1930,7 +1930,13 @@ fn parse_plain_http_target(url: &str) -> Option<(SocketAddr, String, String)> {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
     };
-    let connect_target = if host_port.contains(':') {
+    let connect_target = if host_port.starts_with('[') {
+        if host_port.contains("]:") {
+            host_port.to_string()
+        } else {
+            format!("{host_port}:80")
+        }
+    } else if host_port.contains(':') {
         host_port.to_string()
     } else {
         format!("{host_port}:80")
@@ -1978,29 +1984,54 @@ fn build_raw_http11_request(
     req.into_bytes()
 }
 
+fn decode_http_chunked_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let Some(rel_end) = raw[i..].windows(2).position(|w| w == b"\r\n") else {
+            out.extend_from_slice(&raw[i..]);
+            break;
+        };
+        let size_str = String::from_utf8_lossy(&raw[i..i + rel_end]);
+        let size_hex = size_str.split(';').next().unwrap_or("").trim();
+        let Ok(sz) = usize::from_str_radix(size_hex, 16) else {
+            out.extend_from_slice(&raw[i..]);
+            break;
+        };
+        i += rel_end + 2;
+        if sz == 0 {
+            break;
+        }
+        let end = (i + sz).min(raw.len());
+        out.extend_from_slice(&raw[i..end]);
+        i = (end + 2).min(raw.len());
+    }
+    out
+}
+
 fn parse_http_wire_response(
     method: &str,
     url: &str,
     raw_bytes: &[u8],
     elapsed_ms: f64,
 ) -> (HttpProbeResult, String) {
-    let raw = String::from_utf8_lossy(raw_bytes).to_string();
-    let mut rest = raw.as_str();
-    let mut hdr_block = "";
-    while rest.starts_with("HTTP/") {
-        if let Some(idx) = rest.find("\r\n\r\n") {
-            hdr_block = &rest[..idx];
-            rest = &rest[idx + 4..];
-        } else if let Some(idx) = rest.find("\n\n") {
-            hdr_block = &rest[..idx];
-            rest = &rest[idx + 2..];
+    let mut off = 0usize;
+    let mut hdr_bytes: &[u8] = &[];
+    while raw_bytes[off..].starts_with(b"HTTP/") {
+        if let Some(idx) = raw_bytes[off..].windows(4).position(|w| w == b"\r\n\r\n") {
+            hdr_bytes = &raw_bytes[off..off + idx];
+            off += idx + 4;
+        } else if let Some(idx) = raw_bytes[off..].windows(2).position(|w| w == b"\n\n") {
+            hdr_bytes = &raw_bytes[off..off + idx];
+            off += idx + 2;
         } else {
             break;
         }
     }
-    let body_raw = rest;
+    let hdr_block = String::from_utf8_lossy(hdr_bytes);
     let mut status = 0u16;
     let mut ct = String::new();
+    let mut is_chunked = false;
     let mut hdrs = Vec::new();
     for (idx, ln) in hdr_block.lines().enumerate() {
         let t = ln.trim();
@@ -2014,6 +2045,10 @@ fn parse_http_wire_response(
             if let Some((k, v)) = t.split_once(':') {
                 if k.eq_ignore_ascii_case("content-type") {
                     ct = v.trim().to_string();
+                } else if k.eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked")
+                {
+                    is_chunked = true;
                 }
             }
             if hdrs.len() < 24 {
@@ -2021,6 +2056,13 @@ fn parse_http_wire_response(
             }
         }
     }
+    let raw_body_bytes = &raw_bytes[off..];
+    let decoded_body = if is_chunked {
+        decode_http_chunked_bytes(raw_body_bytes)
+    } else {
+        raw_body_bytes.to_vec()
+    };
+    let body_raw = String::from_utf8_lossy(&decoded_body).into_owned();
     let preview: String = if body_raw.len() > 2400 {
         format!(
             "{}...\n[truncated: {}B total]",
@@ -2028,7 +2070,7 @@ fn parse_http_wire_response(
             body_raw.len()
         )
     } else {
-        body_raw.to_string()
+        body_raw.clone()
     };
     (
         HttpProbeResult {
@@ -2041,7 +2083,7 @@ fn parse_http_wire_response(
             body_preview: preview,
             error: String::new(),
         },
-        body_raw.to_string(),
+        body_raw,
     )
 }
 
@@ -3723,5 +3765,20 @@ mod tests {
         assert!(flow_diff.possible_bypass);
         assert!(flow_diff.added_paths.contains(&"extra".to_string()));
         assert!(flow_diff.changed_paths.contains(&"role".to_string()));
+    }
+
+    #[test]
+    fn race_wire_parser_decodes_chunked_json_and_ipv6_portless_target() {
+        let (sa, hp, path) = parse_plain_http_target("http://[::1]/api/race").unwrap();
+        assert_eq!(sa.port(), 80);
+        assert_eq!(hp, "[::1]");
+        assert_eq!(path, "/api/race");
+
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n12\r\n{\"id\":\"ok_1\",\"n\":1\r\n2\r\n}\n\r\n0\r\n\r\n";
+        let (res, raw_b) = parse_http_wire_response("POST", "http://[::1]/api/race", wire, 3.0);
+        assert_eq!(res.status, 200);
+        assert_eq!(raw_b.trim(), r#"{"id":"ok_1","n":1}"#);
+        let sel = extract_json_select(&raw_b, "id").expect("select json from decoded chunk");
+        assert_eq!(sel, "ok_1");
     }
 }
