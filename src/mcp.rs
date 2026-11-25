@@ -38,6 +38,10 @@ fn mcp_tools_schema() -> Value {
                     "cert": { "type": "boolean", "description": "X.509 PEM/DER inspector" },
                     "proto": { "type": "boolean", "description": "Raw protobuf wire decoder" },
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML routes, sinks & origins" },
+                    "mutating_only": { "type": "boolean", "description": "Filter --routes to POST/PUT/PATCH/DELETE, mutations & WS emits with body_keys" },
+                    "asar_surface": { "type": "boolean", "description": "Compact Electron .asar security surface extractor (minified flags, IPC channels, sinks & .unpacked)" },
+                    "ioctl": { "type": "boolean", "description": "Extract PE/driver Windows CTL_CODE IOCTLs, IAT XREFs & exports" },
+                    "pipes": { "type": "boolean", "description": "Extract binary ASCII/UTF-16LE \\\\.\\pipe\\* and \\Device\\* / \\DosDevices\\* artifacts + XREFs" },
                     "candidates": { "type": "boolean", "description": "Spotlight synthesized --race/--flow probe candidates" },
                     "jwt": { "type": "boolean", "description": "Decode JWT header/claims & posture" },
                     "secrets": { "type": "boolean", "description": "Scan redacted hardcoded keys/tokens" },
@@ -306,7 +310,11 @@ fn mcp_tools_schema() -> Value {
                 "eval": { "type": "string", "description": "JavaScript expression to evaluate (awaits Promises)" },
                 "watch_ms": { "type": "integer", "description": "Optional non-blocking bounded event watch window in ms (captures async console logs & network responses)" },
                 "audit": { "type": "boolean", "description": "Run live DOM layout/overflow/overlap check" },
-                "screenshot": { "type": "string", "description": "Optional PNG screenshot output path" }
+                "screenshot": { "type": "string", "description": "Optional PNG screenshot output path" },
+                "export_role": { "description": "Export cookies + localStorage/sessionStorage auth/CSRF headers into ap_http roles_matrix schema (boolean or port integer)" },
+                "role_name": { "type": "string", "description": "Role name for export_role (default: 'role1')" },
+                "origin": { "type": "string", "description": "Origin filter for export_role" },
+                "redact": { "type": "boolean", "description": "Redact exported secret values for logs" }
             }
         }
     },
@@ -340,6 +348,7 @@ fn mcp_tools_schema() -> Value {
                 "role_vars": { "type": "array", "description": "Per-role vars e.g. ['owner:id=101','other:id=102']", "items": { "type": "string" } },
                 "methods": { "type": "string", "description": "Comma-separated methods for roles_matrix (e.g. 'GET,POST,DELETE')" },
                 "cross_id": { "type": "boolean", "description": "Expand cross-tenant (actor, target_owner) matrix cells" },
+                "vary_json_field": { "type": "string", "description": "JSON body key name(s) rewritten via target owner role_vars in roles_matrix" },
                 "sentinels": { "type": "array", "description": "Sentinel strings flagged if leaked", "items": { "type": "string" } },
                 "timeout": { "type": "integer", "description": "Timeout sec (default: 15)" },
                 "insecure": { "type": "boolean", "description": "Skip TLS verify (-k)" },
@@ -385,6 +394,7 @@ fn mcp_tools_schema() -> Value {
                 "unquoted": { "type": "boolean", "description": "Audit services for unquoted space paths + writable hop dirs" },
                 "com": { "type": "boolean", "description": "Audit HKLM\\SOFTWARE\\Classes\\CLSID COM hijacks & AutoElevation" },
                 "rpc": { "type": "boolean", "description": "Enumerate live Windows RPC Endpoint Mapper bindings" },
+                "non_ms": { "type": "boolean", "description": "Filter out standard Microsoft / Windows OS baseline pipes, System32 services, core COM DLLs & OS RPC bindings" },
                 "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services/COM/RPC" },
                 "max": { "type": "integer", "description": "Max entries to return (default: 60)" }
             }
@@ -1387,6 +1397,26 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push("--routes".to_string());
             }
             if args
+                .get("mutating_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--mutating-only".to_string());
+            }
+            if args
+                .get("asar_surface")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--asar-surface".to_string());
+            }
+            if args.get("ioctl").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--ioctl".to_string());
+            }
+            if args.get("pipes").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--pipes".to_string());
+            }
+            if args
                 .get("candidates")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
@@ -2268,6 +2298,36 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     cli.push(wm.to_string());
                 }
             }
+            if let Some(er) = args.get("export_role") {
+                if let Some(p) = er.as_u64() {
+                    cli.push("--export-role".into());
+                    cli.push(p.to_string());
+                } else if er.as_bool() == Some(true) {
+                    cli.push("--export-role".into());
+                } else if let Some(s) = er.as_str().filter(|s| !s.trim().is_empty()) {
+                    cli.push("--export-role".into());
+                    cli.push(s.trim().to_string());
+                }
+            }
+            if let Some(rn) = args
+                .get("role_name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--role-name".into());
+                cli.push(rn.trim().to_string());
+            }
+            if let Some(org) = args
+                .get("origin")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--origin".into());
+                cli.push(org.trim().to_string());
+            }
+            if args.get("redact").and_then(Value::as_bool).unwrap_or(false) {
+                cli.push("--redact".into());
+            }
             run_self_captured(&cli, eval_stdin_payload)
         }
         "ap_http" => {
@@ -2440,6 +2500,15 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             {
                 cli.push("--cross-id".into());
             }
+            if let Some(vjf) = args
+                .get("vary_json_field")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                cli.push("--vary-json-field".into());
+                cli.push(vjf.to_string());
+            }
             if let Some(rm) = args
                 .get("roles_matrix")
                 .and_then(Value::as_str)
@@ -2562,6 +2631,9 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             if args.get("rpc").and_then(Value::as_bool) == Some(true) {
                 cli.push("--rpc".into());
+            }
+            if args.get("non_ms").and_then(Value::as_bool) == Some(true) {
+                cli.push("--non-ms".into());
             }
             if let Some(fl) = args
                 .get("filter")

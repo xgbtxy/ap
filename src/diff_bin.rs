@@ -73,11 +73,6 @@ pub fn run_diff_paths(
     let new_norm = crate::ls::normalize_cli_path(new_raw);
     let old_p = Path::new(&old_norm);
     let new_p = Path::new(&new_norm);
-    let old_bytes =
-        fs::read(old_p).map_err(|e| format!("[ap diff] failed to read old `{old_raw}`: {e}"))?;
-    let new_bytes =
-        fs::read(new_p).map_err(|e| format!("[ap diff] failed to read new `{new_raw}`: {e}"))?;
-
     let new_ext = new_p
         .extension()
         .and_then(|e| e.to_str())
@@ -93,6 +88,23 @@ pub fn run_diff_paths(
     } else {
         old_ext.as_str()
     };
+
+    if eff_ext == "asar" && old_p.is_file() && new_p.is_file() {
+        let (md, jv) = crate::binary::diff_asar_files_streaming(
+            new_p,
+            old_p,
+            &new_norm,
+            &old_norm,
+            deep,
+            max_items.clamp(1, 100),
+        )?;
+        return Ok((md, bound_diff_json(jv, 16_000)));
+    }
+
+    let old_bytes =
+        fs::read(old_p).map_err(|e| format!("[ap diff] failed to read old `{old_raw}`: {e}"))?;
+    let new_bytes =
+        fs::read(new_p).map_err(|e| format!("[ap diff] failed to read new `{new_raw}`: {e}"))?;
 
     if !crate::binary::is_binary_magic(&new_bytes) && !crate::binary::is_binary_magic(&old_bytes) {
         if let (Ok(new_v), Ok(old_v)) = (

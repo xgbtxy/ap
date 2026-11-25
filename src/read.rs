@@ -107,6 +107,18 @@ struct ReadCli {
     /// Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins
     #[arg(long)]
     routes: bool,
+    /// When used with `--routes`, keep ONLY state-mutating routes (POST/PUT/PATCH/DELETE, mutations, WS emits) with extracted body keys
+    #[arg(long = "mutating-only")]
+    mutating_only: bool,
+    /// Compact Electron `.asar` security surface extractor (handles minified `!0`/`!1` flags, IPC channels, sinks & `.asar.unpacked`)
+    #[arg(long = "asar-surface")]
+    asar_surface: bool,
+    /// Extract PE/driver Windows `CTL_CODE` IOCTL constants, dangerous IOCTL/memory IAT XREFs & exports
+    #[arg(long)]
+    ioctl: bool,
+    /// Extract binary ASCII & UTF-16LE named-pipe (`\\.\pipe\*`) and Windows device/DOS device (`\Device\*`, `\DosDevices\*`) artifacts + XREFs
+    #[arg(long)]
+    pipes: bool,
     /// Spotlight synthesized `--race` and multi-step `--flow` probe candidates extracted from routes/HAR/archives
     #[arg(long)]
     candidates: bool,
@@ -629,7 +641,11 @@ fn parse_line_window(spec: &str, total: usize) -> Option<(usize, usize)> {
     let norm = spec.trim().replace(':', "-");
     let (a, b) = norm.split_once('-')?;
     let s = a.trim().parse::<usize>().ok()?.max(1);
-    let e = b.trim().parse::<usize>().ok()?.max(s).min(total.max(1));
+    let b_num = b.trim().parse::<usize>().ok()?;
+    if total == 0 {
+        return Some((1, 0));
+    }
+    let e = b_num.max(s).min(total);
     Some((s, e))
 }
 
@@ -1191,10 +1207,11 @@ fn read_single_target(
                     let norm_old = crate::ls::normalize_cli_path(s);
                     std::path::PathBuf::from(norm_old)
                 });
-                let (mut rendered, jv_inner) = crate::inspect::extract_js_dir_routes_md(
+                let (mut rendered, jv_inner) = crate::inspect::extract_js_dir_routes_md_opts(
                     p,
                     cli.query.as_deref(),
                     old_path.as_deref(),
+                    cli.mutating_only,
                 )?;
                 if cli.candidates {
                     rendered = crate::inspect::render_candidates_focus_md(&jv_inner, target);
@@ -1234,10 +1251,44 @@ fn read_single_target(
             .unwrap_or("")
             .to_ascii_lowercase();
         let lbl = p.to_string_lossy().replace('\\', "/");
+        if !cli.hex && !cli.routes && cli.entry.is_none() && ext_s == "asar" {
+            if let Some(ref old_path_str) = cli.diff {
+                let norm_old = crate::ls::normalize_cli_path(old_path_str);
+                let old_p = Path::new(&norm_old);
+                if old_p.is_file()
+                    && old_p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("asar"))
+                {
+                    let (rendered, mut diff_jv) = crate::binary::diff_asar_files_streaming(
+                        p, old_p, &lbl, &norm_old, true, 25,
+                    )
+                    .map_err(|e| (1, format!("[ap read --diff] {e}")))?;
+                    record_event(
+                        "read",
+                        p.metadata().map(|m| m.len()).unwrap_or(0)
+                            + old_p.metadata().map(|m| m.len()).unwrap_or(0),
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        "asar-diff",
+                    );
+                    if let Some(obj) = diff_jv.as_object_mut() {
+                        obj.insert("format".to_string(), json!("binary-diff"));
+                        obj.insert("target".to_string(), json!(lbl));
+                        if !cli.json {
+                            obj.insert("content".to_string(), json!(rendered));
+                        }
+                    }
+                    return Ok((rendered, diff_jv));
+                }
+            }
+        }
         if !cli.hex
             && cli.diff.is_none()
             && cli.entry.is_none()
-            && (cli.surface || cli.routes)
+            && (cli.asar_surface || cli.surface || cli.routes)
             && matches!(
                 ext_s.as_str(),
                 "asar" | "zip" | "vsix" | "jar" | "war" | "ear" | "apk" | "whl"
@@ -1245,13 +1296,24 @@ fn read_single_target(
         {
             let mut f = fs::File::open(p)
                 .map_err(|e| (1, format!("[ap read] failed to open `{target}`: {e}")))?;
-            let (mut rendered, mut jv) = crate::binary::inspect_archive_surface_reader(
-                &mut f,
-                &ext_s,
-                &lbl,
-                cli.routes,
-                cli.query.as_deref(),
-            )
+            let (mut rendered, mut jv) = if cli.asar_surface {
+                crate::binary::inspect_asar_surface_compact_reader(
+                    &mut f,
+                    &ext_s,
+                    &lbl,
+                    Some(p),
+                    cli.routes,
+                    cli.query.as_deref(),
+                )
+            } else {
+                crate::binary::inspect_archive_surface_reader(
+                    &mut f,
+                    &ext_s,
+                    &lbl,
+                    cli.routes,
+                    cli.query.as_deref(),
+                )
+            }
             .map_err(|e| (1, format!("[ap read --surface] {e}")))?;
             if cli.candidates {
                 rendered = crate::inspect::render_candidates_focus_md(&jv, &lbl);
@@ -1262,10 +1324,19 @@ fn read_single_target(
                 rendered.len() as u64,
                 0,
                 1,
-                "archive-surface",
+                if cli.asar_surface {
+                    "asar-surface"
+                } else {
+                    "archive-surface"
+                },
             );
             if let Some(m) = jv.as_object_mut() {
-                m.insert("content".to_string(), json!(rendered));
+                if cli.asar_surface && cli.json {
+                    let first_ln = rendered.lines().next().unwrap_or("").to_string();
+                    m.insert("summary".to_string(), json!(first_ln));
+                } else {
+                    m.insert("content".to_string(), json!(rendered));
+                }
             }
             return Ok((rendered, jv));
         } else if !cli.hex
@@ -1648,10 +1719,11 @@ fn read_single_target(
             let norm_old = crate::ls::normalize_cli_path(old_path_str);
             let old_p = Path::new(&norm_old);
             if old_p.is_dir() {
-                crate::inspect::extract_js_dir_routes_md(
+                crate::inspect::extract_js_dir_routes_md_opts(
                     Path::new(&target),
                     cli.query.as_deref(),
                     Some(old_p),
+                    cli.mutating_only,
                 )
                 .map(|(m, j)| (m, j, "js-routes"))?
             } else {
@@ -1662,18 +1734,23 @@ fn read_single_target(
                     )
                 })?;
                 let (old_txt, _, _) = decode_any_bytes(&old_bytes);
-                let (j_md, j_jv) = crate::inspect::extract_js_routes_diff_md(
+                let (j_md, j_jv) = crate::inspect::extract_js_routes_diff_md_opts(
                     &decoded_txt,
                     &label,
                     cli.query.as_deref(),
                     &old_txt,
                     old_path_str,
+                    cli.mutating_only,
                 );
                 (j_md, j_jv, "js-routes")
             }
         } else {
-            let (j_md, j_jv) =
-                crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());
+            let (j_md, j_jv) = crate::inspect::extract_js_routes_md_opts(
+                &decoded_txt,
+                &label,
+                cli.query.as_deref(),
+                cli.mutating_only,
+            );
             (j_md, j_jv, "js-routes")
         };
         if cli.candidates {
@@ -1874,6 +1951,31 @@ fn read_single_target(
                     | "pyc"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
+                if cli.ioctl || cli.pipes {
+                    format_tag = "binary-ioctl-pipes";
+                    let (rendered, mut jv) = crate::binary::inspect_pe_ioctl_and_pipes(
+                        &raw_bytes,
+                        &label,
+                        cli.ioctl,
+                        cli.pipes,
+                        cli.query.as_deref(),
+                    );
+                    record_event(
+                        "read",
+                        raw_bytes.len() as u64,
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        format_tag,
+                    );
+                    if let Some(m) = jv.as_object_mut() {
+                        m.insert("format_tag".to_string(), json!(format_tag));
+                        if !cli.json {
+                            m.insert("content".to_string(), json!(rendered));
+                        }
+                    }
+                    return Ok((rendered, jv));
+                }
                 if cli.surface {
                     format_tag = "binary-surface";
                     let surf_json = crate::binary::inspect_binary_surface(&raw_bytes);
@@ -2174,10 +2276,18 @@ fn read_single_target(
             };
             let s = s_ln.max(1);
             let e = e_ln.min(total_lines);
-            let slice = (s..=e)
-                .map(|ln| format!("{ln:5}: {}", all_lines[ln - 1]))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let slice = if total_lines == 0 || s > e {
+                String::new()
+            } else {
+                (s..=e)
+                    .filter_map(|ln| {
+                        ln.checked_sub(1)
+                            .and_then(|idx| all_lines.get(idx))
+                            .map(|line| format!("{ln:5}: {line}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             blocks.push(format!("## {kind} {qual} [L{s}-L{e}]\n{slice}"));
         }
         format!(
@@ -2249,10 +2359,18 @@ fn read_single_target(
             .collect();
         if parts.len() <= 1 {
             if let Some((s, e)) = parse_line_window(lspec, total_lines) {
-                let slice = (s..=e)
-                    .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let slice = if total_lines == 0 || s > e {
+                    "*(empty)*".to_string()
+                } else {
+                    (s..=e)
+                        .filter_map(|ln| {
+                            ln.checked_sub(1)
+                                .and_then(|idx| all_lines.get(idx))
+                                .map(|line| format!("{ln:5}: {}", cap_line_width(line, cli.width)))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 format!("# READ `{label}` [L{s}-L{e} of {total_lines} | {format_tag}]\n{slice}")
             } else {
                 return Err((
@@ -2269,10 +2387,18 @@ fn read_single_target(
                         format!("[ap read] invalid --lines range `{p}` in `{lspec}`"),
                     ));
                 };
-                let slice = (s..=e)
-                    .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let slice = if total_lines == 0 || s > e {
+                    "*(empty)*".to_string()
+                } else {
+                    (s..=e)
+                        .filter_map(|ln| {
+                            ln.checked_sub(1)
+                                .and_then(|idx| all_lines.get(idx))
+                                .map(|line| format!("{ln:5}: {}", cap_line_width(line, cli.width)))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 blocks.push(format!("## L{s}-L{e}\n{slice}"));
             }
             format!(
@@ -2291,7 +2417,11 @@ fn read_single_target(
             let s = total_lines.saturating_sub(tail_n) + 1;
             let e = total_lines;
             let slice = (s..=e)
-                .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
+                .filter_map(|ln| {
+                    ln.checked_sub(1)
+                        .and_then(|idx| all_lines.get(idx))
+                        .map(|line| format!("{ln:5}: {}", cap_line_width(line, cli.width)))
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             format!("# READ `{label}` [L{s}-L{e} of {total_lines} | {format_tag}]\n{slice}")
@@ -2353,8 +2483,10 @@ fn read_single_target(
                     let s = idx.saturating_sub(ctx_n);
                     let e = (idx + ctx_n).min(total_lines.saturating_sub(1));
                     let ctx = (s..=e)
-                        .map(|k| {
-                            format!("  {}: {}", k + 1, cap_line_width(all_lines[k], cli.width))
+                        .filter_map(|k| {
+                            all_lines.get(k).map(|line| {
+                                format!("  {}: {}", k + 1, cap_line_width(line, cli.width))
+                            })
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -2448,7 +2580,11 @@ fn read_single_target(
         };
         let head_n = 45.min(total_lines);
         let head_s = (1..=head_n)
-            .map(|ln| format!("{ln:5}: {}", cap_line_width(all_lines[ln - 1], cli.width)))
+            .filter_map(|ln| {
+                ln.checked_sub(1)
+                    .and_then(|idx| all_lines.get(idx))
+                    .map(|line| format!("{ln:5}: {}", cap_line_width(line, cli.width)))
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let tip = if is_ast_code {

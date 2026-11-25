@@ -1258,9 +1258,8 @@ fn flatten_json_paths(
         }
         Value::Array(arr) => {
             if arr.is_empty() {
-                if !prefix.is_empty() {
-                    out.insert(prefix.to_string(), Value::Array(Vec::new()));
-                }
+                let key = if prefix.is_empty() { "$" } else { prefix };
+                out.insert(key.to_string(), Value::Array(Vec::new()));
                 return;
             }
             for (idx, item) in arr.iter().take(16).enumerate() {
@@ -1384,6 +1383,7 @@ pub(crate) fn classify_auth_matrix_diff_deep_bodies(
     let mut added_paths = Vec::new();
     let mut removed_paths = Vec::new();
     let mut changed_paths = Vec::new();
+
     if !base_paths.is_empty() && !cand_paths.is_empty() {
         for (k, bv) in &base_paths {
             match cand_paths.get(k) {
@@ -1418,6 +1418,44 @@ pub(crate) fn classify_auth_matrix_diff_deep_bodies(
                 cand.status,
                 sentinel_hits.join(", ")
             ),
+            shared_nonempty_paths,
+            added_paths,
+            removed_paths,
+            changed_paths,
+            sentinel_hits,
+        };
+    }
+
+    if (300..400).contains(&cand.status) {
+        let loc = cand
+            .headers
+            .iter()
+            .find_map(|h| {
+                h.split_once(':').and_then(|(k, v)| {
+                    k.trim()
+                        .eq_ignore_ascii_case("location")
+                        .then_some(v.trim())
+                })
+            })
+            .unwrap_or("");
+        let loc_low = loc.to_ascii_lowercase();
+        let is_login_redir = ["login", "signin", "sign-in", "auth", "sso", "oauth"]
+            .iter()
+            .any(|kw| loc_low.contains(kw));
+        let verdict = if is_login_redir {
+            "AUTH_REDIRECT_LOGIN"
+        } else {
+            "REDIRECT_3XX"
+        };
+        let loc_note = if loc.is_empty() {
+            String::new()
+        } else {
+            format!(" -> Location: {loc}")
+        };
+        return HttpDiffReport {
+            verdict: verdict.to_string(),
+            possible_bypass: false,
+            reason: format!("redirected with HTTP {}{loc_note}", cand.status),
             shared_nonempty_paths,
             added_paths,
             removed_paths,
@@ -1475,6 +1513,33 @@ pub(crate) fn classify_auth_matrix_diff_deep_bodies(
                 sentinel_hits,
             };
         }
+    }
+
+    let trimmed_cand = cand.body_preview.trim_start();
+    let looks_html_or_nonjson = !trimmed_cand.starts_with('{') && !trimmed_cand.starts_with('[');
+    if looks_html_or_nonjson
+        && (low_body.contains("<form")
+            || low_body.contains("<html")
+            || low_body.contains("<!doctype"))
+        && (low_body.contains("type=\"password\"")
+            || low_body.contains("type='password'")
+            || low_body.contains("name=\"password\"")
+            || (low_body.contains("login") && low_body.contains("password"))
+            || (low_body.contains("sign in") && low_body.contains("password")))
+    {
+        return HttpDiffReport {
+            verdict: "LOGIN_HTML".to_string(),
+            possible_bypass: false,
+            reason: format!(
+                "HTTP {} returned an HTML login shell instead of protected data",
+                cand.status
+            ),
+            shared_nonempty_paths,
+            added_paths,
+            removed_paths,
+            changed_paths,
+            sentinel_hits,
+        };
     }
 
     if !base_paths.is_empty() && !cand_paths.is_empty() {
@@ -1970,6 +2035,78 @@ fn render_template_vars(raw: &str, vars: &std::collections::BTreeMap<String, Str
     s
 }
 
+fn rewrite_json_key_recursive(
+    v: &mut Value,
+    fields: &[String],
+    vars: &std::collections::BTreeMap<String, String>,
+) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                let matched_var = fields
+                    .iter()
+                    .find(|f| f.as_str() == k.as_str())
+                    .and_then(|f| {
+                        vars.get(f).or_else(|| {
+                            if vars.len() == 1 {
+                                vars.values().next()
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                if let Some(new_raw) = matched_var {
+                    *val = if val.is_i64() || val.is_u64() {
+                        new_raw
+                            .parse::<i64>()
+                            .map(Value::from)
+                            .unwrap_or_else(|_| Value::String(new_raw.clone()))
+                    } else if val.is_f64() {
+                        new_raw
+                            .parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                            .map(Value::Number)
+                            .unwrap_or_else(|| Value::String(new_raw.clone()))
+                    } else if val.is_boolean() {
+                        new_raw
+                            .parse::<bool>()
+                            .map(Value::Bool)
+                            .unwrap_or_else(|_| Value::String(new_raw.clone()))
+                    } else {
+                        Value::String(new_raw.clone())
+                    };
+                } else {
+                    rewrite_json_key_recursive(val, fields, vars);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                rewrite_json_key_recursive(item, fields, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_role_vars_to_body(
+    raw_body: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+    vary_json_fields: &[String],
+) -> String {
+    let rendered = render_template_vars(raw_body, vars);
+    if vary_json_fields.is_empty() || vars.is_empty() {
+        return rendered;
+    }
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(rendered.trim()) {
+        rewrite_json_key_recursive(&mut parsed, vary_json_fields, vars);
+        serde_json::to_string(&parsed).unwrap_or(rendered)
+    } else {
+        rendered
+    }
+}
+
 fn is_write_method(m: &str) -> bool {
     matches!(
         m.trim().to_ascii_uppercase().as_str(),
@@ -2000,6 +2137,7 @@ pub fn evaluate_http_roles_matrix(
     principals: &[String],
     principal_cdps: &[String],
     role_vars: &[String],
+    vary_json_fields: &[String],
     cross_id: bool,
     rate_ms: u64,
     max_variants: usize,
@@ -2277,7 +2415,9 @@ pub fn evaluate_http_roles_matrix(
         for target_owner in &owner_roles {
             let tvars = &role_map[target_owner].vars;
             let cell_url = render_template_vars(&base_url, tvars);
-            let cell_body = base_body.as_ref().map(|b| render_template_vars(b, tvars));
+            let cell_body = base_body
+                .as_ref()
+                .map(|b| apply_role_vars_to_body(b, tvars, vary_json_fields));
             for actor in &role_order {
                 let rspec = &role_map[actor];
                 let strip_auth = rspec.headers.is_empty();
@@ -2480,6 +2620,7 @@ pub fn evaluate_http_roles_matrix(
         if !is_self && (200..300).contains(&ex.result.status) {
             let low_body = ex.raw_body.to_ascii_lowercase();
             let app_denied = diff_rep.verdict == "PSEUDO_DENIAL_200"
+                || diff_rep.verdict == "LOGIN_HTML"
                 || low_body.contains("\"success\":false")
                 || low_body.contains("\"ok\":false")
                 || low_body.contains("\"code\":401")
@@ -2566,6 +2707,7 @@ pub fn run_http_roles_matrix(
     principals: &[String],
     principal_cdps: &[String],
     role_vars: &[String],
+    vary_json_fields: &[String],
     cross_id: bool,
     rate_ms: u64,
     max_variants: usize,
@@ -2587,6 +2729,7 @@ pub fn run_http_roles_matrix(
         principals,
         principal_cdps,
         role_vars,
+        vary_json_fields,
         cross_id,
         rate_ms,
         max_variants,
@@ -4570,6 +4713,7 @@ mod tests {
             &principals,
             &[],
             &role_vars,
+            &[],
             true,
             0,
             24,

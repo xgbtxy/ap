@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const DEFAULT_MAX_STORE_BYTES: u64 = 50 * 1024 * 1024;
+pub const DEFAULT_MAX_STORE_BYTES: u64 = 18 * 1024 * 1024;
 pub const PASSTHROUGH_BYTES: usize = 1200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,7 +197,6 @@ fn index_archive(store: &Path, item_id: &str, label: &str, raw_text: &str) {
         let _ = conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(id UNINDEXED, label, content);",
         );
-        let _ = conn.execute("DELETE FROM chunks WHERE id = ?1", params![item_id]);
         if conn
             .execute(
                 "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
@@ -214,13 +213,79 @@ fn index_archive(store: &Path, item_id: &str, label: &str, raw_text: &str) {
     }
 }
 
+fn delete_chunk_ids(conn: &Connection, ids: &[String]) {
+    for chunk in ids.chunks(64) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM chunks WHERE id IN ({placeholders})");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let params_iter = chunk.iter().map(|s| s as &dyn rusqlite::ToSql);
+            let _ = stmt.execute(rusqlite::params_from_iter(params_iter));
+        }
+    }
+}
+
+fn rebuild_fts_from_surviving(
+    conn: &Connection,
+    store: &Path,
+    surviving_ids: &std::collections::HashSet<String>,
+) {
+    let _ = conn.execute_batch(
+        "DROP TABLE IF EXISTS chunks;\
+         CREATE VIRTUAL TABLE chunks USING fts5(id UNINDEXED, label, content);",
+    );
+    if let Ok(tx) = conn.unchecked_transaction() {
+        for id in surviving_ids {
+            let raw_p = store.join(format!("{id}.raw"));
+            let meta_p = store.join(format!("{id}.meta.json"));
+            let label = fs::read_to_string(&meta_p)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.get("label").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_else(|| "archive".to_string());
+            if let Ok(raw_text) = fs::read_to_string(&raw_p) {
+                let _ = tx.execute(
+                    "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
+                    params![id, label, raw_text],
+                );
+            }
+        }
+        let _ = tx.commit();
+    }
+}
+
+fn collect_orphan_chunk_ids(
+    conn: &Connection,
+    surviving_ids: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut orphans = Vec::new();
+    if let Ok(mut st) = conn.prepare("SELECT id FROM chunks") {
+        if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
+            for id in rows.flatten() {
+                if !surviving_ids.contains(&id) {
+                    orphans.push(id);
+                }
+            }
+        }
+    }
+    orphans
+}
+
 fn prune_ring_buffer(store: &Path, max_bytes: u64) {
     let Ok(rd) = fs::read_dir(store) else { return };
-    let mut raw_files: Vec<(u64, u64, PathBuf)> = Vec::new();
+    let mut raw_files: Vec<(u64, u64, String, PathBuf)> = Vec::new();
     let mut total = 0u64;
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) == Some("raw") {
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+                continue;
+            };
             if let Ok(meta) = entry.metadata() {
                 let sz = meta.len();
                 let mtime = meta
@@ -230,18 +295,34 @@ fn prune_ring_buffer(store: &Path, max_bytes: u64) {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 total += sz;
-                raw_files.push((mtime, sz, p));
+                raw_files.push((mtime, sz, stem, p));
             }
         }
     }
     raw_files.sort_by_key(|x| x.0);
     let mut idx = 0usize;
-    while total > max_bytes && raw_files.len().saturating_sub(idx) > 1 {
-        let (_, sz, ref victim) = raw_files[idx];
+    let mut removed_ids: Vec<String> = Vec::new();
+    // Bound synchronous eviction per hot-path call so huge backlogs drain incrementally without stalling.
+    while total > max_bytes && raw_files.len().saturating_sub(idx) > 1 && removed_ids.len() < 32 {
+        let (_, sz, ref stem, ref victim) = raw_files[idx];
         let _ = fs::remove_file(victim);
         let _ = fs::remove_file(victim.with_extension("meta.json"));
+        removed_ids.push(stem.clone());
         total = total.saturating_sub(sz);
         idx += 1;
+    }
+
+    if removed_ids.is_empty() {
+        return;
+    }
+    let db_path = store.join("index.sqlite");
+    if !db_path.is_file() {
+        return;
+    }
+    // Synchronously delete evicted IDs from FTS5 so pages are freed for reuse in <1ms without
+    // stalling the sub-20ms archive hot path; physical shrinkage runs via `ap sieve prune --vacuum`.
+    if let Ok(conn) = open_sieve_db(&db_path) {
+        delete_chunk_ids(&conn, &removed_ids);
     }
 }
 
@@ -313,10 +394,27 @@ pub fn prune_store(
         }
     }
 
-    // Evict oldest non-expired items until kept_bytes <= max_bytes (or empty if max_bytes == 0)
+    let db_path = store.join("index.sqlite");
+    let db_bytes_before = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let effective_raw_cap = if max_bytes == 0 {
+        0
+    } else if db_bytes_before > max_bytes && kept_bytes > 0 {
+        let ratio_cap = ((kept_bytes as u128 * max_bytes as u128 / db_bytes_before.max(1) as u128)
+            * 75
+            / 100) as u64;
+        max_bytes.min(ratio_cap.max(max_bytes / 4))
+    } else {
+        max_bytes
+    };
+
+    let mut surviving_ids = std::collections::HashSet::new();
+    let mut surviving_list: Vec<(u64, String, PathBuf)> = Vec::new();
+    // Evict oldest non-expired items until kept_bytes <= effective_raw_cap (guaranteeing index.sqlite <= max_bytes)
     for (_, sz, id, raw_p) in remaining {
-        if kept_bytes <= max_bytes {
-            break;
+        if kept_bytes <= effective_raw_cap && (max_bytes > 0 || effective_raw_cap > 0) {
+            surviving_ids.insert(id.clone());
+            surviving_list.push((sz, id, raw_p));
+            continue;
         }
         let _ = fs::remove_file(&raw_p);
         let _ = fs::remove_file(store.join(format!("{id}.meta.json")));
@@ -325,22 +423,57 @@ pub fn prune_store(
         removed_ids.push(id);
     }
 
-    let db_path = store.join("index.sqlite");
-    let db_bytes_before = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let mut vacuumed = false;
     if db_path.is_file() {
         if let Ok(conn) = open_sieve_db(&db_path) {
-            for chunk in removed_ids.chunks(64) {
-                if let Ok(tx) = conn.unchecked_transaction() {
-                    for id in chunk {
-                        let _ = tx.execute("DELETE FROM chunks WHERE id = ?1", params![id]);
-                    }
-                    let _ = tx.commit();
-                }
-            }
-            if vacuum || db_bytes_before > max_bytes.max(1) {
+            let orphans = collect_orphan_chunk_ids(&conn, &surviving_ids);
+            let total_del = removed_ids.len() + orphans.len();
+            if total_del >= 100 {
+                // Dropping & rebuilding FTS5 is >50x faster than un-indexing hundreds of docs via UNINDEXED scans.
+                rebuild_fts_from_surviving(&conn, store, &surviving_ids);
                 let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
                 vacuumed = true;
+            } else {
+                if !removed_ids.is_empty() {
+                    delete_chunk_ids(&conn, &removed_ids);
+                }
+                if !orphans.is_empty() {
+                    delete_chunk_ids(&conn, &orphans);
+                }
+                if vacuum
+                    || !orphans.is_empty()
+                    || !removed_ids.is_empty()
+                    || db_bytes_before > max_bytes.max(1)
+                {
+                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+                    vacuumed = true;
+                }
+            }
+            if max_bytes > 0 {
+                for _ in 0..2 {
+                    let cur_db = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+                    if cur_db <= max_bytes || surviving_list.is_empty() {
+                        break;
+                    }
+                    let trim_n = (surviving_list.len() / 2).max(1);
+                    let mut extra_ids = Vec::with_capacity(trim_n);
+                    for (sz, id, raw_p) in surviving_list.drain(..trim_n) {
+                        let _ = fs::remove_file(&raw_p);
+                        let _ = fs::remove_file(store.join(format!("{id}.meta.json")));
+                        kept_bytes = kept_bytes.saturating_sub(sz);
+                        freed_bytes = freed_bytes.saturating_add(sz);
+                        surviving_ids.remove(&id);
+                        removed_ids.push(id.clone());
+                        extra_ids.push(id);
+                    }
+                    if extra_ids.len() >= 100 {
+                        rebuild_fts_from_surviving(&conn, store, &surviving_ids);
+                    } else {
+                        delete_chunk_ids(&conn, &extra_ids);
+                    }
+                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+                    vacuumed = true;
+                }
             }
         }
     }
@@ -371,6 +504,7 @@ fn archive_stream(
     let id = format!("{:x}", hasher.finalize())[..10].to_string();
     let raw_path = store.join(format!("{id}.raw"));
     let meta_path = store.join(format!("{id}.meta.json"));
+    let already_indexed = raw_path.is_file();
     let _ = fs::write(&raw_path, raw_text);
     let raw_lines = raw_text.lines().count();
     let meta = json!({
@@ -385,7 +519,9 @@ fn archive_stream(
     if let Ok(ms) = serde_json::to_string_pretty(&meta) {
         let _ = fs::write(&meta_path, ms);
     }
-    index_archive(store, &id, label, raw_text);
+    if !already_indexed {
+        index_archive(store, &id, label, raw_text);
+    }
     if raw_text.len() >= 16_384 || id.as_bytes().first().copied().unwrap_or(0) % 8 == 0 {
         prune_ring_buffer(store, DEFAULT_MAX_STORE_BYTES);
     }

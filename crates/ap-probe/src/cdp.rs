@@ -1284,6 +1284,400 @@ pub fn run_cdp_diff_ports(
     }
 }
 
+fn is_loopback_cdp_host(host: &str) -> bool {
+    let host_low = host.trim().to_ascii_lowercase();
+    matches!(
+        host_low.as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
+}
+
+fn redact_header_value(hdr: &str) -> String {
+    let Some((k, v)) = hdr.split_once(':') else {
+        return "***".to_string();
+    };
+    let val = v.trim();
+    if val.len() <= 8 {
+        return format!("{k}: ***");
+    }
+    let head: String = val.chars().take(4).collect();
+    let tail: String = val
+        .chars()
+        .rev()
+        .take(3)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{k}: {head}***{tail} (len={})", val.len())
+}
+
+pub fn synthesize_role_headers_from_capture(
+    cookies: &[(String, String)],
+    storage_items: &[(String, String)],
+    meta_csrfs: &[(String, String)],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut headers: Vec<String> = Vec::new();
+    let mut auth_keys: Vec<String> = Vec::new();
+    let mut csrf_keys: Vec<String> = Vec::new();
+
+    if !cookies.is_empty() {
+        let cookie_str = cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        headers.push(format!("Cookie: {cookie_str}"));
+    }
+
+    let mut bearer_val: Option<String> = None;
+    let mut csrf_pair: Option<(String, String)> = None;
+
+    for (k, v) in storage_items {
+        let vt = v.trim();
+        if vt.is_empty() || vt.len() > 4096 || vt.contains(['\r', '\n']) {
+            continue;
+        }
+        let kl = k.to_ascii_lowercase();
+        if kl.contains("csrf") || kl.contains("xsrf") {
+            csrf_keys.push(k.clone());
+            if csrf_pair.is_none() {
+                let hdr_name = if kl.contains("xsrf") {
+                    "X-XSRF-TOKEN"
+                } else {
+                    "X-CSRF-Token"
+                };
+                csrf_pair = Some((hdr_name.to_string(), vt.to_string()));
+            }
+            continue;
+        }
+        if kl.contains("token")
+            || kl.contains("jwt")
+            || kl.contains("auth")
+            || kl.contains("bearer")
+            || kl.contains("session")
+            || kl.contains("ticket")
+        {
+            auth_keys.push(k.clone());
+            if bearer_val.is_none()
+                && (vt.starts_with("eyJ")
+                    || vt.to_ascii_lowercase().starts_with("bearer ")
+                    || vt.len() >= 12)
+            {
+                let formatted = if vt.to_ascii_lowercase().starts_with("bearer ") {
+                    vt.to_string()
+                } else {
+                    format!("Bearer {vt}")
+                };
+                bearer_val = Some(formatted);
+            }
+        }
+    }
+
+    for (k, v) in meta_csrfs {
+        let vt = v.trim();
+        if vt.is_empty() || vt.len() > 1024 || vt.contains(['\r', '\n']) {
+            continue;
+        }
+        let kl = k.to_ascii_lowercase();
+        csrf_keys.push(format!("meta:{k}"));
+        if csrf_pair.is_none() {
+            let hdr_name = if kl.contains("xsrf") {
+                "X-XSRF-TOKEN"
+            } else {
+                "X-CSRF-Token"
+            };
+            csrf_pair = Some((hdr_name.to_string(), vt.to_string()));
+        }
+    }
+
+    for (ck, cv) in cookies {
+        let kl = ck.to_ascii_lowercase();
+        let vt = cv.trim();
+        if (kl.contains("csrf") || kl.contains("xsrf"))
+            && !vt.is_empty()
+            && !vt.contains(['\r', '\n'])
+        {
+            csrf_keys.push(format!("cookie:{ck}"));
+            if csrf_pair.is_none() {
+                let hdr_name = if kl.contains("xsrf") {
+                    "X-XSRF-TOKEN"
+                } else {
+                    "X-CSRF-Token"
+                };
+                csrf_pair = Some((hdr_name.to_string(), vt.to_string()));
+            }
+        }
+    }
+
+    if let Some(bv) = bearer_val {
+        headers.push(format!("Authorization: {bv}"));
+    }
+    if let Some((hk, hv)) = csrf_pair {
+        headers.push(format!("{hk}: {hv}"));
+    }
+
+    (headers, auth_keys, csrf_keys)
+}
+
+/// Export live cookies, localStorage/sessionStorage auth/Bearer tokens, and CSRF tokens from an active
+/// local CDP browser session directly into the `ap probe http --roles-matrix` role schema.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cdp_export_role(
+    host: &str,
+    port: u16,
+    target_filter: Option<&str>,
+    role_name: &str,
+    origin_filter: Option<&str>,
+    include_storage: bool,
+    redact: bool,
+    as_json: bool,
+) -> i32 {
+    if !is_loopback_cdp_host(host) {
+        let err = format!("refusing CDP --export-role from non-loopback host `{host}`");
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({ "ok": false, "mode": "export_role", "error": err })
+                )
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("[probe cdp] {err}");
+        }
+        return 1;
+    }
+
+    let targets = match CdpSession::list_targets(host, port) {
+        Ok(t) => t,
+        Err(e) => {
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({ "ok": false, "mode": "export_role", "error": e })
+                    )
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("[probe cdp] {e}");
+            }
+            return 1;
+        }
+    };
+
+    let origin_low = origin_filter
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let filt_low = target_filter
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let pages: Vec<&CdpTarget> = targets
+        .iter()
+        .filter(|t| t.target_type == "page" && !t.ws_url.is_empty())
+        .collect();
+    let pool: Vec<&CdpTarget> = if pages.is_empty() {
+        targets.iter().filter(|t| !t.ws_url.is_empty()).collect()
+    } else {
+        pages
+    };
+    let chosen = pool
+        .iter()
+        .copied()
+        .find(|t| {
+            let u_low = t.url.to_ascii_lowercase();
+            let o_ok = origin_low
+                .as_ref()
+                .map(|o| u_low.contains(o))
+                .unwrap_or(true);
+            let f_ok = filt_low
+                .as_ref()
+                .map(|f| {
+                    u_low.contains(f)
+                        || t.title.to_ascii_lowercase().contains(f)
+                        || t.id.to_ascii_lowercase().contains(f)
+                })
+                .unwrap_or(true);
+            o_ok && f_ok
+        })
+        .or_else(|| pool.first().copied());
+
+    let Some(tgt) = chosen else {
+        let err = format!("no attachable page target found on CDP {host}:{port}");
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({ "ok": false, "mode": "export_role", "error": err })
+                )
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("[probe cdp] {err}");
+        }
+        return 1;
+    };
+
+    let mut sess = match CdpSession::attach(&tgt.ws_url) {
+        Ok(s) => s,
+        Err(e) => {
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({ "ok": false, "mode": "export_role", "error": e })
+                    )
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("[probe cdp] {e}");
+            }
+            return 1;
+        }
+    };
+
+    let effective_origin = origin_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let pfx = extract_origin_prefix(&tgt.url);
+            if pfx.is_empty() {
+                tgt.url.clone()
+            } else {
+                pfx
+            }
+        });
+
+    let cookie_params =
+        if effective_origin.starts_with("http://") || effective_origin.starts_with("https://") {
+            json!({ "urls": [effective_origin] })
+        } else {
+            json!({})
+        };
+    let mut cookies: Vec<(String, String)> = Vec::new();
+    if let Ok(res) = sess.call("Network.getCookies", cookie_params) {
+        if let Some(arr) = res.get("cookies").and_then(Value::as_array) {
+            for c in arr {
+                let name = c.get("name").and_then(Value::as_str).unwrap_or("").trim();
+                let val = c.get("value").and_then(Value::as_str).unwrap_or("");
+                if !name.is_empty()
+                    && !name.contains(['\r', '\n', ';', '='])
+                    && !val.contains(['\r', '\n'])
+                {
+                    cookies.push((name.to_string(), val.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut storage_items: Vec<(String, String)> = Vec::new();
+    let mut meta_csrfs: Vec<(String, String)> = Vec::new();
+    if include_storage {
+        let js = r#"(() => {
+            const keyRe = /(?:token|jwt|auth|bearer|csrf|xsrf|session|ticket)/i;
+            const storage = [];
+            for (const [scope, st] of [['localStorage', window.localStorage], ['sessionStorage', window.sessionStorage]]) {
+                try {
+                    if (!st) continue;
+                    for (let i = 0; i < st.length; i++) {
+                        const k = st.key(i);
+                        if (!k || !keyRe.test(k)) continue;
+                        const v = st.getItem(k);
+                        if (typeof v === 'string' && v.length > 0 && v.length <= 4096) {
+                            storage.push([scope + '.' + k, v]);
+                        }
+                    }
+                } catch {}
+            }
+            const metas = [];
+            try {
+                for (const m of document.querySelectorAll('meta[name*="csrf" i], meta[name*="xsrf" i]')) {
+                    const nm = m.getAttribute('name') || 'csrf-token';
+                    const ct = m.getAttribute('content') || '';
+                    if (ct) metas.push([nm, ct]);
+                }
+            } catch {}
+            return JSON.stringify({ storage, metas, origin: location.origin });
+        })()"#;
+        if let Ok(raw_s) = sess.eval_js(js) {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw_s) {
+                if let Some(arr) = v.get("storage").and_then(Value::as_array) {
+                    for pair in arr {
+                        if let (Some(k), Some(val)) = (
+                            pair.get(0).and_then(Value::as_str),
+                            pair.get(1).and_then(Value::as_str),
+                        ) {
+                            storage_items.push((k.to_string(), val.to_string()));
+                        }
+                    }
+                }
+                if let Some(arr) = v.get("metas").and_then(Value::as_array) {
+                    for pair in arr {
+                        if let (Some(k), Some(val)) = (
+                            pair.get(0).and_then(Value::as_str),
+                            pair.get(1).and_then(Value::as_str),
+                        ) {
+                            meta_csrfs.push((k.to_string(), val.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (raw_headers, storage_auth_keys, csrf_tokens) =
+        synthesize_role_headers_from_capture(&cookies, &storage_items, &meta_csrfs);
+    let out_headers: Vec<String> = if redact {
+        raw_headers.iter().map(|h| redact_header_value(h)).collect()
+    } else {
+        raw_headers
+    };
+    let clean_role = if role_name.trim().is_empty() {
+        "role1"
+    } else {
+        role_name.trim()
+    };
+
+    let out = json!({
+        "ok": true,
+        "mode": "export_role",
+        "origin": effective_origin,
+        "cdp_port": port,
+        "target_url": tgt.url,
+        "redacted": redact,
+        "role": {
+            "name": clean_role,
+            "headers": out_headers,
+            "cdp_port": port,
+            "cookie_count": cookies.len(),
+            "storage_auth_keys": storage_auth_keys,
+            "csrf_tokens": csrf_tokens,
+        },
+        "matrix_snippet": {
+            "roles": [
+                {
+                    "name": clean_role,
+                    "headers": out_headers,
+                }
+            ]
+        }
+    });
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        println!(
+            "[probe cdp export-role] role=`{clean_role}` origin=`{effective_origin}` cookies={} headers={} storage_keys={:?}",
+            cookies.len(),
+            out_headers.len(),
+            out["role"]["storage_auth_keys"]
+        );
+    }
+    0
+}
+
 #[cfg(test)]
 mod cdp_tests {
     use super::*;

@@ -83,21 +83,20 @@ pub fn extract_service_exe_path(bin_path: &str) -> String {
         rest.split('\'').next().unwrap_or("").trim().to_string()
     } else {
         let low = s.to_ascii_lowercase();
-        let mut end = s.len();
+        let mut matched_end: Option<usize> = None;
         for ext in [".exe", ".sys", ".dll", ".bat", ".cmd"] {
             if let Some(pos) = low.find(ext) {
                 let candidate_end = pos + ext.len();
                 let next_ch = s.as_bytes().get(candidate_end).copied();
                 if next_ch.is_none() || next_ch == Some(b' ') || next_ch == Some(b'\t') {
-                    end = candidate_end;
+                    matched_end = Some(candidate_end);
                     break;
                 }
             }
         }
-        if end == s.len() {
-            s.split_whitespace().next().unwrap_or("").to_string()
-        } else {
-            s[..end].trim().to_string()
+        match matched_end {
+            Some(end) => s[..end].trim().to_string(),
+            None => s.split_whitespace().next().unwrap_or("").to_string(),
         }
     };
     let unprefixed = clean
@@ -153,6 +152,166 @@ pub fn find_unquoted_space_prefixes(bin_path: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Resolve bare system DLL names (`combase.dll`, `ole32.dll`) and common Windows env-var prefixes
+/// into concrete filesystem paths so `--com` does not emit false `missing_target` warnings.
+pub fn resolve_windows_exe_candidate(raw_exe: &str) -> String {
+    let trimmed = raw_exe.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let low = trimmed.to_ascii_lowercase();
+    let expanded = if low.starts_with("%systemroot%") {
+        format!(r"C:\Windows{}", &trimmed["%systemroot%".len()..])
+    } else if low.starts_with("%windir%") {
+        format!(r"C:\Windows{}", &trimmed["%windir%".len()..])
+    } else if low.starts_with("%programfiles(x86)%") {
+        format!(
+            r"C:\Program Files (x86){}",
+            &trimmed["%programfiles(x86)%".len()..]
+        )
+    } else if low.starts_with("%programfiles%") {
+        format!(r"C:\Program Files{}", &trimmed["%programfiles%".len()..])
+    } else if low.starts_with("%programdata%") {
+        format!(r"C:\ProgramData{}", &trimmed["%programdata%".len()..])
+    } else {
+        trimmed.to_string()
+    };
+    if !expanded.contains('\\') && !expanded.contains('/') && !expanded.contains('%') {
+        let sys32 = format!(r"C:\Windows\System32\{expanded}");
+        if std::path::Path::new(&sys32).exists() {
+            return sys32;
+        }
+        let syswow = format!(r"C:\Windows\SysWOW64\{expanded}");
+        if std::path::Path::new(&syswow).exists() {
+            return syswow;
+        }
+    }
+    expanded
+}
+
+pub(crate) fn is_ms_os_pipe(name_low: &str) -> bool {
+    let short = name_low
+        .trim_start_matches(r"\\.\pipe\")
+        .trim_start_matches(r"\pipe\");
+    if matches!(
+        short,
+        "lsass"
+            | "initshutdown"
+            | "srvsvc"
+            | "wkssvc"
+            | "ntsvcs"
+            | "scerpc"
+            | "spoolss"
+            | "winreg"
+            | "efsrpc"
+            | "atsvc"
+            | "trkwks"
+            | "epmapper"
+            | "eventlog"
+            | "samr"
+            | "netlogon"
+            | "svcctl"
+            | "browser"
+            | "plugplay"
+            | "umpnpmgr"
+            | "wininit"
+            | "w32time"
+            | "w32time_alt"
+            | "dnsserver"
+            | "dhcpserver"
+            | "protected_storage"
+            | "router"
+            | "netdfs"
+            | "lsarpc"
+            | "llsrpc"
+            | "keysvc"
+            | "cryptsvc"
+            | "iphlpsvc"
+            | "tapsrv"
+            | "seclogon"
+            | "audiosrv"
+            | "aelookupsvc"
+            | "cert"
+            | "nla"
+            | "p2pimsvc"
+    ) {
+        return true;
+    }
+    short.starts_with("winsock2\\")
+        || short.starts_with("w32time")
+        || short.starts_with("hydra")
+        || short.starts_with("ts_")
+        || short.starts_with("termsrv")
+        || short.starts_with("protectedprefix\\")
+        || short.starts_with("sessenv")
+        || short.starts_with("pipe_eventroot\\")
+        || short.starts_with("pshost.")
+        || short.starts_with("msdtc")
+        || short.starts_with("msft_")
+        || short.starts_with("windows_")
+}
+
+pub(crate) fn is_ms_os_path(path_low: &str) -> bool {
+    path_low.starts_with(r"c:\windows\system32\")
+        || path_low.starts_with(r"c:\windows\syswow64\")
+        || path_low.starts_with(r"c:\windows\winsxs\")
+        || path_low.starts_with(r"c:\windows\systemapps\")
+        || path_low.starts_with(r"c:\windows\servicing\")
+        || path_low.starts_with(r"c:\windows\immersivecontrolpanel\")
+        || path_low.starts_with(r"c:\windows\explorer.exe")
+        || path_low.starts_with(r"c:\windows\regedit.exe")
+        || path_low.starts_with(r"c:\program files\windows defender")
+        || path_low.starts_with(r"c:\program files\windowsapps\microsoft.")
+        || path_low.starts_with(r"c:\program files (x86)\windows ")
+        || path_low.contains(r"\system32\svchost.exe")
+        || path_low.contains(r"\syswow64\svchost.exe")
+}
+
+pub(crate) fn is_ms_os_rpc(binding_low: &str, ann_low: &str, weak_pipe: bool) -> bool {
+    if weak_pipe {
+        return false;
+    }
+    if ann_low.starts_with("ms ")
+        || ann_low.starts_with("windows ")
+        || ann_low.starts_with("microsoft ")
+        || ann_low.starts_with("active directory")
+        || ann_low.starts_with("com+")
+        || ann_low.starts_with("dcom")
+        || ann_low.starts_with("task scheduler")
+        || ann_low.starts_with("print spooler")
+        || ann_low.starts_with("background intelligent transfer")
+        || ann_low.starts_with("remote procedure call")
+        || ann_low.starts_with("lsa ")
+        || ann_low.starts_with("sam ")
+        || ann_low.starts_with("efs ")
+    {
+        return true;
+    }
+    if ann_low.is_empty()
+        && (binding_low.contains("[lrpc-")
+            || binding_low.contains("[epmapper]")
+            || binding_low.contains("[lsass]")
+            || binding_low.contains("[security")
+            || binding_low.contains("[audit")
+            || binding_low.contains("[ole")
+            || binding_low.contains("[eventlog")
+            || binding_low.contains("[sam")
+            || binding_low.contains("[srvsvc")
+            || binding_low.contains("[wkssvc")
+            || binding_low.contains("[spoolss"))
+    {
+        return true;
+    }
+    if let Some(np_idx) = binding_low.find(r"\pipe\") {
+        let rest = &binding_low[np_idx..];
+        let ep = rest.split(']').next().unwrap_or(rest);
+        if is_ms_os_pipe(ep) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Normalizes MSYS2 `/c/...` and POSIX `/tmp/...` paths on Windows when the literal path is absent.
@@ -803,7 +962,17 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
     pub fn query_pipes(filter: Option<&str>, max: usize) -> Value {
+        query_pipes_opts(filter, max, false, true)
+    }
+
+    pub fn query_pipes_opts(
+        filter: Option<&str>,
+        max: usize,
+        non_ms: bool,
+        enforce_200_cap: bool,
+    ) -> Value {
         let pat_w = to_wide(r"\\.\pipe\*");
         let mut fd: Win32FindDataW = unsafe { core::mem::zeroed() };
         let h = unsafe { FindFirstFileW(pat_w.as_ptr(), &mut fd) };
@@ -817,12 +986,11 @@ mod imp {
         let mut all_names: Vec<String> = Vec::new();
         loop {
             let nm = unsafe { read_wide_buf(&fd.c_file_name) };
-            if !nm.is_empty()
-                && f_low
-                    .as_ref()
-                    .map(|fl| nm.to_ascii_lowercase().contains(fl))
-                    .unwrap_or(true)
-            {
+            let nm_low = nm.to_ascii_lowercase();
+            let keep_filter =
+                !nm.is_empty() && f_low.as_ref().map(|fl| nm_low.contains(fl)).unwrap_or(true);
+            let keep_ms = !non_ms || !super::is_ms_os_pipe(&nm_low);
+            if keep_filter && keep_ms {
                 all_names.push(nm);
             }
             if unsafe { FindNextFileW(h, &mut fd) } == 0 {
@@ -835,7 +1003,11 @@ mod imp {
         all_names.sort();
         all_names.dedup();
         let total_matched = all_names.len();
-        let cap = max.clamp(1, 200);
+        let cap = if enforce_200_cap {
+            max.clamp(1, 200)
+        } else {
+            max.max(1)
+        };
         let inspect_sddl = true;
         let mut entries = Vec::new();
         for nm in all_names.into_iter().take(cap) {
@@ -1168,7 +1340,12 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
     pub fn query_services(filter: Option<&str>, max: usize) -> Value {
+        query_services_opts(filter, max, false)
+    }
+
+    pub fn query_services_opts(filter: Option<&str>, max: usize, non_ms: bool) -> Value {
         let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ENUMERATE_SERVICE) };
         if scm.is_null() {
             return json!({
@@ -1241,10 +1418,6 @@ mod imp {
             if !match_hit {
                 continue;
             }
-            total_matched += 1;
-            if matched.len() >= cap {
-                continue;
-            }
             let mut bin_path = String::new();
             let mut account = String::new();
             let mut start_type = "Unknown".to_string();
@@ -1267,6 +1440,23 @@ mod imp {
                 unsafe {
                     CloseServiceHandle(hs);
                 }
+            }
+            if non_ms {
+                let exe_low = super::resolve_windows_exe_candidate(
+                    &super::extract_service_exe_path(&bin_path),
+                )
+                .to_ascii_lowercase();
+                let nm_low = name.to_ascii_lowercase();
+                if super::is_ms_os_path(&exe_low)
+                    || nm_low.starts_with("microsoft.")
+                    || nm_low.starts_with("windows.")
+                {
+                    continue;
+                }
+            }
+            total_matched += 1;
+            if matched.len() >= cap {
+                continue;
             }
             matched.push(json!({
                 "name": name,
@@ -2001,7 +2191,12 @@ mod imp {
         Ok(out)
     }
 
+    #[cfg(test)]
     pub fn query_unquoted_services(filter: Option<&str>, max: usize) -> Value {
+        query_unquoted_services_opts(filter, max, false)
+    }
+
+    pub fn query_unquoted_services_opts(filter: Option<&str>, max: usize, non_ms: bool) -> Value {
         let services = match collect_all_services_raw() {
             Ok(s) => s,
             Err(e) => return json!({ "ok": false, "mode": "unquoted", "error": e }),
@@ -2016,6 +2211,15 @@ mod imp {
                     && !display_name.to_ascii_lowercase().contains(fl)
                     && !bin_path.to_ascii_lowercase().contains(fl)
                 {
+                    continue;
+                }
+            }
+            if non_ms {
+                let exe_low = super::resolve_windows_exe_candidate(
+                    &super::extract_service_exe_path(&bin_path),
+                )
+                .to_ascii_lowercase();
+                if super::is_ms_os_path(&exe_low) {
                     continue;
                 }
             }
@@ -2065,10 +2269,20 @@ mod imp {
         })
     }
 
+    #[cfg(test)]
     pub fn query_weak_acl(
         target_or_empty: Option<&str>,
         filter: Option<&str>,
         max: usize,
+    ) -> Value {
+        query_weak_acl_opts(target_or_empty, filter, max, false)
+    }
+
+    pub fn query_weak_acl_opts(
+        target_or_empty: Option<&str>,
+        filter: Option<&str>,
+        max: usize,
+        non_ms: bool,
     ) -> Value {
         let cap = max.clamp(1, 200);
         let raw_tgt = target_or_empty.map(str::trim).filter(|s| !s.is_empty());
@@ -2121,9 +2335,10 @@ mod imp {
         }
 
         // OS-wide non-admin write attack-surface sweep (pipes + services/bins/regkeys + unquoted)
+        // Inspect ALL matching pipes cleanly before applying output cap.
         let eff_filter = filter.or(raw_tgt);
         let f_low = eff_filter.map(|s| s.to_ascii_lowercase());
-        let pipe_res = query_pipes(eff_filter, 200);
+        let pipe_res = query_pipes_opts(eff_filter, usize::MAX, non_ms, false);
         let mut weak_pipes = Vec::new();
         if let Some(arr) = pipe_res.get("pipes").and_then(Value::as_array) {
             for p in arr {
@@ -2149,13 +2364,17 @@ mod imp {
                         continue;
                     }
                 }
-                let exe = super::extract_service_exe_path(&bin_path);
+                let exe = super::resolve_windows_exe_candidate(&super::extract_service_exe_path(
+                    &bin_path,
+                ));
                 if exe.is_empty() {
                     continue;
                 }
                 let exe_low = exe.to_ascii_lowercase();
-                let is_sys_exe = exe_low.starts_with(r"c:\windows\system32\")
-                    || exe_low.starts_with(r"c:\windows\syswow64\");
+                let is_sys_exe = super::is_ms_os_path(&exe_low);
+                if non_ms && is_sys_exe {
+                    continue;
+                }
                 let mut issues = Vec::new();
                 if !is_sys_exe && std::path::Path::new(&exe).exists() {
                     let (ew, _esddl, et) = path_non_admin_write_summary(&exe);
@@ -2233,7 +2452,12 @@ mod imp {
         })
     }
 
+    #[cfg(test)]
     pub fn query_com_audit(filter: Option<&str>, max: usize) -> Value {
+        query_com_audit_opts(filter, max, false)
+    }
+
+    pub fn query_com_audit_opts(filter: Option<&str>, max: usize, non_ms: bool) -> Value {
         let root_sub = r"SOFTWARE\Classes\CLSID";
         let root_w = to_wide(root_sub);
         let mut h_clsid: isize = 0;
@@ -2299,18 +2523,24 @@ mod imp {
                     continue;
                 }
             }
-            let target_exe = super::extract_service_exe_path(target_raw);
+            let raw_extracted = super::extract_service_exe_path(target_raw);
+            let target_exe = super::resolve_windows_exe_candidate(&raw_extracted);
             let low_exe = target_exe.to_ascii_lowercase();
-            let is_sys = low_exe.starts_with(r"c:\windows\system32\")
-                || low_exe.starts_with(r"c:\windows\syswow64\");
+            let is_sys = super::is_ms_os_path(&low_exe);
+            let bare_name_only =
+                !target_exe.is_empty() && !target_exe.contains('\\') && !target_exe.contains('/');
             let missing = !target_exe.is_empty()
                 && !target_exe.contains('%')
+                && !bare_name_only
                 && !std::path::Path::new(&target_exe).exists();
             let (writable, _sddl, trustees) = if !is_sys && !target_exe.is_empty() && !missing {
                 path_non_admin_write_summary(&target_exe)
             } else {
                 (false, None, Vec::new())
             };
+            if non_ms && (is_sys || bare_name_only) && !writable && !auto_elev {
+                continue;
+            }
             if f_low.is_some() || missing || writable || auto_elev {
                 findings.push(json!({
                     "clsid": clsid,
@@ -2337,7 +2567,12 @@ mod imp {
         })
     }
 
+    #[cfg(test)]
     pub fn query_rpc_endpoints(filter: Option<&str>, max: usize) -> Value {
+        query_rpc_endpoints_opts(filter, max, false)
+    }
+
+    pub fn query_rpc_endpoints_opts(filter: Option<&str>, max: usize, non_ms: bool) -> Value {
         let mut inq: Handle = ptr::null_mut();
         let rc = unsafe {
             RpcMgmtEpEltInqBegin(
@@ -2357,9 +2592,9 @@ mod imp {
             });
         }
 
-        // Cross-link named pipes for `ncacn_np` weak-ACL visibility
+        // Cross-link all named pipes for `ncacn_np` weak-ACL visibility
         let mut weak_pipe_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(arr) = query_pipes(None, 200)
+        if let Some(arr) = query_pipes_opts(None, usize::MAX, false, false)
             .get("pipes")
             .and_then(Value::as_array)
         {
@@ -2462,14 +2697,23 @@ mod imp {
                     continue;
                 }
             }
+            let pipe_short = endpoint
+                .trim_start_matches(r"\pipe\")
+                .trim_start_matches(r"\\.\pipe\")
+                .to_ascii_lowercase();
+            let weak_pipe =
+                protseq.eq_ignore_ascii_case("ncacn_np") && weak_pipe_set.contains(&pipe_short);
+            if non_ms
+                && super::is_ms_os_rpc(
+                    &str_binding.to_ascii_lowercase(),
+                    &annotation.to_ascii_lowercase(),
+                    weak_pipe,
+                )
+            {
+                continue;
+            }
             total_matched += 1;
             if endpoints.len() < cap {
-                let pipe_short = endpoint
-                    .trim_start_matches(r"\pipe\")
-                    .trim_start_matches(r"\\.\pipe\")
-                    .to_ascii_lowercase();
-                let weak_pipe =
-                    protseq.eq_ignore_ascii_case("ncacn_np") && weak_pipe_set.contains(&pipe_short);
                 endpoints.push(json!({
                     "uuid": uuid_str,
                     "version": format!("{}.{}", if_id.vers_major, if_id.vers_minor),
@@ -2506,6 +2750,7 @@ pub fn run_win_cli(
     unquoted: bool,
     com: bool,
     rpc: bool,
+    non_ms: bool,
     filter: Option<&str>,
     max: usize,
     as_json: bool,
@@ -2513,7 +2758,8 @@ pub fn run_win_cli(
     #[cfg(not(windows))]
     {
         let _ = (
-            pipes, reg, acl, services, whoami, sig, weak_acl, unquoted, com, rpc, filter, max,
+            pipes, reg, acl, services, whoami, sig, weak_acl, unquoted, com, rpc, non_ms, filter,
+            max,
         );
         let out = json!({
             "ok": false,
@@ -2556,13 +2802,13 @@ pub fn run_win_cli(
             return 2;
         }
         let val = if let Some(wa) = weak_acl {
-            imp::query_weak_acl(Some(wa), filter, max)
+            imp::query_weak_acl_opts(Some(wa), filter, max, non_ms)
         } else if unquoted {
-            imp::query_unquoted_services(filter, max)
+            imp::query_unquoted_services_opts(filter, max, non_ms)
         } else if com {
-            imp::query_com_audit(filter, max)
+            imp::query_com_audit_opts(filter, max, non_ms)
         } else if rpc {
-            imp::query_rpc_endpoints(filter, max)
+            imp::query_rpc_endpoints_opts(filter, max, non_ms)
         } else if let Some(sp) = sig {
             imp::query_signature(&sp.to_string_lossy())
         } else if let Some(rk) = reg {
@@ -2570,9 +2816,9 @@ pub fn run_win_cli(
         } else if let Some(ap) = acl {
             imp::query_acl(ap)
         } else if pipes {
-            imp::query_pipes(filter, max)
+            imp::query_pipes_opts(filter, max, non_ms, true)
         } else if services {
-            imp::query_services(filter, max)
+            imp::query_services_opts(filter, max, non_ms)
         } else {
             imp::query_whoami()
         };

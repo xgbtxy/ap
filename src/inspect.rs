@@ -1821,6 +1821,8 @@ pub(crate) struct JsRouteEntry {
     pub(crate) file: Option<String>,
     pub(crate) tags: Vec<&'static str>,
     pub(crate) params: Vec<String>,
+    pub(crate) body_keys: Vec<String>,
+    pub(crate) risk_tags: Vec<&'static str>,
 }
 
 struct RankedJsRoute<'a> {
@@ -2227,6 +2229,155 @@ pub fn render_candidates_focus_md(jv: &serde_json::Value, label: &str) -> String
     out.join("\n")
 }
 
+fn extract_route_body_keys(slice: &str, match_off: usize, end_off: usize) -> Vec<String> {
+    let mut w_start = match_off.saturating_sub(180);
+    while w_start < match_off && !slice.is_char_boundary(w_start) {
+        w_start += 1;
+    }
+    let mut w_end = (end_off + 300).min(slice.len());
+    while w_end > end_off && !slice.is_char_boundary(w_end) {
+        w_end -= 1;
+    }
+    let win = &slice[w_start..w_end];
+    let mut keys: Vec<String> = Vec::new();
+    static BODY_KEY_RE: OnceLock<Regex> = OnceLock::new();
+    static SHORTHAND_RE: OnceLock<Regex> = OnceLock::new();
+    let kre = BODY_KEY_RE.get_or_init(|| {
+        Regex::new(r#"(?:"([A-Za-z_][A-Za-z0-9_]{1,28})"|\b([A-Za-z_][A-Za-z0-9_]{1,28}))\s*:"#)
+            .unwrap()
+    });
+    let sre = SHORTHAND_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:body|data|payload|params)\s*:\s*(?:JSON\.stringify\s*\(\s*)?\{([^{}]{1,220})\}"#,
+        )
+        .unwrap()
+    });
+    let mut push_k = |raw: &str| {
+        if keys.len() >= 10 {
+            return;
+        }
+        let k = raw.trim();
+        if k.len() >= 2
+            && k.len() <= 28
+            && !matches!(
+                k.to_ascii_lowercase().as_str(),
+                "headers"
+                    | "method"
+                    | "url"
+                    | "timeout"
+                    | "mode"
+                    | "cache"
+                    | "signal"
+                    | "credentials"
+                    | "referrer"
+                    | "content-type"
+                    | "authorization"
+                    | "accept"
+                    | "http"
+                    | "https"
+            )
+            && !keys.iter().any(|x| x == k)
+        {
+            keys.push(k.to_string());
+        }
+    };
+    if let Some(cap) = sre.captures(win) {
+        if let Some(obj_inner) = cap.get(1) {
+            for kc in kre.captures_iter(obj_inner.as_str()) {
+                if let Some(km) = kc.get(1).or_else(|| kc.get(2)) {
+                    push_k(km.as_str());
+                }
+            }
+            for tok in obj_inner.as_str().split(',') {
+                let t = tok.trim();
+                if !t.is_empty()
+                    && !t.contains(':')
+                    && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    push_k(t);
+                }
+            }
+        }
+    }
+    let tail_start = (end_off.saturating_sub(w_start)).min(win.len());
+    for kc in kre.captures_iter(&win[tail_start..]) {
+        if let Some(km) = kc.get(1).or_else(|| kc.get(2)) {
+            push_k(km.as_str());
+        }
+    }
+    keys.truncate(10);
+    keys
+}
+
+fn classify_route_risk_tags(
+    method: &str,
+    path_low: &str,
+    params: &[String],
+    body_keys: &[String],
+) -> Vec<&'static str> {
+    let mut tags: Vec<&'static str> = Vec::new();
+    if [
+        "admin", "role", "perm", "grant", "revoke", "auth", "token", "secret", "password",
+        "passwd", "login", "sso", "user",
+    ]
+    .iter()
+    .any(|kw| path_low.contains(kw))
+    {
+        tags.push("AUTH_ADMIN");
+    }
+    if [
+        "file", "upload", "import", "export", "download", "path", "dir", "archive", "extract",
+    ]
+    .iter()
+    .any(|kw| path_low.contains(kw))
+        || body_keys.iter().any(|k| {
+            let kl = k.to_ascii_lowercase();
+            kl.contains("file") || kl.contains("path") || kl.contains("dir")
+        })
+    {
+        tags.push("FILE_OP");
+    }
+    if ["exec", "run", "cmd", "shell", "eval", "script", "command"]
+        .iter()
+        .any(|kw| path_low.contains(kw))
+        || body_keys.iter().any(|k| {
+            let kl = k.to_ascii_lowercase();
+            kl == "cmd" || kl == "command" || kl == "script"
+        })
+    {
+        tags.push("EXEC");
+    }
+    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+        || !body_keys.is_empty()
+        || !params.is_empty()
+    {
+        tags.push("STATE_WRITE");
+    }
+    tags
+}
+
+fn is_mutating_route_entry(path: &str, e: &JsRouteEntry) -> bool {
+    let m = e.method.to_ascii_uppercase();
+    if matches!(m.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return true;
+    }
+    if matches!(m.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return false;
+    }
+    // Ambiguous FETCH / ANY / REQUEST: include when carrying body keys or mutating path verbs
+    if !e.body_keys.is_empty() {
+        return true;
+    }
+    let pl = path.to_ascii_lowercase();
+    [
+        "create", "update", "delete", "remove", "grant", "revoke", "upload", "import", "export",
+        "transfer", "submit", "set", "reset", "exec", "run", "save", "modify", "apply", "approve",
+        "bind", "unbind", "claim", "redeem", "pay", "order", "checkout", "register", "invite",
+    ]
+    .iter()
+    .any(|v| pl.contains(v))
+}
+
 fn extract_route_param_hints(slice: &str, path: &str, end_off: usize) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     let mut push_key = |raw: &str| {
@@ -2336,6 +2487,7 @@ pub(crate) fn collect_js_surface_into(
         }
         let line = line_idx.line_of(off);
         let params = extract_route_param_hints(slice, p, end_off);
+        let body_keys = extract_route_body_keys(slice, off, end_off);
         let mut tags: Vec<&'static str> = Vec::new();
         if p.contains(':') || p.contains('{') || p.contains("${") || p.contains('?') {
             tags.push("PARAM");
@@ -2347,11 +2499,13 @@ pub(crate) fn collect_js_surface_into(
         ]
         .iter()
         .any(|kw| pl.contains(kw));
-        let sens_param = params.iter().any(|k| is_sensitive_param_name(k));
+        let sens_param = params.iter().any(|k| is_sensitive_param_name(k))
+            || body_keys.iter().any(|k| is_sensitive_param_name(k));
         if sens_path || sens_param {
             tags.push("SENSITIVE");
         }
         let m_up = method.to_ascii_uppercase();
+        let risk_tags = classify_route_risk_tags(&m_up, &pl, &params, &body_keys);
         acc.route_map
             .entry(p.to_string())
             .and_modify(|e| {
@@ -2363,9 +2517,19 @@ pub(crate) fn collect_js_surface_into(
                         e.tags.push(*t);
                     }
                 }
+                for rt in &risk_tags {
+                    if !e.risk_tags.contains(rt) {
+                        e.risk_tags.push(*rt);
+                    }
+                }
                 for pk in &params {
                     if !e.params.contains(pk) && e.params.len() < 5 {
                         e.params.push(pk.clone());
+                    }
+                }
+                for bk in &body_keys {
+                    if !e.body_keys.contains(bk) && e.body_keys.len() < 10 {
+                        e.body_keys.push(bk.clone());
                     }
                 }
             })
@@ -2375,6 +2539,8 @@ pub(crate) fn collect_js_surface_into(
                 file: file_owned.clone(),
                 tags,
                 params,
+                body_keys,
+                risk_tags,
             });
     };
 
@@ -2687,9 +2853,19 @@ pub(crate) fn render_js_surface(
     label: &str,
     diff_vs: Option<(&JsSurfaceData, &str)>,
 ) -> (String, serde_json::Value) {
+    render_js_surface_opts(acc, label, diff_vs, false)
+}
+
+pub(crate) fn render_js_surface_opts(
+    acc: JsSurfaceData,
+    label: &str,
+    diff_vs: Option<(&JsSurfaceData, &str)>,
+    mutating_only: bool,
+) -> (String, serde_json::Value) {
     let mut sorted_routes: Vec<RankedJsRoute<'_>> = acc
         .route_map
         .iter()
+        .filter(|(p, e)| !mutating_only || is_mutating_route_entry(p, e))
         .map(|(p, e)| RankedJsRoute {
             risk: route_risk_score(&e.method, &e.tags, &e.params),
             path: p.as_str(),
@@ -2703,9 +2879,10 @@ pub(crate) fn render_js_surface(
             .then_with(|| a.entry.method.cmp(&b.entry.method))
     });
 
+    let route_limit = if mutating_only { 60 } else { 120 };
     let mut routes_json: Vec<serde_json::Value> = Vec::new();
     let mut route_lines: Vec<String> = Vec::new();
-    for r in sorted_routes.iter().take(120) {
+    for r in sorted_routes.iter().take(route_limit) {
         let e = r.entry;
         let tag_str = if e.tags.is_empty() {
             String::new()
@@ -2717,12 +2894,17 @@ pub(crate) fn render_js_surface(
         } else {
             format!(" params=[{}]", e.params.join(","))
         };
+        let body_str = if e.body_keys.is_empty() {
+            String::new()
+        } else {
+            format!(" body=[{}]", e.body_keys.join(","))
+        };
         let loc_str = match &e.file {
             Some(rf) => format!("{rf}:L{}", e.line),
             None => format!("L{}", e.line),
         };
         route_lines.push(format!(
-            "- `{}` `{}`{tag_str}{param_str} ({loc_str})",
+            "- `{}` `{}`{tag_str}{param_str}{body_str} ({loc_str})",
             e.method, r.path
         ));
         let mut rj = serde_json::json!({
@@ -2731,7 +2913,9 @@ pub(crate) fn render_js_surface(
             "line": e.line,
             "risk_score": r.risk,
             "tags": e.tags,
+            "risk_tags": e.risk_tags,
             "params": e.params,
+            "body_keys": e.body_keys,
         });
         if let Some(rf) = &e.file {
             rj["file"] = serde_json::json!(rf);
@@ -3052,6 +3236,7 @@ pub(crate) fn render_js_surface(
     let graphql_json: Vec<serde_json::Value> = acc
         .graphql_ops
         .iter()
+        .filter(|(k, _, _, _, _)| !mutating_only || k.eq_ignore_ascii_case("mutation"))
         .take(80)
         .map(|(k, nm, ln, off, file)| {
             let mut o = serde_json::json!({"kind": k, "name": nm, "line": ln, "offset": off});
@@ -3073,19 +3258,35 @@ pub(crate) fn render_js_surface(
             o
         })
         .collect();
-    let origins_vec: Vec<String> = acc.origins.into_iter().take(80).collect();
-    let chunks_vec: Vec<String> = acc.lazy_chunks.into_iter().take(50).collect();
+    let origins_vec: Vec<String> = if mutating_only {
+        Vec::new()
+    } else {
+        acc.origins.into_iter().take(80).collect()
+    };
+    let chunks_vec: Vec<String> = if mutating_only {
+        Vec::new()
+    } else {
+        acc.lazy_chunks.into_iter().take(50).collect()
+    };
     let headers_vec: Vec<String> = acc.custom_headers.into_iter().take(30).collect();
+    let total_routes_all = acc.route_map.len();
+    let emitted_routes_cnt = if mutating_only {
+        sorted_routes.len()
+    } else {
+        total_routes_all
+    };
     let mut jv = serde_json::json!({
         "target": label,
+        "mutating_only": mutating_only,
         "scanned_files": acc.scanned_files,
         "counts": {
-            "routes": acc.route_map.len(),
+            "routes": emitted_routes_cnt,
+            "routes_total_before_filter": total_routes_all,
             "graphql": graphql_json.len(),
             "ws_sse": ws_json.len(),
             "post_message": acc.post_messages.len(),
             "local_server_ipc": acc.local_ipc_sinks.len(),
-            "dom_sinks": acc.dom_sinks.len(),
+            "dom_sinks": if mutating_only { 0 } else { acc.dom_sinks.len() },
             "lazy_chunks": chunks_vec.len(),
             "custom_headers": headers_vec.len(),
             "origins": origins_vec.len(),
@@ -3097,7 +3298,7 @@ pub(crate) fn render_js_surface(
         "ws_sse_endpoints": ws_json,
         "post_message_handlers": acc.post_messages,
         "local_server_and_ipc": acc.local_ipc_sinks,
-        "client_sinks": acc.dom_sinks,
+        "client_sinks": if mutating_only { Vec::new() } else { acc.dom_sinks },
         "lazy_chunks": chunks_vec,
         "custom_headers": headers_vec,
         "external_origins": origins_vec,
@@ -3115,9 +3316,18 @@ pub fn extract_js_routes_md(
     label: &str,
     query: Option<&str>,
 ) -> (String, serde_json::Value) {
+    extract_js_routes_md_opts(text, label, query, false)
+}
+
+pub fn extract_js_routes_md_opts(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+    mutating_only: bool,
+) -> (String, serde_json::Value) {
     let mut acc = JsSurfaceData::default();
     collect_js_surface_into(text, None, query, &mut acc);
-    render_js_surface(acc, label, None)
+    render_js_surface_opts(acc, label, None, mutating_only)
 }
 
 pub fn extract_js_routes_diff_md(
@@ -3127,11 +3337,22 @@ pub fn extract_js_routes_diff_md(
     old_text: &str,
     old_label: &str,
 ) -> (String, serde_json::Value) {
+    extract_js_routes_diff_md_opts(text, label, query, old_text, old_label, false)
+}
+
+pub fn extract_js_routes_diff_md_opts(
+    text: &str,
+    label: &str,
+    query: Option<&str>,
+    old_text: &str,
+    old_label: &str,
+    mutating_only: bool,
+) -> (String, serde_json::Value) {
     let mut acc = JsSurfaceData::default();
     collect_js_surface_into(text, None, query, &mut acc);
     let mut old_acc = JsSurfaceData::default();
     collect_js_surface_into(old_text, None, query, &mut old_acc);
-    render_js_surface(acc, label, Some((&old_acc, old_label)))
+    render_js_surface_opts(acc, label, Some((&old_acc, old_label)), mutating_only)
 }
 
 fn collect_surface_for_path(
@@ -3233,12 +3454,26 @@ pub fn extract_js_dir_routes_md(
     query: Option<&str>,
     old_path: Option<&std::path::Path>,
 ) -> Result<(String, serde_json::Value), (i32, String)> {
+    extract_js_dir_routes_md_opts(dir, query, old_path, false)
+}
+
+pub fn extract_js_dir_routes_md_opts(
+    dir: &std::path::Path,
+    query: Option<&str>,
+    old_path: Option<&std::path::Path>,
+    mutating_only: bool,
+) -> Result<(String, serde_json::Value), (i32, String)> {
     let (acc, label) = collect_surface_for_path(dir, query, 120)?;
     if let Some(op) = old_path {
         let (old_acc, old_label) = collect_surface_for_path(op, query, 120)?;
-        Ok(render_js_surface(acc, &label, Some((&old_acc, &old_label))))
+        Ok(render_js_surface_opts(
+            acc,
+            &label,
+            Some((&old_acc, &old_label)),
+            mutating_only,
+        ))
     } else {
-        Ok(render_js_surface(acc, &label, None))
+        Ok(render_js_surface_opts(acc, &label, None, mutating_only))
     }
 }
 

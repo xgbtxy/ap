@@ -1704,3 +1704,875 @@ assert.ok(g.includes("ap diff") && g.includes("--weak-acl") && g.includes("--rol
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+#[test]
+fn corpus_13_read_panic_win_unquoted_and_accel_v3() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. Reproduce & verify fix for `src/read.rs:2253:77` panic on empty file + `--lines`
+    let empty_f = root.join("empty.txt");
+    fs::write(&empty_f, b"").unwrap();
+    for args in [
+        vec![
+            "read",
+            empty_f.to_str().unwrap(),
+            "--lines",
+            "1-50",
+            "--json",
+        ],
+        vec![
+            "read",
+            empty_f.to_str().unwrap(),
+            "--lines",
+            "1-10,20-30",
+            "--json",
+        ],
+        vec!["read", empty_f.to_str().unwrap(), "--tail", "10", "--json"],
+    ] {
+        let out = run_ap(root, &args, None, &[]);
+        assert!(
+            out.status.success(),
+            "empty read {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let jv: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(jv["ok"], true, "{jv}");
+    }
+
+    // CJK multibyte `--lines --width` & `--offset` boundary safety
+    let cjk_f = root.join("cjk.txt");
+    fs::write(&cjk_f, "第一行中文测试内容很长很长\n第二行Hello世界\n").unwrap();
+    for args in [
+        vec![
+            "read",
+            cjk_f.to_str().unwrap(),
+            "--lines",
+            "1-2",
+            "--width",
+            "4",
+            "--json",
+        ],
+        vec![
+            "read",
+            cjk_f.to_str().unwrap(),
+            "--offset",
+            "1",
+            "--chars",
+            "5",
+            "--json",
+        ],
+    ] {
+        let out = run_ap(root, &args, None, &[]);
+        assert!(out.status.success(), "{args:?}");
+    }
+
+    // 2. `win.rs` `extract_service_exe_path` unquoted path WITHOUT trailing CLI args + bare system DLL
+    let no_arg_unquoted = r"C:\Program Files\Vendor App\svc.exe";
+    assert_eq!(
+        ap_probe::win::extract_service_exe_path(no_arg_unquoted),
+        no_arg_unquoted
+    );
+    let hops = ap_probe::win::find_unquoted_space_prefixes(no_arg_unquoted);
+    assert_eq!(hops.len(), 2, "{hops:?}");
+    assert_eq!(hops[0].0, r"C:\Program.exe");
+    assert_eq!(hops[1].0, r"C:\Program Files\Vendor.exe");
+    #[cfg(windows)]
+    {
+        let resolved = ap_probe::win::resolve_windows_exe_candidate("combase.dll");
+        assert!(
+            resolved
+                .to_ascii_lowercase()
+                .contains(r"\system32\combase.dll")
+                || resolved
+                    .to_ascii_lowercase()
+                    .contains(r"\syswow64\combase.dll"),
+            "expected System32/SysWOW64 resolution for combase.dll, got `{resolved}`"
+        );
+    }
+
+    // 3. `zz-ap-accelerator.ts` v3 trailing-pipe python, multi-line exit-1 & quoted space grep fixes
+    if !Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let fake_home = root.join("home_c13");
+    let ap_home = root.join("ap_home_c13");
+    fs::create_dir_all(fake_home.join(".pi").join("agent")).unwrap();
+    let init_out = run_ap(
+        root,
+        &["init", "-a", "pi", "--with-hooks", "--no-rules"],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("AP_HOME", ap_home.as_path()),
+        ],
+    );
+    assert!(init_out.status.success());
+    let accel_ts = fake_home
+        .join(".pi")
+        .join("agent")
+        .join("extensions")
+        .join("zz-ap-accelerator.ts");
+
+    let node_check = r###"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const { healCommand } = await import(pathToFileURL(process.env.ACCEL_TS).href);
+
+// Balanced `python -c "..." | awk ... | head -60` must NEVER fold pipe into `--base64`
+const pyPipeClean = healCommand('python -c "import sys; print(sys.version)" | awk \'{print $1}\' | head -60', "bash");
+assert.ok(!pyPipeClean || !pyPipeClean.includes("--base64"), `unexpected base64 wrap: ${pyPipeClean}`);
+
+// Broken inner python with trailing pipe keeps trailing pipe OUTSIDE `--base64`
+const pyTrapPipe = healCommand('python3 -c "print(p.split(\'\\\'))" | head -20'.replace("\\\\", "\\"), "bash");
+assert.ok(pyTrapPipe && pyTrapPipe.includes("exec --lang py --base64 ") && pyTrapPipe.trim().endsWith("| head -20"), pyTrapPipe);
+const b64Part = pyTrapPipe.match(/--base64\s+([A-Za-z0-9+/=]+)/)?.[1] || "";
+const decodedPy = Buffer.from(b64Part, "base64").toString("utf8");
+assert.ok(!decodedPy.includes("| head -20"), `pipe leaked into python source: ${decodedPy}`);
+
+// Multi-line scripts must NEVER be wrapped by wrapBenignSearchExit1
+const multiLine = 'SDK="foo"\ngrep bar app.txt\nls . | grep baz';
+const multiRes = healCommand(multiLine, "bash");
+assert.ok(!multiRes || !multiRes.includes("_ap_ec="), `unexpected multi-line exit-1 wrap: ${multiRes}`);
+
+// Quoted paths with spaces in `grep -n` rewrite cleanly to `ap search`
+const spacedGrep = healCommand('grep -n "needle" "Program Files/Vendor Dir/cfg.xml"', "bash");
+assert.ok(spacedGrep && spacedGrep.includes(" search ") && spacedGrep.includes("Program Files/Vendor Dir/cfg.xml"), spacedGrep);
+"###;
+
+    let run = Command::new("node")
+        .args([
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            node_check,
+        ])
+        .env("ACCEL_TS", &accel_ts)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "Node corpus_13 check failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+fn build_synthetic_asar(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+    let mut files_map = serde_json::Map::new();
+    let mut payload = Vec::new();
+    for &(name, data, unpacked) in entries {
+        let off = payload.len();
+        if !unpacked {
+            payload.extend_from_slice(data);
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("size".into(), json!(data.len()));
+        obj.insert("offset".into(), json!(off.to_string()));
+        if unpacked {
+            obj.insert("unpacked".into(), json!(true));
+        }
+        files_map.insert(name.to_string(), Value::Object(obj));
+    }
+    let header_json = json!({ "files": files_map });
+    let hdr_bytes = serde_json::to_vec(&header_json).unwrap();
+    let aligned_len = (hdr_bytes.len() + 3) & !3;
+    let pad = aligned_len - hdr_bytes.len();
+    let mut asar = Vec::new();
+    asar.extend_from_slice(&4u32.to_le_bytes());
+    asar.extend_from_slice(&((aligned_len + 8) as u32).to_le_bytes());
+    asar.extend_from_slice(&((aligned_len + 4) as u32).to_le_bytes());
+    asar.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+    asar.extend_from_slice(&hdr_bytes);
+    asar.resize(asar.len() + pad, 0);
+    asar.extend_from_slice(&payload);
+    asar
+}
+
+#[test]
+fn corpus_14_asar_surface_streaming_diff_and_sieve_sqlite() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. `--asar-surface --json` handles minified `!0`/`!1`, IPC channels, sinks, protocols & `.unpacked` sibling dir
+    let pkg = br#"{"name":"app","version":"2.0.0","main":"main.js","build":{"protocols":[{"name":"Demo","schemes":["demoapp"]}]}}"#;
+    let main_v1 = br#"const {BrowserWindow:B,ipcMain:I,shell:S}=require("electron");new B({webPreferences:{nodeIntegration:!0,contextIsolation:!1,webSecurity:!1}});I.handle("app:open",(e,p)=>execFile(p));S.openExternal(u);axios.post("/api/v1/items/create",{name:n});"#;
+    let helper_v1 = br#"exports.ping = () => "pong";"#;
+
+    let asar_v1_path = root.join("app.asar");
+    fs::write(
+        &asar_v1_path,
+        build_synthetic_asar(&[
+            ("package.json", pkg, false),
+            ("main.js", main_v1, false),
+            ("helper.js", helper_v1, false),
+        ]),
+    )
+    .unwrap();
+    let unpacked_dir = root.join("app.asar.unpacked");
+    fs::create_dir_all(&unpacked_dir).unwrap();
+    fs::write(unpacked_dir.join("bridge.node"), b"MZ\x90\x00").unwrap();
+
+    let surf_out = run_ap(
+        root,
+        &[
+            "read",
+            asar_v1_path.to_str().unwrap(),
+            "--asar-surface",
+            "--routes",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        surf_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&surf_out.stderr)
+    );
+    assert!(
+        surf_out.stdout.len() < 10_000,
+        "expected compact <10KB JSON, got {}B",
+        surf_out.stdout.len()
+    );
+    let sj: Value = serde_json::from_slice(&surf_out.stdout).unwrap();
+    assert_eq!(sj["format"], "asar-surface", "{sj}");
+    let flags = sj["electron_security_flags"].as_array().unwrap();
+    assert!(
+        flags.iter().any(|f| f["kind"] == "nodeIntegration_enabled"),
+        "{sj}"
+    );
+    assert!(
+        flags
+            .iter()
+            .any(|f| f["kind"] == "contextIsolation_disabled"),
+        "{sj}"
+    );
+    assert!(
+        flags.iter().any(|f| f["kind"] == "webSecurity_disabled"),
+        "{sj}"
+    );
+    assert_eq!(sj["ipc_handlers"][0]["channel"], "app:open", "{sj}");
+    assert!(
+        !sj["dangerous_sinks"].as_array().unwrap().is_empty(),
+        "{sj}"
+    );
+    assert!(
+        sj["native_bins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["path"] == "bridge.node" && b["on_disk_unpacked"] == true),
+        "{sj}"
+    );
+    assert_eq!(sj["manifests"][0]["protocols"][0], "demoapp", "{sj}");
+
+    // 2. Streaming `.asar` diff detects modified code member without loading unchanged members into RAM
+    let main_v2 = br#"const {BrowserWindow:B,ipcMain:I,shell:S}=require("electron");new B({webPreferences:{nodeIntegration:!0,contextIsolation:!1,webSecurity:!1}});I.handle("app:open",(e,p)=>execFile(p));I.handle("app:admin",(e,c)=>eval(c));S.openExternal(u);axios.post("/api/v1/items/create",{name:n});axios.delete("/api/v1/items/:id");"#;
+    let asar_v2_path = root.join("app_v2.asar");
+    fs::write(
+        &asar_v2_path,
+        build_synthetic_asar(&[
+            ("package.json", pkg, false),
+            ("main.js", main_v2, false),
+            ("helper.js", helper_v1, false),
+        ]),
+    )
+    .unwrap();
+
+    let diff_out = run_ap(
+        root,
+        &[
+            "diff",
+            asar_v1_path.to_str().unwrap(),
+            asar_v2_path.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        diff_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff_out.stderr)
+    );
+    let dj: Value = serde_json::from_slice(&diff_out.stdout).unwrap();
+    assert_eq!(dj["streaming"], true, "{dj}");
+    assert_eq!(dj["archive_summary"]["unchanged"], 2, "{dj}");
+    assert_eq!(dj["archive_summary"]["modified_hash"], 1, "{dj}");
+
+    // 3. `ap-sieve` cleans orphan SQLite rows and vacuums `index.sqlite`
+    let sieve_home = root.join("sieve_c14");
+    let fake_home_c14 = root.join("home_c14");
+    fs::create_dir_all(&sieve_home).unwrap();
+    fs::create_dir_all(&fake_home_c14).unwrap();
+    let big_log = (0..180)
+        .map(|i| format!("line-{i}: INFO verbose diagnostic entry c14orphanxyz padding abcdefghijklmnopqrstuvwxyz"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let c1 = ap_sieve::compress_stream_in(&sieve_home, &big_log, "c14alpha", 0, 1.0);
+    let _c2 = ap_sieve::compress_stream_in(
+        &sieve_home,
+        &format!("{big_log}\nextra-2"),
+        "c14beta",
+        0,
+        1.0,
+    );
+    // Simulate orphan SQLite row where `.raw` was previously removed
+    let _ = fs::remove_file(sieve_home.join(format!("{}.raw", c1.id)));
+    let _ = fs::remove_file(sieve_home.join(format!("{}.meta.json", c1.id)));
+
+    let env_c14 = [
+        ("SIEVE_HOME", sieve_home.as_path()),
+        ("HOME", fake_home_c14.as_path()),
+        ("USERPROFILE", fake_home_c14.as_path()),
+    ];
+    let pr_out = run_ap(
+        root,
+        &["sieve", "prune", "--max-mb", "1", "--vacuum", "--json"],
+        None,
+        &env_c14,
+    );
+    assert!(
+        pr_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pr_out.stderr)
+    );
+    let pj: Value = serde_json::from_slice(&pr_out.stdout).unwrap();
+    assert_eq!(pj["stores"][0]["vacuumed"], true, "{pj}");
+    let srch = run_ap(
+        root,
+        &["sieve", "search", "c14alpha", "--json"],
+        None,
+        &env_c14,
+    );
+    assert!(srch.status.success());
+    let sj2: Value = serde_json::from_slice(&srch.stdout).unwrap();
+    assert_eq!(
+        sj2["hits"].as_array().unwrap().len(),
+        0,
+        "orphan chunk row should be deleted: {sj2}"
+    );
+}
+
+fn build_synthetic_pe64_driver(code: &[u8], rdata: &[u8]) -> Vec<u8> {
+    // Minimal PE64 with Export (`DriverEntry`), `.text` (code), and `.rdata` (strings)
+    let text_raw_ptr = 0x200usize;
+    let text_raw_sz = code.len().max(16).div_ceil(0x200) * 0x200;
+    let rdata_raw_ptr = text_raw_ptr + text_raw_sz;
+    let rdata_raw_sz = (rdata.len() + 0x100).div_ceil(0x200) * 0x200;
+    let total_len = rdata_raw_ptr + rdata_raw_sz;
+    let mut pe = vec![0u8; total_len];
+
+    pe[0..2].copy_from_slice(b"MZ");
+    let pe_off = 0x80usize;
+    pe[0x3C..0x40].copy_from_slice(&(pe_off as u32).to_le_bytes());
+    pe[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
+    pe[pe_off + 4..pe_off + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+    pe[pe_off + 6..pe_off + 8].copy_from_slice(&2u16.to_le_bytes()); // 2 sections
+    pe[pe_off + 20..pe_off + 22].copy_from_slice(&0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
+    let opt = pe_off + 24;
+    pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+    pe[opt + 24..opt + 32].copy_from_slice(&0x0001_4000_0000u64.to_le_bytes());
+
+    let text_va = 0x1000u32;
+    let rdata_va = 0x2000u32;
+    let dd = opt + 112;
+    // Export Directory in `.rdata` right after `rdata` bytes
+    let exp_local_off = (rdata.len() + 15) & !15;
+    let exp_rva = rdata_va + exp_local_off as u32;
+    pe[dd..dd + 4].copy_from_slice(&exp_rva.to_le_bytes());
+    pe[dd + 4..dd + 8].copy_from_slice(&0x60u32.to_le_bytes());
+
+    let sec_base = opt + 0xF0;
+    // .text
+    pe[sec_base..sec_base + 5].copy_from_slice(b".text");
+    pe[sec_base + 8..sec_base + 12].copy_from_slice(&(code.len() as u32).to_le_bytes());
+    pe[sec_base + 12..sec_base + 16].copy_from_slice(&text_va.to_le_bytes());
+    pe[sec_base + 16..sec_base + 20].copy_from_slice(&(text_raw_sz as u32).to_le_bytes());
+    pe[sec_base + 20..sec_base + 24].copy_from_slice(&(text_raw_ptr as u32).to_le_bytes());
+    pe[sec_base + 36..sec_base + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+    // .rdata
+    let s2 = sec_base + 40;
+    pe[s2..s2 + 6].copy_from_slice(b".rdata");
+    pe[s2 + 8..s2 + 12].copy_from_slice(&((rdata.len() + 0x80) as u32).to_le_bytes());
+    pe[s2 + 12..s2 + 16].copy_from_slice(&rdata_va.to_le_bytes());
+    pe[s2 + 16..s2 + 20].copy_from_slice(&(rdata_raw_sz as u32).to_le_bytes());
+    pe[s2 + 20..s2 + 24].copy_from_slice(&(rdata_raw_ptr as u32).to_le_bytes());
+    pe[s2 + 36..s2 + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+
+    pe[text_raw_ptr..text_raw_ptr + code.len()].copy_from_slice(code);
+    pe[rdata_raw_ptr..rdata_raw_ptr + rdata.len()].copy_from_slice(rdata);
+
+    // Populate minimal export table (`NumberOfNames=1`, `AddressOfNames`)
+    let exp_file = rdata_raw_ptr + exp_local_off;
+    let names_rva = exp_rva + 0x28;
+    let str_rva = exp_rva + 0x30;
+    pe[exp_file + 24..exp_file + 28].copy_from_slice(&1u32.to_le_bytes());
+    pe[exp_file + 32..exp_file + 36].copy_from_slice(&names_rva.to_le_bytes());
+    pe[exp_file + 0x28..exp_file + 0x2C].copy_from_slice(&str_rva.to_le_bytes());
+    pe[exp_file + 0x30..exp_file + 0x3C].copy_from_slice(b"DriverEntry\0");
+    pe
+}
+
+#[test]
+fn corpus_15_routes_mutating_ioctl_pipes_and_cdp_export_role() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. `--routes --mutating-only --json` filters out GET/query noise and keeps body_keys + risk_tags
+    let bundle = root.join("bundle.js");
+    fs::write(
+        &bundle,
+        r#"
+        axios.get('/api/v1/public/catalog');
+        axios.get('/api/v1/public/health');
+        axios.get('/api/v1/public/banner');
+        fetch('/api/v1/admin/grant', { method: 'POST', body: JSON.stringify({ userId: 42, roleName: 'admin' }) });
+        axios.delete('/api/v1/files/:id', { data: { filePath: '/tmp/a' } });
+        const q = `query ListDocs { docs { id } }`;
+        const m = `mutation DeleteDoc($id: ID!) { deleteDoc(id: $id) }`;
+        "#,
+    )
+    .unwrap();
+    let all_r = run_ap(
+        root,
+        &["read", bundle.to_str().unwrap(), "--routes", "--json"],
+        None,
+        &[],
+    );
+    let mut_r = run_ap(
+        root,
+        &[
+            "read",
+            bundle.to_str().unwrap(),
+            "--routes",
+            "--mutating-only",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(all_r.status.success() && mut_r.status.success());
+    let mj: Value = serde_json::from_slice(&mut_r.stdout).unwrap();
+    let surf = &mj["surface"];
+    assert_eq!(surf["mutating_only"], true, "{mj}");
+    let routes = surf["routes"].as_array().unwrap();
+    assert!(
+        routes.iter().all(|r| r["method"] != "GET"),
+        "expected 0 GET routes: {routes:?}"
+    );
+    let grant = routes
+        .iter()
+        .find(|r| r["path"] == "/api/v1/admin/grant")
+        .unwrap();
+    assert!(
+        grant["body_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "userId" || k == "roleName"),
+        "{grant}"
+    );
+    assert!(
+        grant["risk_tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "AUTH_ADMIN"),
+        "{grant}"
+    );
+    assert!(
+        surf["graphql_ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|g| g["kind"] == "mutation"),
+        "{surf}"
+    );
+    assert!(
+        mut_r.stdout.len() < all_r.stdout.len(),
+        "mutating-only should shrink JSON"
+    );
+
+    // 2. `ap read <driver.sys> --ioctl --pipes --json`
+    // Code: `sub rsp, 0x28` (48 83 EC 28), `mov eax, 0x00222003` (B8 03 20 22 00), `cmp ecx, 0x80002004` (81 F9 04 20 00 80)
+    let code: Vec<u8> = vec![
+        0x48, 0x83, 0xEC, 0x28, 0xB8, 0x03, 0x20, 0x22, 0x00, 0x81, 0xF9, 0x04, 0x20, 0x00, 0x80,
+        0xC3,
+    ];
+    let mut rdata: Vec<u8> = Vec::new();
+    rdata.extend_from_slice(br"\Device\DemoCtl");
+    rdata.push(0);
+    for ch in r"\\.\pipe\demo_ctl_pipe".encode_utf16() {
+        rdata.extend_from_slice(&ch.to_le_bytes());
+    }
+    rdata.extend_from_slice(&[0, 0]);
+    let sys_path = root.join("demo_drv.sys");
+    fs::write(&sys_path, build_synthetic_pe64_driver(&code, &rdata)).unwrap();
+    let io_out = run_ap(
+        root,
+        &[
+            "read",
+            sys_path.to_str().unwrap(),
+            "--ioctl",
+            "--pipes",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        io_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&io_out.stderr)
+    );
+    let ioj: Value = serde_json::from_slice(&io_out.stdout).unwrap();
+    assert_eq!(ioj["format"], "binary-ioctl-pipes", "{ioj}");
+    let ioctls = ioj["ioctl_codes"].as_array().unwrap();
+    assert!(
+        ioctls
+            .iter()
+            .any(|c| c["code"] == "0x00222003" && c["method"] == "METHOD_NEITHER"),
+        "{ioj}"
+    );
+    assert!(ioctls.iter().any(|c| c["code"] == "0x80002004"), "{ioj}");
+    let pipes = ioj["device_pipes"].as_array().unwrap();
+    assert!(
+        pipes
+            .iter()
+            .any(|p| p["value"].as_str().unwrap().contains("demo_ctl_pipe")),
+        "{ioj}"
+    );
+    assert!(
+        pipes
+            .iter()
+            .any(|p| p["value"].as_str().unwrap().contains(r"\Device\DemoCtl")),
+        "{ioj}"
+    );
+    assert!(
+        ioj["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "DriverEntry"),
+        "{ioj}"
+    );
+
+    // 3. Mock CDP `--export-role` + `ap probe http --roles-matrix --vary-json-field` + `LOGIN_HTML`/`302`/array
+    let cdp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cdp_port = cdp_listener.local_addr().unwrap().port();
+    let stop_cdp = Arc::new(AtomicBool::new(false));
+    let stop_cdp_c = Arc::clone(&stop_cdp);
+    let cdp_srv = thread::spawn(move || {
+        let _ = cdp_listener.set_nonblocking(true);
+        while !stop_cdp_c.load(Ordering::Relaxed) {
+            match cdp_listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_nonblocking(false);
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let req = read_http_req_wire(&mut sock);
+                    if req.starts_with("GET /json/list") || req.starts_with("GET /json ") {
+                        let targets = json!([{
+                            "id": "tab1",
+                            "type": "page",
+                            "title": "Demo App",
+                            "url": format!("http://127.0.0.1:{cdp_port}/app"),
+                            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{cdp_port}/devtools/page/tab1"),
+                        }])
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{targets}",
+                            targets.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes());
+                    } else if let Some(_key_line) = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                    {
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: dummy=\r\n\r\n",
+                        );
+                        // Read CDP command frames (enable calls + Network.getCookies + Runtime.evaluate) and reply
+                        for _ in 0..10 {
+                            let mut hdr = [0u8; 2];
+                            if sock.read_exact(&mut hdr).is_err() {
+                                break;
+                            }
+                            let mut plen = (hdr[1] & 0x7F) as usize;
+                            if plen == 126 {
+                                let mut b = [0u8; 2];
+                                if sock.read_exact(&mut b).is_err() {
+                                    break;
+                                }
+                                plen = u16::from_be_bytes(b) as usize;
+                            }
+                            let mut mask = [0u8; 4];
+                            if (hdr[1] & 0x80) != 0 && sock.read_exact(&mut mask).is_err() {
+                                break;
+                            }
+                            let mut data = vec![0u8; plen];
+                            if sock.read_exact(&mut data).is_err() {
+                                break;
+                            }
+                            if (hdr[1] & 0x80) != 0 {
+                                for (idx, b) in data.iter_mut().enumerate() {
+                                    *b ^= mask[idx & 3];
+                                }
+                            }
+                            let msg: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
+                            let cid = msg["id"].as_u64().unwrap_or(1);
+                            let meth = msg["method"].as_str().unwrap_or("");
+                            let reply = if meth == "Network.getCookies" {
+                                json!({
+                                    "id": cid,
+                                    "result": {
+                                        "cookies": [
+                                            { "name": "sid", "value": "sess_owner_1" },
+                                            { "name": "XSRF-TOKEN", "value": "xsrf_val_9" }
+                                        ]
+                                    }
+                                })
+                            } else if meth == "Runtime.evaluate" {
+                                json!({
+                                    "id": cid,
+                                    "result": {
+                                        "result": {
+                                            "value": json!({
+                                                "storage": [["localStorage.authToken", "eyJhbGciOiJIUzI1NiJ9.payload.sig"]],
+                                                "metas": []
+                                            }).to_string()
+                                        }
+                                    }
+                                })
+                            } else {
+                                json!({ "id": cid, "result": {} })
+                            }
+                            .to_string();
+                            let rb = reply.as_bytes();
+                            let mut frame = Vec::with_capacity(rb.len() + 4);
+                            frame.push(0x81);
+                            if rb.len() <= 125 {
+                                frame.push(rb.len() as u8);
+                            } else {
+                                frame.push(126);
+                                frame.extend_from_slice(&(rb.len() as u16).to_be_bytes());
+                            }
+                            frame.extend_from_slice(rb);
+                            let _ = sock.write_all(&frame);
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let exp_out = run_ap(
+        root,
+        &[
+            "probe",
+            "cdp",
+            "--export-role",
+            &cdp_port.to_string(),
+            "--role-name",
+            "owner",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    stop_cdp.store(true, Ordering::Relaxed);
+    let _ = cdp_srv.join();
+    assert!(
+        exp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exp_out.stderr)
+    );
+    let ej: Value = serde_json::from_slice(&exp_out.stdout).unwrap();
+    assert_eq!(ej["mode"], "export_role", "{ej}");
+    assert_eq!(ej["role"]["name"], "owner", "{ej}");
+    let hdrs = ej["role"]["headers"].as_array().unwrap();
+    assert!(
+        hdrs.iter()
+            .any(|h| h.as_str().unwrap().contains("sid=sess_owner_1")),
+        "{ej}"
+    );
+    assert!(
+        hdrs.iter()
+            .any(|h| h.as_str().unwrap().starts_with("Authorization: Bearer eyJ")),
+        "{ej}"
+    );
+    assert!(
+        hdrs.iter()
+            .any(|h| h.as_str().unwrap() == "X-XSRF-TOKEN: xsrf_val_9"),
+        "{ej}"
+    );
+
+    // 4. `http_probe` `--vary-json-field` + `LOGIN_HTML` + `302 /login` + JSON-array root diff
+    let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let stop_http = Arc::new(AtomicBool::new(false));
+    let stop_http_c = Arc::clone(&stop_http);
+    let http_srv = thread::spawn(move || {
+        let _ = http_listener.set_nonblocking(true);
+        while !stop_http_c.load(Ordering::Relaxed) {
+            match http_listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_nonblocking(false);
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let req = read_http_req_wire(&mut sock);
+                    let req_line = req.lines().next().unwrap_or("");
+                    let low = req.to_ascii_lowercase();
+                    let (status, ct, extra_hdr, body) = if req_line.contains("/arr") {
+                        if low.contains("bearer owner_tok") {
+                            (
+                                "200 OK",
+                                "application/json",
+                                "",
+                                r#"[{"id":101,"name":"Alpha"}]"#,
+                            )
+                        } else {
+                            ("200 OK", "application/json", "", "[]")
+                        }
+                    } else if low.contains("bearer anon_login_html") {
+                        (
+                            "200 OK",
+                            "text/html",
+                            "",
+                            "<html><body><form action=\"/login\"><input type=\"password\" name=\"password\"></form></body></html>",
+                        )
+                    } else if !low.contains("authorization:") {
+                        ("302 Found", "text/html", "Location: /login\r\n", "")
+                    } else if req_line.starts_with("POST ") && req.contains("\"docId\":\"101\"") {
+                        ("200 OK", "application/json", "", r#"{"updated":"101"}"#)
+                    } else {
+                        (
+                            "403 Forbidden",
+                            "application/json",
+                            "",
+                            r#"{"err":"denied"}"#,
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\n{extra_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let rm_out = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            &format!("http://127.0.0.1:{http_port}/api/update"),
+            "-X",
+            "POST",
+            "-d",
+            r#"{"docId":"999","title":"hi"}"#,
+            "--vary-json-field",
+            "docId",
+            "--principal",
+            "owner=Authorization: Bearer owner_tok",
+            "--principal",
+            "other=Authorization: Bearer anon_login_html",
+            "--principal",
+            "anon=",
+            "--role-var",
+            "owner:docId=101",
+            "--role-var",
+            "other:docId=102",
+            "--cross-id",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    let arr_out = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            &format!("http://127.0.0.1:{http_port}/arr"),
+            "--principal",
+            "owner=Authorization: Bearer owner_tok",
+            "--principal",
+            "other=Authorization: Bearer other_tok",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    stop_http.store(true, Ordering::Relaxed);
+    let _ = http_srv.join();
+
+    assert!(
+        rm_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rm_out.stderr)
+    );
+    let rmj: Value = serde_json::from_slice(&rm_out.stdout).unwrap();
+    let matrix = rmj["matrix"].as_array().unwrap();
+    assert!(
+        matrix
+            .iter()
+            .any(|r| r["actor"] == "anon" && r["verdict"] == "AUTH_REDIRECT_LOGIN"),
+        "{rmj}"
+    );
+    assert!(
+        matrix
+            .iter()
+            .any(|r| r["actor"] == "other" && r["verdict"] == "LOGIN_HTML"),
+        "{rmj}"
+    );
+    assert!(
+        matrix
+            .iter()
+            .any(|r| r["actor"] == "owner" && r["target_owner"] == "owner" && r["status"] == 200),
+        "expected `--vary-json-field docId` rewrite to 101: {rmj}"
+    );
+
+    assert!(arr_out.status.success());
+    let arrj: Value = serde_json::from_slice(&arr_out.stdout).unwrap();
+    assert_eq!(arrj["possible_bypass_count"], 0, "{arrj}");
+
+    #[cfg(windows)]
+    {
+        for wargs in [
+            vec![
+                "probe",
+                "win",
+                "--services",
+                "--non-ms",
+                "--max",
+                "10",
+                "--json",
+            ],
+            vec!["probe", "win", "--rpc", "--non-ms", "--max", "10", "--json"],
+        ] {
+            let wo = run_ap(root, &wargs, None, &[]);
+            assert!(wo.status.success(), "{wargs:?}");
+            let wj: Value = serde_json::from_slice(&wo.stdout).unwrap();
+            assert_eq!(wj["ok"], true, "{wj}");
+        }
+    }
+}

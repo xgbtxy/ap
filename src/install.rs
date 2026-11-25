@@ -2589,7 +2589,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 export const AP_DEEPSEEK_GUIDELINES: readonly string[] = [
 	"Parallel-first execution: batch 2+ independent reads/searches/checks in parallel tool calls OR one codemode script via `const res = await Promise.allSettled([tools.read({{path}}), tools.bash({{command}})]);` (cuts latency & thinking tokens ~40%); persist cross-turn state via `store(key, val)`/`load(key)`.",
 	"In codemode (QuickJS sandbox — NO Node fs/path/require/process/fetch; `await sleep(ms)` is available): prefer typed MCP primitives `tools.mcp__agent_primitives__ap_search({{pattern, path, only_matching: true, unique: true, json: true}})`, `ap_read({{target, routes: true, section, json: true}})`, `ap_http`, `ap_cdp` over bash python/grep one-liners; `tools.bash({{command}})` returns `{{ output, exit_code }}`.",
-	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--xref`, `ap diff <old> <new> --json`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>|--weak-acl|--unquoted|--com|--rpc`, `ap http --roles-matrix`, `ap atlas map .`.',
+	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--asar-surface|--routes --mutating-only|--ioctl --pipes|--xref`, `ap diff <old> <new> --json`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>|--weak-acl|--unquoted|--com|--rpc --non-ms`, `ap cdp --export-role <port>`, `ap http --roles-matrix`, `ap atlas map .`.',
 ];
 
 export function injectDeepSeekGuidelines(guidelines: string[]): boolean {{
@@ -3786,7 +3786,10 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const cdPrefix = m[1] || "";
 		const rawPat = m[3] || (m[4] ? m[4].replace(/\\"/g, '"') : "") || m[5] || "";
 		const target = m[6] || m[7] || m[8] || ".";
-		const hasConcreteTarget = Boolean(m[6] || m[7] || m[8]) && target !== "-" && !/[*?,\s]/.test(target);
+		const hasConcreteTarget =
+			Boolean(m[6] || m[7] || m[8]) &&
+			target !== "-" &&
+			(Boolean(m[6] || m[7]) ? !/[*?,]/.test(target) : !/[*?,\s]/.test(target));
 		if (rawPat && (/[rR]/.test(flags) || (hasConcreteTarget && flags.includes("n") && !m[9]))) {{
 			const rustPat = translateGrepBreToRustRegex(rawPat, flags);
 			const pipeSuffix = m[9] || "";
@@ -3880,7 +3883,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		if (ok && pos.length >= 1 && pos.length <= 2) {{
 			const rawPat = pos[0];
 			const target = pos[1] || ".";
-			const concreteSingleFile = pos.length === 2 && target !== "-" && !/[*?,\s]/.test(target);
+			const concreteSingleFile = pos.length === 2 && target !== "-" && !/[*?,]/.test(target);
 			if (rawPat && (rec || (!pipeSuffix && concreteSingleFile && (lineNum || ctxA > 0 || ctxB > 0 || ctxC > 0 || rawPat.includes("\\|"))))) {{
 				const flagsStr = `${{extRe ? "E" : ""}}${{fixed ? "F" : ""}}`;
 				const rustPat = translateGrepBreToRustRegex(rawPat, flagsStr);
@@ -5576,16 +5579,11 @@ function healBrokenInlinePythonCommand(cmd: string): string | undefined {{
 	const argTail = m[3].trim();
 	if (!argTail || (!argTail.startsWith('"') && !argTail.startsWith("'"))) return undefined;
 
-	// Check whether outer bash quoting is cleanly balanced AND free of single-backslash inner trap
+	// Locate balanced closing quote cleanly, even when followed by a trailing shell pipe (e.g. `| awk ... | head -60`).
 	const outerQ = argTail[0];
-	let quoteOk = false;
 	let consumedEnd = -1;
 	if (outerQ === "'") {{
-		const closeIdx = argTail.indexOf("'", 1);
-		if (closeIdx > 0 && argTail.slice(closeIdx + 1).trim() === "") {{
-			quoteOk = true;
-			consumedEnd = closeIdx;
-		}}
+		consumedEnd = argTail.indexOf("'", 1);
 	}} else {{
 		let esc = false;
 		for (let i = 1; i < argTail.length; i++) {{
@@ -5593,24 +5591,33 @@ function healBrokenInlinePythonCommand(cmd: string): string | undefined {{
 			if (esc) {{ esc = false; continue; }}
 			if (ch === "\\") {{ esc = true; continue; }}
 			if (ch === '"') {{
-				if (argTail.slice(i + 1).trim() === "") {{
-					quoteOk = true;
-					consumedEnd = i;
-				}}
+				consumedEnd = i;
 				break;
 			}}
 		}}
 	}}
-	// Valid balanced single-line command with no trailing pipe/broken inner quotes -> leave untouched!
-	if (quoteOk && consumedEnd > 0) {{
+
+	const trailing = consumedEnd > 0 ? argTail.slice(consumedEnd + 1) : "";
+	const trailingTrim = trailing.trim();
+	const trailingIsValidShell =
+		trailingTrim === "" ||
+		/^(?:\||2?>|&>|&&|\|\||;)/.test(trailingTrim);
+
+	if (consumedEnd > 0 && !trailingIsValidShell) return undefined;
+
+	if (consumedEnd > 0 && trailingIsValidShell) {{
 		const inner = argTail.slice(1, consumedEnd);
 		const hasInnerTrap =
 			/(?<![rR\\])'\\'/.test(inner) ||
 			(outerQ === '"' && /[\r\n]/.test(inner) && /"[^"\r\n]*"/.test(inner));
 		if (!hasInnerTrap) return undefined;
+		if (!inner.trim() || inner.length > 32_000) return undefined;
+		const b64 = Buffer.from(inner, "utf8").toString("base64");
+		return `${{lead}}"${{AP_BIN}}" exec --lang py --base64 ${{b64}}${{trailing}}`;
 	}}
-	// Reject if unrelated shell chaining appears clearly after a quoted token
-	if (quoteOk && consumedEnd > 0 && consumedEnd < argTail.length - 1) return undefined;
+
+	// Unclosed outer quote -> reject if unquoted shell chaining appears
+	if (consumedEnd <= 0 && /(?:\||2?>|&&|\|\||;)/.test(argTail.slice(1))) return undefined;
 
 	let rawBody = argTail.slice(1);
 	if (rawBody.endsWith(outerQ) && !rawBody.endsWith("\\" + outerQ)) {{
@@ -5622,6 +5629,7 @@ function healBrokenInlinePythonCommand(cmd: string): string | undefined {{
 }}
 
 function wrapBenignSearchExit1(cmd: string): string | undefined {{
+	if (/[\r\n]/.test(cmd)) return undefined;
 	if (cmd.includes("_ap_ec=") || cmd.includes("[ap-empty]")) return undefined;
 	const cdM = cmd.match(/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)([\s\S]+)$/);
 	const lead = cdM ? cdM[1] : "";

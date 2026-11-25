@@ -84,6 +84,7 @@ pub struct AsarEntry {
     pub offset: usize,
     pub size: usize,
     pub unpacked: bool,
+    pub hash: Option<String>,
 }
 
 fn read_u64_le(b: &[u8], off: usize) -> Option<u64> {
@@ -203,11 +204,16 @@ fn walk_asar_tree(node: &Value, prefix: &str, out: &mut Vec<AsarEntry>) {
                         .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                 })
                 .unwrap_or(0) as usize;
+            let hash = val
+                .pointer("/integrity/hash")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             out.push(AsarEntry {
                 path: full,
                 offset: off,
                 size: sz as usize,
                 unpacked,
+                hash,
             });
         }
     }
@@ -255,37 +261,37 @@ fn electron_flag_patterns() -> &'static ElectronFlagPatterns {
             (
                 "nodeIntegration_enabled",
                 "HIGH",
-                Regex::new(r#"\bnodeIntegration\s*:\s*true\b"#).unwrap(),
+                Regex::new(r#"\bnodeIntegration\s*:\s*(?:true|!0)\b"#).unwrap(),
             ),
             (
                 "contextIsolation_disabled",
                 "HIGH",
-                Regex::new(r#"\bcontextIsolation\s*:\s*false\b"#).unwrap(),
+                Regex::new(r#"\bcontextIsolation\s*:\s*(?:false|!1)\b"#).unwrap(),
             ),
             (
                 "sandbox_disabled",
                 "MEDIUM",
-                Regex::new(r#"\bsandbox\s*:\s*false\b"#).unwrap(),
+                Regex::new(r#"\bsandbox\s*:\s*(?:false|!1)\b"#).unwrap(),
             ),
             (
                 "webSecurity_disabled",
                 "HIGH",
-                Regex::new(r#"\bwebSecurity\s*:\s*false\b"#).unwrap(),
+                Regex::new(r#"\bwebSecurity\s*:\s*(?:false|!1)\b"#).unwrap(),
             ),
             (
                 "allowRunningInsecureContent",
                 "HIGH",
-                Regex::new(r#"\ballowRunningInsecureContent\s*:\s*true\b"#).unwrap(),
+                Regex::new(r#"\ballowRunningInsecureContent\s*:\s*(?:true|!0)\b"#).unwrap(),
             ),
             (
                 "enableRemoteModule_enabled",
                 "HIGH",
-                Regex::new(r#"\benableRemoteModule\s*:\s*true\b"#).unwrap(),
+                Regex::new(r#"\benableRemoteModule\s*:\s*(?:true|!0)\b"#).unwrap(),
             ),
             (
                 "webviewTag_enabled",
                 "MEDIUM",
-                Regex::new(r#"\bwebviewTag\s*:\s*true\b"#).unwrap(),
+                Regex::new(r#"\bwebviewTag\s*:\s*(?:true|!0)\b"#).unwrap(),
             ),
             (
                 "protocol_handler",
@@ -298,17 +304,20 @@ fn electron_flag_patterns() -> &'static ElectronFlagPatterns {
             (
                 "ipc_handler",
                 "MEDIUM",
-                Regex::new(r#"\bipcMain\.(?:handle|on)\s*\("#).unwrap(),
+                Regex::new(
+                    r#"(?:\b(?:ipcMain|ipcRenderer)\.(?:handle|on|once|handleOnce|invoke)\s*\(|\b[A-Za-z_$][A-Za-z0-9_$]{0,16}\.(?:handle|handleOnce)\(\s*["'`][A-Za-z0-9_.:/-]{2,80}["'`]\s*,)"#,
+                )
+                .unwrap(),
             ),
             (
                 "contextBridge_expose",
                 "MEDIUM",
-                Regex::new(r#"\bcontextBridge\.exposeInMainWorld\s*\("#).unwrap(),
+                Regex::new(r#"(?:\bcontextBridge|["']electron["']).*?\.exposeInMainWorld\s*\(|\bcontextBridge\.exposeInMainWorld\s*\("#).unwrap(),
             ),
             (
                 "shell_openExternal",
                 "MEDIUM",
-                Regex::new(r#"\bshell\.openExternal\s*\("#).unwrap(),
+                Regex::new(r#"(?:\bshell\.open(?:External|Path)|\.openExternal)\s*\("#).unwrap(),
             ),
         ],
     })
@@ -411,6 +420,42 @@ fn inspect_archive_manifest(
                     }));
                 }
             }
+            let mut protocol_schemes: Vec<String> = Vec::new();
+            let push_schemes = |arr: Option<&Vec<Value>>, dst: &mut Vec<String>| {
+                if let Some(items) = arr {
+                    for it in items {
+                        if let Some(schemes) = it.get("schemes").and_then(Value::as_array) {
+                            for s in schemes.iter().filter_map(Value::as_str) {
+                                let clean = s.trim().to_string();
+                                if !clean.is_empty() && !dst.contains(&clean) {
+                                    dst.push(clean);
+                                }
+                            }
+                        } else if let Some(s) = it.as_str() {
+                            let clean = s.trim().to_string();
+                            if !clean.is_empty() && !dst.contains(&clean) {
+                                dst.push(clean);
+                            }
+                        }
+                    }
+                }
+            };
+            push_schemes(
+                v.get("protocols").and_then(Value::as_array),
+                &mut protocol_schemes,
+            );
+            push_schemes(
+                v.pointer("/build/protocols").and_then(Value::as_array),
+                &mut protocol_schemes,
+            );
+            if !protocol_schemes.is_empty() {
+                manifest_risks.push(json!({
+                    "kind": "custom_protocol_schemes",
+                    "severity": "MEDIUM",
+                    "entry_path": path,
+                    "detail": format!("registered protocol schemes: {}", protocol_schemes.join(", ")),
+                }));
+            }
             manifests.push(json!({
                 "entry_path": path,
                 "kind": "package.json",
@@ -418,6 +463,7 @@ fn inspect_archive_manifest(
                 "version": version,
                 "main": main_entry,
                 "scripts": script_keys,
+                "protocols": protocol_schemes,
             }));
         }
     } else if low.ends_with("manifest.mf")
@@ -441,6 +487,66 @@ fn inspect_archive_manifest(
     }
 }
 
+fn extract_first_quoted_arg(snip: &str) -> Option<String> {
+    let open_paren = snip.find('(')?;
+    let rest = snip[open_paren + 1..].trim_start();
+    let q = rest.chars().next()?;
+    if q != '\'' && q != '"' && q != '`' {
+        return None;
+    }
+    let body = &rest[q.len_utf8()..];
+    let end = body.find(q)?;
+    let tok = body[..end].trim();
+    if tok.is_empty() || tok.len() > 120 {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
+fn collect_unpacked_sibling_bins(disk_path: Option<&std::path::Path>) -> Vec<Value> {
+    let Some(p) = disk_path else {
+        return Vec::new();
+    };
+    let unpacked_dir = std::path::PathBuf::from(format!("{}.unpacked", p.display()));
+    if !unpacked_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let walker = ignore::WalkBuilder::new(&unpacked_dir)
+        .hidden(false)
+        .git_ignore(false)
+        .build();
+    for ent in walker.flatten() {
+        if !ent.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let ep = ent.path();
+        let low = ep.to_string_lossy().to_ascii_lowercase();
+        if [".node", ".exe", ".dll", ".so", ".dylib", ".wasm"]
+            .iter()
+            .any(|x| low.ends_with(x))
+        {
+            let rel = ep
+                .strip_prefix(&unpacked_dir)
+                .unwrap_or(ep)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let sz = ent.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(json!({
+                "path": rel,
+                "size": sz,
+                "unpacked": true,
+                "on_disk_unpacked": true,
+            }));
+            if out.len() >= 60 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Zero-unpack in-memory / seek-streamed archive surface scanner for `.asar`, `.zip`, `.vsix`, `.jar`, `.apk`, `.whl`.
 pub fn inspect_archive_surface_reader<R: Read + Seek>(
     r: &mut R,
@@ -448,6 +554,31 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
     label: &str,
     include_routes: bool,
     query: Option<&str>,
+) -> Result<(String, Value), String> {
+    inspect_archive_surface_reader_opts(r, ext, label, None, include_routes, query, false)
+}
+
+/// Compact Electron `.asar` security surface extractor (`--asar-surface`), checking `<target>.unpacked`
+/// on disk, minified `!0`/`!1` flags, up to 64 IPC channels/entry, and dangerous exec/shell/eval/FS sinks.
+pub fn inspect_asar_surface_compact_reader<R: Read + Seek>(
+    r: &mut R,
+    ext: &str,
+    label: &str,
+    disk_path: Option<&std::path::Path>,
+    include_routes: bool,
+    query: Option<&str>,
+) -> Result<(String, Value), String> {
+    inspect_archive_surface_reader_opts(r, ext, label, disk_path, include_routes, query, true)
+}
+
+fn inspect_archive_surface_reader_opts<R: Read + Seek>(
+    r: &mut R,
+    ext: &str,
+    label: &str,
+    disk_path: Option<&std::path::Path>,
+    include_routes: bool,
+    query: Option<&str>,
+    compact_asar_surface: bool,
 ) -> Result<(String, Value), String> {
     let t0 = Instant::now();
     let ext_low = ext.to_ascii_lowercase();
@@ -586,8 +717,20 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
     let mut manifest_risks: Vec<Value> = Vec::new();
     let mut electron_flags: Vec<Value> = Vec::new();
     let mut ipc_handlers: Vec<Value> = Vec::new();
+    let mut seen_ipc_chans: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut dangerous_sinks: Vec<Value> = Vec::new();
+    let mut seen_sinks: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let mut js_acc = crate::inspect::JsSurfaceData::default();
     let mut scanned_js_entries = 0usize;
+    let snip_cap = if compact_asar_surface { 96 } else { 140 };
+    let ipc_cap = if compact_asar_surface { 120 } else { 40 };
+
+    static SINK_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let sink_re = SINK_RE.get_or_init(|| {
+        Regex::new(r#"(?:\bchild_process\b|(?:\b|\.)(?:execFile|execFileSync|spawn|spawnSync|execSync)\s*\(|\.(?:exec|openExternal|openPath)\s*\(|\bvm\.runIn[A-Za-z]*\s*\(|\beval\s*\(|\bnew\s+Function\s*\(|\bfs\.(?:writeFile|writeFileSync|chmod|chmodSync)\s*\()"#).unwrap()
+    });
 
     let read_entry_text = |stream: &mut R, off: usize, sz: usize| -> Option<String> {
         let pos = (asar_base as u64).checked_add(off as u64)?;
@@ -599,9 +742,21 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
 
     let mut process_code = |path: &str, text: &str| {
         scanned_js_entries += 1;
+        let has_electron_ctx = text.contains("electron")
+            || text.contains("ipcMain")
+            || text.contains("ipcRenderer")
+            || path.to_ascii_lowercase().contains("ipc");
         let pats = electron_flag_patterns();
         for (kind, default_sev, re) in &pats.rules {
-            for m in re.find_iter(text).take(8) {
+            let match_take = if matches!(*kind, "ipc_handler" | "contextBridge_expose") {
+                64
+            } else {
+                12
+            };
+            for m in re.find_iter(text).take(match_take) {
+                if *kind == "ipc_handler" && !has_electron_ctx && !m.as_str().contains("ipc") {
+                    continue;
+                }
                 let ln = text[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
                 let mut w_end = (m.end() + 140).min(text.len());
                 while w_end > m.end() && !text.is_char_boundary(w_end) {
@@ -611,11 +766,8 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
                 while w_start < m.start() && !text.is_char_boundary(w_start) {
                     w_start += 1;
                 }
-                let snip: String = text[w_start..w_end]
-                    .replace(['\r', '\n'], " ")
-                    .chars()
-                    .take(140)
-                    .collect();
+                let raw_snip: String = text[w_start..w_end].replace(['\r', '\n'], " ");
+                let snip: String = raw_snip.chars().take(snip_cap).collect();
                 if let Some(ref q) = q_low {
                     if !snip.to_ascii_lowercase().contains(q)
                         && !path.to_ascii_lowercase().contains(q)
@@ -625,31 +777,90 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
                     }
                 }
                 let sev = if *kind == "contextBridge_expose"
-                    && (snip.contains("ipcRenderer.send")
-                        || snip.contains("ipcRenderer.invoke")
-                        || snip.contains("ipcRenderer.on"))
+                    && (raw_snip.contains("ipcRenderer.send")
+                        || raw_snip.contains("ipcRenderer.invoke")
+                        || raw_snip.contains("ipcRenderer.on"))
                 {
                     "HIGH"
                 } else {
                     *default_sev
                 };
                 if *kind == "ipc_handler" {
-                    if ipc_handlers.len() < 40 {
-                        ipc_handlers.push(json!({
+                    let chan = extract_first_quoted_arg(
+                        &raw_snip[(m.start() - w_start).min(raw_snip.len())..],
+                    )
+                    .unwrap_or_default();
+                    let dedup_k = (
+                        path.to_string(),
+                        if chan.is_empty() {
+                            format!("L{ln}")
+                        } else {
+                            chan.clone()
+                        },
+                    );
+                    if seen_ipc_chans.insert(dedup_k) && ipc_handlers.len() < ipc_cap {
+                        let mut item = json!({
                             "entry_path": path,
                             "line": ln,
                             "snippet": snip,
-                        }));
+                        });
+                        if !chan.is_empty() {
+                            item["channel"] = json!(chan);
+                        }
+                        ipc_handlers.push(item);
                     }
                 } else if electron_flags.len() < 60 {
-                    electron_flags.push(json!({
+                    let mut item = json!({
                         "kind": kind,
                         "severity": sev,
                         "entry_path": path,
                         "line": ln,
                         "snippet": snip,
-                    }));
+                    });
+                    if *kind == "contextBridge_expose" {
+                        if let Some(api_nm) = extract_first_quoted_arg(
+                            &raw_snip[(m.start() - w_start).min(raw_snip.len())..],
+                        ) {
+                            item["api_name"] = json!(api_nm);
+                        }
+                    }
+                    electron_flags.push(item);
                 }
+            }
+        }
+        for sm in sink_re.find_iter(text).take(32) {
+            if dangerous_sinks.len() >= 40 {
+                break;
+            }
+            let sink_tok = sm.as_str().trim_end_matches('(').trim().to_string();
+            if seen_sinks.insert((path.to_string(), sink_tok.clone())) {
+                let ln = text[..sm.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+                let mut ws = sm.start().saturating_sub(20);
+                while ws < sm.start() && !text.is_char_boundary(ws) {
+                    ws += 1;
+                }
+                let mut we = (sm.end() + 72).min(text.len());
+                while we > sm.end() && !text.is_char_boundary(we) {
+                    we -= 1;
+                }
+                let sn: String = text[ws..we]
+                    .replace(['\r', '\n'], " ")
+                    .chars()
+                    .take(snip_cap)
+                    .collect();
+                if let Some(ref q) = q_low {
+                    if !sn.to_ascii_lowercase().contains(q)
+                        && !path.to_ascii_lowercase().contains(q)
+                    {
+                        continue;
+                    }
+                }
+                dangerous_sinks.push(json!({
+                    "sink": sink_tok,
+                    "entry_path": path,
+                    "line": ln,
+                    "snippet": sn,
+                }));
             }
         }
         crate::inspect::collect_js_surface_into(text, Some(path), query, &mut js_acc);
@@ -700,12 +911,27 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
             .unwrap_or(0)
             > 0;
 
+    let disk_unpacked_bins = collect_unpacked_sibling_bins(disk_path);
+    if !disk_unpacked_bins.is_empty() {
+        for ub in disk_unpacked_bins {
+            let p_str = ub["path"].as_str().unwrap_or("");
+            if !native_bins
+                .iter()
+                .any(|x| x["path"].as_str().unwrap_or("") == p_str)
+                && native_bins.len() < 80
+            {
+                native_bins.push(ub);
+            }
+        }
+    }
+
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let mut md = vec![format!(
-        "# ARCHIVE SURFACE `{label}` ({ext_low} | entries={total_entries}, scanned_js={scanned_js_entries}, native_bins={}, electron_flags={}, ipc_handlers={}, manifest_risks={} in {elapsed_ms}ms)",
+        "# ARCHIVE SURFACE `{label}` ({ext_low} | entries={total_entries}, scanned_js={scanned_js_entries}, native_bins={}, electron_flags={}, ipc_handlers={}, dangerous_sinks={}, manifest_risks={} in {elapsed_ms}ms)",
         native_bins.len(),
         electron_flags.len(),
         ipc_handlers.len(),
+        dangerous_sinks.len(),
         manifest_risks.len(),
     )];
     if !electron_flags.is_empty() {
@@ -735,12 +961,30 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
     }
     if !ipc_handlers.is_empty() {
         md.push(format!("\n## IPC Handlers ({})", ipc_handlers.len()));
-        for h in ipc_handlers.iter().take(20) {
+        for h in ipc_handlers.iter().take(25) {
+            let ch = h.get("channel").and_then(Value::as_str).unwrap_or("");
+            let ch_s = if ch.is_empty() {
+                String::new()
+            } else {
+                format!(" `{ch}`")
+            };
             md.push(format!(
-                "- `{}:L{}`: `{}`",
+                "- `{}:L{}`{ch_s}: `{}`",
                 h["entry_path"].as_str().unwrap_or(""),
                 h["line"].as_u64().unwrap_or(0),
                 h["snippet"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    if !dangerous_sinks.is_empty() {
+        md.push(format!("\n## Dangerous Sinks ({})", dangerous_sinks.len()));
+        for sk in dangerous_sinks.iter().take(20) {
+            md.push(format!(
+                "- `{}` (`{}:L{}`): `{}`",
+                sk["sink"].as_str().unwrap_or(""),
+                sk["entry_path"].as_str().unwrap_or(""),
+                sk["line"].as_u64().unwrap_or(0),
+                sk["snippet"].as_str().unwrap_or(""),
             ));
         }
     }
@@ -784,7 +1028,7 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
 
     let mut jv = json!({
         "ok": true,
-        "format": "archive-surface",
+        "format": if compact_asar_surface { "asar-surface" } else { "archive-surface" },
         "archive_kind": ext_low,
         "target": label,
         "elapsed_ms": elapsed_ms,
@@ -796,11 +1040,27 @@ pub fn inspect_archive_surface_reader<R: Read + Seek>(
         },
         "manifests": manifests,
         "manifest_risks": manifest_risks,
-        "native_bins": native_bins,
-        "electron_security_flags": electron_flags,
-        "ipc_handlers": ipc_handlers,
+        "native_bins": if compact_asar_surface { native_bins.iter().take(20).cloned().collect() } else { native_bins },
+        "electron_security_flags": if compact_asar_surface { electron_flags.iter().take(25).cloned().collect() } else { electron_flags },
+        "ipc_handlers": if compact_asar_surface { ipc_handlers.iter().take(40).cloned().collect() } else { ipc_handlers },
+        "dangerous_sinks": if compact_asar_surface { dangerous_sinks.iter().take(20).cloned().collect() } else { dangerous_sinks },
     });
-    if has_js_hits {
+    if compact_asar_surface {
+        let mut compact_routes: Vec<Value> = Vec::new();
+        if let Some(arr) = js_surface_json.get("routes").and_then(Value::as_array) {
+            for r in arr.iter().take(12) {
+                compact_routes.push(json!({
+                    "method": r["method"],
+                    "path": r["path"],
+                    "risk_score": r["risk_score"],
+                }));
+            }
+        }
+        jv["js_surface_summary"] = json!({
+            "counts": js_surface_json["counts"],
+            "top_routes": compact_routes,
+        });
+    } else if has_js_hits {
         jv["js_surface"] = js_surface_json;
     }
     Ok((md.join("\n"), jv))
@@ -1651,6 +1911,304 @@ fn diff_archive_member_bytes(
         "security_signals": security_signals,
     });
     (out.join("\n"), jv)
+}
+
+/// Streaming zero-full-RAM `.asar` archive diff: parses Pickle headers first and compares entry sizes /
+/// `.asar` integrity hashes (or 64 KiB streamed member chunks) without allocating unchanged members into memory.
+pub fn diff_asar_files_streaming(
+    new_p: &std::path::Path,
+    old_p: &std::path::Path,
+    new_label: &str,
+    old_label: &str,
+    deep: bool,
+    max_items: usize,
+) -> Result<(String, Value), String> {
+    let new_len = std::fs::metadata(new_p).map(|m| m.len()).unwrap_or(0);
+    let old_len = std::fs::metadata(old_p).map(|m| m.len()).unwrap_or(0);
+    let mut fn_new = std::io::BufReader::new(
+        std::fs::File::open(new_p).map_err(|e| format!("failed to open `{new_label}`: {e}"))?,
+    );
+    let mut fn_old = std::io::BufReader::new(
+        std::fs::File::open(old_p).map_err(|e| format!("failed to open `{old_label}`: {e}"))?,
+    );
+    let (base_new, en_new) = parse_asar_index_reader(&mut fn_new)?;
+    let (base_old, en_old) = parse_asar_index_reader(&mut fn_old)?;
+
+    let mut old_idx: BTreeMap<String, &AsarEntry> = BTreeMap::new();
+    for e in &en_old {
+        if !e.unpacked {
+            old_idx.insert(e.path.clone(), e);
+        }
+    }
+    let mut new_idx: BTreeMap<String, &AsarEntry> = BTreeMap::new();
+    for e in &en_new {
+        if !e.unpacked {
+            new_idx.insert(e.path.clone(), e);
+        }
+    }
+
+    let read_member = |r: &mut std::io::BufReader<std::fs::File>,
+                       base: usize,
+                       off: usize,
+                       sz: usize|
+     -> Option<Vec<u8>> {
+        let pos = (base as u64).checked_add(off as u64)?;
+        r.seek(SeekFrom::Start(pos)).ok()?;
+        let mut buf = vec![0u8; sz];
+        r.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+    let stream_member_eq = |r1: &mut std::io::BufReader<std::fs::File>,
+                            b1: usize,
+                            o1: usize,
+                            r2: &mut std::io::BufReader<std::fs::File>,
+                            b2: usize,
+                            o2: usize,
+                            sz: usize|
+     -> bool {
+        if r1.seek(SeekFrom::Start((b1 + o1) as u64)).is_err()
+            || r2.seek(SeekFrom::Start((b2 + o2) as u64)).is_err()
+        {
+            return false;
+        }
+        let mut rem = sz;
+        let mut buf1 = [0u8; 65_536];
+        let mut buf2 = [0u8; 65_536];
+        while rem > 0 {
+            let chunk = rem.min(buf1.len());
+            if r1.read_exact(&mut buf1[..chunk]).is_err()
+                || r2.read_exact(&mut buf2[..chunk]).is_err()
+            {
+                return false;
+            }
+            if buf1[..chunk] != buf2[..chunk] {
+                return false;
+            }
+            rem -= chunk;
+        }
+        true
+    };
+
+    let mut added: Vec<(String, usize, &AsarEntry)> = Vec::new();
+    let mut removed: Vec<(String, usize)> = Vec::new();
+    let mut changed: Vec<(String, i64, usize, bool, &AsarEntry, &AsarEntry)> = Vec::new();
+    let mut unchanged = 0usize;
+
+    for (path, ne) in &new_idx {
+        match old_idx.get(path) {
+            None => added.push((path.clone(), ne.size, *ne)),
+            Some(oe) => {
+                let same = if ne.size != oe.size {
+                    false
+                } else if let (Some(hn), Some(ho)) = (&ne.hash, &oe.hash) {
+                    hn == ho
+                } else {
+                    stream_member_eq(
+                        &mut fn_new,
+                        base_new,
+                        ne.offset,
+                        &mut fn_old,
+                        base_old,
+                        oe.offset,
+                        ne.size,
+                    )
+                };
+                if same {
+                    unchanged += 1;
+                } else {
+                    changed.push((
+                        path.clone(),
+                        (ne.size as i64) - (oe.size as i64),
+                        ne.size,
+                        is_code_member_ext(path),
+                        *ne,
+                        *oe,
+                    ));
+                }
+            }
+        }
+    }
+    for (path, oe) in &old_idx {
+        if !new_idx.contains_key(path) {
+            removed.push((path.clone(), oe.size));
+        }
+    }
+
+    let size_delta = (new_len as i64) - (old_len as i64);
+    let mut out = vec![format!(
+        "## Binary/Archive Patch Diff: `{new_label}` ({new_len} B) vs `{old_label}` ({old_len} B, delta={size_delta:+} B)"
+    )];
+
+    if size_delta == 0 && added.is_empty() && removed.is_empty() && changed.is_empty() {
+        out.push(format!(
+            "- **IDENTICAL** ({unchanged} member(s) match by header+size/hash)"
+        ));
+        return Ok((
+            out.join("\n"),
+            json!({
+                "ok": true,
+                "mode": "version-diff",
+                "identical": true,
+                "kind": "asar",
+                "old_target": old_label,
+                "new_target": new_label,
+                "size_delta": 0,
+                "archive_summary": {
+                    "added": 0,
+                    "removed": 0,
+                    "modified_hash": 0,
+                    "unchanged": unchanged,
+                },
+            }),
+        ));
+    }
+
+    added.sort_by(|a, b| {
+        is_code_member_ext(&b.0)
+            .cmp(&is_code_member_ext(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    removed.sort_by(|a, b| {
+        is_code_member_ext(&b.0)
+            .cmp(&is_code_member_ext(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    changed.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| b.1.abs().cmp(&a.1.abs())));
+
+    out.push(format!(
+        "### Archive Member Diff (asar): +{} added, -{} removed, ~{} changed ({unchanged} identical)",
+        added.len(),
+        removed.len(),
+        changed.len()
+    ));
+    for (p, sz, _) in added.iter().take(max_items) {
+        out.push(format!("- [ADDED] `{p}` ({sz} B)"));
+    }
+    for (p, sz) in removed.iter().take(max_items) {
+        out.push(format!("- [REMOVED] `{p}` ({sz} B)"));
+    }
+    for (p, d, sz, _, _, _) in changed.iter().take(max_items) {
+        out.push(format!("- [CHANGED] `{p}` ({d:+} B -> {sz} B)"));
+    }
+
+    let mut changed_code_members = Vec::new();
+    let mut security_signals = Vec::new();
+    if deep {
+        let mut inspect_targets: Vec<(&str, bool, &AsarEntry, Option<&AsarEntry>)> = Vec::new();
+        for (p, _, _, is_code, ne, oe) in &changed {
+            if *is_code && inspect_targets.len() < 12 {
+                inspect_targets.push((p.as_str(), false, *ne, Some(*oe)));
+            }
+        }
+        for (p, _, ne) in &added {
+            if is_code_member_ext(p) && inspect_targets.len() < 12 {
+                inspect_targets.push((p.as_str(), true, *ne, None));
+            }
+        }
+        for (mpath, is_added, ne, oe_opt) in inspect_targets {
+            if ne.size > 2 * 1024 * 1024 {
+                continue;
+            }
+            let Some(nb) = read_member(&mut fn_new, base_new, ne.offset, ne.size) else {
+                continue;
+            };
+            let new_txt = String::from_utf8_lossy(&nb);
+            let old_bytes = oe_opt
+                .filter(|o| o.size <= 2 * 1024 * 1024)
+                .and_then(|o| read_member(&mut fn_old, base_old, o.offset, o.size))
+                .unwrap_or_default();
+            let old_txt = String::from_utf8_lossy(&old_bytes);
+            let mut routes_added = Vec::new();
+            let mut removed_routes_count = 0u64;
+            let mut ipc_sinks_added = Vec::new();
+            if is_js_like_member(mpath) {
+                let (_, jv) = crate::inspect::extract_js_routes_diff_md(
+                    &new_txt, mpath, None, &old_txt, mpath,
+                );
+                removed_routes_count = jv
+                    .pointer("/diff/removed_routes_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(ra) = jv.pointer("/diff/new_routes").and_then(Value::as_array) {
+                    routes_added = ra
+                        .iter()
+                        .take(12)
+                        .filter_map(|item| {
+                            if let Some(s) = item.as_str() {
+                                Some(s.to_string())
+                            } else {
+                                let meth = item.get("method").and_then(Value::as_str).unwrap_or("");
+                                let path = item.get("path").and_then(Value::as_str)?;
+                                Some(if meth.is_empty() {
+                                    path.to_string()
+                                } else {
+                                    format!("{meth} {path}")
+                                })
+                            }
+                        })
+                        .collect();
+                }
+                if let Some(ni) = jv.pointer("/diff/new_ipc_sinks").and_then(Value::as_array) {
+                    for item in ni.iter().take(12) {
+                        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("ipc");
+                        let snip = item.get("snippet").and_then(Value::as_str).unwrap_or("");
+                        let tag = format!("{kind}: {snip}");
+                        if !ipc_sinks_added.contains(&tag) {
+                            ipc_sinks_added.push(tag.clone());
+                            security_signals.push(format!("{mpath}: added {tag}"));
+                        }
+                    }
+                }
+                let old_ipc = scan_electron_ipc_flags(&old_txt);
+                let new_ipc = scan_electron_ipc_flags(&new_txt);
+                for f in new_ipc.difference(&old_ipc) {
+                    if !ipc_sinks_added.contains(f) {
+                        ipc_sinks_added.push(f.clone());
+                        security_signals.push(format!("{mpath}: added {f}"));
+                    }
+                }
+                for r in &routes_added {
+                    security_signals.push(format!("{mpath}: added route {r}"));
+                }
+            }
+            let hunk_preview = if is_added {
+                new_txt.lines().take(12).collect::<Vec<_>>().join("\n")
+            } else {
+                compact_text_hunk(&old_txt, &new_txt, 14)
+            };
+            changed_code_members.push(json!({
+                "path": mpath,
+                "status": if is_added { "added" } else { "modified" },
+                "size_delta": (ne.size as i64) - (oe_opt.map(|o| o.size as i64).unwrap_or(0)),
+                "routes_added": routes_added,
+                "removed_routes_count": removed_routes_count,
+                "ipc_sinks_added": ipc_sinks_added,
+                "hunk_preview": hunk_preview,
+            }));
+        }
+    }
+
+    let jv = json!({
+        "ok": true,
+        "mode": "version-diff",
+        "kind": "asar",
+        "streaming": true,
+        "old_target": old_label,
+        "new_target": new_label,
+        "size_delta": size_delta,
+        "archive_summary": {
+            "added": added.len(),
+            "removed": removed.len(),
+            "modified_hash": changed.len(),
+            "unchanged": unchanged,
+        },
+        "members_added": added.iter().take(max_items).map(|(p, sz, _)| json!({"path": p, "bytes": sz})).collect::<Vec<_>>(),
+        "members_removed": removed.iter().take(max_items).map(|(p, sz)| json!({"path": p, "bytes": sz})).collect::<Vec<_>>(),
+        "members_changed": changed.iter().take(max_items).map(|(p, d, sz, _, _, _)| json!({"path": p, "delta_bytes": d, "bytes": sz})).collect::<Vec<_>>(),
+        "changed_code_members": changed_code_members,
+        "security_signals": security_signals,
+    });
+    Ok((out.join("\n"), jv))
 }
 
 /// Pure-Rust Binary & Archive Patch-Diff Engine (`ap diff` & `ap read <new> --diff <old>`).
@@ -5629,6 +6187,388 @@ pub fn format_binary_surface_md(surf: &Value) -> String {
         }
     }
     out.join("\n")
+}
+
+fn decode_ctl_code(code: u32) -> Value {
+    let dev_type = (code >> 16) & 0xFFFF;
+    let access = (code >> 14) & 0x3;
+    let func = (code >> 2) & 0xFFF;
+    let method = code & 0x3;
+    let method_str = match method {
+        0 => "METHOD_BUFFERED",
+        1 => "METHOD_IN_DIRECT",
+        2 => "METHOD_OUT_DIRECT",
+        _ => "METHOD_NEITHER",
+    };
+    let access_str = match access {
+        0 => "FILE_ANY_ACCESS",
+        1 => "FILE_READ_DATA",
+        2 => "FILE_WRITE_DATA",
+        _ => "FILE_READ_DATA|FILE_WRITE_DATA",
+    };
+    let mut risk_flags = Vec::new();
+    if method == 3 {
+        risk_flags.push("METHOD_NEITHER");
+    }
+    if access == 0 {
+        risk_flags.push("FILE_ANY_ACCESS");
+    }
+    json!({
+        "code": format!("0x{code:08x}"),
+        "device_type": format!("0x{dev_type:04x}"),
+        "function": format!("0x{func:03x}"),
+        "method": method_str,
+        "access": access_str,
+        "risk_flags": risk_flags,
+    })
+}
+
+fn is_plausible_ctl_code(code: u32) -> bool {
+    let dev_type = (code >> 16) & 0xFFFF;
+    let func = (code >> 2) & 0xFFF;
+    let valid_dev = (0x0011..=0x0055).contains(&dev_type) || (0x8000..=0xFFFE).contains(&dev_type);
+    if !valid_dev || (dev_type != 0x0022 && func == 0) {
+        return false;
+    }
+    // Filter out printable 4-byte ASCII constants like 'TEST' / 'DATA'
+    !code.to_le_bytes().iter().all(|b| (0x20..=0x7E).contains(b))
+}
+
+fn is_pipe_or_device_artifact(s: &str) -> bool {
+    let low = s.to_ascii_lowercase();
+    low.contains(r"\\.\pipe\")
+        || low.starts_with(r"\device\")
+        || low.starts_with(r"\dosdevices\")
+        || low.starts_with(r"\\.\")
+        || low.contains("ncacn_np:")
+}
+
+/// Pure-Rust Win32 driver / native IPC static slicer (`--ioctl` & `--pipes`):
+/// extracts decoded `CTL_CODE` immediates (`METHOD_NEITHER`/`FILE_ANY_ACCESS`), IAT XREFs,
+/// ASCII/UTF-16LE `\\.\pipe\*` / `\Device\*` / `\DosDevices\*` strings & XREFs, and PE exports.
+pub fn inspect_pe_ioctl_and_pipes(
+    bytes: &[u8],
+    label: &str,
+    include_ioctl: bool,
+    include_pipes: bool,
+    query: Option<&str>,
+) -> (String, Value) {
+    let t0 = Instant::now();
+    let q_re = query.and_then(|q| {
+        Regex::new(&format!("(?i){q}"))
+            .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
+            .ok()
+    });
+
+    let mut dummy_hdr = Vec::new();
+    let mut pe_ctx: Option<PeContext> = None;
+    let mut arch = "unknown";
+    if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
+        let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
+        if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
+            let machine = read_u16_le(bytes, pe_off + 4).unwrap_or(0);
+            arch = match machine {
+                0x8664 => "x86_64",
+                0x014c => "x86",
+                0xaa64 => "ARM64",
+                _ => "pe",
+            };
+            pe_ctx = Some(parse_pe_details(bytes, pe_off, &mut dummy_hdr));
+        }
+    }
+
+    let exports: Vec<String> = extract_pe_exports_set(bytes).into_iter().take(80).collect();
+
+    let mut ioctl_iat_imports: Vec<String> = Vec::new();
+    let mut ioctl_iat_xrefs: Vec<String> = Vec::new();
+    let mut ioctl_codes: Vec<Value> = Vec::new();
+    if include_ioctl {
+        if let Some(ref pe) = pe_ctx {
+            let ioctl_re = Regex::new(
+                r"(?i)(?:DeviceIoControl|IoCreateDevice|IoCreateSymbolicLink|MmMapIoSpace|ZwMapViewOfSection|ZwOpenSection|ProbeForRead|ProbeForWrite|ExAllocatePool)",
+            )
+            .unwrap();
+            for (_, sym) in &pe.iat_map {
+                if ioctl_re.is_match(sym) && !ioctl_iat_imports.contains(sym) {
+                    ioctl_iat_imports.push(sym.clone());
+                }
+            }
+            ioctl_iat_xrefs = scan_pe64_xrefs(bytes, pe, &[], Some(&ioctl_re), 40);
+
+            let mut seen_codes = std::collections::HashSet::<u32>::new();
+            for s in &pe.secs {
+                if (s.chars & 0x2000_0000) == 0 || s.raw_size < 5 {
+                    continue;
+                }
+                let start = s.raw_ptr as usize;
+                let len = (s.raw_size as usize).min(16 * 1024 * 1024);
+                let Some(code) = bytes.get(start..start.saturating_add(len).min(bytes.len()))
+                else {
+                    continue;
+                };
+                let mut i = 0usize;
+                while i + 5 <= code.len() && ioctl_codes.len() < 80 {
+                    let b0 = code[i];
+                    let imm_pair: Option<(u32, usize)> =
+                        if (b0 == 0x3D || b0 == 0x2D || (0xB8..=0xBF).contains(&b0))
+                            && i + 5 <= code.len()
+                        {
+                            Some((
+                                u32::from_le_bytes([
+                                    code[i + 1],
+                                    code[i + 2],
+                                    code[i + 3],
+                                    code[i + 4],
+                                ]),
+                                5,
+                            ))
+                        } else if i + 6 <= code.len()
+                            && ((b0 == 0x41 && (0xB8..=0xBF).contains(&code[i + 1]))
+                                || (b0 == 0x81 && (0xE8..=0xFF).contains(&code[i + 1])))
+                        {
+                            Some((
+                                u32::from_le_bytes([
+                                    code[i + 2],
+                                    code[i + 3],
+                                    code[i + 4],
+                                    code[i + 5],
+                                ]),
+                                6,
+                            ))
+                        } else if (b0 == 0x41 || b0 == 0x48 || b0 == 0x49)
+                            && i + 7 <= code.len()
+                            && code[i + 1] == 0x81
+                            && (0xE8..=0xFF).contains(&code[i + 2])
+                        {
+                            Some((
+                                u32::from_le_bytes([
+                                    code[i + 3],
+                                    code[i + 4],
+                                    code[i + 5],
+                                    code[i + 6],
+                                ]),
+                                7,
+                            ))
+                        } else {
+                            None
+                        };
+                    if let Some((cand, step)) = imm_pair {
+                        if is_plausible_ctl_code(cand) {
+                            let code_hex = format!("0x{cand:08x}");
+                            if q_re.as_ref().map(|r| r.is_match(&code_hex)).unwrap_or(true)
+                                && seen_codes.insert(cand)
+                            {
+                                let insn_rva = s.vaddr.saturating_add(i as u32);
+                                let func_rva = if pe.is_pe64 {
+                                    find_enclosing_x64_func_rva(code, s.vaddr, i)
+                                } else {
+                                    insn_rva
+                                };
+                                let mut obj = decode_ctl_code(cand);
+                                if let Some(m) = obj.as_object_mut() {
+                                    m.insert("section".to_string(), json!(s.name));
+                                    m.insert(
+                                        "file_offset".to_string(),
+                                        json!(format!("0x{:x}", start + i)),
+                                    );
+                                    m.insert(
+                                        "insn_rva".to_string(),
+                                        json!(format!("0x{insn_rva:x}")),
+                                    );
+                                    m.insert(
+                                        "func_rva".to_string(),
+                                        json!(format!("0x{func_rva:x}")),
+                                    );
+                                }
+                                ioctl_codes.push(obj);
+                                i += step;
+                                continue;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    let mut device_pipes: Vec<Value> = Vec::new();
+    let mut pipe_str_rvas: Vec<(u32, String)> = Vec::new();
+    let mut pipe_str_xrefs: Vec<String> = Vec::new();
+    let mut pipe_iat_imports: Vec<String> = Vec::new();
+    if include_pipes {
+        let mut seen_pipe_vals = std::collections::HashSet::<String>::new();
+        let data = &bytes[..bytes.len().min(24 * 1024 * 1024)];
+        let mut push_pipe = |st: usize, enc: &str, s: String| -> bool {
+            if device_pipes.len() >= 120 {
+                return false;
+            }
+            if !is_pipe_or_device_artifact(&s) {
+                return true;
+            }
+            if !q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
+                return true;
+            }
+            if !seen_pipe_vals.insert(s.clone()) {
+                return true;
+            }
+            if let Some((rva, sec)) = pe_ctx
+                .as_ref()
+                .and_then(|p| file_offset_to_rva(st, &p.secs))
+            {
+                pipe_str_rvas.push((rva, s.clone()));
+                device_pipes.push(json!({
+                    "value": s,
+                    "encoding": enc,
+                    "offset": format!("0x{st:x}"),
+                    "rva": format!("0x{rva:x}"),
+                    "section": sec,
+                }));
+            } else {
+                device_pipes.push(json!({
+                    "value": s,
+                    "encoding": enc,
+                    "offset": format!("0x{st:x}"),
+                }));
+            }
+            device_pipes.len() < 120
+        };
+
+        let mut i = 0usize;
+        while i < data.len() {
+            if (0x20..=0x7E).contains(&data[i]) {
+                let st = i;
+                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 240 {
+                    i += 1;
+                }
+                if i - st >= 6 {
+                    let s = String::from_utf8_lossy(&data[st..i]).into_owned();
+                    if !push_pipe(st, "ascii", s) {
+                        break;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut j = 0usize;
+        while j + 1 < data.len() {
+            if (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 {
+                let st = j;
+                let mut s = String::new();
+                while j + 1 < data.len()
+                    && (0x20..=0x7E).contains(&data[j])
+                    && data[j + 1] == 0
+                    && s.len() < 200
+                {
+                    s.push(data[j] as char);
+                    j += 2;
+                }
+                if s.len() >= 6 && !push_pipe(st, "utf16le", s) {
+                    break;
+                }
+            } else {
+                j += 1;
+            }
+        }
+
+        if let Some(ref pe) = pe_ctx {
+            let pipe_iat_re = Regex::new(
+                r"(?i)(?:CreateNamedPipe|ConnectNamedPipe|ImpersonateNamedPipeClient|ConvertStringSecurityDescriptor|SetSecurityDescriptorDacl|RpcServerUseProtseq)",
+            )
+            .unwrap();
+            for (_, sym) in &pe.iat_map {
+                if pipe_iat_re.is_match(sym) && !pipe_iat_imports.contains(sym) {
+                    pipe_iat_imports.push(sym.clone());
+                }
+            }
+            if !pipe_str_rvas.is_empty() {
+                pipe_str_xrefs = scan_pe64_xrefs(bytes, pe, &pipe_str_rvas, None, 60);
+            }
+        }
+    }
+
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+    let mut md = vec![format!(
+        "# BINARY IOCTL / PIPE SURFACE `{label}` ({arch} | ioctls={}, pipes={}, ioctl_xrefs={}, exports={} in {elapsed_ms}ms)",
+        ioctl_codes.len(),
+        device_pipes.len(),
+        ioctl_iat_xrefs.len(),
+        exports.len()
+    )];
+    if !ioctl_iat_imports.is_empty() {
+        md.push(format!(
+            "- **IOCTL/Driver Imports**: `{}`",
+            ioctl_iat_imports.join("`, `")
+        ));
+    }
+    if !ioctl_codes.is_empty() {
+        md.push(format!(
+            "\n## Candidate CTL_CODE Constants ({})",
+            ioctl_codes.len()
+        ));
+        for c in ioctl_codes.iter().take(25) {
+            md.push(format!(
+                "- `{}` dev=`{}` fn=`{}` `{}` `{}` (insn={}, func={})",
+                c["code"].as_str().unwrap_or(""),
+                c["device_type"].as_str().unwrap_or(""),
+                c["function"].as_str().unwrap_or(""),
+                c["method"].as_str().unwrap_or(""),
+                c["access"].as_str().unwrap_or(""),
+                c["insn_rva"].as_str().unwrap_or(""),
+                c["func_rva"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    if !device_pipes.is_empty() {
+        md.push(format!(
+            "\n## Named Pipes & Device Paths ({})",
+            device_pipes.len()
+        ));
+        for p in device_pipes.iter().take(25) {
+            md.push(format!(
+                "- `[{} @{} {}]` `{}`",
+                p["encoding"].as_str().unwrap_or(""),
+                p["offset"].as_str().unwrap_or(""),
+                p["rva"].as_str().unwrap_or(""),
+                p["value"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    if !pipe_iat_imports.is_empty() {
+        md.push(format!(
+            "- **Pipe/SDDL Imports**: `{}`",
+            pipe_iat_imports.join("`, `")
+        ));
+    }
+    if !exports.is_empty() {
+        md.push(format!(
+            "\n## PE Exports ({} shown)\n{}",
+            exports.len(),
+            exports
+                .iter()
+                .take(25)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let jv = json!({
+        "ok": true,
+        "format": "binary-ioctl-pipes",
+        "target": label,
+        "arch": arch,
+        "elapsed_ms": elapsed_ms,
+        "exports": exports,
+        "ioctl_iat_imports": ioctl_iat_imports,
+        "ioctl_iat_xrefs": ioctl_iat_xrefs,
+        "ioctl_codes": ioctl_codes,
+        "device_pipes": device_pipes,
+        "pipe_str_xrefs": pipe_str_xrefs,
+        "pipe_iat_imports": pipe_iat_imports,
+    });
+    (md.join("\n"), jv)
 }
 
 #[cfg(test)]

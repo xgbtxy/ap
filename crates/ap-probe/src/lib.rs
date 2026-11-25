@@ -112,6 +112,21 @@ struct CdpArgs {
     /// Non-blocking bounded event watch window in ms (captures async console logs & network responses without hanging)
     #[arg(long, default_value_t = 0)]
     watch_ms: u64,
+    /// Export cookies + localStorage/sessionStorage auth/CSRF headers into `ap probe http --roles-matrix` JSON schema (`--export-role [PORT]`)
+    #[arg(long = "export-role", num_args = 0..=1, default_missing_value = "")]
+    export_role: Option<String>,
+    /// Role label to emit with `--export-role` (default: `role1`)
+    #[arg(long = "role-name", default_value = "role1")]
+    role_name: String,
+    /// Origin URL filter to match target/cookies for `--export-role`
+    #[arg(long)]
+    origin: Option<String>,
+    /// Skip localStorage/sessionStorage extraction during `--export-role` (cookies only)
+    #[arg(long = "no-storage")]
+    no_storage: bool,
+    /// Redact exported secret header values when printing `--export-role` output
+    #[arg(long)]
+    redact: bool,
     #[arg(long)]
     json: bool,
 }
@@ -195,6 +210,9 @@ struct HttpArgs {
     /// Expand cross-tenant `(actor, target_owner)` combinations when `--role-var` values differ
     #[arg(long = "cross-id")]
     cross_id: bool,
+    /// JSON body key name(s) (comma-separated) whose values should be rewritten using target owner's `--role-var` in `--roles-matrix`
+    #[arg(long = "vary-json-field")]
+    vary_json_field: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -437,6 +455,9 @@ enum SubCmd {
         /// Enumerate live Windows RPC Endpoint Mapper bindings via rpcrt4.dll
         #[arg(long)]
         rpc: bool,
+        /// Filter out standard Microsoft / Windows OS baseline pipes, System32 services, core COM DLLs & OS RPC bindings
+        #[arg(long = "non-ms", alias = "exclude-microsoft")]
+        non_ms: bool,
         /// Case-insensitive substring filter for pipes, registry values/subkeys, services, COM, or RPC
         #[arg(long)]
         filter: Option<String>,
@@ -631,8 +652,36 @@ pub fn run_cli(args: &[String]) -> i32 {
                 screenshot,
                 stdin,
                 watch_ms,
+                export_role,
+                role_name,
+                origin,
+                no_storage,
+                redact,
                 json,
             } = *boxed;
+            if let Some(er_port_str) = export_role {
+                let eff_port = if er_port_str.trim().is_empty() {
+                    port
+                } else {
+                    match er_port_str.trim().parse::<u16>() {
+                        Ok(p) if p > 0 => p,
+                        _ => {
+                            eprintln!("[probe cdp] invalid --export-role port `{er_port_str}`");
+                            return 2;
+                        }
+                    }
+                };
+                return cdp::run_cdp_export_role(
+                    &host,
+                    eff_port,
+                    target.as_deref(),
+                    &role_name,
+                    origin.as_deref(),
+                    !no_storage,
+                    redact,
+                    json,
+                );
+            }
             let mut eval_owned = eval;
             if eval_stdin {
                 let mut js_buf = String::new();
@@ -745,9 +794,25 @@ pub fn run_cli(args: &[String]) -> i32 {
                 role_vars,
                 methods,
                 cross_id,
+                vary_json_field,
                 json,
             } = *boxed;
-            if roles_matrix.is_some() || !role_vars.is_empty() || methods.is_some() || cross_id {
+            let vary_fields_vec: Vec<String> = vary_json_field
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if roles_matrix.is_some()
+                || !role_vars.is_empty()
+                || methods.is_some()
+                || cross_id
+                || !vary_fields_vec.is_empty()
+            {
                 return http_probe::run_http_roles_matrix(
                     roles_matrix.as_deref(),
                     vary_request.as_deref(),
@@ -759,6 +824,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     &principals,
                     &principal_cdps,
                     &role_vars,
+                    &vary_fields_vec,
                     cross_id,
                     rate_ms,
                     max_variants,
@@ -958,6 +1024,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             unquoted,
             com,
             rpc,
+            non_ms,
             filter,
             max,
             json,
@@ -972,6 +1039,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             unquoted,
             com,
             rpc,
+            non_ms,
             filter.as_deref(),
             max,
             json,
