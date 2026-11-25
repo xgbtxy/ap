@@ -995,3 +995,276 @@ fn corpus_07_probe_cdp_eval_stdin_and_invalid_stdin_guard() {
     stop.store(true, Ordering::Relaxed);
     let _ = srv.join();
 }
+
+#[test]
+fn corpus_08_sieve_peek_flags_and_partial_json_invariants() {
+    let td = tempfile::tempdir().unwrap();
+    let sieve_home = td.path().join("sieve_home");
+    fs::create_dir_all(&sieve_home).unwrap();
+    let envs = [("SIEVE_HOME", sieve_home.as_path())];
+
+    // 1. Archive a 60-line stream so we can test --lines A-B, --lines + --grep, --max-chars, --char-offset, --raw
+    let mut lines_raw = String::new();
+    for i in 1..=60 {
+        lines_raw.push_str(&format!(
+            "line-{i:02} marker={} payload={}\n",
+            if i == 10 || i == 45 {
+                "NEEDLE"
+            } else {
+                "noise"
+            },
+            "x".repeat(40)
+        ));
+    }
+    let pipe_out = run_ap(
+        td.path(),
+        &["sieve", "pipe", "--label", "corpus08", "--json"],
+        Some(&lines_raw),
+        &envs,
+    );
+    assert!(pipe_out.status.success());
+    let pj: Value = serde_json::from_slice(&pipe_out.stdout).unwrap();
+    let sid = pj["id"].as_str().unwrap().to_string();
+
+    // Hyphen range --lines 41-50 must return L41..L50 (never fall back to L1..L41)
+    let peek_hyp = run_ap(
+        td.path(),
+        &["sieve", "peek", &sid, "--lines", "41-50"],
+        None,
+        &envs,
+    );
+    assert!(peek_hyp.status.success());
+    let hyp_s = String::from_utf8_lossy(&peek_hyp.stdout);
+    assert!(hyp_s.contains("L41: line-41"), "{hyp_s}");
+    assert!(hyp_s.contains("L50: line-50"), "{hyp_s}");
+    assert!(!hyp_s.contains("L1: line-01"), "{hyp_s}");
+
+    // Invalid range must fail cleanly with exit 2
+    let peek_bad = run_ap(
+        td.path(),
+        &["sieve", "peek", &sid, "--lines", "50-10"],
+        None,
+        &envs,
+    );
+    assert!(!peek_bad.status.success());
+
+    // Compose --lines 40-60 + --grep NEEDLE -> only matches L45, NOT L10
+    let peek_comp = run_ap(
+        td.path(),
+        &[
+            "sieve", "peek", &sid, "--lines", "40-60", "--grep", "NEEDLE",
+        ],
+        None,
+        &envs,
+    );
+    assert!(peek_comp.status.success());
+    let comp_s = String::from_utf8_lossy(&peek_comp.stdout);
+    assert!(comp_s.contains("L45: line-45"), "{comp_s}");
+    assert!(!comp_s.contains("line-10"), "{comp_s}");
+
+    // 2. Single-line JSON with --raw --pretty --max-chars --char-offset
+    let big_json = format!(
+        "{{\"ok\":true,\"entries\":[{}]}}",
+        (0..60)
+            .map(|i| format!("{{\"idx\":{i},\"tag\":\"alpha_{i}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let pj2: Value = serde_json::from_slice(
+        &run_ap(
+            td.path(),
+            &["sieve", "pipe", "--label", "json-peek", "--json"],
+            Some(&big_json),
+            &envs,
+        )
+        .stdout,
+    )
+    .unwrap();
+    let jid = pj2["id"].as_str().unwrap().to_string();
+
+    let raw_peek = run_ap(
+        td.path(),
+        &["sieve", "peek", &jid, "--lines", "1-1", "--raw", "--pretty"],
+        None,
+        &envs,
+    );
+    assert!(raw_peek.status.success());
+    let raw_parsed: Value = serde_json::from_slice(&raw_peek.stdout).unwrap();
+    assert_eq!(raw_parsed["ok"], true);
+    assert_eq!(raw_parsed["entries"].as_array().unwrap().len(), 60);
+
+    let paged = run_ap(
+        td.path(),
+        &[
+            "sieve",
+            "peek",
+            &jid,
+            "--lines",
+            "1-1",
+            "--raw",
+            "--char-offset",
+            "0",
+            "--max-chars",
+            "64",
+        ],
+        None,
+        &envs,
+    );
+    assert!(paged.status.success());
+    let paged_s = String::from_utf8_lossy(&paged.stdout).trim().to_string();
+    assert_eq!(paged_s.chars().count(), 64, "{paged_s}");
+    assert!(!paged_s.contains("[sieve peek chars"), "{paged_s}");
+
+    // 3. Partial truncated JSON digest preserves extracted keys & fields
+    let partial = format!(
+        "<console_output>\n{{\"status\":200,\"workspace_id\":\"demo\",\"action\":\"scan\",\"blob\":\"{}\"",
+        "q".repeat(1600)
+    );
+    let pj3: Value = serde_json::from_slice(
+        &run_ap(
+            td.path(),
+            &["sieve", "pipe", "--label", "partial", "--json"],
+            Some(&partial),
+            &envs,
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(pj3["mode"], "partial-json", "{pj3}");
+    let r3 = pj3["rendered"].as_str().unwrap();
+    assert!(r3.contains("workspace_id") && r3.contains("action"), "{r3}");
+}
+
+#[test]
+fn corpus_09_accelerator_bash_ps_hashline_and_win_sig_invariants() {
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+
+    #[cfg(windows)]
+    {
+        let sig_out = run_ap(
+            root,
+            &[
+                "probe",
+                "win",
+                "--sig",
+                r"C:\Windows\System32\notepad.exe",
+                "--json",
+            ],
+            None,
+            &[],
+        );
+        assert!(
+            sig_out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&sig_out.stderr)
+        );
+        let sj: Value = serde_json::from_slice(&sig_out.stdout).unwrap();
+        assert_eq!(sj["ok"], true, "{sj}");
+        assert_eq!(sj["signed"], true, "{sj}");
+        assert_eq!(sj["valid"], true, "{sj}");
+        assert!(!sj["subject"].as_str().unwrap_or("").is_empty(), "{sj}");
+    }
+
+    let fake_home = root.join("home_c09");
+    let ap_home = root.join("ap_home_c09");
+    let pi_agent = fake_home.join(".pi").join("agent");
+    fs::create_dir_all(&pi_agent).unwrap();
+    let init_out = run_ap(
+        root,
+        &["init", "-a", "pi", "--with-hooks", "--no-rules"],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("AP_HOME", ap_home.as_path()),
+        ],
+    );
+    assert!(init_out.status.success());
+
+    let accel_ts = pi_agent.join("extensions").join("zz-ap-accelerator.ts");
+    let node_check = r###"
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.ACCEL_TS).href);
+const {
+  shouldAutoSieveShellOutput,
+  healCommand,
+  annotateReadWithHashlines,
+  healCodemodeSource,
+  AP_DEEPSEEK_GUIDELINES,
+} = mod;
+
+// 1. Small <=12 line <=12KB minified JS line exempt from SIEVE_GIANT_LINE_CHARS
+const twoLineJs = "line1=" + "a".repeat(5200) + "\nline2=" + "b".repeat(1200);
+assert.equal(shouldAutoSieveShellOutput(twoLineJs, false, undefined, 30000), false);
+assert.equal(shouldAutoSieveShellOutput("x".repeat(5000) + "\n".repeat(15), false, undefined, 30000), true);
+
+// 2. Relative unquoted backslash healing in bash (without breaking regexes)
+const rel1 = healCommand("ap read notes\\current_plan.md --lines 1-30", "bash");
+assert.equal(rel1, "ap read notes/current_plan.md --lines 1-30");
+const rel2 = healCommand("wc -l docs\\guide.md", "bash");
+assert.equal(rel2, "wc -l docs/guide.md");
+
+// 3. Expanded grep (-A/-B/-C, BRE \|, single-file, findstr) & && exit-semantics preservation
+const gCtx = healCommand('grep -n "heading" -A 15 docs/manual.md', "bash");
+assert.ok(gCtx && gCtx.includes("search") && gCtx.includes("-A 15") && gCtx.includes('"docs/manual.md"'), gCtx);
+const gBre = healCommand('grep -n "foo\\|bar" src/lib.rs', "bash");
+assert.ok(gBre && (gBre.includes("'foo|bar'") || gBre.includes('"foo|bar"')) && gBre.includes('"src/lib.rs"'), gBre);
+const fsCmd = healCommand('findstr /i /s "needle" *.ts', "bash");
+assert.ok(fsCmd && fsCmd.includes("search") && fsCmd.includes("-i") && fsCmd.includes("-e ts"), fsCmd);
+const condGrep = healCommand('grep -rn "pat" src && echo found', "bash");
+assert.equal(condGrep, undefined, "must not rewrite grep on LHS of &&");
+
+// 4. Read-only PowerShell discovery -> ap probe ports/win/ps
+const psPorts = healCommand('powershell -NoProfile -Command "Get-NetTCPConnection -State Listen"', "bash");
+assert.ok(psPorts && psPorts.includes("probe ports"), psPorts);
+const psPipes = healCommand(`powershell -NoProfile -Command "[System.IO.Directory]::GetFiles('\\\\\\\\.\\\\pipe\\\\') | Where-Object { \\$_ -match 'ipc' }"`, "bash");
+assert.ok(psPipes && psPipes.includes("probe win --pipes") && psPipes.includes('--filter "ipc"'), psPipes);
+const psProc = healCommand('powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object -First 15"', "bash");
+assert.ok(psProc && psProc.includes("probe ps") && psProc.includes("--limit 15"), psProc);
+const psSvc = healCommand('powershell -NoProfile -Command "Get-Service"', "bash");
+assert.ok(psSvc && psSvc.includes("probe win --services"), psSvc);
+
+// 5. Selective hashline: only editable code/config files <=400 lines
+const code2 = "const a = 1;\nconst b = 2;";
+assert.ok(annotateReadWithHashlines(code2, 1, "src/app.ts")?.includes("|const a = 1;"));
+assert.equal(annotateReadWithHashlines(code2, 1, "notes/readme.md"), undefined);
+assert.equal(annotateReadWithHashlines(code2, 1, "data/out.json"), undefined);
+const code405 = Array.from({ length: 405 }, (_, i) => `let x${i} = ${i};`).join("\n");
+assert.equal(annotateReadWithHashlines(code405, 1, "src/big.ts"), undefined);
+
+// 6. Codemode String.raw inner backtick & regex alternation slash heals
+const psRaw = "const ps = String.raw`\n\"$h`:$p OPEN\"\n`;\ntext(ps);";
+const healedPs = healCodemodeSource(psRaw);
+assert.ok(healedPs, "expected String.raw inner backtick heal");
+new Function(`return async () => {\n${healedPs}\n};`);
+
+const rxRaw = 'const ok = (/alpha|/beta/.test(s));';
+const healedRx = healCodemodeSource(rxRaw);
+assert.ok(healedRx && healedRx.includes("\\/beta/"), healedRx);
+new Function(`return async () => {\n${healedRx}\n};`);
+
+// 7. Guidelines include new high-value primitives
+assert.ok(AP_DEEPSEEK_GUIDELINES.join("\n").includes("ap ps|ports"));
+assert.ok(AP_DEEPSEEK_GUIDELINES.join("\n").includes("--sig"));
+"###;
+
+    let run = Command::new("node")
+        .args([
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            node_check,
+        ])
+        .env("ACCEL_TS", &accel_ts)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "Node corpus_09 check failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}

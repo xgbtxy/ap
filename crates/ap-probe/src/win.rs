@@ -131,6 +131,157 @@ mod imp {
     const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
     const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
 
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+    const WTD_UI_NONE: u32 = 2;
+    const WTD_REVOKE_NONE: u32 = 0;
+    const WTD_CHOICE_FILE: u32 = 1;
+    const WTD_CHOICE_CATALOG: u32 = 2;
+    const WTD_STATEACTION_VERIFY: u32 = 1;
+    const WTD_STATEACTION_CLOSE: u32 = 2;
+    const WTD_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_1000;
+
+    const TRUST_E_NOSIGNATURE_CODE: i32 = 0x800B_0100u32 as i32;
+    const TRUST_E_EXPLICIT_DISTRUST_CODE: i32 = 0x800B_0111u32 as i32;
+    const TRUST_E_SUBJECT_NOT_TRUSTED_CODE: i32 = 0x800B_0004u32 as i32;
+    const CRYPT_E_SECURITY_SETTINGS_CODE: i32 = 0x8009_2026u32 as i32;
+    const CERT_E_EXPIRED_CODE: i32 = 0x800B_0101u32 as i32;
+    const CERT_E_UNTRUSTEDROOT_CODE: i32 = 0x800B_0109u32 as i32;
+    const CERT_E_CHAINING_CODE: i32 = 0x800B_010Au32 as i32;
+
+    const CERT_NAME_RDN_TYPE: u32 = 2;
+    const CERT_NAME_SIMPLE_DISPLAY_TYPE: u32 = 4;
+    const CERT_NAME_ISSUER_FLAG: u32 = 1;
+    const CERT_HASH_PROP_ID: u32 = 3;
+    const CERT_SHA256_HASH_PROP_ID: u32 = 107;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    const WINTRUST_ACTION_GENERIC_VERIFY_V2: Guid = Guid {
+        data1: 0x00AA_C56B,
+        data2: 0xCD44,
+        data3: 0x11d0,
+        data4: [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
+    };
+
+    #[repr(C)]
+    struct SystemTime {
+        w_year: u16,
+        w_month: u16,
+        w_day_of_week: u16,
+        w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        w_second: u16,
+        w_milliseconds: u16,
+    }
+
+    #[repr(C)]
+    struct WinTrustFileInfo {
+        cb_struct: u32,
+        pcwsz_file_path: *const u16,
+        h_file: Handle,
+        pg_known_subject: *const Guid,
+    }
+
+    #[repr(C)]
+    struct WinTrustCatalogInfo {
+        cb_struct: u32,
+        dw_catalog_version: u32,
+        pcwsz_catalog_file_path: *const u16,
+        pcwsz_member_tag: *const u16,
+        pcwsz_member_file_path: *const u16,
+        h_member_file: Handle,
+        pb_calculated_file_hash: *const u8,
+        cb_calculated_file_hash: u32,
+        pc_catalog_context: *const c_void,
+        h_cat_admin: Handle,
+    }
+
+    #[repr(C)]
+    struct WinTrustData {
+        cb_struct: u32,
+        p_policy_callback_data: *mut c_void,
+        p_sip_client_data: *mut c_void,
+        dw_ui_choice: u32,
+        fdw_revocation_checks: u32,
+        dw_union_choice: u32,
+        p_union: *mut c_void,
+        dw_state_action: u32,
+        h_wvt_state_data: Handle,
+        pwsz_url_reference: *const u16,
+        dw_prov_flags: u32,
+        dw_ui_context: u32,
+        p_signature_settings: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct CatalogInfo {
+        cb_struct: u32,
+        wsz_catalog_file: [u16; MAX_PATH_W],
+    }
+
+    #[repr(C)]
+    struct CryptoApiBlob {
+        cb_data: u32,
+        pb_data: *const u8,
+    }
+
+    #[repr(C)]
+    struct CryptAlgorithmIdentifier {
+        psz_obj_id: *const u8,
+        parameters: CryptoApiBlob,
+    }
+
+    #[repr(C)]
+    struct CertInfo {
+        dw_version: u32,
+        serial_number: CryptoApiBlob,
+        signature_algorithm: CryptAlgorithmIdentifier,
+        issuer: CryptoApiBlob,
+        not_before: FileTime,
+        not_after: FileTime,
+    }
+
+    #[repr(C)]
+    struct CertContext {
+        dw_cert_encoding_type: u32,
+        pb_cert_encoded: *const u8,
+        cb_cert_encoded: u32,
+        p_cert_info: *const CertInfo,
+        h_cert_store: Handle,
+    }
+
+    #[repr(C)]
+    struct CryptProviderSgnr {
+        cb_struct: u32,
+        sft_verify_as_of: FileTime,
+        cs_cert_chain: u32,
+        pas_cert_chain: *mut c_void,
+        dw_signer_type: u32,
+        ps_signer: *mut c_void,
+        dw_error: u32,
+        cs_counter_signers: u32,
+        pas_counter_signers: *mut c_void,
+        p_cert_chain_context: *const c_void,
+    }
+
+    #[repr(C)]
+    struct CryptProviderCert {
+        cb_struct: u32,
+        p_cert: *const CertContext,
+    }
+
     const HKEY_CLASSES_ROOT: isize = 0x8000_0000u32 as i32 as isize;
     const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
     const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
@@ -147,6 +298,7 @@ mod imp {
     const SERVICE_STATE_ALL: u32 = 0x0000_0003;
 
     #[repr(C)]
+    #[derive(Copy, Clone)]
     struct FileTime {
         low: u32,
         high: u32,
@@ -235,6 +387,89 @@ mod imp {
         fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
         fn GetCurrentProcess() -> Handle;
         fn GetLastError() -> u32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: Handle,
+        ) -> Handle;
+        fn FileTimeToSystemTime(
+            lp_file_time: *const FileTime,
+            lp_system_time: *mut SystemTime,
+        ) -> Bool;
+    }
+
+    #[link(name = "wintrust")]
+    extern "system" {
+        fn WinVerifyTrust(
+            hwnd: Handle,
+            pg_action_id: *const Guid,
+            p_wvt_data: *mut WinTrustData,
+        ) -> i32;
+        fn WTHelperProvDataFromStateData(h_state_data: Handle) -> *mut c_void;
+        fn WTHelperGetProvSignerFromChain(
+            p_prov_data: *mut c_void,
+            idx_signer: u32,
+            f_counter_signer: Bool,
+            idx_counter_signer: u32,
+        ) -> *mut CryptProviderSgnr;
+        fn WTHelperGetProvCertFromChain(
+            p_sgnr: *mut CryptProviderSgnr,
+            idx_cert: u32,
+        ) -> *mut CryptProviderCert;
+        fn CryptCATAdminAcquireContext2(
+            ph_cat_admin: *mut Handle,
+            pg_subsystem: *const Guid,
+            pwsz_hash_algorithm: *const u16,
+            p_strong_hash_policy: *const c_void,
+            dw_flags: u32,
+        ) -> Bool;
+        fn CryptCATAdminCalcHashFromFileHandle2(
+            h_cat_admin: Handle,
+            h_file: Handle,
+            pcb_hash: *mut u32,
+            pb_hash: *mut u8,
+            dw_flags: u32,
+        ) -> Bool;
+        fn CryptCATAdminEnumCatalogFromHash(
+            h_cat_admin: Handle,
+            pb_hash: *const u8,
+            cb_hash: u32,
+            dw_flags: u32,
+            ph_prev_cat_info: *mut Handle,
+        ) -> Handle;
+        fn CryptCATCatalogInfoFromContext(
+            h_cat_info: Handle,
+            ps_cat_info: *mut CatalogInfo,
+            dw_flags: u32,
+        ) -> Bool;
+        fn CryptCATAdminReleaseCatalogContext(
+            h_cat_admin: Handle,
+            h_cat_info: Handle,
+            dw_flags: u32,
+        ) -> Bool;
+        fn CryptCATAdminReleaseContext(h_cat_admin: Handle, dw_flags: u32) -> Bool;
+    }
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CertGetNameStringW(
+            p_cert_context: *const CertContext,
+            dw_type: u32,
+            dw_flags: u32,
+            pv_type_para: *const c_void,
+            psz_name_string: *mut u16,
+            cch_name_string: u32,
+        ) -> u32;
+        fn CertGetCertificateContextProperty(
+            p_cert_context: *const CertContext,
+            dw_prop_id: u32,
+            pv_data: *mut c_void,
+            pcb_data: *mut u32,
+        ) -> Bool;
     }
 
     #[link(name = "advapi32")]
@@ -1031,6 +1266,368 @@ mod imp {
             "privileges": privileges,
         })
     }
+
+    fn format_trust_status(hr: i32) -> String {
+        let code = hr as u32;
+        let label = match hr {
+            0 => "TRUST_E_OK",
+            TRUST_E_NOSIGNATURE_CODE => "TRUST_E_NOSIGNATURE",
+            TRUST_E_EXPLICIT_DISTRUST_CODE => "TRUST_E_EXPLICIT_DISTRUST",
+            TRUST_E_SUBJECT_NOT_TRUSTED_CODE => "TRUST_E_SUBJECT_NOT_TRUSTED",
+            CRYPT_E_SECURITY_SETTINGS_CODE => "CRYPT_E_SECURITY_SETTINGS",
+            CERT_E_EXPIRED_CODE => "CERT_E_EXPIRED",
+            CERT_E_UNTRUSTEDROOT_CODE => "CERT_E_UNTRUSTEDROOT",
+            CERT_E_CHAINING_CODE => "CERT_E_CHAINING",
+            _ => "WINVERIFYTRUST_STATUS",
+        };
+        format!("{label} (0x{code:08x})")
+    }
+
+    fn filetime_to_iso_utc(ft: FileTime) -> Option<String> {
+        let mut st = SystemTime {
+            w_year: 0,
+            w_month: 0,
+            w_day_of_week: 0,
+            w_day: 0,
+            w_hour: 0,
+            w_minute: 0,
+            w_second: 0,
+            w_milliseconds: 0,
+        };
+        if unsafe { FileTimeToSystemTime(&ft, &mut st) } == 0 {
+            return None;
+        }
+        Some(format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            st.w_year, st.w_month, st.w_day, st.w_hour, st.w_minute, st.w_second
+        ))
+    }
+
+    unsafe fn cert_name_string(p_cert: *const CertContext, name_type: u32, flags: u32) -> String {
+        if p_cert.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let n = CertGetNameStringW(
+            p_cert,
+            name_type,
+            flags,
+            ptr::null(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        );
+        if n <= 1 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..(n as usize - 1)])
+    }
+
+    unsafe fn cert_prop_hex(p_cert: *const CertContext, prop_id: u32) -> Option<String> {
+        let mut sz = 0u32;
+        if CertGetCertificateContextProperty(p_cert, prop_id, ptr::null_mut(), &mut sz) == 0
+            || sz == 0
+            || sz > 256
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; sz as usize];
+        if CertGetCertificateContextProperty(
+            p_cert,
+            prop_id,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut sz,
+        ) == 0
+        {
+            return None;
+        }
+        Some(
+            buf[..sz as usize]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        )
+    }
+
+    unsafe fn extract_signer_from_state(h_state_data: Handle) -> Option<Value> {
+        if h_state_data.is_null() {
+            return None;
+        }
+        let prov_data = WTHelperProvDataFromStateData(h_state_data);
+        if prov_data.is_null() {
+            return None;
+        }
+        let signer = WTHelperGetProvSignerFromChain(prov_data, 0, 0, 0);
+        if signer.is_null() {
+            return None;
+        }
+        let timestamped = (*signer).cs_counter_signers > 0;
+        let prov_cert = WTHelperGetProvCertFromChain(signer, 0);
+        if prov_cert.is_null() || (*prov_cert).p_cert.is_null() {
+            return None;
+        }
+        let p_cert = (*prov_cert).p_cert;
+        let subject = cert_name_string(p_cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0);
+        let issuer = cert_name_string(p_cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG);
+        let subject_dn = cert_name_string(p_cert, CERT_NAME_RDN_TYPE, 0);
+        let issuer_dn = cert_name_string(p_cert, CERT_NAME_RDN_TYPE, CERT_NAME_ISSUER_FLAG);
+        let sha256 = cert_prop_hex(p_cert, CERT_SHA256_HASH_PROP_ID);
+        let sha1 = cert_prop_hex(p_cert, CERT_HASH_PROP_ID);
+
+        let mut serial = String::new();
+        let mut not_before = None;
+        let mut not_after = None;
+        if !(*p_cert).p_cert_info.is_null() {
+            let info = &*(*p_cert).p_cert_info;
+            if !info.serial_number.pb_data.is_null() && info.serial_number.cb_data > 0 {
+                let raw_sn = core::slice::from_raw_parts(
+                    info.serial_number.pb_data,
+                    (info.serial_number.cb_data as usize).min(64),
+                );
+                serial = raw_sn
+                    .iter()
+                    .rev()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+            }
+            not_before = filetime_to_iso_utc(info.not_before);
+            not_after = filetime_to_iso_utc(info.not_after);
+        }
+
+        Some(json!({
+            "subject": subject,
+            "issuer": issuer,
+            "subject_dn": subject_dn,
+            "issuer_dn": issuer_dn,
+            "serial": serial,
+            "sha256": sha256,
+            "sha1": sha1,
+            "not_before": not_before,
+            "not_after": not_after,
+            "timestamped": timestamped,
+        }))
+    }
+
+    pub fn query_signature(raw_path: &str) -> Value {
+        let norm = normalize_win_input_path(raw_path);
+        let path_obj = std::path::Path::new(&norm);
+        if !path_obj.exists() {
+            return json!({
+                "ok": false,
+                "mode": "sig",
+                "path": norm,
+                "error": format!("File not found: {norm}"),
+            });
+        }
+        let abs = std::fs::canonicalize(path_obj)
+            .map(|p| {
+                let s = p.to_string_lossy().to_string();
+                s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+            })
+            .unwrap_or_else(|_| norm.clone());
+        let wpath = to_wide(&abs);
+
+        let mut file_info = WinTrustFileInfo {
+            cb_struct: core::mem::size_of::<WinTrustFileInfo>() as u32,
+            pcwsz_file_path: wpath.as_ptr(),
+            h_file: ptr::null_mut(),
+            pg_known_subject: ptr::null(),
+        };
+        let mut wvt = WinTrustData {
+            cb_struct: core::mem::size_of::<WinTrustData>() as u32,
+            p_policy_callback_data: ptr::null_mut(),
+            p_sip_client_data: ptr::null_mut(),
+            dw_ui_choice: WTD_UI_NONE,
+            fdw_revocation_checks: WTD_REVOKE_NONE,
+            dw_union_choice: WTD_CHOICE_FILE,
+            p_union: (&mut file_info as *mut WinTrustFileInfo) as *mut c_void,
+            dw_state_action: WTD_STATEACTION_VERIFY,
+            h_wvt_state_data: ptr::null_mut(),
+            pwsz_url_reference: ptr::null(),
+            dw_prov_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+            dw_ui_context: 0,
+            p_signature_settings: ptr::null_mut(),
+        };
+
+        let action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        let hr = unsafe { WinVerifyTrust(INVALID_HANDLE_VALUE as Handle, &action, &mut wvt) };
+        let mut signer_meta = unsafe { extract_signer_from_state(wvt.h_wvt_state_data) };
+        if !wvt.h_wvt_state_data.is_null() {
+            wvt.dw_state_action = WTD_STATEACTION_CLOSE;
+            unsafe {
+                WinVerifyTrust(INVALID_HANDLE_VALUE as Handle, &action, &mut wvt);
+            }
+        }
+
+        if hr != TRUST_E_NOSIGNATURE_CODE {
+            let signed = hr == 0 || signer_meta.is_some();
+            let mut out = json!({
+                "ok": true,
+                "mode": "sig",
+                "path": abs,
+                "signed": signed,
+                "valid": hr == 0,
+                "source": if signed { "embedded" } else { "unsigned" },
+                "trust_status": format_trust_status(hr),
+            });
+            if let (Some(obj), Some(Value::Object(sm))) = (out.as_object_mut(), signer_meta) {
+                for (k, v) in sm {
+                    obj.insert(k, v);
+                }
+            }
+            return out;
+        }
+
+        // Fallback: check Windows catalog-signed binaries (e.g. inbox system executables)
+        let mut h_cat_admin: Handle = ptr::null_mut();
+        let sha256_alg = to_wide("SHA256");
+        let h_file = unsafe {
+            CreateFileW(
+                wpath.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_ALL,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if h_file == INVALID_HANDLE_VALUE as Handle || h_file.is_null() {
+            return json!({
+                "ok": true,
+                "mode": "sig",
+                "path": abs,
+                "signed": false,
+                "valid": false,
+                "source": "unsigned",
+                "trust_status": format_trust_status(hr),
+            });
+        }
+
+        let mut cat_hr = hr;
+        let mut cat_file_path: Option<String> = None;
+        if unsafe {
+            CryptCATAdminAcquireContext2(
+                &mut h_cat_admin,
+                ptr::null(),
+                sha256_alg.as_ptr(),
+                ptr::null(),
+                0,
+            )
+        } != 0
+            && !h_cat_admin.is_null()
+        {
+            let mut hash_len = 64u32;
+            let mut hash_buf = vec![0u8; 64];
+            if unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(
+                    h_cat_admin,
+                    h_file,
+                    &mut hash_len,
+                    hash_buf.as_mut_ptr(),
+                    0,
+                )
+            } != 0
+                && hash_len > 0
+            {
+                let h_slice = &hash_buf[..hash_len as usize];
+                let h_cat_info = unsafe {
+                    CryptCATAdminEnumCatalogFromHash(
+                        h_cat_admin,
+                        h_slice.as_ptr(),
+                        hash_len,
+                        0,
+                        ptr::null_mut(),
+                    )
+                };
+                if !h_cat_info.is_null() {
+                    let mut ci = CatalogInfo {
+                        cb_struct: core::mem::size_of::<CatalogInfo>() as u32,
+                        wsz_catalog_file: [0u16; MAX_PATH_W],
+                    };
+                    if unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0) } != 0 {
+                        let cat_path = unsafe { read_wide_cstr(ci.wsz_catalog_file.as_ptr()) };
+                        let w_cat = to_wide(&cat_path);
+                        let hex_tag: String = h_slice.iter().map(|b| format!("{b:02X}")).collect();
+                        let w_tag = to_wide(&hex_tag);
+                        let mut cat_info = WinTrustCatalogInfo {
+                            cb_struct: core::mem::size_of::<WinTrustCatalogInfo>() as u32,
+                            dw_catalog_version: 0,
+                            pcwsz_catalog_file_path: w_cat.as_ptr(),
+                            pcwsz_member_tag: w_tag.as_ptr(),
+                            pcwsz_member_file_path: wpath.as_ptr(),
+                            h_member_file: h_file,
+                            pb_calculated_file_hash: h_slice.as_ptr(),
+                            cb_calculated_file_hash: hash_len,
+                            pc_catalog_context: ptr::null(),
+                            h_cat_admin,
+                        };
+                        let mut cat_wvt = WinTrustData {
+                            cb_struct: core::mem::size_of::<WinTrustData>() as u32,
+                            p_policy_callback_data: ptr::null_mut(),
+                            p_sip_client_data: ptr::null_mut(),
+                            dw_ui_choice: WTD_UI_NONE,
+                            fdw_revocation_checks: WTD_REVOKE_NONE,
+                            dw_union_choice: WTD_CHOICE_CATALOG,
+                            p_union: (&mut cat_info as *mut WinTrustCatalogInfo) as *mut c_void,
+                            dw_state_action: WTD_STATEACTION_VERIFY,
+                            h_wvt_state_data: ptr::null_mut(),
+                            pwsz_url_reference: ptr::null(),
+                            dw_prov_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+                            dw_ui_context: 0,
+                            p_signature_settings: ptr::null_mut(),
+                        };
+                        cat_hr = unsafe {
+                            WinVerifyTrust(INVALID_HANDLE_VALUE as Handle, &action, &mut cat_wvt)
+                        };
+                        signer_meta =
+                            unsafe { extract_signer_from_state(cat_wvt.h_wvt_state_data) };
+                        if !cat_wvt.h_wvt_state_data.is_null() {
+                            cat_wvt.dw_state_action = WTD_STATEACTION_CLOSE;
+                            unsafe {
+                                WinVerifyTrust(
+                                    INVALID_HANDLE_VALUE as Handle,
+                                    &action,
+                                    &mut cat_wvt,
+                                );
+                            }
+                        }
+                        cat_file_path = Some(cat_path);
+                    }
+                    unsafe {
+                        CryptCATAdminReleaseCatalogContext(h_cat_admin, h_cat_info, 0);
+                    }
+                }
+            }
+            unsafe {
+                CryptCATAdminReleaseContext(h_cat_admin, 0);
+            }
+        }
+        unsafe {
+            CloseHandle(h_file);
+        }
+
+        let is_catalog_signed = cat_file_path.is_some();
+        let mut out = json!({
+            "ok": true,
+            "mode": "sig",
+            "path": abs,
+            "signed": is_catalog_signed,
+            "valid": is_catalog_signed && cat_hr == 0,
+            "source": if is_catalog_signed { "catalog" } else { "unsigned" },
+            "trust_status": format_trust_status(cat_hr),
+        });
+        if let Some(cf) = cat_file_path {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("catalog_file".to_string(), Value::String(cf));
+            }
+        }
+        if let (Some(obj), Some(Value::Object(sm))) = (out.as_object_mut(), signer_meta) {
+            for (k, v) in sm {
+                obj.insert(k, v);
+            }
+        }
+        out
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1040,13 +1637,14 @@ pub fn run_win_cli(
     acl: Option<&str>,
     services: bool,
     whoami: bool,
+    sig: Option<&std::path::Path>,
     filter: Option<&str>,
     max: usize,
     as_json: bool,
 ) -> i32 {
     #[cfg(not(windows))]
     {
-        let _ = (pipes, reg, acl, services, whoami, filter, max);
+        let _ = (pipes, reg, acl, services, whoami, sig, filter, max);
         let out = json!({
             "ok": false,
             "os": std::env::consts::OS,
@@ -1068,9 +1666,10 @@ pub fn run_win_cli(
             + usize::from(reg.is_some())
             + usize::from(acl.is_some())
             + usize::from(services)
-            + usize::from(whoami);
+            + usize::from(whoami)
+            + usize::from(sig.is_some());
         if mode_count == 0 {
-            let msg = "[ap probe win] Pass one of --pipes, --reg <KEY>, --acl <PATH>, --services, or --whoami";
+            let msg = "[ap probe win] Pass one of --pipes, --reg <KEY>, --acl <PATH>, --services, --whoami, or --sig <PATH>";
             if as_json {
                 println!(
                     "{}",
@@ -1082,7 +1681,9 @@ pub fn run_win_cli(
             }
             return 2;
         }
-        let val = if let Some(rk) = reg {
+        let val = if let Some(sp) = sig {
+            imp::query_signature(&sp.to_string_lossy())
+        } else if let Some(rk) = reg {
             imp::query_registry(rk, filter, max)
         } else if let Some(ap) = acl {
             imp::query_acl(ap)
@@ -1150,5 +1751,26 @@ mod tests {
         let svcs = imp::query_services(Some("EventLog"), 5);
         assert_eq!(svcs["ok"], Value::Bool(true));
         assert!(!svcs["services"].as_array().unwrap().is_empty());
+
+        let sig_ok = imp::query_signature(r"C:\Windows\System32\notepad.exe");
+        assert_eq!(sig_ok["ok"], Value::Bool(true));
+        assert_eq!(sig_ok["signed"], Value::Bool(true));
+        assert_eq!(sig_ok["valid"], Value::Bool(true));
+        assert!(
+            !sig_ok["subject"].as_str().unwrap_or("").is_empty(),
+            "expected non-empty subject: {sig_ok}"
+        );
+
+        let tmp_unsigned =
+            std::env::temp_dir().join(format!("ap_win_sig_{}.bin", std::process::id()));
+        std::fs::write(&tmp_unsigned, b"unsigned dummy bytes").unwrap();
+        let sig_uns = imp::query_signature(&tmp_unsigned.to_string_lossy());
+        let _ = std::fs::remove_file(&tmp_unsigned);
+        assert_eq!(sig_uns["ok"], Value::Bool(true));
+        assert_eq!(sig_uns["signed"], Value::Bool(false));
+        assert_eq!(sig_uns["valid"], Value::Bool(false));
+
+        let sig_miss = imp::query_signature(r"C:\__ap_nonexistent_sig_target__.exe");
+        assert_eq!(sig_miss["ok"], Value::Bool(false));
     }
 }

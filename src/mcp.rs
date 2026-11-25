@@ -376,6 +376,7 @@ fn mcp_tools_schema() -> Value {
                 "acl": { "type": "string", "description": "File or directory path whose owner, SDDL DACL & non-admin writability to inspect" },
                 "services": { "type": "boolean", "description": "Enumerate Windows services (state, PID, start_type, bin_path, account)" },
                 "whoami": { "type": "boolean", "description": "Inspect current process token user, SID, elevation, integrity level & privileges" },
+                "sig": { "type": "string", "description": "Inspect PE Authenticode signature & Windows catalog trust (signed, valid, subject, issuer, sha256)" },
                 "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services" },
                 "max": { "type": "integer", "description": "Max entries to return (default: 60)" }
             }
@@ -571,9 +572,13 @@ fn mcp_tools_schema() -> Value {
                     "action": { "type": "string", "description": "'peek' or 'search'" },
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
                     "id": { "type": "string", "description": "Archive ID prefix for `peek`" },
-                    "lines": { "type": "string", "description": "Line range 'START:END' for `peek`" },
-                    "grep": { "type": "string", "description": "Regex filter for `peek`" },
+                    "lines": { "type": "string", "description": "Line range 'START-END' or 'START:END' for `peek`" },
+                    "grep": { "type": "string", "description": "Regex filter for `peek` (composes with `lines`)" },
                     "json_path": { "type": "string", "description": "Dot-separated JSON path for `peek`" },
+                    "max_chars": { "type": "integer", "description": "Max output characters for `peek`" },
+                    "char_offset": { "type": "integer", "description": "Starting character offset for `peek`" },
+                    "raw": { "type": "boolean", "description": "Emit raw lines without L<n>: prefixes for `peek`" },
+                    "pretty": { "type": "boolean", "description": "Pretty-print valid JSON before slicing for `peek`" },
                     "query": { "type": "string", "description": "FTS5 search query for `search`" },
                     "limit": { "type": "integer", "description": "Max FTS5 hits (default: 8)" }
                 },
@@ -2456,6 +2461,14 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("whoami").and_then(Value::as_bool) == Some(true) {
                 cli.push("--whoami".into());
             }
+            if let Some(sg) = args
+                .get("sig")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                cli.push("--sig".into());
+                cli.push(sg.to_string());
+            }
             if let Some(fl) = args
                 .get("filter")
                 .and_then(Value::as_str)
@@ -2979,6 +2992,20 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     {
                         cli.push("--json-path".into());
                         cli.push(jp.into());
+                    }
+                    if let Some(mc) = args.get("max_chars").and_then(Value::as_u64) {
+                        cli.push("--max-chars".into());
+                        cli.push(mc.to_string());
+                    }
+                    if let Some(co) = args.get("char_offset").and_then(Value::as_u64) {
+                        cli.push("--char-offset".into());
+                        cli.push(co.to_string());
+                    }
+                    if args.get("raw").and_then(Value::as_bool) == Some(true) {
+                        cli.push("--raw".into());
+                    }
+                    if args.get("pretty").and_then(Value::as_bool) == Some(true) {
+                        cli.push("--pretty".into());
                     }
                     run_self_captured_in(cwd, &cli, None)
                 }

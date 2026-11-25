@@ -410,6 +410,9 @@ enum SubCmd {
         /// Inspect current process token user, SID, elevation, integrity level, and privileges
         #[arg(long)]
         whoami: bool,
+        /// Inspect PE Authenticode signature & Windows catalog trust (`subject`, `issuer`, `valid`, `sha256`)
+        #[arg(long)]
+        sig: Option<PathBuf>,
         /// Case-insensitive substring filter for pipes, registry values/subkeys, or services
         #[arg(long)]
         filter: Option<String>,
@@ -899,6 +902,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             acl,
             services,
             whoami,
+            sig,
             filter,
             max,
             json,
@@ -908,6 +912,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             acl.as_deref(),
             services,
             whoami,
+            sig.as_deref(),
             filter.as_deref(),
             max,
             json,

@@ -76,6 +76,18 @@ enum SubCmd {
         max_hits: usize,
         #[arg(long)]
         json_path: Option<String>,
+        /// Maximum output characters to return (UTF-8 safe)
+        #[arg(long = "max-chars", alias = "max_chars", alias = "chars")]
+        max_chars: Option<usize>,
+        /// Starting character offset for paging huge single-line JSON or text outputs
+        #[arg(long = "char-offset", alias = "char_offset", default_value_t = 0)]
+        char_offset: usize,
+        /// Emit raw lines without `L<n>:` prefixes or truncation footers (safe for `| python -c json.load`)
+        #[arg(long)]
+        raw: bool,
+        /// Pretty-print valid JSON before slicing/outputting
+        #[arg(long)]
+        pretty: bool,
     },
     /// Sub-millisecond SQLite FTS5 full-text search across all archived outputs
     Search {
@@ -1326,6 +1338,192 @@ fn try_summarize_test_output(clean: &str) -> Option<String> {
     Some(out.join("\n"))
 }
 
+fn strip_wrapper_prefix_for_json(clean: &str) -> &str {
+    let mut s = clean.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("<console_output>") {
+            s = rest.trim_start();
+            continue;
+        }
+        if s.starts_with("==> text ") {
+            if let Some(nl) = s.find('\n') {
+                if s[..nl].contains(" <==") {
+                    s = s[nl + 1..].trim_start();
+                    continue;
+                }
+            }
+        }
+        if s.starts_with("Script completed") || s.starts_with("Script failed") {
+            if let Some(out_idx) = s.find("\nOutput:\n") {
+                s = s[out_idx + "\nOutput:\n".len()..].trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    s
+}
+
+fn summarize_partial_json(stripped: &str) -> Option<String> {
+    if !stripped.starts_with('{') && !stripped.starts_with('[') {
+        return None;
+    }
+    static KEY_RE: OnceLock<Regex> = OnceLock::new();
+    let key_re = KEY_RE
+        .get_or_init(|| Regex::new(r#""([A-Za-z0-9_@.\-\u{4e00}-\u{9fff}]{1,48})"\s*:"#).unwrap());
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let scan_slice = if stripped.len() > 24_000 {
+        let mut cut = 24_000;
+        while cut > 0 && !stripped.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        &stripped[..cut]
+    } else {
+        stripped
+    };
+    for cap in key_re.captures_iter(scan_slice) {
+        let k = cap[1].to_string();
+        if seen.insert(k.clone()) {
+            keys.push(k);
+            if keys.len() >= 24 {
+                break;
+            }
+        }
+    }
+    if keys.is_empty() && stripped.len() < 80 {
+        return None;
+    }
+    let line_cnt = stripped.lines().count();
+    let kind_label = if stripped.starts_with('[') {
+        "Truncated JSON Array"
+    } else {
+        "Truncated JSON Object"
+    };
+    let mut out = vec![format!(
+        "{kind_label} ({}B across {line_cnt} lines; keys={}): {}",
+        stripped.len(),
+        keys.len(),
+        if keys.is_empty() {
+            "(none)".to_string()
+        } else {
+            keys.join(", ")
+        }
+    )];
+    static ALERT_RE: OnceLock<Regex> = OnceLock::new();
+    let alert_re = ALERT_RE.get_or_init(|| {
+        Regex::new(r#""(ok|status|error|errors|workspace_id|action|dedup_risk|verdict)"\s*:\s*("[^"\r\n]{0,120}"|true|false|-?\d+)"#).unwrap()
+    });
+    let mut alerts: Vec<String> = Vec::new();
+    let mut seen_a: HashSet<String> = HashSet::new();
+    for cap in alert_re.captures_iter(scan_slice) {
+        let pair = format!("{}: {}", &cap[1], &cap[2]);
+        if seen_a.insert(pair.clone()) {
+            alerts.push(format!("  - {pair}"));
+            if alerts.len() >= 8 {
+                break;
+            }
+        }
+    }
+    if !alerts.is_empty() {
+        out.push("Extracted Fields:".to_string());
+        out.extend(alerts);
+    }
+    out.push(format!(
+        "Head: {}",
+        trunc_chars(stripped, 280).replace('\n', " ")
+    ));
+    let tail_char_cnt = stripped.chars().count();
+    if tail_char_cnt > 320 {
+        let tail: String = stripped
+            .chars()
+            .skip(tail_char_cnt.saturating_sub(200))
+            .collect();
+        out.push(format!("Tail: ...{}", tail.replace('\n', " ")));
+    }
+    Some(out.join("\n"))
+}
+
+fn parse_line_range(spec: &str) -> Result<(usize, usize), String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("empty --lines specification".to_string());
+    }
+    let sep = if trimmed.contains(':') {
+        Some(':')
+    } else if trimmed.contains('-') {
+        Some('-')
+    } else {
+        None
+    };
+    if let Some(delim) = sep {
+        let parts: Vec<&str> = trimmed.split(delim).collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "invalid --lines range '{spec}' (expected N, A-B, or A:B)"
+            ));
+        }
+        let start = parts[0]
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --lines start in '{spec}'"))?;
+        if start == 0 {
+            return Err(format!("invalid --lines start 0 in '{spec}' (1-based)"));
+        }
+        let end = if parts[1].trim().is_empty() {
+            usize::MAX
+        } else {
+            let e = parts[1]
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid --lines end in '{spec}'"))?;
+            if e < start {
+                return Err(format!(
+                    "invalid --lines range '{spec}' (end {e} < start {start})"
+                ));
+            }
+            e
+        };
+        Ok((start, end))
+    } else {
+        let line = trimmed
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --lines value '{spec}' (expected N, A-B, or A:B)"))?;
+        if line == 0 {
+            return Err(format!("invalid --lines value 0 in '{spec}' (1-based)"));
+        }
+        Ok((line, line))
+    }
+}
+
+fn slice_chars_window(
+    s: &str,
+    char_offset: usize,
+    max_chars: Option<usize>,
+) -> (String, usize, usize, bool) {
+    let total = s.chars().count();
+    let start = char_offset.min(total);
+    let mut end = total;
+    let body: String = match max_chars {
+        Some(limit) => {
+            let mut buf = String::new();
+            let mut taken = 0usize;
+            for ch in s.chars().skip(start) {
+                if taken >= limit {
+                    break;
+                }
+                buf.push(ch);
+                taken += 1;
+            }
+            end = start + taken;
+            buf
+        }
+        None => s.chars().skip(start).collect(),
+    };
+    let truncated = start > 0 || end < total;
+    (body, start, end, truncated)
+}
+
 pub fn compress_stream_in(
     store: &Path,
     raw_text: &str,
@@ -1357,12 +1555,14 @@ pub fn compress_stream_in(
 
     let clean_cow = strip_ansi(raw_text);
     let clean = clean_cow.as_ref();
-    let stripped = clean.trim_start();
+    let stripped = strip_wrapper_prefix_for_json(clean);
     let (kind, body_summary) = if stripped.starts_with('{') || stripped.starts_with('[') {
         if let Ok(parsed) = serde_json::from_str::<Value>(stripped) {
             ("json".to_string(), summarize_json(&parsed))
-        } else if let Some(jl) = try_summarize_jsonl(clean) {
+        } else if let Some(jl) = try_summarize_jsonl(stripped) {
             ("jsonl".to_string(), jl)
+        } else if let Some(pj) = summarize_partial_json(stripped) {
+            ("partial-json".to_string(), pj)
         } else {
             ("log".to_string(), summarize_log(clean))
         }
@@ -1609,6 +1809,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             context,
             max_hits,
             json_path,
+            max_chars,
+            char_offset,
+            raw: raw_mode,
+            pretty,
         } => {
             let primary = store_dir_readonly(&cwd);
             let mut candidate_dirs = vec![primary.clone()];
@@ -1640,20 +1844,25 @@ pub fn run_cli(args: &[String]) -> i32 {
                 );
                 return 1;
             };
-            let raw = String::from_utf8_lossy(&fs::read(&raw_path).unwrap_or_default()).to_string();
+            let raw_body =
+                String::from_utf8_lossy(&fs::read(&raw_path).unwrap_or_default()).to_string();
 
             if let Some(jpath) = json_path {
-                let parsed_val: Option<Value> = if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                let parsed_val: Option<Value> = if let Ok(v) =
+                    serde_json::from_str::<Value>(strip_wrapper_prefix_for_json(&raw_body))
+                {
                     Some(v)
                 } else {
-                    let raw_lines: Vec<&str> = raw.lines().collect();
+                    let raw_lines: Vec<&str> = raw_body.lines().collect();
                     if let Some(ls) = &line_spec {
-                        let idx = ls
-                            .split(':')
-                            .next()
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .unwrap_or(1)
-                            .saturating_sub(1);
+                        let (start, _) = match parse_line_range(ls) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("[sieve] error: {e}");
+                                return 2;
+                            }
+                        };
+                        let idx = start.saturating_sub(1);
                         raw_lines
                             .get(idx)
                             .and_then(|ln| serde_json::from_str::<Value>(ln).ok())
@@ -1674,33 +1883,46 @@ pub fn run_cli(args: &[String]) -> i32 {
                     eprintln!("[sieve] json-path '{jpath}' not found in archive '{id}'");
                     return 1;
                 };
-                let pretty = serde_json::to_string_pretty(sub).unwrap_or_default();
-                println!("{}", trunc_chars(&pretty, 8000));
+                let out_json = serde_json::to_string_pretty(sub).unwrap_or_default();
+                let limit = max_chars.unwrap_or(8000);
+                let (sliced, _, _, _) = slice_chars_window(&out_json, char_offset, Some(limit));
+                println!("{sliced}");
                 return 0;
             }
 
-            let all_lines: Vec<&str> = raw.lines().collect();
-            if let Some(ls) = line_spec {
-                let parts: Vec<&str> = ls.split(':').collect();
-                let start = parts
-                    .first()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .max(1);
-                let end = parts
-                    .get(1)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(start + 40)
-                    .min(all_lines.len());
-                if start <= end && start <= all_lines.len() {
-                    for (idx, line_txt) in all_lines.iter().enumerate().take(end).skip(start - 1) {
-                        println!("L{}: {line_txt}", idx + 1);
+            let parsed_range = if let Some(ref ls) = line_spec {
+                match parse_line_range(ls) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        eprintln!("[sieve] error: {e}");
+                        return 2;
                     }
                 }
-                return 0;
-            }
+            } else {
+                None
+            };
 
+            let maybe_pretty_owned = if pretty && parsed_range.is_none() && grep.is_none() {
+                let candidate = strip_wrapper_prefix_for_json(&raw_body);
+                serde_json::from_str::<Value>(candidate)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            } else {
+                None
+            };
+            let source_text = maybe_pretty_owned.as_deref().unwrap_or(&raw_body);
+            let all_lines: Vec<&str> = source_text.lines().collect();
+
+            let (win_start_idx, win_end_excl) = if let Some((s, e)) = parsed_range {
+                let s_idx = s.saturating_sub(1).min(all_lines.len());
+                let e_excl = e.min(all_lines.len());
+                (s_idx, e_excl)
+            } else {
+                (0usize, all_lines.len())
+            };
+
+            let mut rendered_lines: Vec<String> = Vec::new();
+            let mut pretty_slice_used = false;
             if let Some(pat_str) = grep {
                 let pat = match Regex::new(&format!("(?i){pat_str}")) {
                     Ok(r) => r,
@@ -1711,19 +1933,26 @@ pub fn run_cli(args: &[String]) -> i32 {
                 };
                 let mut shown: HashSet<usize> = HashSet::new();
                 let mut hits = 0usize;
-                for (i, &ln) in all_lines.iter().enumerate() {
+                for i in win_start_idx..win_end_excl {
+                    let ln = all_lines[i];
                     if pat.is_match(ln) {
                         hits += 1;
-                        let s = i.saturating_sub(context);
-                        let e = (i + context + 1).min(all_lines.len());
+                        let s = i.saturating_sub(context).max(win_start_idx);
+                        let e = (i + context + 1).min(win_end_excl);
                         for (j, j_line) in all_lines.iter().enumerate().take(e).skip(s) {
                             if shown.insert(j) {
-                                let marker = if j == i { '>' } else { ' ' };
-                                println!("{marker}L{}: {j_line}", j + 1);
+                                if raw_mode {
+                                    rendered_lines.push((*j_line).to_string());
+                                } else {
+                                    let marker = if j == i { '>' } else { ' ' };
+                                    rendered_lines.push(format!("{marker}L{}: {j_line}", j + 1));
+                                }
                             }
                         }
                         if hits >= max_hits {
-                            println!("... (capped at {max_hits} matches)");
+                            if !raw_mode {
+                                rendered_lines.push(format!("... (capped at {max_hits} matches)"));
+                            }
                             break;
                         }
                     }
@@ -1731,14 +1960,66 @@ pub fn run_cli(args: &[String]) -> i32 {
                 if hits == 0 {
                     println!(
                         "[sieve] 0 matches for /{pat_str}/ in {} lines.",
-                        all_lines.len()
+                        win_end_excl.saturating_sub(win_start_idx)
                     );
+                    return 0;
                 }
-                return 0;
+            } else if parsed_range.is_some() {
+                if pretty {
+                    let joined = all_lines[win_start_idx..win_end_excl].join("\n");
+                    if let Ok(v) =
+                        serde_json::from_str::<Value>(strip_wrapper_prefix_for_json(&joined))
+                    {
+                        if let Ok(pj) = serde_json::to_string_pretty(&v) {
+                            pretty_slice_used = true;
+                            if raw_mode {
+                                rendered_lines.push(pj);
+                            } else {
+                                for (k, ln) in pj.lines().enumerate() {
+                                    rendered_lines.push(format!("L{}: {ln}", k + 1));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !pretty_slice_used {
+                    for (idx, line_txt) in all_lines
+                        .iter()
+                        .enumerate()
+                        .take(win_end_excl)
+                        .skip(win_start_idx)
+                    {
+                        if raw_mode {
+                            rendered_lines.push((*line_txt).to_string());
+                        } else {
+                            rendered_lines.push(format!("L{}: {line_txt}", idx + 1));
+                        }
+                    }
+                }
+            } else {
+                for (idx, &ln) in all_lines.iter().take(40).enumerate() {
+                    if raw_mode {
+                        rendered_lines.push(ln.to_string());
+                    } else {
+                        rendered_lines.push(format!("L{}: {ln}", idx + 1));
+                    }
+                }
             }
 
-            for (idx, &ln) in all_lines.iter().take(40).enumerate() {
-                println!("L{}: {ln}", idx + 1);
+            let combined = rendered_lines.join("\n");
+            let total_chars = combined.chars().count();
+            if char_offset > 0 || max_chars.is_some() {
+                let (sliced, start_c, end_c, truncated) =
+                    slice_chars_window(&combined, char_offset, max_chars);
+                if raw_mode || !truncated {
+                    println!("{sliced}");
+                } else {
+                    println!(
+                        "{sliced}\n... [sieve peek chars {start_c}..{end_c} of {total_chars}; pass --char-offset {end_c}]"
+                    );
+                }
+            } else if !combined.is_empty() {
+                println!("{combined}");
             }
             0
         }
@@ -1838,6 +2119,64 @@ mod tests {
             res.rendered.contains("[sieve id="),
             "missing archive header: {}",
             res.rendered
+        );
+    }
+
+    #[test]
+    fn parse_line_range_supports_hyphen_colon_and_rejects_invalid() {
+        assert_eq!(parse_line_range("41-150").unwrap(), (41, 150));
+        assert_eq!(parse_line_range("41:150").unwrap(), (41, 150));
+        assert_eq!(parse_line_range("7").unwrap(), (7, 7));
+        assert_eq!(parse_line_range("12:").unwrap(), (12, usize::MAX));
+        assert_eq!(parse_line_range("12-").unwrap(), (12, usize::MAX));
+        assert!(parse_line_range("0-10").is_err());
+        assert!(parse_line_range("50-10").is_err());
+        assert!(parse_line_range("abc").is_err());
+        assert!(parse_line_range("1:2:3").is_err());
+    }
+
+    #[test]
+    fn pipe_strips_wrapper_prefix_and_summarizes_truncated_json() {
+        let tmp = std::env::temp_dir().join(format!("ap_sieve_pjson_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let wrapped_ok = format!(
+            "<console_output>\n{{\"ok\":true,\"items\":[{}]}}\n",
+            (0..80)
+                .map(|i| format!("{{\"id\":{i},\"name\":\"item_{i}\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let res_ok = compress_stream_in(&tmp, &wrapped_ok, "wrapped-json", 0, 5.0);
+        assert_eq!(res_ok.mode, "json", "rendered={}", res_ok.rendered);
+        assert!(res_ok.rendered.contains("items"), "{}", res_ok.rendered);
+
+        let partial = format!(
+            "==> text 1/1 <==\n{{\n  \"workspace_id\": \"ws_alpha\",\n  \"ok\": true,\n  \"dedup_risk\": \"low\",\n  \"payload\": \"{}\"",
+            "z".repeat(1600)
+        );
+        let res_part = compress_stream_in(&tmp, &partial, "partial-json", 0, 5.0);
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(
+            res_part.mode, "partial-json",
+            "rendered={}",
+            res_part.rendered
+        );
+        assert!(
+            res_part.rendered.contains("Truncated JSON Object"),
+            "{}",
+            res_part.rendered
+        );
+        assert!(
+            res_part.rendered.contains("workspace_id"),
+            "{}",
+            res_part.rendered
+        );
+        assert!(
+            res_part.rendered.contains("dedup_risk"),
+            "{}",
+            res_part.rendered
         );
     }
 }

@@ -2153,13 +2153,94 @@ function stripTsTypesInCodemode(code: string): string {{
 	return res.replace(/\u0001T(\d+)\u0001/g, (_m, idx: string) => tokens[Number(idx)] ?? "");
 }}
 
+export function healStringRawInnerBackticks(code: string): string {{
+	if (!code || !code.includes("String.raw`")) return code;
+	let out = "";
+	let last = 0;
+	let i = 0;
+	const n = code.length;
+	while (i < n) {{
+		if (
+			code.startsWith("String.raw`", i) &&
+			(i === 0 || !/[A-Za-z0-9_$]/.test(code[i - 1]))
+		) {{
+			let j = i + "String.raw`".length;
+			let segOut = "";
+			let segLast = j;
+			let closed = false;
+			while (j < n) {{
+				const ch = code[j];
+				if (ch === "$" && code[j + 1] === "{{") {{
+					j += 2;
+					let depth = 1;
+					let q: string | null = null;
+					while (j < n && depth > 0) {{
+						const ic = code[j];
+						if (q) {{
+							if (ic === "\\" && q !== "`") {{ j += 2; continue; }}
+							if (ic === q) q = null;
+							j++;
+							continue;
+						}}
+						if (ic === "'" || ic === '"' || ic === "`") {{ q = ic; j++; continue; }}
+						if (ic === "{{") depth++;
+						else if (ic === "}}") depth--;
+						j++;
+					}}
+					continue;
+				}}
+				if (ch === "`") {{
+					const after = code.slice(j + 1);
+					const eolM = after.match(/^([^\r\n]*)/);
+					const restLine = (eolM ? eolM[1] : "").trim();
+					const isClosing =
+						/^[;,)\]\}}]?(?:\s*(?:\/\/.*)?)?$/.test(restLine) &&
+						(restLine.length > 0 ||
+							after.trim().length === 0 ||
+							/^\r?\n(?:\s*(?:const|let|var|await|return|if|for|while|try|text|console|tools|\}}|\)|\]|;))/.test(after));
+					if (isClosing) {{
+						segOut += code.slice(segLast, j + 1);
+						j++;
+						closed = true;
+						break;
+					}}
+					segOut += code.slice(segLast, j) + '${{"`"}}';
+					j++;
+					segLast = j;
+					continue;
+				}}
+				j++;
+			}}
+			if (closed && segOut !== code.slice(i + "String.raw`".length, j)) {{
+				out += code.slice(last, i + "String.raw`".length) + segOut;
+				last = j;
+				i = j;
+				continue;
+			}}
+			i = j;
+			continue;
+		}}
+		i++;
+	}}
+	return last === 0 ? code : out + code.slice(last);
+}}
+
+export function healRegexAlternationSlashes(code: string): string {{
+	if (!code || !code.includes("|/")) return code;
+	return code.replace(
+		/([(=,:;!&|?]\s*\/[^\/\r\n]*\|)\/([^\/\r\n]+\/[gimsuy]*\s*\.(?:test|exec)\b)/g,
+		"$1\\/$2",
+	);
+}}
+
 /**
  * Lossless pre-execution auto-heal for Pi `codemode` JS scripts:
  * 1) Strips outer markdown code fences (```js ... ```) that break QuickJS parsing / `// @options:` line 1.
  * 2) Repairs `tools.mcp__agent-primitives__` -> `tools.mcp__agent_primitives__` (avoids JS subtraction ReferenceError).
  * 3) Escapes raw newlines inside single/double-quoted strings & heals trailing escaped quotes (`healJsStringRawNewlines`).
- * 4) Strips accidental TypeScript variable/parameter/return annotations and `as <Type>` casts (`stripTsTypesInCodemode`).
- * 5) Auto-shims `setTimeout(...)` via host `sleep(ms)` (eliminating 100% of QuickJS timer ReferenceErrors while keeping `// @options:` on line 1).
+ * 4) Escapes embedded backticks inside `String.raw` blocks & unescaped alternation slashes in `.test()`/`.exec()` regexes.
+ * 5) Strips accidental TypeScript variable/parameter/return annotations and `as <Type>` casts (`stripTsTypesInCodemode`).
+ * 6) Auto-shims `setTimeout(...)` via host `sleep(ms)` (eliminating 100% of QuickJS timer ReferenceErrors while keeping `// @options:` on line 1).
  */
 export function healCodemodeSource(
 	code: string,
@@ -2171,6 +2252,7 @@ export function healCodemodeSource(
 	if (fenced) {{
 		next = fenced[1];
 	}}
+	next = healStringRawInnerBackticks(next);
 	if (next.includes("String.raw`")) {{
 		next = next.replace(
 			/(\bString\.raw`[^`\r\n]*?)(\\+)`([ \t]*(?:[;,)\]]|$))/gm,
@@ -2182,6 +2264,7 @@ export function healCodemodeSource(
 	if (healedNewlines) {{
 		next = healedNewlines;
 	}}
+	next = healRegexAlternationSlashes(next);
 
 	let needsSetTimeoutShim = false;
 	const spanRes = maskCodemodeSpans(next);
@@ -2506,7 +2589,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 export const AP_DEEPSEEK_GUIDELINES: readonly string[] = [
 	"Parallel-first execution: batch 2+ independent reads/searches/checks in parallel tool calls OR one codemode script via `const res = await Promise.allSettled([tools.read({{path}}), tools.bash({{command}})]);` (cuts latency & thinking tokens ~40%); persist cross-turn state via `store(key, val)`/`load(key)`.",
 	"In codemode (QuickJS sandbox — NO Node fs/path/require/process/fetch; `await sleep(ms)` is available): prefer typed MCP primitives `tools.mcp__agent_primitives__ap_search({{pattern, path, only_matching: true, unique: true, json: true}})`, `ap_read({{target, routes: true, section, json: true}})`, `ap_http`, `ap_cdp` over bash python/grep one-liners; `tools.bash({{command}})` returns `{{ output, exit_code }}`.",
-	'Fast local CLI & exact edits: direct `read` shows `L:HH|` hashline anchors (pass `L:HH|` lines in `edit` `oldText` to disambiguate duplicates in 1 shot). In bash, prefer zero-dep `ap` over slow grep/python: `ap ls <dir>`, `ap search -o -u "<re>" [dir]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex` (`--section`/`--routes`), `ap query -f db=<db> "<sql>"`, `ap atlas map .`.',
+	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--xref`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>`, `ap atlas map .`.',
 ];
 
 export function injectDeepSeekGuidelines(guidelines: string[]): boolean {{
@@ -2645,7 +2728,7 @@ export function shouldAutoSieveShellOutput(
 	);
 	if (text.length >= hardLimit) return true;
 	const lines = text.split("\n");
-	if (lines.some((l) => l.length > SIEVE_GIANT_LINE_CHARS)) return true;
+	if (lines.some((l) => l.length > SIEVE_GIANT_LINE_CHARS) && !(lines.length <= 12 && text.length <= 12288)) return true;
 	const structuredMin =
 		typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 60000
 			? 18000
@@ -2730,18 +2813,22 @@ export function hashlineTag(line: string): string {{
 	return ((h ^ (h >>> 8) ^ (h >>> 16) ^ (h >>> 24)) & 0xff).toString(16).padStart(2, "0");
 }}
 
+const HASHLINE_EDITABLE_EXT = /\.(?:rs|ts|tsx|js|jsx|mjs|cjs|py|go|c|cc|cpp|h|hpp|toml|yaml|yml|ini|cfg|conf|sh|ps1|bat|cmd|sql|html|css|scss|vue|svelte)$/i;
+
 /**
  * Annotate direct built-in `read` text output with compact `L:HH|` hashline anchors while
  * preserving Pi's trailing truncation banner and leaving `codemode` raw `structuredContent` untouched.
+ * Emits anchors selectively for editable code/config files with <= 400 lines.
  */
-export function annotateReadWithHashlines(outText: string, startOffset = 1): string | undefined {{
+export function annotateReadWithHashlines(outText: string, startOffset = 1, filePath?: string): string | undefined {{
 	if (!outText || outText.length > 60_000) return undefined;
+	if (filePath && !HASHLINE_EDITABLE_EXT.test(filePath.trim())) return undefined;
 	const trailerRe = /\n\n(\[(?:Showing lines [^\]]+|\d+ more lines in file[^\]]+|Truncated[^\]]+)\])\s*$/;
 	const tm = outText.match(trailerRe);
 	const body = tm ? outText.slice(0, tm.index) : outText;
 	const trailer = tm ? outText.slice(tm.index) : "";
 	const lines = body.split("\n");
-	if (lines.length < 2) return undefined;
+	if (lines.length < 2 || lines.length > 400) return undefined;
 	// Skip minified / giant single-line bundles
 	if (lines.some((l) => l.length > 600)) return undefined;
 	// Skip if already line-numbered or hashline-tagged
@@ -3523,6 +3610,11 @@ function shellQuoteBashPat(pat: string): string {{
 	return `'${{pat.replace(/'/g, "'\\''")}}'`;
 }}
 
+function translateGrepBreToRustRegex(pat: string, flags: string): string {{
+	if (!pat || flags.includes("E") || flags.includes("F")) return pat;
+	return pat.replace(/\\([|(){{}}+?])/g, "$1");
+}}
+
 function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undefined {{
 	// Match optional leading `cd <dir> && ` or `cd <dir>; `, strip `2>/dev/null` & trailing pagers (`| more`/`| less`).
 	const cleaned = cmd
@@ -3655,13 +3747,15 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const restArgs = (complexRec[6] || "").trim();
 		const pipeSuffix = complexRec[7] || "";
 		const hasBacktickPat = complexRec[3]?.includes("`") || complexRec[4]?.includes("`");
+		const restUnquoted = restArgs.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
+		const hasCompoundOps = /[;&<>`]|\$\(/.test(restUnquoted);
 		const hasTrailingFlag = /(?:^|\s)-[lch](?:\s|$)/.test(restArgs);
 		const isAppData = /AppData[/\\]Roaming/i.test(restArgs);
 		const multiTarget = restArgs.split(/\s+/).filter(Boolean).length > 1;
 		const hasArbitraryPipe =
 			Boolean(pipeSuffix) &&
 			!/^(?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+$/.test(pipeSuffix);
-		if (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget || hasArbitraryPipe) {{
+		if (!hasCompoundOps && (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget || hasArbitraryPipe)) {{
 			const rFlags = [
 				/[a]/.test(rawFlags) ? "-a" : "",
 				/[n]/.test(rawFlags) ? "-n --no-heading" : "",
@@ -3687,26 +3781,174 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	const m = withoutIncludes.match(
 		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aArRnwiEHhlcIFso]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
 	);
-	if (!m) return undefined;
-	const flags = m[2].replace(/[\s-]+/g, "");
-	if (!/[rR]/.test(flags)) return undefined;
-	const cdPrefix = m[1] || "";
-	const rawPat = m[3] || (m[4] ? m[4].replace(/\\"/g, '"') : "") || m[5] || "";
-	if (!rawPat) return undefined;
-	const target = m[6] || m[7] || m[8] || ".";
-	const pipeSuffix = m[9] || "";
-	const extFlag = exts.length > 0 ? ` -e ${{[...new Set(exts)].join(",")}}` : "";
-	const incFlags = extraIncludes.map((inc) => ` --include "${{inc.replace(/"/g, '\\"')}}"`).join("");
-	const prefix = toolName === "powershell" ? "& " : "";
-	const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${{rawPat.replace(/"/g, '\\"')}}"`;
-	const extra = [
-		flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
-		flags.includes("o") ? " -o" : "",
-		flags.includes("i") ? " -i" : "",
-		flags.includes("F") ? " -F" : "",
-		flags.includes("h") ? " --no-filename" : "",
-	].join("");
-	return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}}${{incFlags}} ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
+	if (m) {{
+		const flags = m[2].replace(/[\s-]+/g, "");
+		const cdPrefix = m[1] || "";
+		const rawPat = m[3] || (m[4] ? m[4].replace(/\\"/g, '"') : "") || m[5] || "";
+		const target = m[6] || m[7] || m[8] || ".";
+		const hasConcreteTarget = Boolean(m[6] || m[7] || m[8]) && target !== "-" && !/[*?,\s]/.test(target);
+		if (rawPat && (/[rR]/.test(flags) || (hasConcreteTarget && flags.includes("n") && !m[9]))) {{
+			const rustPat = translateGrepBreToRustRegex(rawPat, flags);
+			const pipeSuffix = m[9] || "";
+			const extFlag = exts.length > 0 ? ` -e ${{[...new Set(exts)].join(",")}}` : "";
+			const incFlags = extraIncludes.map((inc) => ` --include "${{inc.replace(/"/g, '\\"')}}"`).join("");
+			const prefix = toolName === "powershell" ? "& " : "";
+			const quotedPat = toolName === "bash" ? shellQuoteBashPat(rustPat) : `"${{rustPat.replace(/"/g, '\\"')}}"`;
+			const extra = [
+				flags.includes("l") ? " -l" : flags.includes("c") ? " -c" : "",
+				flags.includes("o") ? " -o" : "",
+				flags.includes("i") ? " -i" : "",
+				flags.includes("F") ? " -F" : "",
+				flags.includes("h") ? " --no-filename" : "",
+			].join("");
+			return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}}${{extFlag}}${{incFlags}} ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
+		}}
+	}}
+
+	// Generalized standalone grep with -A/-B/-C context flags anywhere, BRE `\|`, or single-file grep
+	const stdGrepM = withoutIncludes.match(
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+([\s\S]+?)((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
+	);
+	if (stdGrepM && !/[;&><{{}}`]|\$\(/.test((stdGrepM[2] || "").replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, ""))) {{
+		const cdPrefix = stdGrepM[1] || "";
+		const pipeSuffix = stdGrepM[3] || "";
+		const toks = ((stdGrepM[2] || "").match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) =>
+			(t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))
+				? t.slice(1, -1).replace(/\\"/g, '"')
+				: t,
+		);
+		let rec = false;
+		let lineNum = false;
+		let ignoreCase = false;
+		let fixed = false;
+		let extRe = false;
+		let filesOnly = false;
+		let countOnly = false;
+		let onlyMatch = false;
+		let noFilename = false;
+		let wordRe = false;
+		let ctxA = 0;
+		let ctxB = 0;
+		let ctxC = 0;
+		let ok = true;
+		let endOpts = false;
+		const pos: string[] = [];
+		for (let i = 0; i < toks.length; i++) {{
+			const tok = toks[i];
+			if (!endOpts && tok === "--") {{ endOpts = true; continue; }}
+			if (!endOpts && (tok === "-A" || tok === "-B" || tok === "-C")) {{
+				const num = Number(toks[++i]);
+				if (!Number.isInteger(num) || num < 0) {{ ok = false; break; }}
+				if (tok === "-A") ctxA = num;
+				else if (tok === "-B") ctxB = num;
+				else ctxC = num;
+				continue;
+			}}
+			if (!endOpts && /^-[ABC]\d+$/.test(tok)) {{
+				const num = Number(tok.slice(2));
+				if (tok[1] === "A") ctxA = num;
+				else if (tok[1] === "B") ctxB = num;
+				else ctxC = num;
+				continue;
+			}}
+			if (!endOpts && tok === "-e") {{
+				if (i + 1 >= toks.length) {{ ok = false; break; }}
+				pos.unshift(toks[++i]);
+				continue;
+			}}
+			if (!endOpts && tok.startsWith("-") && tok.length > 1) {{
+				if (tok.startsWith("--")) {{ ok = false; break; }}
+				for (const ch of tok.slice(1)) {{
+					if (ch === "r" || ch === "R") rec = true;
+					else if (ch === "n") lineNum = true;
+					else if (ch === "i") ignoreCase = true;
+					else if (ch === "F") fixed = true;
+					else if (ch === "E") extRe = true;
+					else if (ch === "l") filesOnly = true;
+					else if (ch === "c") countOnly = true;
+					else if (ch === "o") onlyMatch = true;
+					else if (ch === "h") noFilename = true;
+					else if (ch === "w") wordRe = true;
+					else if (ch === "H" || ch === "s" || ch === "a") continue;
+					else {{ ok = false; break; }}
+				}}
+				if (!ok) break;
+				continue;
+			}}
+			pos.push(tok);
+		}}
+		if (ok && pos.length >= 1 && pos.length <= 2) {{
+			const rawPat = pos[0];
+			const target = pos[1] || ".";
+			const concreteSingleFile = pos.length === 2 && target !== "-" && !/[*?,\s]/.test(target);
+			if (rawPat && (rec || (!pipeSuffix && concreteSingleFile && (lineNum || ctxA > 0 || ctxB > 0 || ctxC > 0 || rawPat.includes("\\|"))))) {{
+				const flagsStr = `${{extRe ? "E" : ""}}${{fixed ? "F" : ""}}`;
+				const rustPat = translateGrepBreToRustRegex(rawPat, flagsStr);
+				const prefix = toolName === "powershell" ? "& " : "";
+				const quotedPat = toolName === "bash" ? shellQuoteBashPat(rustPat) : `"${{rustPat.replace(/"/g, '\\"')}}"`;
+				const extra = [
+					filesOnly ? " -l" : countOnly ? " -c" : "",
+					onlyMatch ? " -o" : "",
+					ignoreCase ? " -i" : "",
+					fixed ? " -F" : "",
+					wordRe ? " -w" : "",
+					noFilename ? " --no-filename" : "",
+					ctxC > 0 ? ` -C ${{ctxC}}` : "",
+					ctxB > 0 ? ` -B ${{ctxB}}` : "",
+					ctxA > 0 ? ` -A ${{ctxA}}` : "",
+					exts.length > 0 ? ` -e ${{[...new Set(exts)].join(",")}}` : "",
+					...extraIncludes.map((inc) => ` --include "${{inc.replace(/"/g, '\\"')}}"`),
+				].join("");
+				return `${{cdPrefix}}${{prefix}}"${{AP_BIN}}" search${{extra}} ${{quotedPat}} "${{target}}"${{pipeSuffix}}`;
+			}}
+		}}
+	}}
+
+	// Windows `findstr [/i] [/s] [/n] [/c:pat | pat] target` -> `ap search`
+	if (toolName === "bash" && /\bfindstr\b/i.test(cleaned)) {{
+		const fsM = cleaned.match(
+			/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?findstr\s+([\s\S]+?)((?:\s*\|\s*(?:head|tail|wc|sort)\b[^;&|<>]*)+)?\s*$/i,
+		);
+		if (fsM && !/[;&><{{}}`]|\$\(/.test((fsM[2] || "").replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, ""))) {{
+			const toks = ((fsM[2] || "").match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) =>
+				(t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")) ? t.slice(1, -1) : t,
+			);
+			let ignoreCase = false;
+			let fixed = false;
+			let recursive = false;
+			let explicitPat = "";
+			const pos: string[] = [];
+			let fsOk = true;
+			for (const tok of toks) {{
+				const low = tok.toLowerCase();
+				if (low.startsWith("/c:")) {{
+					explicitPat = tok.slice(3).replace(/^(['"])(.*)\1$/, "$2");
+					fixed = true;
+				}} else if (low === "/i") ignoreCase = true;
+				else if (low === "/s") recursive = true;
+				else if (low === "/l") fixed = true;
+				else if (low === "/n" || low === "/p" || low === "/r") continue;
+				else if (tok.startsWith("/")) {{ fsOk = false; break; }}
+				else pos.push(tok);
+			}}
+			if (fsOk) {{
+				const pat = explicitPat || pos[0] || "";
+				const tgt = explicitPat ? (pos[0] || "") : (pos[1] || "");
+				if (pat && (tgt || recursive)) {{
+					const rawTgt = tgt || ".";
+					const extM = rawTgt.match(/^\*\.([A-Za-z0-9_]+)$/);
+					const actualTgt = extM ? "." : rawTgt;
+					if (!/[*?,\s]/.test(actualTgt) && actualTgt !== "-") {{
+						const extFlag = extM ? ` -e ${{extM[1]}}` : "";
+						const flags = `${{ignoreCase ? " -i" : ""}}${{fixed ? " -F" : ""}}${{extFlag}}`;
+						return `${{fsM[1] || ""}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(pat)}} "${{actualTgt}}"${{fsM[3] || ""}}`;
+					}}
+				}}
+			}}
+		}}
+	}}
+
+	return undefined;
 }}
 
 /**
@@ -4052,6 +4294,57 @@ export function healCmdForLoop(raw: string, toolName = "bash"): string | undefin
 const BARE_PS_CMDLET_PREFIX_RE =
 	/^(?:\(\s*)?(?:Get-ChildItem|Get-Content|Get-Process|Get-CimInstance|Select-String|Get-NetTCPConnection|Get-Service|Get-ItemProperty|Get-Item|Get-FileHash|Get-Acl|Get-AuthenticodeSignature|Get-ScheduledTask|Test-NetConnection|Test-Path|Resolve-Path)\b/;
 
+function normalizeUnquotedRelativeBackslashes(raw: string): string {{
+	let out = "";
+	let quote: string | null = null;
+	let i = 0;
+	const n = raw.length;
+	while (i < n) {{
+		const ch = raw[i];
+		if (quote) {{
+			out += ch;
+			if (ch === "\\" && quote === '"' && i + 1 < n) {{
+				out += raw[i + 1];
+				i += 2;
+				continue;
+			}}
+			if (ch === quote) quote = null;
+			i++;
+			continue;
+		}}
+		if (ch === "'" || ch === '"') {{
+			quote = ch;
+			out += ch;
+			i++;
+			continue;
+		}}
+		if ((i === 0 || /[\s=;]/.test(raw[i - 1])) && /[A-Za-z0-9_.\u4e00-\u9fff]/.test(ch)) {{
+			let j = i;
+			while (j < n && !/[\s'"`;|&<>()]/.test(raw[j])) {{
+				j++;
+			}}
+			const tok = raw.slice(i, j);
+			if (
+				tok.includes("\\") &&
+				!/^[A-Za-z]:/.test(tok) &&
+				!/[*?{{}}\[\]|^$<>`]/.test(tok) &&
+				!/^\\/.test(tok) &&
+				/^(?:\.\.?\\[^\s\\]+|[A-Za-z0-9_\u4e00-\u9fff-]{{2,}}\\[A-Za-z0-9_\u4e00-\u9fff.-]{{2,}}(?:\\[^\s\\]+)*|[A-Za-z0-9_\u4e00-\u9fff-]+\\[A-Za-z0-9_.-]+\.[A-Za-z0-9]{{1,8}})$/.test(tok)
+			) {{
+				out += tok.replace(/\\/g, "/");
+				i = j;
+				continue;
+			}}
+			out += tok;
+			i = j;
+			continue;
+		}}
+		out += ch;
+		i++;
+	}}
+	return out;
+}}
+
 function normalizeUnquotedBashDrivePaths(raw: string): string {{
 	let out = "";
 	let quote: string | null = null;
@@ -4168,6 +4461,9 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	let invertMatch = false;
 	let noFilename = false;
 	let optMaxCount = 0;
+	let ctxA = 0;
+	let ctxB = 0;
+	let ctxC = 0;
 	const exts: string[] = [];
 	const includes: string[] = [];
 	const addGlob = (g: string): boolean => {{
@@ -4235,6 +4531,22 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		}}
 		if (!endOpts && gt.startsWith("-") && gt.length > 1) {{
 			const sh = gt.slice(1);
+			if (sh === "A" || sh === "B" || sh === "C") {{
+				gi += 1;
+				const m = gi < gToks.length ? Number(gToks[gi]) : NaN;
+				if (!Number.isInteger(m) || m < 0) return undefined;
+				if (sh === "A") ctxA = m;
+				else if (sh === "B") ctxB = m;
+				else ctxC = m;
+				continue;
+			}}
+			if (/^[ABC]\d+$/.test(sh)) {{
+				const m = Number(sh.slice(1));
+				if (sh[0] === "A") ctxA = m;
+				else if (sh[0] === "B") ctxB = m;
+				else ctxC = m;
+				continue;
+			}}
 			if (sh === "m") {{
 				gi += 1;
 				const m = gi < gToks.length ? Number(gToks[gi]) : NaN;
@@ -4280,6 +4592,10 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 	if (!patPos || !tgtPos || tgtPos === "-" || /[*?,]/.test(tgtPos) || (gPos.length !== 2 && !(isRg && gPos.length === 1))) {{
 		return undefined;
 	}}
+	const isSingleConcreteFile = !isRg && !gToks.some((t) => /^-[a-zA-Z]*[rR]/.test(t));
+	if (isSingleConcreteFile && (tgtPos === "." || !/[./\\]/.test(tgtPos))) {{
+		return undefined;
+	}}
 	let cutWidth = 0;
 	let maxHits = optMaxCount;
 	let unique = false;
@@ -4322,6 +4638,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		}}
 	}}
 	if (sawBareSort || (cutWidth === 0 && maxHits === 0 && !unique)) return undefined;
+	const rustPat = isRg ? patPos : translateGrepBreToRustRegex(patPos, `${{fixed ? "F" : ""}}${{gToks.some((t) => /^-[a-zA-Z]*E/.test(t)) ? "E" : ""}}`);
 	const flags = [
 		cutWidth > 0 ? ` --width ${{cutWidth}}` : "",
 		maxHits > 0 ? ` --max ${{maxHits}}` : "",
@@ -4333,10 +4650,13 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		ignoreCase ? " -i" : "",
 		fixed ? " --fixed-strings" : "",
 		wordRe ? " -w" : "",
+		ctxC > 0 ? ` -C ${{ctxC}}` : "",
+		ctxB > 0 ? ` -B ${{ctxB}}` : "",
+		ctxA > 0 ? ` -A ${{ctxA}}` : "",
 		exts.length > 0 ? ` --ext ${{exts.join(",")}}` : "",
 		...includes.map((inc) => ` --include "${{inc.replace(/"/g, '\\"')}}"`),
 	].join("");
-	return `${{cdLeadPfx}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(patPos)}} "${{tgtPos.replace(/"/g, '\\"')}}"`;
+	return `${{cdLeadPfx}}"${{AP_BIN}}" search${{flags}} ${{shellQuoteBashPat(rustPat)}} "${{tgtPos.replace(/"/g, '\\"')}}"`;
 }}
 
 function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
@@ -4757,6 +5077,72 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 		if (boundedPs !== seg) return boundedPs;
 	}}
 
+	// Accelerate simple read-only Windows discovery PowerShell one-liners (`Get-NetTCPConnection`,
+	// `GetFiles('\\.\pipe\')`, `Get-CimInstance Win32_Process` / `Get-Process`, `Get-Service`) -> fast `ap probe`
+	if (toolName === "bash" && /\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(seg)) {{
+		const psDiscM = seg.match(
+			/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+(['"])([\s\S]+?)\2(?:\s*2>&1)?\s*$/i,
+		);
+		if (psDiscM) {{
+			const cdLead = psDiscM[1] || "";
+			const body = psDiscM[3]
+				.replace(/^\s*\[Console\]::OutputEncoding\s*=[^;]+;\s*/i, "")
+				.trim();
+			const hasSideEffectsOrComplex =
+				PS_MUTATING_CMDLET_RE.test(body) ||
+				/[;>=<`]|(?:\b(?:ForEach-Object|Format-Table|Format-List|ConvertTo-|Export-|Import-)\b|\$[A-Za-z_]\w*\s*=)/i.test(
+					body.replace(/\s-(?:match|like|eq)\s/gi, " "),
+				);
+			if (body && !hasSideEffectsOrComplex) {{
+				const firstM = body.match(/\|\s*Select-Object\s+[^|;]*?-First\s+(\d+)\b\s*$/i);
+				const core = firstM ? body.slice(0, firstM.index).trim() : body;
+				const limNum = firstM ? Math.min(200, Math.max(1, Number(firstM[1]))) : 0;
+
+				// 1. Listening TCP ports
+				const tcpM = core.match(
+					/^Get-NetTCPConnection(?:\s+-State\s+Listen)?(?:\s+-LocalPort\s+(\d+))?(?:\s+-State\s+Listen)?(?:\s*\|\s*Select-Object\b[^|]*)?$/i,
+				);
+				if (tcpM) {{
+					const portArg = tcpM[1] ? ` -p ${{tcpM[1]}}` : "";
+					return `${{cdLead}}"${{AP_BIN}}" probe ports${{portArg}}`;
+				}}
+
+				// 2. Named pipes (`[System.IO.Directory]::GetFiles('\\.\pipe\')` or `Get-ChildItem \\.\pipe\`)
+				const pipeMatch = core.match(
+					/^(?:\[System\.IO\.Directory\]::GetFiles\(\s*['"][\\\/]{{2,4}}\.[\\\/]{{1,2}}pipe[\\\/]*['"]\s*\)|Get-ChildItem\s+['"]?[\\\/]{{2,4}}\.[\\\/]{{1,2}}pipe[\\\/]*['"]?)(?:\s*\|\s*Where-Object\s*\{{\s*\\?\$_\s*-(?:match|like)\s*['"]([^'"]+)['"]\s*\}})?$/i,
+				);
+				if (pipeMatch) {{
+					const rawF = (pipeMatch[1] || "").replace(/^\*+|\*+$/g, "");
+					const fFlag = rawF && !/[`$]/.test(rawF) ? ` --filter "${{rawF.replace(/"/g, '\\"')}}"` : "";
+					const mFlag = limNum > 0 ? ` --max ${{limNum}}` : "";
+					return `${{cdLead}}"${{AP_BIN}}" probe win --pipes${{fFlag}}${{mFlag}}`;
+				}}
+
+				// 3. Running processes (`Get-Process` or `Get-CimInstance Win32_Process`)
+				const procMatch = core.match(
+					/^(?:Get-Process(?:\s+(?:-Name\s+)?['"]?([A-Za-z0-9_.*-]+)['"]?)?|Get-CimInstance\s+Win32_Process(?:\s+-Filter\s+["']Name=['"]([^'"]+)['"]["'])?)(?:\s*\|\s*Where-Object\s*\{{\s*\\?\$_\.(?:Process)?Name\s*-(?:match|like)\s*['"]([^'"]+)['"]\s*\}})?(?:\s*\|\s*Select-Object\b[^|]*)?$/i,
+				);
+				if (procMatch) {{
+					const rawF = (procMatch[1] || procMatch[2] || procMatch[3] || "").replace(/^\*+|\*+$/g, "");
+					const fFlag = rawF && !/[`$]/.test(rawF) ? ` --filter "${{rawF.replace(/"/g, '\\"')}}"` : "";
+					const lFlag = limNum > 0 ? ` --limit ${{limNum}}` : "";
+					return `${{cdLead}}"${{AP_BIN}}" probe ps${{fFlag}}${{lFlag}}`;
+				}}
+
+				// 4. Windows services (`Get-Service`)
+				const svcMatch = core.match(
+					/^Get-Service(?:\s+(?:-Name\s+)?['"]?([A-Za-z0-9_.*-]+)['"]?)?(?:\s*\|\s*Where-Object\s*\{{\s*\\?\$_\.(?:Service|Display)?Name\s*-(?:match|like)\s*['"]([^'"]+)['"]\s*\}})?(?:\s*\|\s*Select-Object\b[^|]*)?$/i,
+				);
+				if (svcMatch) {{
+					const rawF = (svcMatch[1] || svcMatch[2] || "").replace(/^\*+|\*+$/g, "");
+					const fFlag = rawF && !/[`$]/.test(rawF) ? ` --filter "${{rawF.replace(/"/g, '\\"')}}"` : "";
+					const mFlag = limNum > 0 ? ` --max ${{limNum}}` : "";
+					return `${{cdLead}}"${{AP_BIN}}" probe win --services${{fFlag}}${{mFlag}}`;
+				}}
+			}}
+		}}
+	}}
+
 	return undefined;
 }}
 
@@ -4812,7 +5198,9 @@ function accelerateCompoundSegments(cmd: string, toolName: string): string | und
 		const core = part.text.trim();
 		let nextCore = core;
 		if (core) {{
-			const accel = accelerateSingleBashSegment(core, toolName);
+			const isAndConditionGrep =
+				part.sep === "&&" && /^(?:grep|egrep|fgrep|rg|findstr)\b/i.test(core);
+			const accel = isAndConditionGrep ? undefined : accelerateSingleBashSegment(core, toolName);
 			if (accel) {{
 				nextCore = accel;
 				anyChanged = true;
@@ -4903,7 +5291,12 @@ export function healCommand(
 					changed = true;
 				}}
 			}}
-			if (!PY_INVOKE.test(cmd)) {{
+			if (!PY_INVOKE.test(cmd) && !/\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(cmd)) {{
+				const normRel = normalizeUnquotedRelativeBackslashes(cmd);
+				if (normRel !== cmd) {{
+					cmd = normRel;
+					changed = true;
+				}}
 				const fixedBs = cmd.replace(/(?<!\\)"([A-Za-z]:\\[^"]*?)"/g, (_m, inner: string) => `"${{inner.replace(/\\/g, "/")}}"`);
 				if (fixedBs !== cmd) {{
 					cmd = fixedBs;
@@ -7249,7 +7642,7 @@ export default function (pi: ExtensionAPI) {{
 				}}
 			}}
 			if (!didAutoSieveRead) {{
-				const hashed = annotateReadWithHashlines(readText, startOff);
+				const hashed = annotateReadWithHashlines(readText, startOff, p);
 				if (hashed) {{
 					readText = hashed;
 					readBlockMutated = true;
@@ -7403,7 +7796,12 @@ export default function (pi: ExtensionAPI) {{
 			for (const blk of workingContent) {{
 				if (blk?.type === "text" && typeof blk.text === "string") {{
 					if (blk.text.length > maxShellBlockLen) maxShellBlockLen = blk.text.length;
-					if (!hasGiantShellLine && blk.text.split("\n").some((l) => l.length > SIEVE_GIANT_LINE_CHARS)) {{
+					const blkLines = blk.text.split("\n");
+					if (
+						!hasGiantShellLine &&
+						!(blkLines.length <= 12 && blk.text.length <= 12288) &&
+						blkLines.some((l) => l.length > SIEVE_GIANT_LINE_CHARS)
+					) {{
 						hasGiantShellLine = true;
 					}}
 				}}
