@@ -118,10 +118,25 @@ pub fn save_frontier(store_path: &Path, state: &mut FrontierState) -> Result<(),
     let tmp = store_path.with_extension(format!("json.{}.tmp", std::process::id()));
     let body = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    if store_path.exists() {
-        let _ = fs::remove_file(store_path);
+    if fs::rename(&tmp, store_path).is_err() {
+        let bak = store_path.with_extension(format!("json.{}.bak", std::process::id()));
+        let had_bak = store_path.exists() && fs::rename(store_path, &bak).is_ok();
+        match fs::rename(&tmp, store_path) {
+            Ok(()) => {
+                if had_bak {
+                    let _ = fs::remove_file(&bak);
+                }
+            }
+            Err(e) => {
+                if had_bak {
+                    let _ = fs::rename(&bak, store_path);
+                }
+                let _ = fs::remove_file(&tmp);
+                return Err(e.to_string());
+            }
+        }
     }
-    fs::rename(&tmp, store_path).map_err(|e| e.to_string())
+    Ok(())
 }
 
 fn upsert_item(state: &mut FrontierState, item: FrontierItem) -> bool {
@@ -129,12 +144,38 @@ fn upsert_item(state: &mut FrontierState, item: FrontierItem) -> bool {
         x.id == item.id
             || (x.axis == item.axis && x.target == item.target && x.symbol == item.symbol)
     }) {
-        // Preserve already-explored status; only refresh metadata/snippet if empty
-        if existing.snippet.is_empty() && !item.snippet.is_empty() {
+        // Preserve already-explored status/reason/evidence while refreshing structural metadata
+        let mut changed = false;
+        if item.line > 0 && existing.line != item.line {
+            existing.line = item.line;
+            changed = true;
+        }
+        if item.score > existing.score {
+            existing.score = item.score;
+            changed = true;
+        }
+        if !item.guard_hint.is_empty()
+            && (existing.guard_hint.is_empty()
+                || (existing.status == FrontierStatus::Unvisited
+                    && existing.guard_hint != item.guard_hint))
+        {
+            existing.guard_hint = item.guard_hint;
+            changed = true;
+        }
+        if !item.snippet.is_empty()
+            && (existing.snippet.is_empty()
+                || (existing.status == FrontierStatus::Unvisited
+                    && existing.snippet != item.snippet))
+        {
             existing.snippet = item.snippet;
+            changed = true;
         }
         if existing.module.is_empty() && !item.module.is_empty() {
             existing.module = item.module;
+            changed = true;
+        }
+        if changed {
+            existing.updated_at = item.updated_at;
         }
         return false;
     }
@@ -425,6 +466,63 @@ fn extract_distinct_tokens(text: &str) -> HashSet<String> {
         "await",
         "spawn",
         "exec",
+        "admin",
+        "token",
+        "auth",
+        "authn",
+        "authz",
+        "user",
+        "users",
+        "handler",
+        "handle",
+        "query",
+        "route",
+        "routes",
+        "port",
+        "ports",
+        "http",
+        "https",
+        "params",
+        "param",
+        "listen",
+        "listener",
+        "control",
+        "fastfail",
+        "pipe",
+        "pipes",
+        "target",
+        "request",
+        "response",
+        "error",
+        "status",
+        "check",
+        "checked",
+        "verified",
+        "safe",
+        "data",
+        "info",
+        "item",
+        "items",
+        "list",
+        "create",
+        "update",
+        "delete",
+        "read",
+        "write",
+        "post",
+        "patch",
+        "body",
+        "header",
+        "cookie",
+        "role",
+        "name",
+        "value",
+        "type",
+        "mode",
+        "code",
+        "line",
+        "test",
+        "spec",
     ]
     .into_iter()
     .collect();
@@ -445,51 +543,162 @@ fn extract_distinct_tokens(text: &str) -> HashSet<String> {
     out
 }
 
+fn strip_contrast_and_dedup_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_contrast_block = false;
+    for raw_ln in text.lines() {
+        let trim = raw_ln.trim();
+        let low = trim.to_ascii_lowercase();
+        if trim.is_empty() {
+            in_contrast_block = false;
+            continue;
+        }
+        let is_heading = trim.starts_with('#');
+        let is_contrast_header = [
+            "contrast",
+            "differentiate",
+            "dedup",
+            "non-duplicate",
+            "adjacent",
+            "exclusion",
+            "去重",
+            "对比",
+            "区别",
+            "邻近",
+            "相邻",
+            "排除",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw) || trim.contains(kw));
+        if is_heading {
+            in_contrast_block = is_contrast_header;
+            continue;
+        }
+        if in_contrast_block {
+            continue;
+        }
+        if low.len() < 8 {
+            continue;
+        }
+        let is_contrast_line = [
+            "not duplicate",
+            "non-duplicate",
+            "differs from",
+            "distinct from",
+            "not the same",
+            "instead of",
+            "rather than",
+            "unlike ",
+            "differentiate:",
+            "excluded:",
+            "false positive",
+            "去重",
+            "不撞",
+            "区别",
+            "不是同一条",
+            "非重复",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw) || trim.contains(kw));
+        if is_contrast_line {
+            continue;
+        }
+        out.push(low);
+    }
+    out
+}
+
+fn extract_word_tokens_set(line_low: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut buf = String::new();
+    for ch in line_low.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            buf.push(ch);
+        } else {
+            if buf.len() >= 4 {
+                out.insert(buf.clone());
+            }
+            buf.clear();
+        }
+    }
+    if buf.len() >= 4 {
+        out.insert(buf);
+    }
+    out
+}
+
+fn contains_bounded_path(haystack_low: &str, needle_low: &str) -> bool {
+    let hb = haystack_low.as_bytes();
+    let nb = needle_low.as_bytes();
+    if nb.is_empty() || hb.len() < nb.len() {
+        return false;
+    }
+    for (idx, win) in hb.windows(nb.len()).enumerate() {
+        if win == nb {
+            let left_ok = idx == 0
+                || !matches!(
+                    hb[idx - 1],
+                    b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'/'
+                );
+            let r = idx + nb.len();
+            let right_ok =
+                r >= hb.len() || !matches!(hb[r], b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'/');
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn sync_stopped_from_text(state: &mut FrontierState, source_label: &str, text: &str) -> usize {
-    let lines: Vec<String> = text
-        .lines()
-        .map(|l| l.trim().to_ascii_lowercase())
-        .filter(|l| l.len() >= 8)
-        .collect();
+    let lines = strip_contrast_and_dedup_lines(text);
     if lines.is_empty() {
         return 0;
     }
+    let line_words: Vec<HashSet<String>> =
+        lines.iter().map(|ln| extract_word_tokens_set(ln)).collect();
     let now = now_iso_utc();
     let mut marked = 0usize;
     for it in &mut state.items {
         if it.status != FrontierStatus::Unvisited {
             continue;
         }
-        let target_low = it.target.to_ascii_lowercase();
-        let file_stem = Path::new(&it.target)
-            .file_name()
+        let target_low = it.target.to_ascii_lowercase().replace('\\', "/");
+        let file_stem = Path::new(&target_low)
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
-            .to_ascii_lowercase();
+            .to_string();
         let sym_low = it.symbol.to_ascii_lowercase();
         let item_tokens =
-            extract_distinct_tokens(&format!("{} {} {}", it.module, it.target, it.symbol));
+            extract_distinct_tokens(&format!("{} {} {}", it.module, target_low, it.symbol));
+        let stem_tokens = extract_distinct_tokens(&format!("{file_stem} {sym_low}"));
 
-        let hit = lines.iter().any(|ln| {
-            // Exact target path match
-            if !target_low.is_empty() && target_low.len() >= 10 && ln.contains(&target_low) {
-                return true;
-            }
-            // File name + symbol match on the same line
-            if file_stem.len() >= 6
-                && sym_low.len() >= 5
-                && ln.contains(&file_stem)
-                && ln.contains(&sym_low)
+        let hit = lines.iter().zip(line_words.iter()).any(|(ln, words)| {
+            // 1. Exact bounded target path match (or relative path + word-bounded symbol)
+            if !target_low.is_empty()
+                && target_low.len() >= 10
+                && contains_bounded_path(ln, &target_low)
             {
                 return true;
             }
-            // High-precision >=3 distinct token overlap on the same line
-            if item_tokens.len() >= 3 {
+            if target_low.contains('/')
+                && target_low.len() >= 8
+                && sym_low.len() >= 5
+                && contains_bounded_path(ln, &target_low)
+                && contains_ascii_word(ln, &sym_low)
+            {
+                return true;
+            }
+            // 2. High-precision word-bounded >=4 distinctive tokens + non-generic stem anchor
+            if item_tokens.len() >= 4 && !stem_tokens.is_empty() {
                 let hits = item_tokens
                     .iter()
-                    .filter(|t| ln.contains(t.as_str()))
+                    .filter(|t| words.contains(t.as_str()))
                     .count();
-                if hits >= 3 {
+                let has_stem = stem_tokens.iter().any(|st| words.contains(st.as_str()));
+                if hits >= 4 && has_stem {
                     return true;
                 }
             }
@@ -2390,5 +2599,54 @@ mod tests {
         assert!(st.items.iter().any(|x| x.axis == "loader_plugin_ext"
             && x.guard_hint == "IDE_UNTRUSTED_WORKSPACE"
             && x.score == 90));
+    }
+
+    #[test]
+    fn sync_stopped_ignores_contrast_blocks_and_generic_tokens_and_upsert_refreshes() {
+        let mut st = FrontierState::default();
+        let sample = json!({
+            "items": [
+                {"id": "web_api:1", "axis": "web_api_route", "module": "src/auth", "target": "src/auth/jwt_guard.ts", "line": 40, "symbol": "verifyJwtAdmin", "score": 88},
+                {"id": "ipc_pipe:1", "axis": "ipc_pipe_proto", "module": "src/rpc", "target": "server.js", "line": 12, "symbol": "handle", "score": 85},
+                {"id": "exec_spawn:1", "axis": "exec_spawn", "module": "pkg/worker", "target": "pkg/worker/runner.ts", "line": 18, "symbol": "dispatchWorkerJob", "score": 90}
+            ]
+        });
+        seed_from_json_str(&mut st, &sample.to_string()).unwrap();
+
+        let noisy_and_contrast = "\
+            Differentiate: not duplicate of src/auth/jwt_guard.ts verifyJwtAdmin\n\
+            ## 去重核对\n\
+            src/auth/jwt_guard.ts verifyJwtAdmin checked earlier\n\
+            \n\
+            server.js handle admin token auth route port http listen params\n\
+            pkg/worker/runner.ts dispatchWorkerJob verified clean\n";
+        let stopped = sync_stopped_from_text(&mut st, "notes.md", noisy_and_contrast);
+        assert_eq!(stopped, 1);
+        assert_eq!(st.items[0].status, FrontierStatus::Unvisited);
+        assert_eq!(st.items[1].status, FrontierStatus::Unvisited);
+        assert_eq!(st.items[2].status, FrontierStatus::Stopped);
+
+        // upsert_item refreshes metadata (line/score/guard_hint) while preserving Stopped status
+        let refreshed = json!({
+            "items": [
+                {"id": "web_api:1", "axis": "web_api_route", "module": "src/auth", "target": "src/auth/jwt_guard.ts", "line": 52, "symbol": "verifyJwtAdmin", "guard_hint": "UNGUARDED", "score": 96},
+                {"id": "exec_spawn:1", "axis": "exec_spawn", "module": "pkg/worker", "target": "pkg/worker/runner.ts", "line": 24, "symbol": "dispatchWorkerJob", "guard_hint": "PARAM_TAINTED", "score": 95}
+            ]
+        });
+        seed_from_json_str(&mut st, &refreshed.to_string()).unwrap();
+        assert_eq!(st.items[0].line, 52);
+        assert_eq!(st.items[0].score, 96);
+        assert_eq!(st.items[0].guard_hint, "UNGUARDED");
+        assert_eq!(st.items[2].status, FrontierStatus::Stopped);
+        assert_eq!(st.items[2].line, 24);
+        assert_eq!(st.items[2].score, 95);
+
+        let td = std::env::temp_dir().join(format!("ap_frontier_save_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&td);
+        let fp = td.join("frontier.json");
+        save_frontier(&fp, &mut st).unwrap();
+        save_frontier(&fp, &mut st).unwrap();
+        assert!(fp.is_file());
+        let _ = fs::remove_dir_all(&td);
     }
 }

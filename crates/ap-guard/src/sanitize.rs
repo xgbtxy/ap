@@ -75,7 +75,7 @@ fn san_re() -> &'static SanitizeRegexes {
     })
 }
 
-fn is_placeholder(val: &str) -> bool {
+pub fn is_placeholder(val: &str) -> bool {
     let low = val.trim().to_ascii_lowercase();
     if low.contains("your_")
         || low.contains("replace_")

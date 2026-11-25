@@ -12947,6 +12947,19 @@ const compacted = mod.sieveCodemodeContentBlocks(
 assert.equal(sieveCalled, false, "pretty JSON compacting under limit must skip ap sieve");
 assert.ok(compacted && compacted.length === 2);
 assert.deepEqual(JSON.parse(compacted[1].text), payload);
+
+// Regression checks (#145): string literals/comments untouched in healCodemodeSource + >4.5KB compacted JSON exempted from single-line sieve trigger
+assert.equal(mod.healCodemodeSource('console.log("tools.ap_search // @options: foo setTimeout()");'), undefined);
+assert.equal(mod.healCodemodeSource('setTimeout(() => {}, 10);', { hasBuiltinSetTimeout: true }), undefined);
+const payload7k = Array.from({ length: 900 }, (_, i) => [i, i + 1]);
+let sieve7kCalled = false;
+const compact7k = mod.sieveCodemodeContentBlocks(
+  [{ type: "text", text: "Script completed (5ms)" }, { type: "text", text: JSON.stringify(payload7k, null, 2) }],
+  () => { sieve7kCalled = true; return "[sieve id=unexpected]"; },
+  false,
+);
+assert.equal(sieve7kCalled, false, ">4.5KB compacted JSON under 20KB limit must NOT fall back to sieve");
+assert.deepEqual(JSON.parse(compact7k[1].text), payload7k);
 "###;
         let run = Command::new("node")
             .args([

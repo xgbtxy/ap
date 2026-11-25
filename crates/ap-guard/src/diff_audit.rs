@@ -43,8 +43,55 @@ fn is_test_path(p: &str) -> bool {
         || low.ends_with("_test.rs")
 }
 
+fn strip_comments_and_strings(s: &str) -> String {
+    let trim = s.trim();
+    if trim.starts_with("//")
+        || (trim.starts_with('#') && !trim.starts_with("#["))
+        || trim.starts_with('*')
+        || trim.starts_with("/*")
+    {
+        return String::new();
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+                out.push('"');
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            break;
+        }
+        if b == b'"' || b == b'\'' || b == b'`' {
+            quote = Some(b);
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn is_assertion_line(s: &str) -> bool {
-    let low = s.to_ascii_lowercase();
+    let code = strip_comments_and_strings(s);
+    if code.is_empty() {
+        return false;
+    }
+    let low = code.to_ascii_lowercase();
     low.contains("assert")
         || low.contains("expect(")
         || low.contains(".should")
@@ -52,9 +99,22 @@ fn is_assertion_line(s: &str) -> bool {
         || low.contains("t.fatal")
 }
 
+fn is_parameterized_loop_line(s: &str) -> bool {
+    let code = strip_comments_and_strings(s);
+    if code.is_empty() {
+        return false;
+    }
+    let low = code.to_ascii_lowercase();
+    low.contains("for ")
+        || low.contains(".foreach(")
+        || low.contains(".each(")
+        || low.contains("@pytest.mark.parametrize")
+}
+
 fn has_debug_leftover(s: &str) -> Option<&'static str> {
-    let trim = s.trim();
-    if trim.starts_with("//") || trim.starts_with('#') || trim.starts_with('*') {
+    let code = strip_comments_and_strings(s);
+    let trim = code.trim();
+    if trim.is_empty() {
         return None;
     }
     if trim == "debugger;" || trim == "debugger" || trim.contains(" debugger;") {
@@ -73,8 +133,9 @@ fn has_debug_leftover(s: &str) -> Option<&'static str> {
 }
 
 fn has_test_skip_marker(s: &str) -> Option<&'static str> {
-    let trim = s.trim();
-    if trim.starts_with("//") || trim.starts_with('#') && !trim.starts_with("#[ignore") {
+    let code = strip_comments_and_strings(s);
+    let trim = code.trim();
+    if trim.is_empty() {
         return None;
     }
     if trim.contains(".only(") {
@@ -86,7 +147,7 @@ fn has_test_skip_marker(s: &str) -> Option<&'static str> {
     if trim.contains("#[ignore") {
         return Some("#[ignore]");
     }
-    if trim.contains("@pytest.mark.skip") {
+    if s.trim().contains("@pytest.mark.skip") {
         return Some("@pytest.mark.skip");
     }
     if trim.contains("t.Skip(") || trim.contains("t.SkipNow(") {
@@ -96,24 +157,27 @@ fn has_test_skip_marker(s: &str) -> Option<&'static str> {
 }
 
 fn has_incomplete_stub(s: &str) -> Option<&'static str> {
-    let trim = s.trim();
-    if trim.starts_with("//") || trim.starts_with('#') || trim.starts_with('*') {
-        return None;
+    let code = strip_comments_and_strings(s);
+    let trim = code.trim();
+    if !trim.is_empty() {
+        if trim.contains("todo!(") {
+            return Some("todo!()");
+        }
+        if trim.contains("unimplemented!(") {
+            return Some("unimplemented!()");
+        }
+        if trim.contains("raise NotImplementedError") {
+            return Some("raise NotImplementedError");
+        }
     }
-    if trim.contains("todo!(") {
-        return Some("todo!()");
-    }
-    if trim.contains("unimplemented!(") {
-        return Some("unimplemented!()");
-    }
-    if trim.contains("raise NotImplementedError") {
-        return Some("raise NotImplementedError");
-    }
-    let low = trim.to_ascii_lowercase();
-    if low.contains("throw new error(\"not implemented")
-        || low.contains("throw new error('not implemented")
-    {
-        return Some("throw new Error('not implemented')");
+    let raw_trim = s.trim();
+    if !raw_trim.starts_with("//") && !raw_trim.starts_with('#') && !raw_trim.starts_with('*') {
+        let low = raw_trim.to_ascii_lowercase();
+        if low.contains("throw new error(\"not implemented")
+            || low.contains("throw new error('not implemented")
+        {
+            return Some("throw new Error('not implemented')");
+        }
     }
     None
 }
@@ -231,6 +295,7 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
     let mut per_file_del: HashMap<String, usize> = HashMap::new();
     let mut per_file_assert_add: HashMap<String, usize> = HashMap::new();
     let mut per_file_assert_del: HashMap<String, usize> = HashMap::new();
+    let mut per_file_param_loop_add: HashMap<String, bool> = HashMap::new();
     let mut per_file_del_decls: BTreeMap<String, BTreeMap<String, Option<String>>> =
         BTreeMap::new();
     let mut per_file_add_decls: BTreeMap<String, BTreeMap<String, Option<String>>> =
@@ -259,6 +324,9 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
             if is_test_path(&cur_file) {
                 if is_assertion_line(added) {
                     *per_file_assert_add.entry(cur_file.clone()).or_insert(0) += 1;
+                }
+                if is_parameterized_loop_line(added) {
+                    per_file_param_loop_add.insert(cur_file.clone(), true);
                 }
                 if let Some(tok) = has_test_skip_marker(added) {
                     findings.push(DiffFinding {
@@ -300,7 +368,7 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
                         ),
                     });
                 }
-                for sec_hit in crate::inspect_text_safety(added) {
+                for sec_hit in crate::inspect_secret_safety(added) {
                     if sec_hit.starts_with("Credential/secret") {
                         findings.push(DiffFinding {
                             kind: "SECRET-ADDED".to_string(),
@@ -367,7 +435,8 @@ pub fn audit_git_diff(root: &Path) -> DiffAuditReport {
         let d = *per_file_del.get(f).unwrap_or(&0);
         let aa = *per_file_assert_add.get(f).unwrap_or(&0);
         let ad = *per_file_assert_del.get(f).unwrap_or(&0);
-        if is_test_path(f) && ad > aa {
+        let has_param_loop = *per_file_param_loop_add.get(f).unwrap_or(&false);
+        if is_test_path(f) && ad > aa && !(aa >= 1 && has_param_loop) {
             findings.push(DiffFinding {
                 kind: "TEST-WEAKENING".to_string(),
                 file: f.clone(),
@@ -465,6 +534,69 @@ mod tests {
                 .any(|c| c.kind == "BREAKING-API-REMOVED" && c.symbol == "legacyDrop"),
             "{:?}",
             rep.api_changes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_comments_strings_placeholders_and_parameterized_refactors() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ap_diff_fp_{n}"));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("tests")).unwrap();
+        let ok_git = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok_git {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let _ = Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(&dir)
+            .status();
+        let _ = Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .status();
+        fs::write(dir.join("src/rules.rs"), "pub fn init() -> bool { true }\n").unwrap();
+        fs::write(
+            dir.join("tests/calc_test.rs"),
+            "fn checks() {\n  assert_eq!(1, 1);\n  assert_eq!(2, 2);\n  assert_eq!(3, 3);\n}\n",
+        )
+        .unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .status();
+
+        // Add string constants mentioning "breakpoint()" / "todo!(" / placeholder key + parameterize 3 asserts into a loop
+        let placeholder_tok = ["sk", "ant", "example_placeholder_key_123456"].join("-");
+        let rule_src = format!(
+            "pub fn init() -> &'static str {{\n  // todo!(explain)\n  let _tok = \"{placeholder_tok}\";\n  if _tok.contains(\"breakpoint()\") {{ return \"todo!(\"; }}\n  \"debugger;\"\n}}\n"
+        );
+        fs::write(dir.join("src/rules.rs"), rule_src).unwrap();
+        fs::write(
+            dir.join("tests/calc_test.rs"),
+            "fn checks() {\n  for x in [1, 2, 3] { assert_eq!(x, x); }\n}\n",
+        )
+        .unwrap();
+
+        let rep = audit_git_diff(&dir);
+        assert!(
+            rep.findings.is_empty(),
+            "unexpected false findings: {:?}",
+            rep.findings
         );
         let _ = fs::remove_dir_all(&dir);
     }

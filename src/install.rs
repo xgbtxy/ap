@@ -1357,7 +1357,7 @@ export function stabilizeProviderTools(payload: unknown): unknown {{
 }}
 
 const CODEMODE_SETTIMEOUT_SHIM =
-	`const setTimeout = (fn, ms = 0, ...a) => {{ if (typeof sleep === "function") {{ sleep(ms).then(() => {{ if (typeof fn === "function") fn(...a); }}); }} else if (typeof fn === "function") {{ fn(...a); }} return 0; }};`;
+	`const setTimeout = typeof globalThis.setTimeout === "function" ? globalThis.setTimeout : (fn, ms = 0, ...a) => {{ if (typeof sleep === "function") {{ sleep(ms).then(() => {{ if (typeof fn === "function") fn(...a); }}); }} else if (typeof fn === "function") {{ fn(...a); }} return 0; }};`;
 
 export interface ApProfileOverrides {{
 	modelProfile: string;
@@ -1670,8 +1670,8 @@ const AP_MCP_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"ap_call",
 ]);
 
-function stripTsTypesInCodemode(code: string): string {{
-	if (!code || (!code.includes(":") && !/\bas\s+/.test(code))) return code;
+function maskCodemodeSpans(code: string): {{ masked: string; tokens: string[] }} | null {{
+	if (!code || code.includes("\u0001")) return null;
 	const tokens: string[] = [];
 	let masked = "";
 	let last = 0;
@@ -1806,9 +1806,16 @@ function stripTsTypesInCodemode(code: string): string {{
 			i++;
 		}}
 	}};
-	if (code.includes("\u0001")) return code;
 	scanCode(false);
 	masked += code.slice(last);
+	return {{ masked, tokens }};
+}}
+
+function stripTsTypesInCodemode(code: string): string {{
+	if (!code || (!code.includes(":") && !/\bas\s+/.test(code))) return code;
+	const spanRes = maskCodemodeSpans(code);
+	if (!spanRes) return code;
+	const {{ masked, tokens }} = spanRes;
 
 	const consumeBalancedType = (s: string, start: number, allowFnArrow: boolean): number => {{
 		let p = start;
@@ -2154,46 +2161,15 @@ function stripTsTypesInCodemode(code: string): string {{
  * 4) Strips accidental TypeScript variable/parameter/return annotations and `as <Type>` casts (`stripTsTypesInCodemode`).
  * 5) Auto-shims `setTimeout(...)` via host `sleep(ms)` (eliminating 100% of QuickJS timer ReferenceErrors while keeping `// @options:` on line 1).
  */
-export function healCodemodeSource(code: string): string | undefined {{
+export function healCodemodeSource(
+	code: string,
+	options?: {{ hasBuiltinSetTimeout?: boolean }},
+): string | undefined {{
 	if (!code) return undefined;
 	let next = code;
 	const fenced = next.match(/^\s*```(?:js|javascript|ts|typescript)?[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/i);
 	if (fenced) {{
 		next = fenced[1];
-	}}
-	// Hoist any non-line-1 `// @options: {{...}}` directive cleanly to line 1 so Pi codemode never rejects it
-	const firstNl = next.indexOf("\n");
-	const firstLine = firstNl >= 0 ? next.slice(0, firstNl) : next;
-	if (!/^[ \t]*\/\/[ \t]*@options\b/.test(firstLine)) {{
-		const hoistM = next.match(/(?:^|\r?\n)([ \t]*\/\/[ \t]*@options[ \t]*:[^\r\n]*)/);
-		if (hoistM && hoistM.index !== undefined) {{
-			const optText = hoistM[1].trim();
-			const before = next.slice(0, hoistM.index);
-			const after = next.slice(hoistM.index + hoistM[0].length);
-			const rest = `${{before}}${{after}}`.replace(/^(?:[ \t]*\r?\n)+/, "");
-			next = `${{optText}}\n${{rest}}`;
-		}}
-	}}
-	if (next.includes("tools.mcp__agent-primitives__")) {{
-		next = next.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
-	}}
-	if (/\btools\??\.ap_[a-z_]+\b/.test(next)) {{
-		next = next.replace(/\btools(\??\.)(ap_[a-z_]+)\b/g, (m, sep: string, name: string) =>
-			AP_MCP_TOOL_NAMES.has(name) ? `tools${{sep}}mcp__agent_primitives__${{name}}` : m,
-		);
-	}}
-	if (/\btools\[['"]ap_[a-z_]+['"]\]/.test(next)) {{
-		next = next.replace(/\btools\[(['"])(ap_[a-z_]+)\1\]/g, (m, q: string, name: string) =>
-			AP_MCP_TOOL_NAMES.has(name) ? `tools[${{q}}mcp__agent_primitives__${{name}}${{q}}]` : m,
-		);
-	}}
-	if (/\bdescribeTool\(['"]ap_[a-z_]+['"]\)/.test(next)) {{
-		next = next.replace(/\bdescribeTool\((['"])(ap_[a-z_]+)\1\)/g, (m, q: string, name: string) =>
-			AP_MCP_TOOL_NAMES.has(name) ? `describeTool(${{q}}mcp__agent_primitives__${{name}}${{q}})` : m,
-		);
-	}}
-	if (/\btools\.(?:describeTool|searchTools|describeNamespace)\b/.test(next)) {{
-		next = next.replace(/\btools\.(describeTool|searchTools|describeNamespace)\b/g, "$1");
 	}}
 	if (next.includes("String.raw`")) {{
 		next = next.replace(
@@ -2206,8 +2182,74 @@ export function healCodemodeSource(code: string): string | undefined {{
 	if (healedNewlines) {{
 		next = healedNewlines;
 	}}
+
+	let needsSetTimeoutShim = false;
+	const spanRes = maskCodemodeSpans(next);
+	if (spanRes) {{
+		let {{ masked }} = spanRes;
+		const {{ tokens }} = spanRes;
+		// Hoist any real standalone `// @options:` comment (never inside string/template literals) to line 1
+		const firstNl = next.indexOf("\n");
+		const firstLine = firstNl >= 0 ? next.slice(0, firstNl) : next;
+		if (!/^[ \t]*\/\/[ \t]*@options\b/.test(firstLine)) {{
+			const optIdx = tokens.findIndex((t) => /^\/\/[ \t]*@options[ \t]*:[^\r\n]*/.test(t));
+			if (optIdx >= 0) {{
+				const tokTag = `\u0001T${{optIdx}}\u0001`;
+				const tagRe = new RegExp(`(?:^|\\r?\\n)([ \\t]*${{tokTag}})`);
+				const hm = masked.match(tagRe);
+				if (hm && hm.index !== undefined) {{
+					const before = masked.slice(0, hm.index);
+					const after = masked.slice(hm.index + hm[0].length);
+					const rest = `${{before}}${{after}}`.replace(/^(?:[ \t]*\r?\n)+/, "");
+					masked = `${{tokTag}}\n${{rest}}`;
+				}}
+			}}
+		}}
+		if (masked.includes("tools.mcp__agent-primitives__")) {{
+			masked = masked.replace(/tools\.mcp__agent-primitives__/g, "tools.mcp__agent_primitives__");
+		}}
+		if (/\btools\??\.ap_[a-z_]+\b/.test(masked)) {{
+			masked = masked.replace(/\btools(\??\.)(ap_[a-z_]+)\b/g, (m, sep: string, name: string) =>
+				AP_MCP_TOOL_NAMES.has(name) ? `tools${{sep}}mcp__agent_primitives__${{name}}` : m,
+			);
+		}}
+		if (/\btools\[/.test(masked)) {{
+			masked = masked.replace(/\btools\[\u0001T(\d+)\u0001\]/g, (m, idxStr: string) => {{
+				const idx = Number(idxStr);
+				const tm = tokens[idx]?.match(/^(['"])(ap_[a-z_]+)\1$/);
+				if (tm && AP_MCP_TOOL_NAMES.has(tm[2])) {{
+					tokens[idx] = `${{tm[1]}}mcp__agent_primitives__${{tm[2]}}${{tm[1]}}`;
+				}}
+				return m;
+			}});
+		}}
+		if (/\bdescribeTool\(/.test(masked)) {{
+			masked = masked.replace(/\bdescribeTool\(\u0001T(\d+)\u0001\)/g, (m, idxStr: string) => {{
+				const idx = Number(idxStr);
+				const tm = tokens[idx]?.match(/^(['"])(ap_[a-z_]+)\1$/);
+				if (tm && AP_MCP_TOOL_NAMES.has(tm[2])) {{
+					tokens[idx] = `${{tm[1]}}mcp__agent_primitives__${{tm[2]}}${{tm[1]}}`;
+				}}
+				return m;
+			}});
+		}}
+		if (/\btools\.(?:describeTool|searchTools|describeNamespace)\b/.test(masked)) {{
+			masked = masked.replace(/\btools\.(describeTool|searchTools|describeNamespace)\b/g, "$1");
+		}}
+		needsSetTimeoutShim =
+			!options?.hasBuiltinSetTimeout &&
+			/\bsetTimeout\s*\(/.test(masked) &&
+			!/\b(?:const|let|var|function)\s+setTimeout\b/.test(masked);
+		next = masked.replace(/\u0001T(\d+)\u0001/g, (_m, idx: string) => tokens[Number(idx)] ?? "");
+	}} else {{
+		needsSetTimeoutShim =
+			!options?.hasBuiltinSetTimeout &&
+			/\bsetTimeout\s*\(/.test(next) &&
+			!/\b(?:const|let|var|function)\s+setTimeout\b/.test(next);
+	}}
+
 	next = stripTsTypesInCodemode(next);
-	if (/\bsetTimeout\s*\(/.test(next) && !/\b(?:const|let|var|function)\s+setTimeout\b/.test(next)) {{
+	if (needsSetTimeoutShim) {{
 		const optLine = next.match(/^([ \t]*\/\/[ \t]*@options:[^\r\n]*\r?\n)([\s\S]*)$/);
 		if (optLine) {{
 			next = `${{optLine[1]}}${{CODEMODE_SETTIMEOUT_SHIM}}\n${{optLine[2]}}`;
@@ -2231,6 +2273,38 @@ export function extractAllToolResultText(
 		.filter((c) => c?.type === "text" && typeof c.text === "string")
 		.map((c) => c.text as string)
 		.join("\n");
+}}
+
+function tryCompactJsonUnderLimit(
+	raw: string,
+	isFastModel = false,
+	hardLimitOverride?: number,
+	contextTokens?: number,
+): string | undefined {{
+	const trimmed = raw.trim();
+	if (
+		!(trimmed.startsWith("{{") && trimmed.endsWith("}}")) &&
+		!(trimmed.startsWith("[") && trimmed.endsWith("]"))
+	) {{
+		return undefined;
+	}}
+	let effHard = isFastModel ? 12000 : SIEVE_HARD_CHARS;
+	if (typeof hardLimitOverride === "number" && hardLimitOverride > 0) {{
+		effHard = hardLimitOverride;
+	}}
+	if (typeof contextTokens === "number" && contextTokens > 0 && contextTokens < 45000) {{
+		effHard = Math.min(effHard, 8500);
+	}}
+	try {{
+		const compacted = JSON.stringify(JSON.parse(trimmed));
+		// Exempt valid compacted single-line JSON < effHard from SIEVE_GIANT_LINE_CHARS (4.5KB) fallback
+		if (compacted && compacted.length < raw.length * 0.9 && compacted.length < effHard) {{
+			return compacted;
+		}}
+	}} catch {{
+		// Fall through to full `ap sieve`
+	}}
+	return undefined;
 }}
 
 /**
@@ -2284,28 +2358,14 @@ export function sieveCodemodeContentBlocks(
 		return undefined;
 	}}
 	// Lossless whitespace compaction on pretty-printed JSON before invoking `ap sieve`
-	const trimmedJson = sieveInput.trim();
-	if (
-		(trimmedJson.startsWith("{{") && trimmedJson.endsWith("}}")) ||
-		(trimmedJson.startsWith("[") && trimmedJson.endsWith("]"))
-	) {{
-		try {{
-			const compacted = JSON.stringify(JSON.parse(trimmedJson));
-			if (
-				compacted &&
-				compacted.length < sieveInput.length * 0.9 &&
-				!shouldAutoSieveShellOutput(compacted, isFastModel, hardLimitOverride, contextTokens)
-			) {{
-				const finalCompact = errorTail ? `${{compacted}}\n\n${{errorTail}}` : compacted;
-				const outCompact: Array<{{ type?: string; text?: string; [k: string]: unknown }}> = [];
-				if (hasHeader) outCompact.push(first);
-				outCompact.push(...preservedNonText);
-				outCompact.push({{ type: "text", text: finalCompact }});
-				return outCompact;
-			}}
-		}} catch {{
-			// Fall through to full `ap sieve`
-		}}
+	const compacted = tryCompactJsonUnderLimit(sieveInput, isFastModel, hardLimitOverride, contextTokens);
+	if (compacted) {{
+		const finalCompact = errorTail ? `${{compacted}}\n\n${{errorTail}}` : compacted;
+		const outCompact: Array<{{ type?: string; text?: string; [k: string]: unknown }}> = [];
+		if (hasHeader) outCompact.push(first);
+		outCompact.push(...preservedNonText);
+		outCompact.push({{ type: "text", text: finalCompact }});
+		return outCompact;
 	}}
 	const digested = sieveFn(sieveInput);
 	if (!digested || digested.length <= 40 || digested.length >= sieveInput.length * 0.78) {{
@@ -2360,6 +2420,11 @@ export function sieveShellContentBlocks(
 			!blk.text.includes("[sieve id=") &&
 			shouldAutoSieveShellOutput(blk.text, isFastModel, hardLimitOverride, contextTokens)
 		) {{
+			const compacted = tryCompactJsonUnderLimit(blk.text, isFastModel, hardLimitOverride, contextTokens);
+			if (compacted) {{
+				changed = true;
+				return {{ ...blk, text: compacted }};
+			}}
 			const digested = sieveFn(blk.text);
 			if (digested && digested.length > 40 && digested.length < blk.text.length * 0.78) {{
 				changed = true;
@@ -5659,6 +5724,32 @@ function extractEditedPathsFromTool(toolName: string, input: Record<string, unkn
 	return out;
 }}
 
+let cachedPiBuiltinSetTimeout: boolean | null = null;
+function detectPiBuiltinSetTimeout(): boolean {{
+	if (cachedPiBuiltinSetTimeout !== null) return cachedPiBuiltinSetTimeout;
+	try {{
+		const cands = [
+			process.env.PI_PACKAGE_DIR,
+			process.env.APPDATA && join(process.env.APPDATA, "npm", "node_modules", "@earendil-works", "pi-coding-agent"),
+			join(homedir(), ".npm-global", "lib", "node_modules", "@earendil-works", "pi-coding-agent"),
+		].filter((p): p is string => Boolean(p));
+		for (const root of cands) {{
+			const worker = join(root, "dist", "bundle", "chunks", "codemode-worker.js");
+			if (existsSync(worker)) {{
+				const src = readFileSync(worker, "utf8");
+				if (src.includes("globalThis, \"setTimeout\"") || src.includes("globalThis,\"setTimeout\"")) {{
+					cachedPiBuiltinSetTimeout = true;
+					return true;
+				}}
+			}}
+		}}
+	}} catch {{
+		// ignore fs errors
+	}}
+	cachedPiBuiltinSetTimeout = false;
+	return false;
+}}
+
 export default function (pi: ExtensionAPI) {{
 	const apProfileOverrides = loadApProfile();
 	const recentShellFps: string[] = [];
@@ -6945,7 +7036,8 @@ export default function (pi: ExtensionAPI) {{
 		if (event.toolName === "codemode" && event.input && typeof event.input === "object") {{
 			readOnlyBashStreak = 0;
 			const code = typeof event.input.code === "string" ? event.input.code : "";
-			const healedCode = healCodemodeSource(code);
+			const hasBuiltinSetTimeout = detectPiBuiltinSetTimeout();
+			const healedCode = healCodemodeSource(code, {{ hasBuiltinSetTimeout }});
 			if (healedCode && healedCode !== code) {{
 				event.input.code = healedCode;
 			}}
@@ -7058,12 +7150,6 @@ export default function (pi: ExtensionAPI) {{
 			const isTruncated =
 				readDetails?.truncation?.truncated === true ||
 				/use offset=\d+|lines remaining|more lines in file|truncated to \d+/i.test(readText);
-			const hashed = annotateReadWithHashlines(readText, startOff);
-			if (hashed) {{
-				readText = hashed;
-				readBlockMutated = true;
-				mutated = true;
-			}}
 			if (typeof event.toolCallId === "string") {{
 				const clamped = clampedReadCallIds.get(event.toolCallId);
 				if (clamped) {{
@@ -7071,6 +7157,7 @@ export default function (pi: ExtensionAPI) {{
 					readAdvisory += `\n[ap read-clamped] Requested offset=${{clamped.requestedOffset}} > EOF (${{clamped.totalLines}} lines); showing tail from L${{clamped.clampedOffset}}.`;
 				}}
 			}}
+			let didAutoSieveRead = false;
 			if (p) {{
 				const key = `${{p}}::${{off}}::${{lim}}`;
 				const hits = (unchangedReads.get(key) ?? 0) + 1;
@@ -7121,6 +7208,7 @@ export default function (pi: ExtensionAPI) {{
 						readText = `${{res.stdout.trimEnd()}}\n[ap read-sieve] Unbounded full-file read archived losslessly; use read(offset, limit) for exact edit lines or ap sieve peek/search.`;
 						sievedCount += 1;
 						readBlockMutated = true;
+						didAutoSieveRead = true;
 						mutated = true;
 					}}
 				}} else if (!largeReadTipShown && readText.length >= LARGE_CODE_READ_CHARS && CODE_FILE_EXT.test(p)) {{
@@ -7131,6 +7219,14 @@ export default function (pi: ExtensionAPI) {{
 					if (docTip) {{
 						readAdvisory += `\n${{docTip}}`;
 					}}
+				}}
+			}}
+			if (!didAutoSieveRead) {{
+				const hashed = annotateReadWithHashlines(readText, startOff);
+				if (hashed) {{
+					readText = hashed;
+					readBlockMutated = true;
+					mutated = true;
 				}}
 			}}
 			if (readBlockMutated) {{

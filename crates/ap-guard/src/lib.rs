@@ -276,19 +276,46 @@ fn should_auto_win_exec(cmd: &str) -> bool {
     re.is_match(t)
 }
 
-pub fn inspect_text_safety(text: &str) -> Vec<String> {
+fn is_destructive_command_match(cmd: &str) -> Vec<String> {
     let pats = safety_patterns();
+    let trim = cmd.trim_start();
+    // Read-only search / echo / git-read invocations frequently cite patterns like "DROP TABLE" or "git reset --hard"
+    let first_tok = trim.split_whitespace().next().unwrap_or("");
+    let is_readonly_search = matches!(first_tok, "rg" | "grep" | "egrep" | "fgrep" | "echo")
+        || trim.starts_with("ap search ")
+        || trim.starts_with("ap.exe search ")
+        || trim.starts_with("git log")
+        || trim.starts_with("git diff")
+        || trim.starts_with("git show");
+    if is_readonly_search && !trim.contains('|') && !trim.contains("&&") && !trim.contains(';') {
+        return Vec::new();
+    }
     let mut findings = Vec::new();
     for (label, pat) in &pats.destructive {
-        if pat.is_match(text) {
+        if pat.is_match(cmd) {
             findings.push(format!("Destructive action blocked: {label}"));
         }
     }
+    findings
+}
+
+pub fn inspect_secret_safety(text: &str) -> Vec<String> {
+    let pats = safety_patterns();
+    let mut findings = Vec::new();
     for (label, pat) in &pats.secrets {
-        if pat.is_match(text) {
+        let has_real_secret = pat
+            .find_iter(text)
+            .any(|m| !sanitize::is_placeholder(m.as_str()));
+        if has_real_secret {
             findings.push(format!("Credential/secret leak blocked: {label}"));
         }
     }
+    findings
+}
+
+pub fn inspect_text_safety(text: &str) -> Vec<String> {
+    let mut findings = is_destructive_command_match(text);
+    findings.extend(inspect_secret_safety(text));
     findings
 }
 
@@ -1038,7 +1065,18 @@ pub fn run_cli(args: &[String]) -> i32 {
                     if map.contains_key("hookEventName") || map.contains_key("toolCall") {
                         let target_val = map.get("toolCall").cloned().unwrap_or(Value::Object(map));
                         let target_text = serde_json::to_string(&target_val).unwrap_or_default();
-                        let findings = inspect_text_safety(&target_text);
+                        let cmd_field = target_val
+                            .get("args")
+                            .or_else(|| target_val.get("input"))
+                            .unwrap_or(&target_val)
+                            .get("command")
+                            .and_then(Value::as_str);
+                        let mut findings = if let Some(c) = cmd_field {
+                            is_destructive_command_match(c)
+                        } else {
+                            Vec::new()
+                        };
+                        findings.extend(inspect_secret_safety(&target_text));
                         if !findings.is_empty() {
                             println!(
                                 "{}",
@@ -1069,7 +1107,12 @@ pub fn run_cli(args: &[String]) -> i32 {
                         let target_val =
                             map.get("tool_input").cloned().unwrap_or(Value::Object(map));
                         let target_text = serde_json::to_string(&target_val).unwrap_or_default();
-                        let findings = inspect_text_safety(&target_text);
+                        let mut findings = if !raw_cmd.is_empty() {
+                            is_destructive_command_match(&raw_cmd)
+                        } else {
+                            Vec::new()
+                        };
+                        findings.extend(inspect_secret_safety(&target_text));
                         if !findings.is_empty() {
                             for f in findings {
                                 eprintln!("[GUARD BLOCKED | exit 2] {f}");
@@ -1517,5 +1560,28 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shield_exempts_placeholder_secrets_and_readonly_search_patterns() {
+        let placeholder_sample = format!(
+            "const k = \"{}\";",
+            ["sk", "ant", "example_placeholder_key_123456"].join("-")
+        );
+        let synthetic_tok_sample = format!(
+            "const k = \"{}\";",
+            ["sk", "ant", "99887766554433221100aabbcc"].join("-")
+        );
+        assert!(inspect_secret_safety(&placeholder_sample).is_empty());
+        assert!(!inspect_secret_safety(&synthetic_tok_sample).is_empty());
+        assert!(is_destructive_command_match("rg \"DROP TABLE\" src/").is_empty());
+        assert!(is_destructive_command_match("echo \"git reset --hard\"").is_empty());
+        assert!(!is_destructive_command_match("git reset --hard HEAD~1").is_empty());
+        assert!(!is_destructive_command_match("DROP TABLE users;").is_empty());
     }
 }

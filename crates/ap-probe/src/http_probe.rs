@@ -1333,6 +1333,22 @@ pub fn classify_auth_matrix_diff_deep(
     cand: &HttpProbeResult,
     sentinels: &[String],
 ) -> HttpDiffReport {
+    classify_auth_matrix_diff_deep_bodies(
+        base,
+        &base.body_preview,
+        cand,
+        &cand.body_preview,
+        sentinels,
+    )
+}
+
+pub(crate) fn classify_auth_matrix_diff_deep_bodies(
+    base: &HttpProbeResult,
+    base_raw: &str,
+    cand: &HttpProbeResult,
+    cand_raw: &str,
+    sentinels: &[String],
+) -> HttpDiffReport {
     if cand.status == 0 || !cand.error.is_empty() {
         return HttpDiffReport {
             verdict: "TRANSPORT_ERROR".to_string(),
@@ -1349,14 +1365,14 @@ pub fn classify_auth_matrix_diff_deep(
     let sentinel_hits: Vec<String> = sentinels
         .iter()
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && cand.body_preview.contains(*s))
+        .filter(|s| !s.is_empty() && cand_raw.contains(*s))
         .map(str::to_string)
         .collect();
 
     let mut base_paths = std::collections::BTreeMap::new();
     let mut cand_paths = std::collections::BTreeMap::new();
-    let base_json = serde_json::from_str::<Value>(base.body_preview.trim()).ok();
-    let cand_json = serde_json::from_str::<Value>(cand.body_preview.trim()).ok();
+    let base_json = serde_json::from_str::<Value>(base_raw.trim()).ok();
+    let cand_json = serde_json::from_str::<Value>(cand_raw.trim()).ok();
     if let Some(ref bv) = base_json {
         flatten_json_paths(bv, "", 0, &mut base_paths);
     }
@@ -1624,6 +1640,7 @@ struct ResolvedPrincipal {
 struct AuthMatrixRow {
     label: String,
     result: HttpProbeResult,
+    raw_body: String,
     gaps: Vec<String>,
     cookie_count: Option<usize>,
     selected: Option<Value>,
@@ -1730,6 +1747,7 @@ pub fn run_http_auth_matrix(
                     body_preview: String::new(),
                     error: err_msg.clone(),
                 },
+                raw_body: String::new(),
                 gaps: Vec::new(),
                 cookie_count: spec.cookie_count,
                 selected: None,
@@ -1759,13 +1777,16 @@ pub fn run_http_auth_matrix(
         rows.push(AuthMatrixRow {
             label: spec.label.clone(),
             result: res,
+            raw_body: raw_b,
             gaps,
             cookie_count: spec.cookie_count,
             selected: sel_val,
         });
     }
 
-    let baseline = rows.first().map(|row| row.result.clone());
+    let baseline = rows
+        .first()
+        .map(|row| (row.result.clone(), row.raw_body.clone()));
     let mut bypasses = Vec::new();
     let mut json_rows = Vec::new();
     for (idx, row) in rows.iter().enumerate() {
@@ -1785,8 +1806,8 @@ pub fn run_http_auth_matrix(
                 changed_paths: Vec::new(),
                 sentinel_hits: Vec::new(),
             }
-        } else if let Some(ref base) = baseline {
-            classify_auth_matrix_diff_deep(base, r, sentinels)
+        } else if let Some((ref base, ref base_raw)) = baseline {
+            classify_auth_matrix_diff_deep_bodies(base, base_raw, r, &row.raw_body, sentinels)
         } else {
             HttpDiffReport {
                 verdict: "NO_BASELINE".to_string(),
@@ -2423,6 +2444,7 @@ pub fn run_http_flow(
     }
 
     let mut step_results: Vec<HttpProbeResult> = Vec::with_capacity(steps.len());
+    let mut step_raw_bodies: Vec<String> = Vec::with_capacity(steps.len());
     let mut json_steps: Vec<Value> = Vec::with_capacity(steps.len());
     let mut failed_count = 0usize;
     let mut sentinel_leak_count = 0usize;
@@ -2489,8 +2511,10 @@ pub fn run_http_flow(
 
         let diff_rep = step
             .compare_step
-            .and_then(|base_i| step_results.get(base_i))
-            .map(|base_res| classify_auth_matrix_diff_deep(base_res, &res, &step_sents));
+            .and_then(|base_i| step_results.get(base_i).zip(step_raw_bodies.get(base_i)))
+            .map(|(base_res, base_raw)| {
+                classify_auth_matrix_diff_deep_bodies(base_res, base_raw, &res, &raw_b, &step_sents)
+            });
 
         let non_json = summarize_non_json_body(&res.content_type, &res.body_preview);
         let mut obj = json!({
@@ -2515,6 +2539,7 @@ pub fn run_http_flow(
             }
         }
         step_results.push(res);
+        step_raw_bodies.push(raw_b);
         json_steps.push(obj);
     }
 
@@ -2900,9 +2925,35 @@ pub fn build_semantic_mutation_matrix(
 
 type MutationAnomaly = (String, String, Vec<String>, Vec<String>, Vec<String>);
 
+#[cfg(test)]
 fn classify_mutation_anomaly(
     base: &HttpProbeResult,
     cand: &HttpProbeResult,
+    class_name: &str,
+    label: &str,
+    alt: &str,
+    volatile_paths: &std::collections::HashSet<String>,
+    sentinels: &[String],
+) -> Option<MutationAnomaly> {
+    classify_mutation_anomaly_raw(
+        base,
+        &base.body_preview,
+        cand,
+        &cand.body_preview,
+        class_name,
+        label,
+        alt,
+        volatile_paths,
+        sentinels,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_mutation_anomaly_raw(
+    base: &HttpProbeResult,
+    base_raw: &str,
+    cand: &HttpProbeResult,
+    cand_raw: &str,
     class_name: &str,
     label: &str,
     alt: &str,
@@ -2916,14 +2967,14 @@ fn classify_mutation_anomaly(
     let sentinel_hits: Vec<String> = sentinels
         .iter()
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && cand.body_preview.contains(*s))
+        .filter(|s| !s.is_empty() && cand_raw.contains(*s))
         .map(str::to_string)
         .collect();
 
     let mut base_paths = std::collections::BTreeMap::new();
     let mut cand_paths = std::collections::BTreeMap::new();
-    let base_json = serde_json::from_str::<Value>(base.body_preview.trim()).ok();
-    let cand_json = serde_json::from_str::<Value>(cand.body_preview.trim()).ok();
+    let base_json = serde_json::from_str::<Value>(base_raw.trim()).ok();
+    let cand_json = serde_json::from_str::<Value>(cand_raw.trim()).ok();
     if let Some(ref bv) = base_json {
         flatten_json_paths(bv, "", 0, &mut base_paths);
     }
@@ -2956,7 +3007,7 @@ fn classify_mutation_anomaly(
         ));
     }
 
-    let low_body = cand.body_preview.to_ascii_lowercase();
+    let low_body = cand_raw.to_ascii_lowercase();
     let is_pseudo_denial = [
         "unauthorized",
         "forbidden",
@@ -2988,7 +3039,7 @@ fn classify_mutation_anomaly(
             .as_ref()
             .and_then(Value::as_array)
             .is_some_and(|a| a.len() >= 2);
-        let alias_ok = cand.body_preview.contains("ap_a1") && cand.body_preview.contains("ap_a2");
+        let alias_ok = cand_raw.contains("ap_a1") && cand_raw.contains("ap_a2");
         if batch_ok || alias_ok {
             return Some((
                 "GRAPHQL_BATCH_OR_ALIAS_ALLOWED".to_string(),
@@ -3001,11 +3052,10 @@ fn classify_mutation_anomaly(
     }
 
     if label == "mass_assign:role_admin" && (200..300).contains(&cand.status) {
-        let echoed_admin = (cand.body_preview.contains("\"role\"")
-            && cand.body_preview.contains("\"admin\"")
-            && !base.body_preview.contains("\"admin\""))
-            || (cand.body_preview.contains("\"isAdmin\":true")
-                && !base.body_preview.contains("\"isAdmin\":true"))
+        let echoed_admin = (cand_raw.contains("\"role\"")
+            && cand_raw.contains("\"admin\"")
+            && !base_raw.contains("\"admin\""))
+            || (cand_raw.contains("\"isAdmin\":true") && !base_raw.contains("\"isAdmin\":true"))
             || !(200..300).contains(&base.status);
         if echoed_admin {
             return Some((
@@ -3020,8 +3070,8 @@ fn classify_mutation_anomaly(
 
     if label.starts_with("json:dup_key:")
         && (200..300).contains(&cand.status)
-        && cand.body_preview.contains(alt)
-        && !base.body_preview.contains(alt)
+        && cand_raw.contains(alt)
+        && !base_raw.contains(alt)
     {
         return Some((
             "PARSER_DESYNC_ECHO".to_string(),
@@ -3177,12 +3227,14 @@ pub fn run_http_mutate_matrix(
     }
 
     // Run baseline twice to automatically discover volatile JSON fields (timestamps/request_id/nonces)
-    let base1 = execute_http_probe(&m, &u, &hdrs, b.as_deref(), timeout_sec, insecure, follow);
-    let base2 = execute_http_probe(&m, &u, &hdrs, b.as_deref(), timeout_sec, insecure, follow);
+    let (base1, base1_raw) =
+        execute_http_probe_with_raw(&m, &u, &hdrs, b.as_deref(), timeout_sec, insecure, follow);
+    let (_base2, base2_raw) =
+        execute_http_probe_with_raw(&m, &u, &hdrs, b.as_deref(), timeout_sec, insecure, follow);
     let mut volatile_paths = std::collections::HashSet::new();
     if let (Ok(v1), Ok(v2)) = (
-        serde_json::from_str::<Value>(base1.body_preview.trim()),
-        serde_json::from_str::<Value>(base2.body_preview.trim()),
+        serde_json::from_str::<Value>(base1_raw.trim()),
+        serde_json::from_str::<Value>(base2_raw.trim()),
     ) {
         let mut p1 = std::collections::BTreeMap::new();
         let mut p2 = std::collections::BTreeMap::new();
@@ -3206,7 +3258,7 @@ pub fn run_http_mutate_matrix(
         if idx > 0 && rate_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(rate_ms.min(5000)));
         }
-        let cand = execute_http_probe(
+        let (cand, cand_raw) = execute_http_probe_with_raw(
             &spec.method,
             &spec.url,
             &spec.headers,
@@ -3215,9 +3267,11 @@ pub fn run_http_mutate_matrix(
             insecure,
             follow,
         );
-        if let Some((kind, detail, added, changed, s_hits)) = classify_mutation_anomaly(
+        if let Some((kind, detail, added, changed, s_hits)) = classify_mutation_anomaly_raw(
             &base1,
+            &base1_raw,
             &cand,
+            &cand_raw,
             cls,
             &spec.label,
             alt,
@@ -3607,5 +3661,67 @@ mod tests {
         )
         .expect("graphql alias detected");
         assert_eq!(gk, "GRAPHQL_BATCH_OR_ALIAS_ALLOWED");
+    }
+
+    #[test]
+    fn mutate_matrix_and_deep_diff_handle_over_4kb_json_bodies() {
+        let big_pad = "x".repeat(4200);
+        let base_raw =
+            format!(r#"{{"pad":"{big_pad}","meta":{{"req_id":"r1"}},"role":"user","ok":true}}"#);
+        let cand_raw = format!(
+            r#"{{"pad":"{big_pad}","meta":{{"req_id":"r2"}},"role":"admin","extra":"leaked","ok":true}}"#
+        );
+        let base_meta = HttpProbeResult {
+            method: "POST".to_string(),
+            url: "https://api.example/v1/profile".to_string(),
+            status: 200,
+            elapsed_ms: 4.0,
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body_preview: format!(
+                "{}...\n[truncated: {}B total]",
+                &base_raw[..2400],
+                base_raw.len()
+            ),
+            error: String::new(),
+        };
+        let cand_meta = HttpProbeResult {
+            body_preview: format!(
+                "{}...\n[truncated: {}B total]",
+                &cand_raw[..2400],
+                cand_raw.len()
+            ),
+            ..base_meta.clone()
+        };
+
+        let mut volatile = std::collections::HashSet::new();
+        volatile.insert("meta.req_id".to_string());
+        let (kind, _, added, changed, _) = classify_mutation_anomaly_raw(
+            &base_meta,
+            &base_raw,
+            &cand_meta,
+            &cand_raw,
+            "mass_assignment",
+            "mass_assign:role_admin",
+            "alt",
+            &volatile,
+            &[],
+        )
+        .expect("mass-assignment beyond 2400B preview detected");
+        assert_eq!(kind, "PARSER_DESYNC_ECHO");
+        assert!(added.contains(&"extra".to_string()), "{added:?}");
+        assert!(changed.contains(&"role".to_string()), "{changed:?}");
+        assert!(!changed.contains(&"meta.req_id".to_string()), "{changed:?}");
+
+        let flow_diff = classify_auth_matrix_diff_deep_bodies(
+            &base_meta,
+            &base_raw,
+            &cand_meta,
+            &cand_raw,
+            &[],
+        );
+        assert!(flow_diff.possible_bypass);
+        assert!(flow_diff.added_paths.contains(&"extra".to_string()));
+        assert!(flow_diff.changed_paths.contains(&"role".to_string()));
     }
 }

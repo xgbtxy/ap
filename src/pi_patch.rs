@@ -274,8 +274,10 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 id: "bundle_usage_calibrated_compaction_cut",
                 rel_hint: None,
                 old: r#"let boundaryEnd=projectedEntries.length,tokensBefore=estimateProjectedContextTokens(projection,pathEntries).tokens,cutPoint=findProjectedCutPoint(projectedEntries,boundaryStart,boundaryEnd,settings.keepRecentTokens)"#,
-                alt_olds: &[],
-                new: r#"let boundaryEnd=projectedEntries.length,tokensBefore=estimateProjectedContextTokens(projection,pathEntries).tokens,_est=0;for(let _i=boundaryStart;_i<boundaryEnd;_i++)for(let _m of projectedEntries[_i].messages)_est+=estimateTokens(_m);let _cal=_est>0&&tokensBefore>0?Math.min(4,Math.max(1,tokensBefore/_est)):1,cutPoint=findProjectedCutPoint(projectedEntries,boundaryStart,boundaryEnd,Math.max(1024,Math.floor(settings.keepRecentTokens/_cal)))"#,
+                alt_olds: &[
+                    r#"let boundaryEnd=projectedEntries.length,tokensBefore=estimateProjectedContextTokens(projection,pathEntries).tokens,_est=0;for(let _i=boundaryStart;_i<boundaryEnd;_i++)for(let _m of projectedEntries[_i].messages)_est+=estimateTokens(_m);let _cal=_est>0&&tokensBefore>0?Math.min(4,Math.max(1,tokensBefore/_est)):1,cutPoint=findProjectedCutPoint(projectedEntries,boundaryStart,boundaryEnd,Math.max(1024,Math.floor(settings.keepRecentTokens/_cal)))"#,
+                ],
+                new: r#"let boundaryEnd=projectedEntries.length,tokensBefore=estimateProjectedContextTokens(projection,pathEntries).tokens,_est=0;for(let _i=boundaryStart;_i<boundaryEnd;_i++)for(let _m of projectedEntries[_i].messages)_est+=estimateTokens(_m);let _cal=_est>=25e3&&tokensBefore>0?Math.min(4,Math.max(1,tokensBefore/_est)):1,cutPoint=findProjectedCutPoint(projectedEntries,boundaryStart,boundaryEnd,Math.max(1024,Math.floor(settings.keepRecentTokens/_cal)))"#,
             },
         ],
     },
