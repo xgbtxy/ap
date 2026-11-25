@@ -13195,3 +13195,118 @@ fn test_v276_baton_frontier_coverage_challenge_and_auto_ingest() {
     assert_eq!(cov_v["pressure_score"], 0);
     assert_eq!(cov_v["shallow_stopped"], 0);
 }
+
+#[test]
+fn test_v277_archive_surface_scanner_and_race_flow_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Electron ASAR `--surface --routes --json` (zero-unpack seek reader)
+    let pkg = br#"{"name":"demo","scripts":{"postinstall":"echo hi"}}"#;
+    let main_js = br#"
+new BrowserWindow({ webPreferences: { nodeIntegration: true, contextIsolation: false } });
+ipcMain.handle('svc:exec', (e, p) => spawnSync(p));
+axios.post('/api/v1/coupons/redeem', { couponId: id });
+axios.get('/api/v1/coupons/:id');
+axios.delete('/api/v1/coupons/:id');
+"#;
+    let hdr_json = serde_json::json!({
+        "files": {
+            "package.json": { "size": pkg.len(), "offset": "0" },
+            "main.js": { "size": main_js.len(), "offset": pkg.len().to_string() }
+        }
+    });
+    let hdr_b = serde_json::to_vec(&hdr_json).unwrap();
+    let aligned = (hdr_b.len() + 3) & !3;
+    let mut asar = Vec::new();
+    asar.extend_from_slice(&4u32.to_le_bytes());
+    asar.extend_from_slice(&((aligned + 8) as u32).to_le_bytes());
+    asar.extend_from_slice(&((aligned + 4) as u32).to_le_bytes());
+    asar.extend_from_slice(&(hdr_b.len() as u32).to_le_bytes());
+    asar.extend_from_slice(&hdr_b);
+    asar.resize(asar.len() + (aligned - hdr_b.len()), 0);
+    asar.extend_from_slice(pkg);
+    asar.extend_from_slice(main_js);
+    let asar_path = root.join("desktop.asar");
+    fs::write(&asar_path, &asar).unwrap();
+
+    let surf_out = run_ap(
+        root,
+        &[
+            "read",
+            asar_path.to_str().unwrap(),
+            "--surface",
+            "--routes",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(surf_out.status.success());
+    let sv: Value = serde_json::from_slice(&surf_out.stdout).unwrap();
+    assert_eq!(sv["format"], "archive-surface");
+    assert!(sv["electron_security_flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["kind"] == "nodeIntegration_enabled"));
+    assert_eq!(sv["ipc_handlers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sv["js_surface"]["race_candidates"][0]["path"],
+        "/api/v1/coupons/redeem"
+    );
+    assert_eq!(
+        sv["js_surface"]["flow_candidates"][0]["stem"],
+        "/api/v1/coupons"
+    );
+
+    // 2. Auto-ingest `archive-surface` + `--race`/`--flow` candidates into `ap baton frontier`
+    let store_path = root.join("frontier_v277.json");
+    let ing = run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "ingest",
+            "--store",
+            store_path.to_str().unwrap(),
+            "--stdin",
+            "--json",
+        ],
+        Some(&String::from_utf8_lossy(&surf_out.stdout)),
+        &[],
+    );
+    assert!(ing.status.success());
+    let iv: Value = serde_json::from_slice(&ing.stdout).unwrap();
+    assert_eq!(iv["detected_kind"], "archive_surface");
+    assert!(iv["added"].as_u64().unwrap() >= 4);
+
+    // 3. `ap read <js_bundle> --routes --candidates`
+    let js_path = root.join("routes.js");
+    fs::write(
+        &js_path,
+        "axios.post('/api/v1/transfers/create', { toAccount: a, amount: n });\n\
+         axios.post('/api/v1/transfers/approve', { id: tid });\n\
+         axios.get('/api/v1/transfers/:id');\n",
+    )
+    .unwrap();
+    let cand_md = run_ap(
+        root,
+        &[
+            "read",
+            js_path.to_str().unwrap(),
+            "--routes",
+            "--candidates",
+        ],
+        None,
+        &[],
+    );
+    assert!(cand_md.status.success());
+    let md_s = String::from_utf8_lossy(&cand_md.stdout);
+    assert!(
+        md_s.contains("PROBE CANDIDATES")
+            && md_s.contains("/api/v1/transfers/create")
+            && md_s.contains("Stateful Flow Candidates"),
+        "{md_s}"
+    );
+}

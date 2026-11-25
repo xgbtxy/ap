@@ -2,7 +2,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::time::Instant;
 use zip::ZipArchive;
 
@@ -213,24 +213,607 @@ fn walk_asar_tree(node: &Value, prefix: &str, out: &mut Vec<AsarEntry>) {
     }
 }
 
-/// Parse Electron `.asar` Chromium Pickle header -> (base_data_offset, sorted entries).
-pub fn parse_asar_index(bytes: &[u8]) -> Result<(usize, Vec<AsarEntry>), String> {
-    if bytes.len() < 16 {
-        return Err("invalid .asar file (too short)".to_string());
-    }
-    let header_pickle_sz = read_u32_le(bytes, 4).ok_or("asar header truncated")? as usize;
-    let json_len = read_u32_le(bytes, 12).ok_or("asar json_len truncated")? as usize;
-    let json_end = 16usize.saturating_add(json_len);
-    if json_end > bytes.len() {
+/// Parse Electron `.asar` Chromium Pickle header from any `Read + Seek` stream -> (base_data_offset, sorted entries).
+pub fn parse_asar_index_reader<R: Read + Seek>(
+    r: &mut R,
+) -> Result<(usize, Vec<AsarEntry>), String> {
+    r.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("asar seek failed: {e}"))?;
+    let mut hdr = [0u8; 16];
+    r.read_exact(&mut hdr)
+        .map_err(|_| "invalid .asar file (too short)".to_string())?;
+    let header_pickle_sz = read_u32_le(&hdr, 4).ok_or("asar header truncated")? as usize;
+    let json_len = read_u32_le(&hdr, 12).ok_or("asar json_len truncated")? as usize;
+    if json_len == 0 || json_len > 64 * 1024 * 1024 {
         return Err("invalid .asar header JSON bounds".to_string());
     }
-    let header_json: Value = serde_json::from_slice(&bytes[16..json_end])
-        .map_err(|e| format!("invalid .asar JSON header: {e}"))?;
+    let mut json_buf = vec![0u8; json_len];
+    r.read_exact(&mut json_buf)
+        .map_err(|_| "invalid .asar header JSON bounds".to_string())?;
+    let header_json: Value =
+        serde_json::from_slice(&json_buf).map_err(|e| format!("invalid .asar JSON header: {e}"))?;
     let base_offset = 8usize.saturating_add(header_pickle_sz);
     let mut entries = Vec::new();
     walk_asar_tree(&header_json, "", &mut entries);
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((base_offset, entries))
+}
+
+/// Parse Electron `.asar` Chromium Pickle header -> (base_data_offset, sorted entries).
+pub fn parse_asar_index(bytes: &[u8]) -> Result<(usize, Vec<AsarEntry>), String> {
+    parse_asar_index_reader(&mut Cursor::new(bytes))
+}
+
+struct ElectronFlagPatterns {
+    rules: [(&'static str, &'static str, Regex); 11],
+}
+
+fn electron_flag_patterns() -> &'static ElectronFlagPatterns {
+    static P: std::sync::OnceLock<ElectronFlagPatterns> = std::sync::OnceLock::new();
+    P.get_or_init(|| ElectronFlagPatterns {
+        rules: [
+            (
+                "nodeIntegration_enabled",
+                "HIGH",
+                Regex::new(r#"\bnodeIntegration\s*:\s*true\b"#).unwrap(),
+            ),
+            (
+                "contextIsolation_disabled",
+                "HIGH",
+                Regex::new(r#"\bcontextIsolation\s*:\s*false\b"#).unwrap(),
+            ),
+            (
+                "sandbox_disabled",
+                "MEDIUM",
+                Regex::new(r#"\bsandbox\s*:\s*false\b"#).unwrap(),
+            ),
+            (
+                "webSecurity_disabled",
+                "HIGH",
+                Regex::new(r#"\bwebSecurity\s*:\s*false\b"#).unwrap(),
+            ),
+            (
+                "allowRunningInsecureContent",
+                "HIGH",
+                Regex::new(r#"\ballowRunningInsecureContent\s*:\s*true\b"#).unwrap(),
+            ),
+            (
+                "enableRemoteModule_enabled",
+                "HIGH",
+                Regex::new(r#"\benableRemoteModule\s*:\s*true\b"#).unwrap(),
+            ),
+            (
+                "webviewTag_enabled",
+                "MEDIUM",
+                Regex::new(r#"\bwebviewTag\s*:\s*true\b"#).unwrap(),
+            ),
+            (
+                "protocol_handler",
+                "MEDIUM",
+                Regex::new(
+                    r#"(?:\bsetAsDefaultProtocolClient\s*\(|\bprotocol\.register[A-Za-z]*\s*\()"#,
+                )
+                .unwrap(),
+            ),
+            (
+                "ipc_handler",
+                "MEDIUM",
+                Regex::new(r#"\bipcMain\.(?:handle|on)\s*\("#).unwrap(),
+            ),
+            (
+                "contextBridge_expose",
+                "MEDIUM",
+                Regex::new(r#"\bcontextBridge\.exposeInMainWorld\s*\("#).unwrap(),
+            ),
+            (
+                "shell_openExternal",
+                "MEDIUM",
+                Regex::new(r#"\bshell\.openExternal\s*\("#).unwrap(),
+            ),
+        ],
+    })
+}
+
+fn archive_entry_priority(path_low: &str) -> Option<(u8, bool)> {
+    if path_low.ends_with(".d.ts") {
+        return None;
+    }
+    let is_code = [
+        ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".html", ".htm",
+    ]
+    .iter()
+    .any(|ext| path_low.ends_with(ext));
+    if !is_code {
+        return None;
+    }
+    let in_nm = path_low.starts_with("node_modules/") || path_low.contains("/node_modules/");
+    let high_sig = [
+        "main",
+        "preload",
+        "ipc",
+        "bridge",
+        "protocol",
+        "electron",
+        "background",
+        "extension",
+        "server",
+        "router",
+        "auth",
+        "window",
+        "app",
+    ]
+    .iter()
+    .any(|kw| path_low.contains(kw));
+    let tier = match (in_nm, high_sig) {
+        (false, true) => 0,
+        (false, false) => 1,
+        (true, true) => 2,
+        (true, false) => 3,
+    };
+    Some((tier, in_nm))
+}
+
+fn inspect_archive_manifest(
+    path: &str,
+    text: &str,
+    manifests: &mut Vec<Value>,
+    manifest_risks: &mut Vec<Value>,
+) {
+    let low = path.to_ascii_lowercase();
+    if low.ends_with("package.json") && !low.contains("node_modules/") {
+        if let Ok(v) = serde_json::from_str::<Value>(text) {
+            let name = v["name"].as_str().unwrap_or("");
+            let version = v["version"].as_str().unwrap_or("");
+            let main_entry = v["main"].as_str().unwrap_or("");
+            let mut script_keys: Vec<String> = Vec::new();
+            if let Some(sc) = v["scripts"].as_object() {
+                for k in sc.keys() {
+                    script_keys.push(k.clone());
+                    if matches!(k.as_str(), "postinstall" | "preinstall" | "install") {
+                        manifest_risks.push(json!({
+                            "kind": "lifecycle_install_script",
+                            "severity": "HIGH",
+                            "entry_path": path,
+                            "detail": format!("script `{k}`: {}", sc[k].as_str().unwrap_or("").chars().take(120).collect::<String>()),
+                        }));
+                    }
+                }
+            }
+            if v.pointer("/capabilities/untrustedWorkspaces/supported")
+                .is_some()
+            {
+                let sup = &v["capabilities"]["untrustedWorkspaces"]["supported"];
+                if sup.as_bool() == Some(true) {
+                    manifest_risks.push(json!({
+                        "kind": "untrusted_workspaces_enabled",
+                        "severity": "MEDIUM",
+                        "entry_path": path,
+                        "detail": "capabilities.untrustedWorkspaces.supported = true",
+                    }));
+                }
+            }
+            if let Some(cfg) = v.pointer("/contributes/configuration") {
+                let has_unrestricted = cfg
+                    .pointer("/properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|props| {
+                        props.values().any(|p| {
+                            p["scope"].as_str() != Some("application")
+                                && p["scope"].as_str() != Some("machine")
+                        })
+                    });
+                if has_unrestricted {
+                    manifest_risks.push(json!({
+                        "kind": "workspace_overridable_setting",
+                        "severity": "MEDIUM",
+                        "entry_path": path,
+                        "detail": "contributes.configuration contains non-machine-scoped settings",
+                    }));
+                }
+            }
+            manifests.push(json!({
+                "entry_path": path,
+                "kind": "package.json",
+                "name": name,
+                "version": version,
+                "main": main_entry,
+                "scripts": script_keys,
+            }));
+        }
+    } else if low.ends_with("manifest.mf")
+        || low.ends_with("extension.vsixmanifest")
+        || low.ends_with("plugin.xml")
+        || low.ends_with("manifest.json")
+    {
+        let preview: String = text
+            .lines()
+            .take(12)
+            .collect::<Vec<_>>()
+            .join(" | ")
+            .chars()
+            .take(240)
+            .collect();
+        manifests.push(json!({
+            "entry_path": path,
+            "kind": path.rsplit('/').next().unwrap_or(path),
+            "preview": preview,
+        }));
+    }
+}
+
+/// Zero-unpack in-memory / seek-streamed archive surface scanner for `.asar`, `.zip`, `.vsix`, `.jar`, `.apk`, `.whl`.
+pub fn inspect_archive_surface_reader<R: Read + Seek>(
+    r: &mut R,
+    ext: &str,
+    label: &str,
+    include_routes: bool,
+    query: Option<&str>,
+) -> Result<(String, Value), String> {
+    let t0 = Instant::now();
+    let ext_low = ext.to_ascii_lowercase();
+    let q_low = query
+        .map(|q| q.trim().to_ascii_lowercase())
+        .filter(|q| !q.is_empty());
+
+    struct CandidateEntry {
+        path: String,
+        tier: u8,
+        offset: usize,
+        size: usize,
+        zip_index: usize,
+    }
+
+    let total_entries;
+    let mut unpacked_count = 0usize;
+    let mut asar_base = 0usize;
+    let mut native_bins: Vec<Value> = Vec::new();
+    let mut manifest_targets: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut code_targets: Vec<CandidateEntry> = Vec::new();
+
+    if ext_low == "asar" {
+        let (base, entries) = parse_asar_index_reader(r)?;
+        asar_base = base;
+        total_entries = entries.len();
+        for e in entries {
+            if e.unpacked {
+                unpacked_count += 1;
+            }
+            let pl = e.path.to_ascii_lowercase();
+            if [".exe", ".dll", ".so", ".dylib", ".node", ".wasm"]
+                .iter()
+                .any(|x| pl.ends_with(x))
+            {
+                if native_bins.len() < 60 {
+                    native_bins.push(json!({
+                        "path": e.path,
+                        "size": e.size,
+                        "unpacked": e.unpacked,
+                    }));
+                }
+                continue;
+            }
+            if e.unpacked {
+                continue;
+            }
+            if (pl.ends_with("package.json")
+                || pl.ends_with("manifest.mf")
+                || pl.ends_with("extension.vsixmanifest")
+                || pl.ends_with("plugin.xml")
+                || pl.ends_with("manifest.json"))
+                && !pl.contains("node_modules/")
+                && e.size <= 256 * 1024
+                && manifest_targets.len() < 20
+            {
+                manifest_targets.push((e.path, e.offset, e.size, 0));
+                continue;
+            }
+            if e.size > 4 * 1024 * 1024 || e.size == 0 {
+                continue;
+            }
+            if let Some((tier, in_nm)) = archive_entry_priority(&pl) {
+                if in_nm && !q_low.as_ref().is_some_and(|q| pl.contains(q)) {
+                    continue;
+                }
+                code_targets.push(CandidateEntry {
+                    path: e.path,
+                    tier,
+                    offset: e.offset,
+                    size: e.size,
+                    zip_index: 0,
+                });
+            }
+        }
+    } else {
+        let mut za = ZipArchive::new(&mut *r).map_err(|e| format!("zip error: {e}"))?;
+        total_entries = za.len();
+        for idx in 0..za.len() {
+            let Ok(f) = za.by_index(idx) else {
+                continue;
+            };
+            if f.is_dir() {
+                continue;
+            }
+            let path = f.name().replace('\\', "/");
+            let sz = f.size() as usize;
+            let pl = path.to_ascii_lowercase();
+            if [".exe", ".dll", ".so", ".dylib", ".node", ".wasm"]
+                .iter()
+                .any(|x| pl.ends_with(x))
+            {
+                if native_bins.len() < 60 {
+                    native_bins.push(json!({
+                        "path": path,
+                        "size": sz,
+                        "unpacked": false,
+                    }));
+                }
+                continue;
+            }
+            if (pl.ends_with("package.json")
+                || pl.ends_with("meta-inf/manifest.mf")
+                || pl.ends_with("extension.vsixmanifest")
+                || pl.ends_with("plugin.xml")
+                || pl.ends_with("manifest.json"))
+                && !pl.contains("node_modules/")
+                && sz <= 256 * 1024
+                && manifest_targets.len() < 20
+            {
+                manifest_targets.push((path, 0, sz, idx));
+                continue;
+            }
+            if sz > 4 * 1024 * 1024 || sz == 0 {
+                continue;
+            }
+            if let Some((tier, in_nm)) = archive_entry_priority(&pl) {
+                if in_nm && !q_low.as_ref().is_some_and(|q| pl.contains(q)) {
+                    continue;
+                }
+                code_targets.push(CandidateEntry {
+                    path,
+                    tier,
+                    offset: 0,
+                    size: sz,
+                    zip_index: idx,
+                });
+            }
+        }
+    }
+
+    code_targets.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.path.cmp(&b.path)));
+    let selected_code: Vec<CandidateEntry> = code_targets.into_iter().take(150).collect();
+
+    let mut manifests: Vec<Value> = Vec::new();
+    let mut manifest_risks: Vec<Value> = Vec::new();
+    let mut electron_flags: Vec<Value> = Vec::new();
+    let mut ipc_handlers: Vec<Value> = Vec::new();
+    let mut js_acc = crate::inspect::JsSurfaceData::default();
+    let mut scanned_js_entries = 0usize;
+
+    let read_entry_text = |stream: &mut R, off: usize, sz: usize| -> Option<String> {
+        let pos = (asar_base as u64).checked_add(off as u64)?;
+        stream.seek(SeekFrom::Start(pos)).ok()?;
+        let mut buf = vec![0u8; sz];
+        stream.read_exact(&mut buf).ok()?;
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    };
+
+    let mut process_code = |path: &str, text: &str| {
+        scanned_js_entries += 1;
+        let pats = electron_flag_patterns();
+        for (kind, default_sev, re) in &pats.rules {
+            for m in re.find_iter(text).take(8) {
+                let ln = text[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+                let mut w_end = (m.end() + 140).min(text.len());
+                while w_end > m.end() && !text.is_char_boundary(w_end) {
+                    w_end -= 1;
+                }
+                let mut w_start = m.start().saturating_sub(24);
+                while w_start < m.start() && !text.is_char_boundary(w_start) {
+                    w_start += 1;
+                }
+                let snip: String = text[w_start..w_end]
+                    .replace(['\r', '\n'], " ")
+                    .chars()
+                    .take(140)
+                    .collect();
+                if let Some(ref q) = q_low {
+                    if !snip.to_ascii_lowercase().contains(q)
+                        && !path.to_ascii_lowercase().contains(q)
+                        && !kind.to_ascii_lowercase().contains(q)
+                    {
+                        continue;
+                    }
+                }
+                let sev = if *kind == "contextBridge_expose"
+                    && (snip.contains("ipcRenderer.send")
+                        || snip.contains("ipcRenderer.invoke")
+                        || snip.contains("ipcRenderer.on"))
+                {
+                    "HIGH"
+                } else {
+                    *default_sev
+                };
+                if *kind == "ipc_handler" {
+                    if ipc_handlers.len() < 40 {
+                        ipc_handlers.push(json!({
+                            "entry_path": path,
+                            "line": ln,
+                            "snippet": snip,
+                        }));
+                    }
+                } else if electron_flags.len() < 60 {
+                    electron_flags.push(json!({
+                        "kind": kind,
+                        "severity": sev,
+                        "entry_path": path,
+                        "line": ln,
+                        "snippet": snip,
+                    }));
+                }
+            }
+        }
+        crate::inspect::collect_js_surface_into(text, Some(path), query, &mut js_acc);
+    };
+
+    if ext_low == "asar" {
+        for (mpath, moff, msz, _) in &manifest_targets {
+            if let Some(txt) = read_entry_text(r, *moff, *msz) {
+                inspect_archive_manifest(mpath, &txt, &mut manifests, &mut manifest_risks);
+            }
+        }
+        for c in &selected_code {
+            if let Some(txt) = read_entry_text(r, c.offset, c.size) {
+                process_code(&c.path, &txt);
+            }
+        }
+    } else {
+        let mut za = ZipArchive::new(&mut *r).map_err(|e| format!("zip error: {e}"))?;
+        for (mpath, _, msz, zidx) in &manifest_targets {
+            if let Ok(f) = za.by_index(*zidx) {
+                let mut buf = Vec::with_capacity((*msz).min(256 * 1024));
+                let _ = f.take(256 * 1024).read_to_end(&mut buf);
+                let txt = String::from_utf8_lossy(&buf);
+                inspect_archive_manifest(mpath, &txt, &mut manifests, &mut manifest_risks);
+            }
+        }
+        for c in &selected_code {
+            if let Ok(f) = za.by_index(c.zip_index) {
+                let mut buf = Vec::with_capacity(c.size.min(4 * 1024 * 1024));
+                let _ = f.take(4 * 1024 * 1024).read_to_end(&mut buf);
+                let txt = String::from_utf8_lossy(&buf);
+                process_code(&c.path, &txt);
+            }
+        }
+    }
+
+    let (_, js_surface_json) = crate::inspect::render_js_surface(js_acc, label, None);
+    let has_js_hits = include_routes
+        || js_surface_json["counts"]["routes"].as_u64().unwrap_or(0) > 0
+        || js_surface_json["counts"]["graphql"].as_u64().unwrap_or(0) > 0
+        || js_surface_json["counts"]["ws_sse"].as_u64().unwrap_or(0) > 0
+        || js_surface_json["counts"]["post_message"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        || js_surface_json["counts"]["local_server_ipc"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0;
+
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+    let mut md = vec![format!(
+        "# ARCHIVE SURFACE `{label}` ({ext_low} | entries={total_entries}, scanned_js={scanned_js_entries}, native_bins={}, electron_flags={}, ipc_handlers={}, manifest_risks={} in {elapsed_ms}ms)",
+        native_bins.len(),
+        electron_flags.len(),
+        ipc_handlers.len(),
+        manifest_risks.len(),
+    )];
+    if !electron_flags.is_empty() {
+        md.push("\n## Electron / Bridge Security Posture".to_string());
+        for fl in electron_flags.iter().take(25) {
+            md.push(format!(
+                "- [{}] `{}` (`{}:L{}`): `{}`",
+                fl["severity"].as_str().unwrap_or(""),
+                fl["kind"].as_str().unwrap_or(""),
+                fl["entry_path"].as_str().unwrap_or(""),
+                fl["line"].as_u64().unwrap_or(0),
+                fl["snippet"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    if !manifest_risks.is_empty() {
+        md.push("\n## Manifest & Extension Risks".to_string());
+        for mr in manifest_risks.iter().take(15) {
+            md.push(format!(
+                "- [{}] `{}` (`{}`): {}",
+                mr["severity"].as_str().unwrap_or(""),
+                mr["kind"].as_str().unwrap_or(""),
+                mr["entry_path"].as_str().unwrap_or(""),
+                mr["detail"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    if !ipc_handlers.is_empty() {
+        md.push(format!("\n## IPC Handlers ({})", ipc_handlers.len()));
+        for h in ipc_handlers.iter().take(20) {
+            md.push(format!(
+                "- `{}:L{}`: `{}`",
+                h["entry_path"].as_str().unwrap_or(""),
+                h["line"].as_u64().unwrap_or(0),
+                h["snippet"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    if !native_bins.is_empty() {
+        let nb: Vec<String> = native_bins
+            .iter()
+            .take(20)
+            .map(|b| {
+                format!(
+                    "`{}` ({}B{})",
+                    b["path"].as_str().unwrap_or(""),
+                    b["size"].as_u64().unwrap_or(0),
+                    if b["unpacked"].as_bool().unwrap_or(false) {
+                        ", unpacked"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        md.push(format!(
+            "\n## Native Binaries Inside Archive ({})\n{}",
+            native_bins.len(),
+            nb.join(", ")
+        ));
+    }
+    if has_js_hits {
+        md.push(format!(
+            "\n## Contained JS/API Surface (routes={}, graphql={}, ws_sse={}, race={}, flow={})",
+            js_surface_json["counts"]["routes"].as_u64().unwrap_or(0),
+            js_surface_json["counts"]["graphql"].as_u64().unwrap_or(0),
+            js_surface_json["counts"]["ws_sse"].as_u64().unwrap_or(0),
+            js_surface_json["counts"]["race_candidates"]
+                .as_u64()
+                .unwrap_or(0),
+            js_surface_json["counts"]["flow_candidates"]
+                .as_u64()
+                .unwrap_or(0),
+        ));
+    }
+
+    let mut jv = json!({
+        "ok": true,
+        "format": "archive-surface",
+        "archive_kind": ext_low,
+        "target": label,
+        "elapsed_ms": elapsed_ms,
+        "entry_counts": {
+            "total": total_entries,
+            "unpacked": unpacked_count,
+            "scanned_js": scanned_js_entries,
+            "native_bins": native_bins.len(),
+        },
+        "manifests": manifests,
+        "manifest_risks": manifest_risks,
+        "native_bins": native_bins,
+        "electron_security_flags": electron_flags,
+        "ipc_handlers": ipc_handlers,
+    });
+    if has_js_hits {
+        jv["js_surface"] = js_surface_json;
+    }
+    Ok((md.join("\n"), jv))
+}
+
+pub fn inspect_archive_surface(
+    bytes: &[u8],
+    ext: &str,
+    label: &str,
+    include_routes: bool,
+    query: Option<&str>,
+) -> Result<(String, Value), String> {
+    inspect_archive_surface_reader(&mut Cursor::new(bytes), ext, label, include_routes, query)
 }
 
 pub fn read_asar_member(bytes: &[u8], entry_path: &str) -> Result<Vec<u8>, String> {
@@ -5312,6 +5895,115 @@ mod tests {
         assert!(
             md.contains("BINARY SURFACE") && md.contains("demo_ipc_v1"),
             "{md}"
+        );
+    }
+
+    #[test]
+    fn scans_electron_asar_and_zip_archives_without_disk_unpacking() {
+        use std::io::Write;
+        // 1. Minimal synthetic Electron ASAR archive
+        let pkg = br#"{"name":"demo-app","version":"1.0.0","main":"main.js","scripts":{"postinstall":"node setup.js"},"capabilities":{"untrustedWorkspaces":{"supported":true}}}"#;
+        let main_js = br#"
+const { BrowserWindow, ipcMain, contextBridge, shell } = require('electron');
+new BrowserWindow({ webPreferences: { nodeIntegration: true, contextIsolation: false, webSecurity: false } });
+ipcMain.handle('app:exec', (ev, cmd) => execFile(cmd));
+contextBridge.exposeInMainWorld('api', { send: (c, a) => ipcRenderer.send(c, a) });
+shell.openExternal(url);
+axios.post('/api/v1/quota/redeem', { voucherCode: code });
+axios.get('/api/v1/quota/:id');
+"#;
+        let native_stub = b"MZ\x90\x00";
+        let header_json = serde_json::json!({
+            "files": {
+                "package.json": { "size": pkg.len(), "offset": "0" },
+                "main.js": { "size": main_js.len(), "offset": pkg.len().to_string() },
+                "native": {
+                    "files": {
+                        "addon.node": { "size": native_stub.len(), "offset": (pkg.len() + main_js.len()).to_string(), "unpacked": true }
+                    }
+                }
+            }
+        });
+        let hdr_bytes = serde_json::to_vec(&header_json).unwrap();
+        let aligned_len = (hdr_bytes.len() + 3) & !3;
+        let pad = aligned_len - hdr_bytes.len();
+        let mut asar = Vec::new();
+        asar.extend_from_slice(&4u32.to_le_bytes());
+        asar.extend_from_slice(&((aligned_len + 8) as u32).to_le_bytes());
+        asar.extend_from_slice(&((aligned_len + 4) as u32).to_le_bytes());
+        asar.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+        asar.extend_from_slice(&hdr_bytes);
+        asar.resize(asar.len() + pad, 0);
+        asar.extend_from_slice(pkg);
+        asar.extend_from_slice(main_js);
+        asar.extend_from_slice(native_stub);
+
+        let (md, jv) =
+            inspect_archive_surface(&asar, "asar", "app.asar", true, None).expect("asar surface");
+        assert_eq!(jv["format"], "archive-surface");
+        assert_eq!(jv["entry_counts"]["unpacked"], 1);
+        assert_eq!(jv["native_bins"][0]["path"], "native/addon.node");
+        assert!(jv["manifest_risks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "lifecycle_install_script"));
+        assert!(jv["manifest_risks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "untrusted_workspaces_enabled"));
+        assert!(jv["electron_security_flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "nodeIntegration_enabled" && f["severity"] == "HIGH"));
+        assert!(jv["electron_security_flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "contextBridge_expose" && f["severity"] == "HIGH"));
+        assert_eq!(jv["ipc_handlers"].as_array().unwrap().len(), 1);
+        assert!(jv["js_surface"]["race_candidates"][0]["path"] == "/api/v1/quota/redeem");
+        assert_eq!(
+            jv["js_surface"]["flow_candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(md.contains("ARCHIVE SURFACE"), "{md}");
+
+        // 2. Minimal synthetic VSIX/ZIP archive
+        let mut zip_buf = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut zip_buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("extension/package.json", opts).unwrap();
+            zw.write_all(br#"{"name":"ext","contributes":{"configuration":{"properties":{"ext.path":{"type":"string"}}}}}"#).unwrap();
+            zw.start_file("extension/out/ext.js", opts).unwrap();
+            zw.write_all(br#"protocol.registerStringProtocol('demo', h); fetch('/api/v1/orders/create'); axios.delete('/api/v1/orders/:id');"#).unwrap();
+            zw.finish().unwrap();
+        }
+        let zbytes = zip_buf.into_inner();
+        let (_, zjv) = inspect_archive_surface(&zbytes, "vsix", "demo.vsix", true, None)
+            .expect("vsix surface");
+        assert!(zjv["manifest_risks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "workspace_overridable_setting"));
+        assert!(zjv["electron_security_flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "protocol_handler"));
+        assert_eq!(
+            zjv["js_surface"]["flow_candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

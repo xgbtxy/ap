@@ -38,6 +38,7 @@ fn mcp_tools_schema() -> Value {
                     "cert": { "type": "boolean", "description": "X.509 PEM/DER inspector" },
                     "proto": { "type": "boolean", "description": "Raw protobuf wire decoder" },
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML routes, sinks & origins" },
+                    "candidates": { "type": "boolean", "description": "Spotlight synthesized --race/--flow probe candidates" },
                     "jwt": { "type": "boolean", "description": "Decode JWT header/claims & posture" },
                     "secrets": { "type": "boolean", "description": "Scan redacted hardcoded keys/tokens" },
                     "diff": { "type": "string", "description": "Older binary/archive/config path to diff" },
@@ -1365,6 +1366,13 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             if args.get("routes").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--routes".to_string());
+            }
+            if args
+                .get("candidates")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--candidates".to_string());
             }
             if args.get("jwt").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--jwt".to_string());

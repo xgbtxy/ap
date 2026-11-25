@@ -1712,8 +1712,10 @@ pub fn extract_har_routes_md(
         hosts.len()
     )];
     let mut ep_json = Vec::new();
+    let mut synth_inputs: Vec<(String, String, Vec<String>, Vec<&'static str>)> = Vec::new();
     for (_, method, ep, st) in rows.into_iter().take(80) {
         let mut flags = Vec::new();
+        let mut s_tags: Vec<&'static str> = Vec::new();
         if st.unauth_2xx {
             unauth_n += 1;
             flags.push("UNAUTH-2XX");
@@ -1731,6 +1733,10 @@ pub fn extract_har_routes_md(
         if !sens_params.is_empty() {
             sens_n += 1;
             flags.push("SENSITIVE-PARAMS");
+            s_tags.push("SENSITIVE");
+        }
+        if ep.contains('{') || ep.contains(':') || !st.params.is_empty() {
+            s_tags.push("PARAM");
         }
         let flag_str = if flags.is_empty() {
             String::new()
@@ -1752,15 +1758,11 @@ pub fn extract_har_routes_md(
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let param_s = if st.params.is_empty() {
+        let param_vec: Vec<String> = st.params.iter().take(10).cloned().collect();
+        let param_s = if param_vec.is_empty() {
             "-".to_string()
         } else {
-            st.params
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
+            param_vec.join(",")
         };
         let size_s = match st.min_body {
             Some(mn) if mn != st.max_body => format!("{mn}..{}B", st.max_body),
@@ -1771,6 +1773,7 @@ pub fn extract_har_routes_md(
             "- `{method}` `{ep}` (hits={} status=[{status_s}] size={size_s} auth=[{auth_s}] params=[{param_s}]){flag_str}",
             st.hits
         ));
+        synth_inputs.push((method.clone(), ep.clone(), param_vec, s_tags));
         ep_json.push(serde_json::json!({
             "method": method,
             "endpoint": ep,
@@ -1781,6 +1784,19 @@ pub fn extract_har_routes_md(
             "flags": flags,
         }));
     }
+    let synth_refs: Vec<SynthRouteInput<'_>> = synth_inputs
+        .iter()
+        .map(|(m, p, params, tags)| SynthRouteInput {
+            method: m.as_str(),
+            path: p.as_str(),
+            file: None,
+            line: 0,
+            params: params.as_slice(),
+            tags: tags.as_slice(),
+        })
+        .collect();
+    let (race_candidates, flow_candidates) = synthesize_race_and_flow_candidates(&synth_refs);
+    append_candidates_md(&mut md_lines, &race_candidates, &flow_candidates);
     let jv = serde_json::json!({
         "entries_total": entries.len(),
         "endpoints_total": total_eps,
@@ -1789,18 +1805,22 @@ pub fn extract_har_routes_md(
             "unauth_2xx": unauth_n,
             "cors_creds_exposed": cors_n,
             "sensitive_params": sens_n,
+            "race_candidates": race_candidates.len(),
+            "flow_candidates": flow_candidates.len(),
         },
         "endpoints": ep_json,
+        "race_candidates": race_candidates,
+        "flow_candidates": flow_candidates,
     });
     Some((md_lines.join("\n"), jv))
 }
 
-struct JsRouteEntry {
-    method: String,
-    line: usize,
-    file: Option<String>,
-    tags: Vec<&'static str>,
-    params: Vec<String>,
+pub(crate) struct JsRouteEntry {
+    pub(crate) method: String,
+    pub(crate) line: usize,
+    pub(crate) file: Option<String>,
+    pub(crate) tags: Vec<&'static str>,
+    pub(crate) params: Vec<String>,
 }
 
 struct RankedJsRoute<'a> {
@@ -1810,19 +1830,401 @@ struct RankedJsRoute<'a> {
 }
 
 #[derive(Default)]
-struct JsSurfaceData {
-    route_map: std::collections::BTreeMap<String, JsRouteEntry>,
-    graphql_ops: Vec<(String, String, usize, usize, Option<String>)>,
-    seen_graphql: std::collections::HashSet<(String, String)>,
-    ws_sse: Vec<(String, String, usize, usize, Option<String>)>,
-    seen_ws: std::collections::HashSet<String>,
-    post_messages: Vec<serde_json::Value>,
-    dom_sinks: Vec<serde_json::Value>,
-    origins: std::collections::BTreeSet<String>,
-    local_ipc_sinks: Vec<serde_json::Value>,
-    lazy_chunks: std::collections::BTreeSet<String>,
-    custom_headers: std::collections::BTreeSet<String>,
-    scanned_files: usize,
+pub(crate) struct JsSurfaceData {
+    pub(crate) route_map: std::collections::BTreeMap<String, JsRouteEntry>,
+    pub(crate) graphql_ops: Vec<(String, String, usize, usize, Option<String>)>,
+    pub(crate) seen_graphql: std::collections::HashSet<(String, String)>,
+    pub(crate) ws_sse: Vec<(String, String, usize, usize, Option<String>)>,
+    pub(crate) seen_ws: std::collections::HashSet<String>,
+    pub(crate) post_messages: Vec<serde_json::Value>,
+    pub(crate) dom_sinks: Vec<serde_json::Value>,
+    pub(crate) origins: std::collections::BTreeSet<String>,
+    pub(crate) local_ipc_sinks: Vec<serde_json::Value>,
+    pub(crate) lazy_chunks: std::collections::BTreeSet<String>,
+    pub(crate) custom_headers: std::collections::BTreeSet<String>,
+    pub(crate) scanned_files: usize,
+}
+
+pub(crate) struct SynthRouteInput<'a> {
+    pub(crate) method: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) file: Option<&'a str>,
+    pub(crate) line: usize,
+    pub(crate) params: &'a [String],
+    pub(crate) tags: &'a [&'static str],
+}
+
+const CONTENTION_VERBS: &[&str] = &[
+    "create", "redeem", "claim", "coupon", "voucher", "transfer", "withdraw", "pay", "quota",
+    "limit", "invite", "bind", "unbind", "approve", "reject", "vote", "enroll", "upload", "import",
+    "reset", "token", "key", "order", "checkout", "submit", "batch", "share", "grant", "revoke",
+    "mint", "buy", "refund", "consume", "exchange", "register",
+];
+
+fn path_stem_and_role(method: &str, path: &str) -> (String, u8, bool) {
+    let no_q = path.split('?').next().unwrap_or(path).trim();
+    let stripped_scheme = no_q
+        .strip_prefix("https://")
+        .or_else(|| no_q.strip_prefix("http://"))
+        .and_then(|rest| rest.find('/').map(|idx| &rest[idx..]))
+        .unwrap_or(no_q);
+    let segs: Vec<&str> = stripped_scheme
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segs.is_empty() {
+        return (String::new(), 9, false);
+    }
+    let has_item_param = segs.iter().any(|s| {
+        s.starts_with(':')
+            || s.starts_with('{')
+            || s.contains("${")
+            || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    });
+    let mut stem_segs = segs.clone();
+    while let Some(&last) = stem_segs.last() {
+        let low = last.to_ascii_lowercase();
+        let is_param = last.starts_with(':')
+            || last.starts_with('{')
+            || last.contains("${")
+            || (!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()));
+        let is_action = matches!(
+            low.as_str(),
+            "create"
+                | "add"
+                | "new"
+                | "init"
+                | "start"
+                | "upload"
+                | "submit"
+                | "invite"
+                | "issue"
+                | "generate"
+                | "get"
+                | "detail"
+                | "details"
+                | "info"
+                | "status"
+                | "update"
+                | "edit"
+                | "approve"
+                | "confirm"
+                | "verify"
+                | "complete"
+                | "callback"
+                | "bind"
+                | "activate"
+                | "publish"
+                | "download"
+                | "export"
+                | "delete"
+                | "remove"
+                | "revoke"
+                | "cancel"
+                | "unbind"
+                | "redeem"
+                | "claim"
+                | "transfer"
+                | "withdraw"
+                | "pay"
+                | "grant"
+                | "enroll"
+                | "checkout"
+                | "consume"
+                | "exchange"
+                | "reset"
+        );
+        if (is_param || is_action) && stem_segs.len() > 1 {
+            stem_segs.pop();
+        } else {
+            break;
+        }
+    }
+    let stem = format!("/{}", stem_segs.join("/"));
+    let last_low = segs.last().unwrap_or(&"").to_ascii_lowercase();
+    let m_up = method.to_ascii_uppercase();
+    let role = if m_up == "DELETE"
+        || matches!(
+            last_low.as_str(),
+            "delete" | "remove" | "revoke" | "cancel" | "unbind"
+        ) {
+        3
+    } else if matches!(m_up.as_str(), "PUT" | "PATCH")
+        || matches!(
+            last_low.as_str(),
+            "update"
+                | "edit"
+                | "approve"
+                | "confirm"
+                | "verify"
+                | "complete"
+                | "callback"
+                | "bind"
+                | "activate"
+                | "publish"
+        )
+    {
+        1
+    } else if m_up == "POST"
+        || matches!(
+            last_low.as_str(),
+            "create" | "add" | "new" | "init" | "start" | "upload" | "submit" | "invite" | "issue"
+        )
+    {
+        0
+    } else if matches!(m_up.as_str(), "GET" | "FETCH")
+        && (has_item_param
+            || matches!(
+                last_low.as_str(),
+                "get" | "detail" | "details" | "info" | "status" | "download" | "export"
+            ))
+    {
+        2
+    } else {
+        9
+    };
+    (stem, role, has_item_param)
+}
+
+pub(crate) fn synthesize_race_and_flow_candidates(
+    routes: &[SynthRouteInput<'_>],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut race_scored: Vec<(u8, serde_json::Value)> = Vec::new();
+    let mut seen_race: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    for r in routes {
+        let m_up = r.method.to_ascii_uppercase();
+        let is_write = matches!(m_up.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+        let low = r.path.to_ascii_lowercase();
+        let mut ctags: Vec<&'static str> = Vec::new();
+        for &v in CONTENTION_VERBS {
+            if low.contains(v) && !ctags.contains(&v) {
+                ctags.push(v);
+                if ctags.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        let has_param_or_sens =
+            r.tags.contains(&"PARAM") || r.tags.contains(&"SENSITIVE") || !r.params.is_empty();
+        if (!is_write && ctags.is_empty()) || (ctags.is_empty() && !has_param_or_sens) {
+            continue;
+        }
+        if !seen_race.insert((m_up.clone(), r.path.to_string())) {
+            continue;
+        }
+        let score = (65u16
+            + if is_write { 15 } else { 5 }
+            + if !ctags.is_empty() { 14 } else { 0 }
+            + if has_param_or_sens { 6 } else { 0 }
+            + (r.params.len() * 2).min(6) as u16)
+            .min(100) as u8;
+        let mut item = serde_json::json!({
+            "method": m_up,
+            "path": r.path,
+            "score": score,
+            "contention_tags": ctags,
+            "params": r.params,
+            "line": r.line,
+            "race_hint": {
+                "concurrency": 10,
+                "mode": "tcp_preconnect",
+            },
+        });
+        if let Some(f) = r.file {
+            item["file"] = serde_json::json!(f);
+        }
+        race_scored.push((score, item));
+    }
+    race_scored.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            a.1["path"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b.1["path"].as_str().unwrap_or(""))
+        })
+    });
+    let race_candidates: Vec<serde_json::Value> =
+        race_scored.into_iter().take(15).map(|(_, v)| v).collect();
+
+    // Group routes by normalized resource stem for producer -> consumer/state/delete CRUD chains
+    #[derive(Clone)]
+    struct FlowStepCand {
+        role: u8,
+        method: String,
+        path: String,
+        has_param: bool,
+        file: Option<String>,
+        line: usize,
+    }
+    let mut by_stem: std::collections::BTreeMap<String, Vec<FlowStepCand>> =
+        std::collections::BTreeMap::new();
+    for r in routes {
+        let (stem, role, has_param) = path_stem_and_role(r.method, r.path);
+        if role > 3 || stem.len() < 3 {
+            continue;
+        }
+        let list = by_stem.entry(stem).or_default();
+        let m_up = r.method.to_ascii_uppercase();
+        if !list.iter().any(|x| x.method == m_up && x.path == r.path) {
+            list.push(FlowStepCand {
+                role,
+                method: m_up,
+                path: r.path.to_string(),
+                has_param,
+                file: r.file.map(str::to_string),
+                line: r.line,
+            });
+        }
+    }
+
+    let mut flow_scored: Vec<(u8, serde_json::Value)> = Vec::new();
+    for (stem, mut steps) in by_stem {
+        let has_producer = steps.iter().any(|s| s.role == 0);
+        let has_consumer_or_mut = steps.iter().any(|s| s.role > 0);
+        if !has_producer || !has_consumer_or_mut || steps.len() < 2 {
+            continue;
+        }
+        steps.sort_by(|a, b| a.role.cmp(&b.role).then_with(|| a.path.cmp(&b.path)));
+        let needs_id_extract = steps.iter().skip(1).any(|s| s.has_param);
+        let step_json: Vec<serde_json::Value> = steps
+            .iter()
+            .take(5)
+            .map(|s| {
+                let mut sj = serde_json::json!({
+                    "method": s.method,
+                    "path": s.path,
+                    "role": match s.role {
+                        0 => "producer",
+                        1 => "state_step",
+                        2 => "consumer",
+                        _ => "delete",
+                    },
+                });
+                if s.role == 0 && needs_id_extract {
+                    sj["extract_hint"] = serde_json::json!("id|token");
+                }
+                if let Some(ref f) = s.file {
+                    sj["file"] = serde_json::json!(f);
+                }
+                if s.line > 0 {
+                    sj["line"] = serde_json::json!(s.line);
+                }
+                sj
+            })
+            .collect();
+        let score = (84 + (step_json.len().min(4) as u8) * 4).min(100);
+        flow_scored.push((
+            score,
+            serde_json::json!({
+                "stem": stem,
+                "score": score,
+                "steps": step_json,
+                "test_patterns": ["cross_principal_replay", "state_skip", "post_delete_access"],
+            }),
+        ));
+    }
+    flow_scored.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            a.1["stem"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b.1["stem"].as_str().unwrap_or(""))
+        })
+    });
+    let flow_candidates: Vec<serde_json::Value> =
+        flow_scored.into_iter().take(12).map(|(_, v)| v).collect();
+
+    (race_candidates, flow_candidates)
+}
+
+fn append_candidates_md(
+    out: &mut Vec<String>,
+    race_candidates: &[serde_json::Value],
+    flow_candidates: &[serde_json::Value],
+) {
+    if !race_candidates.is_empty() {
+        let lines: Vec<String> = race_candidates
+            .iter()
+            .map(|c| {
+                let tags: Vec<&str> = c["contention_tags"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let tag_s = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tags.join(","))
+                };
+                format!(
+                    "- `{}` `{}` (score={}){tag_s}",
+                    c["method"].as_str().unwrap_or(""),
+                    c["path"].as_str().unwrap_or(""),
+                    c["score"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        out.push(format!(
+            "\n## Race Candidates (`--race`, {})\n{}",
+            race_candidates.len(),
+            lines.join("\n")
+        ));
+    }
+    if !flow_candidates.is_empty() {
+        let lines: Vec<String> = flow_candidates
+            .iter()
+            .map(|f| {
+                let steps: Vec<String> = f["steps"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|s| {
+                                format!(
+                                    "{} {}",
+                                    s["method"].as_str().unwrap_or(""),
+                                    s["path"].as_str().unwrap_or("")
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "- `{}` (score={}): {}",
+                    f["stem"].as_str().unwrap_or(""),
+                    f["score"].as_u64().unwrap_or(0),
+                    steps.join(" -> ")
+                )
+            })
+            .collect();
+        out.push(format!(
+            "\n## Stateful Flow Candidates (`--flow`, {})\n{}",
+            flow_candidates.len(),
+            lines.join("\n")
+        ));
+    }
+}
+
+pub fn render_candidates_focus_md(jv: &serde_json::Value, label: &str) -> String {
+    let inner = jv.get("js_surface").unwrap_or(jv);
+    let races = inner["race_candidates"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let flows = inner["flow_candidates"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut out = vec![format!(
+        "# PROBE CANDIDATES `{label}` ({} race_candidates | {} flow_candidates)",
+        races.len(),
+        flows.len()
+    )];
+    append_candidates_md(&mut out, races, flows);
+    if races.is_empty() && flows.is_empty() {
+        out.push("*(no mutating --race or CRUD --flow candidates synthesized)*".to_string());
+    }
+    out.join("\n")
 }
 
 fn extract_route_param_hints(slice: &str, path: &str, end_off: usize) -> Vec<String> {
@@ -1895,7 +2297,7 @@ fn route_risk_score(method: &str, tags: &[&'static str], params: &[String]) -> u
     score
 }
 
-fn collect_js_surface_into(
+pub(crate) fn collect_js_surface_into(
     text: &str,
     rel_file: Option<&str>,
     query: Option<&str>,
@@ -2280,7 +2682,7 @@ fn collect_js_surface_into(
     }
 }
 
-fn render_js_surface(
+pub(crate) fn render_js_surface(
     acc: JsSurfaceData,
     label: &str,
     diff_vs: Option<(&JsSurfaceData, &str)>,
@@ -2633,6 +3035,20 @@ fn render_js_surface(
         out.push(format!("\n## External Origins\n{}", org_list.join(", ")));
     }
 
+    let synth_inputs: Vec<SynthRouteInput<'_>> = sorted_routes
+        .iter()
+        .map(|r| SynthRouteInput {
+            method: r.entry.method.as_str(),
+            path: r.path,
+            file: r.entry.file.as_deref(),
+            line: r.entry.line,
+            params: r.entry.params.as_slice(),
+            tags: r.entry.tags.as_slice(),
+        })
+        .collect();
+    let (race_candidates, flow_candidates) = synthesize_race_and_flow_candidates(&synth_inputs);
+    append_candidates_md(&mut out, &race_candidates, &flow_candidates);
+
     let graphql_json: Vec<serde_json::Value> = acc
         .graphql_ops
         .iter()
@@ -2673,6 +3089,8 @@ fn render_js_surface(
             "lazy_chunks": chunks_vec.len(),
             "custom_headers": headers_vec.len(),
             "origins": origins_vec.len(),
+            "race_candidates": race_candidates.len(),
+            "flow_candidates": flow_candidates.len(),
         },
         "routes": routes_json,
         "graphql_ops": graphql_json,
@@ -2683,6 +3101,8 @@ fn render_js_surface(
         "lazy_chunks": chunks_vec,
         "custom_headers": headers_vec,
         "external_origins": origins_vec,
+        "race_candidates": race_candidates,
+        "flow_candidates": flow_candidates,
     });
     if !diff_json.is_null() {
         jv["diff"] = diff_json;
@@ -4693,6 +5113,37 @@ window.parent.postMessage(payload, '*');
         );
         let _ = std::fs::remove_dir_all(&dir_old);
         let _ = std::fs::remove_dir_all(&dir_new);
+    }
+
+    #[test]
+    fn synthesizes_race_and_flow_candidates_from_routes() {
+        let js = r#"
+axios.post('/api/v1/quota/redeem', { voucherCode: v, accountId: a });
+axios.get('/api/v1/quota/:id');
+axios.delete('/api/v1/quota/:id');
+axios.post('/api/v1/projects', { name: n });
+axios.patch('/api/v1/projects/:id/approve', { approved: true });
+axios.get('/api/v1/projects/:id');
+axios.get('/api/v1/ping');
+"#;
+        let (md, jv) = extract_js_routes_md(js, "api.js", None);
+        let races = jv["race_candidates"].as_array().unwrap();
+        let flows = jv["flow_candidates"].as_array().unwrap();
+        assert!(!races.is_empty());
+        assert!(
+            races.iter().any(|r| r["path"] == "/api/v1/quota/redeem"),
+            "missing quota/redeem in race_candidates: {races:?}"
+        );
+        assert!(races[0]["contention_tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "approve" || v == "redeem"));
+        assert_eq!(flows.len(), 2);
+        assert!(flows.iter().any(|f| f["stem"] == "/api/v1/quota"));
+        assert!(flows.iter().any(|f| f["stem"] == "/api/v1/projects"));
+        assert!(md.contains("Race Candidates"), "{md}");
+        assert!(md.contains("Stateful Flow Candidates"), "{md}");
     }
 
     #[test]

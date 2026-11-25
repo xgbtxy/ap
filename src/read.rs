@@ -107,6 +107,9 @@ struct ReadCli {
     /// Extract JS/TS/HTML API routes, postMessage origin-check posture, DOM/eval sinks & external origins
     #[arg(long)]
     routes: bool,
+    /// Spotlight synthesized `--race` and multi-step `--flow` probe candidates extracted from routes/HAR/archives
+    #[arg(long)]
+    candidates: bool,
     /// Decode JWT header/claims/UTC timestamps & defensive posture flags (accepts file path or inline `eyJ...` token)
     #[arg(long)]
     jwt: bool,
@@ -1188,11 +1191,14 @@ fn read_single_target(
                     let norm_old = crate::ls::normalize_cli_path(s);
                     std::path::PathBuf::from(norm_old)
                 });
-                let (rendered, jv_inner) = crate::inspect::extract_js_dir_routes_md(
+                let (mut rendered, jv_inner) = crate::inspect::extract_js_dir_routes_md(
                     p,
                     cli.query.as_deref(),
                     old_path.as_deref(),
                 )?;
+                if cli.candidates {
+                    rendered = crate::inspect::render_candidates_focus_md(&jv_inner, target);
+                }
                 record_event(
                     "read",
                     rendered.len() as u64,
@@ -1229,6 +1235,40 @@ fn read_single_target(
             .to_ascii_lowercase();
         let lbl = p.to_string_lossy().replace('\\', "/");
         if !cli.hex
+            && cli.diff.is_none()
+            && cli.entry.is_none()
+            && (cli.surface || cli.routes)
+            && matches!(
+                ext_s.as_str(),
+                "asar" | "zip" | "vsix" | "jar" | "war" | "ear" | "apk" | "whl"
+            )
+        {
+            let mut f = fs::File::open(p)
+                .map_err(|e| (1, format!("[ap read] failed to open `{target}`: {e}")))?;
+            let (mut rendered, mut jv) = crate::binary::inspect_archive_surface_reader(
+                &mut f,
+                &ext_s,
+                &lbl,
+                cli.routes,
+                cli.query.as_deref(),
+            )
+            .map_err(|e| (1, format!("[ap read --surface] {e}")))?;
+            if cli.candidates {
+                rendered = crate::inspect::render_candidates_focus_md(&jv, &lbl);
+            }
+            record_event(
+                "read",
+                rendered.len() as u64,
+                rendered.len() as u64,
+                0,
+                1,
+                "archive-surface",
+            );
+            if let Some(m) = jv.as_object_mut() {
+                m.insert("content".to_string(), json!(rendered));
+            }
+            return Ok((rendered, jv));
+        } else if !cli.hex
             && (matches!(ext_s.as_str(), "sqlite" | "db" | "sqlite3")
                 || crate::query::is_sqlite_magic(p))
         {
@@ -1594,9 +1634,15 @@ fn read_single_target(
         return Ok((rendered, jv));
     }
 
-    if cli.routes && cli.entry.is_none() {
+    if cli.routes
+        && cli.entry.is_none()
+        && !matches!(
+            ext.as_str(),
+            "asar" | "zip" | "vsix" | "jar" | "war" | "ear" | "apk" | "whl"
+        )
+    {
         let (decoded_txt, _, _) = decode_any_bytes(&raw_bytes);
-        let (rendered, jv_inner, fmt_tag) = if let Some((h_md, h_jv)) =
+        let (mut rendered, jv_inner, fmt_tag) = if let Some((h_md, h_jv)) =
             crate::inspect::extract_har_routes_md(&decoded_txt, &label, cli.query.as_deref())
         {
             (h_md, h_jv, "har-routes")
@@ -1632,6 +1678,9 @@ fn read_single_target(
                 crate::inspect::extract_js_routes_md(&decoded_txt, &label, cli.query.as_deref());
             (j_md, j_jv, "js-routes")
         };
+        if cli.candidates {
+            rendered = crate::inspect::render_candidates_focus_md(&jv_inner, &label);
+        }
         record_event(
             "read",
             raw_bytes.len() as u64,
