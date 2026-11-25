@@ -1,5 +1,6 @@
 use base64::Engine;
 use clap::{Parser, Subcommand};
+pub mod ai_surface;
 pub mod deps_sec;
 pub mod diff_audit;
 pub mod pack;
@@ -77,6 +78,15 @@ enum SubCmd {
     Sec {
         #[arg(default_value = ".")]
         cwd: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pure-Rust <50ms AI-agent, IDE extension & MCP trust-boundary security-surface auditor
+    AiSurface {
+        #[arg(default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, default_value_t = 1500)]
+        max_files: usize,
         #[arg(long)]
         json: bool,
     },
@@ -1351,6 +1361,11 @@ pub fn run_cli(args: &[String]) -> i32 {
                 EXIT_BLOCK
             }
         }
+        SubCmd::AiSurface {
+            cwd,
+            max_files,
+            json,
+        } => ai_surface::run_ai_surface_cli(&cwd, max_files, json),
         SubCmd::Diff { cwd, json } => {
             let rep = diff_audit::audit_git_diff(&cwd);
             if json {

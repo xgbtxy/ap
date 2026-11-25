@@ -335,6 +335,7 @@ fn mcp_tools_schema() -> Value {
                 "audit_headers": { "type": "boolean", "description": "Audit security/CORS/CSP/cookie headers" },
                 "race": { "type": "integer", "description": "Barrier TOCTOU burst threads (2..=32)" },
                 "flow": { "type": "string", "description": "Stateful multi-step HTTP flow JSON file or '-' stdin with {{var}} extraction" },
+                "mutate_matrix": { "type": "boolean", "description": "Run bounded semantic mutation & parser diff matrix vs baseline" },
                 "sentinels": { "type": "array", "description": "Sentinel strings flagged if leaked", "items": { "type": "string" } },
                 "timeout": { "type": "integer", "description": "Timeout sec (default: 15)" },
                 "insecure": { "type": "boolean", "description": "Skip TLS verify (-k)" },
@@ -486,7 +487,8 @@ fn mcp_tools_schema() -> Value {
             "properties": {
                 "dir": { "type": "string", "description": "Bundle directory to verify" },
                 "max_lines": { "type": "integer", "description": "Optional max non-empty narrative lines budget" },
-                "require_headers": { "type": "array", "items": { "type": "string" }, "description": "Optional required header prefixes" }
+                "require_headers": { "type": "array", "items": { "type": "string" }, "description": "Optional required header prefixes" },
+                "ai_surface": { "type": "boolean", "description": "Audit AI-agent, IDE extension & MCP trust-boundary surfaces instead of pack" }
             },
             "required": ["dir"]
         }
@@ -2356,6 +2358,13 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     cli.push(rc.to_string());
                 }
             }
+            if args
+                .get("mutate_matrix")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--mutate-matrix".into());
+            }
             if let Some(ss) = args.get("sentinels").and_then(Value::as_array) {
                 for s in ss.iter().filter_map(Value::as_str) {
                     if !s.trim().is_empty() {
@@ -2682,6 +2691,19 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
         }
         "ap_guard_pack" => {
             let dir = args.get("dir").and_then(Value::as_str).unwrap_or(".");
+            if args
+                .get("ai_surface")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                let cli = vec![
+                    "guard".into(),
+                    "ai-surface".into(),
+                    dir.to_string(),
+                    "--json".into(),
+                ];
+                return run_self_captured(&cli, None);
+            }
             let mut cli = vec!["guard".into(), "pack".into(), dir.to_string()];
             if let Some(ml) = args.get("max_lines").and_then(Value::as_u64) {
                 cli.extend(["--max-lines".into(), ml.to_string()]);

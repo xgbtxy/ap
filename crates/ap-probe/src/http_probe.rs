@@ -58,6 +58,17 @@ fn execute_http_probe_with_raw(
     if is_loopback_url(url) {
         cmd.args(["--noproxy", "127.0.0.1,localhost,::1"]);
     }
+    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
+    if let Some(slash_idx) = after_scheme.find('/') {
+        let req_path = &after_scheme[slash_idx..];
+        if req_path.contains("/./")
+            || req_path.contains("/../")
+            || req_path.contains("..;")
+            || req_path.contains("//")
+        {
+            cmd.arg("--path-as-is");
+        }
+    }
     if insecure {
         cmd.arg("-k");
     }
@@ -2545,6 +2556,731 @@ pub fn run_http_flow(
     }
 }
 
+fn header_get<'a>(headers: &'a [String], name: &str) -> Option<&'a str> {
+    headers.iter().find_map(|h| {
+        h.split_once(':')
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim())
+    })
+}
+
+fn replace_or_add_header(headers: &[String], name: &str, value: &str) -> Vec<String> {
+    let mut out: Vec<String> = headers
+        .iter()
+        .filter(|h| {
+            h.split_once(':')
+                .map(|(k, _)| !k.trim().eq_ignore_ascii_case(name))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    out.push(format!("{name}: {value}"));
+    out
+}
+
+fn remove_header_ci(headers: &[String], name: &str) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|h| {
+            h.split_once(':')
+                .map(|(k, _)| !k.trim().eq_ignore_ascii_case(name))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn url_append_query_param(url: &str, key: &str, val: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}{key}={val}")
+}
+
+fn path_normalization_variants(url: &str) -> Vec<(&'static str, String)> {
+    let (base_no_q, qs) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+    let scheme_end = base_no_q.find("://").map(|i| i + 3).unwrap_or(0);
+    let Some(rel_slash) = base_no_q[scheme_end..].find('/') else {
+        return Vec::new();
+    };
+    let path_start = scheme_end + rel_slash;
+    let origin = &base_no_q[..path_start];
+    let path = &base_no_q[path_start..];
+    if path.len() <= 1 {
+        return Vec::new();
+    }
+    let trimmed = path.trim_end_matches('/');
+    let Some(last_slash) = trimmed.rfind('/') else {
+        return Vec::new();
+    };
+    let parent = &trimmed[..last_slash];
+    let leaf = &trimmed[last_slash + 1..];
+    if leaf.is_empty() {
+        return Vec::new();
+    }
+    let finish = |p: String| match qs {
+        Some(q) => format!("{origin}{p}?{q}"),
+        None => format!("{origin}{p}"),
+    };
+    vec![
+        ("norm:double_slash", finish(format!("{parent}//{leaf}"))),
+        ("norm:dot_segment", finish(format!("{parent}/./{leaf}"))),
+        (
+            "norm:semicolon_dotdot",
+            finish(format!("{parent}/probe/..;/{leaf}")),
+        ),
+    ]
+}
+
+/// Build a bounded 7-class orthogonal HTTP semantic mutation matrix for parser/gateway differential probing.
+pub fn build_semantic_mutation_matrix(
+    method: &str,
+    url: &str,
+    headers: &[String],
+    body: Option<&str>,
+    alt_value: Option<&str>,
+    max_variants: usize,
+) -> Vec<(String, HttpVariantSpec)> {
+    let mut specs: Vec<(String, HttpVariantSpec)> = Vec::new();
+    let m_up = method.to_ascii_uppercase();
+    let alt = alt_value.unwrap_or("alt_probe");
+    let push_spec = |specs: &mut Vec<(String, HttpVariantSpec)>,
+                     class_name: &str,
+                     label: String,
+                     m: &str,
+                     u: String,
+                     h: Vec<String>,
+                     b: Option<String>| {
+        specs.push((
+            class_name.to_string(),
+            HttpVariantSpec {
+                label,
+                method: m.to_string(),
+                url: u,
+                headers: h,
+                body: b,
+            },
+        ));
+    };
+
+    // 1. Path Normalization Desync (3)
+    for (lbl, u_var) in path_normalization_variants(url) {
+        push_spec(
+            &mut specs,
+            "path_normalization",
+            lbl.to_string(),
+            &m_up,
+            u_var,
+            headers.to_vec(),
+            body.map(str::to_string),
+        );
+    }
+
+    // 2. Method Override & Verb Swap (3)
+    let alt_method = if m_up == "GET" { "POST" } else { "GET" };
+    push_spec(
+        &mut specs,
+        "method_override",
+        format!("method:verb_swap:{alt_method}"),
+        alt_method,
+        url.to_string(),
+        headers.to_vec(),
+        body.map(str::to_string),
+    );
+    let carrier_method = if m_up == "GET" { "POST" } else { "GET" };
+    push_spec(
+        &mut specs,
+        "method_override",
+        format!("method:x_http_method_override:{m_up}"),
+        carrier_method,
+        url.to_string(),
+        replace_or_add_header(headers, "X-HTTP-Method-Override", &m_up),
+        body.map(str::to_string),
+    );
+    push_spec(
+        &mut specs,
+        "method_override",
+        format!("method:query_override:{m_up}"),
+        carrier_method,
+        url_append_query_param(url, "_method", &m_up),
+        headers.to_vec(),
+        body.map(str::to_string),
+    );
+
+    // 3. Content-Type Switch + 4. RFC-8259 Duplicate Key & Type Confusion + 5. Mass Assignment
+    if let Some(b_raw) = body.filter(|s| !s.trim().is_empty()) {
+        push_spec(
+            &mut specs,
+            "content_type_switch",
+            "ctype:text_plain".to_string(),
+            &m_up,
+            url.to_string(),
+            replace_or_add_header(headers, "Content-Type", "text/plain"),
+            Some(b_raw.to_string()),
+        );
+
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(b_raw.trim()) {
+            let mut form_pairs: Vec<String> = Vec::new();
+            for (k, v) in &map {
+                let sv = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                form_pairs.push(format!("{k}={sv}"));
+            }
+            if !form_pairs.is_empty() {
+                push_spec(
+                    &mut specs,
+                    "content_type_switch",
+                    "ctype:form_urlencoded".to_string(),
+                    &m_up,
+                    url.to_string(),
+                    replace_or_add_header(
+                        headers,
+                        "Content-Type",
+                        "application/x-www-form-urlencoded",
+                    ),
+                    Some(form_pairs.join("&")),
+                );
+            }
+
+            if let Some((first_k, orig_val)) = map
+                .iter()
+                .find(|(k, _)| {
+                    let kl = k.to_ascii_lowercase();
+                    kl.contains("id") || kl.contains("role") || kl.contains("user")
+                })
+                .or_else(|| map.iter().next())
+            {
+                if let Some(prefix) = b_raw.trim().strip_suffix('}') {
+                    let dup_body = format!(
+                        "{prefix},{}:{}}}",
+                        serde_json::to_string(first_k).unwrap_or_default(),
+                        serde_json::to_string(alt).unwrap_or_default()
+                    );
+                    push_spec(
+                        &mut specs,
+                        "json_desync",
+                        format!("json:dup_key:{first_k}"),
+                        &m_up,
+                        url.to_string(),
+                        headers.to_vec(),
+                        Some(dup_body),
+                    );
+                }
+
+                let mut arr_m = map.clone();
+                arr_m.insert(first_k.clone(), Value::Array(vec![orig_val.clone()]));
+                push_spec(
+                    &mut specs,
+                    "json_desync",
+                    format!("json:array_wrap:{first_k}"),
+                    &m_up,
+                    url.to_string(),
+                    headers.to_vec(),
+                    Some(Value::Object(arr_m).to_string()),
+                );
+
+                let swapped = match orig_val {
+                    Value::String(_) => json!(0),
+                    Value::Number(_) => Value::Bool(true),
+                    Value::Bool(_) => Value::String("true".to_string()),
+                    _ => json!(0),
+                };
+                let mut type_m = map.clone();
+                type_m.insert(first_k.clone(), swapped);
+                push_spec(
+                    &mut specs,
+                    "json_desync",
+                    format!("json:type_swap:{first_k}"),
+                    &m_up,
+                    url.to_string(),
+                    headers.to_vec(),
+                    Some(Value::Object(type_m).to_string()),
+                );
+            }
+
+            if matches!(m_up.as_str(), "POST" | "PUT" | "PATCH") {
+                let mut mass_m = map.clone();
+                mass_m
+                    .entry("role".to_string())
+                    .or_insert_with(|| Value::String("admin".to_string()));
+                mass_m
+                    .entry("isAdmin".to_string())
+                    .or_insert_with(|| Value::Bool(true));
+                push_spec(
+                    &mut specs,
+                    "mass_assignment",
+                    "mass_assign:role_admin".to_string(),
+                    &m_up,
+                    url.to_string(),
+                    headers.to_vec(),
+                    Some(Value::Object(mass_m).to_string()),
+                );
+            }
+        }
+    }
+
+    // 6. Header-vs-Body Identity Desync (2)
+    for id_hdr in ["X-Tenant-Id", "X-Project-Id", "X-Account-Id", "X-User-Id"] {
+        if header_get(headers, id_hdr).is_some() {
+            push_spec(
+                &mut specs,
+                "identity_desync",
+                format!("id_desync:omit:{id_hdr}"),
+                &m_up,
+                url.to_string(),
+                remove_header_ci(headers, id_hdr),
+                body.map(str::to_string),
+            );
+            push_spec(
+                &mut specs,
+                "identity_desync",
+                format!("id_desync:swap:{id_hdr}"),
+                &m_up,
+                url.to_string(),
+                replace_or_add_header(headers, id_hdr, alt),
+                body.map(str::to_string),
+            );
+            break;
+        }
+    }
+
+    // 7. GraphQL Batch & Alias Probe (2, only when GraphQL)
+    let is_gql = url.to_ascii_lowercase().contains("graphql")
+        || body.is_some_and(|b| b.contains("\"query\""));
+    if is_gql {
+        if let Some(b_raw) = body {
+            let trimmed = b_raw.trim();
+            if trimmed.starts_with('{') {
+                push_spec(
+                    &mut specs,
+                    "graphql_batch_alias",
+                    "graphql:array_batch".to_string(),
+                    &m_up,
+                    url.to_string(),
+                    headers.to_vec(),
+                    Some(format!("[{trimmed},{trimmed}]")),
+                );
+                if let Ok(Value::Object(mut gmap)) = serde_json::from_str::<Value>(trimmed) {
+                    if let Some(q_str) = gmap
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    {
+                        if let (Some(ob), Some(cb)) = (q_str.find('{'), q_str.rfind('}')) {
+                            let inner = q_str[ob + 1..cb].trim();
+                            if !inner.is_empty() && !inner.contains("ap_a1:") {
+                                let aliased = format!(
+                                    "{} {{ ap_a1: {inner} ap_a2: {inner} }}",
+                                    q_str[..ob].trim()
+                                );
+                                gmap.insert("query".to_string(), Value::String(aliased));
+                                push_spec(
+                                    &mut specs,
+                                    "graphql_batch_alias",
+                                    "graphql:dup_alias".to_string(),
+                                    &m_up,
+                                    url.to_string(),
+                                    headers.to_vec(),
+                                    Some(Value::Object(gmap).to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    specs.truncate(max_variants.clamp(1, 32));
+    specs
+}
+
+type MutationAnomaly = (String, String, Vec<String>, Vec<String>, Vec<String>);
+
+fn classify_mutation_anomaly(
+    base: &HttpProbeResult,
+    cand: &HttpProbeResult,
+    class_name: &str,
+    label: &str,
+    alt: &str,
+    volatile_paths: &std::collections::HashSet<String>,
+    sentinels: &[String],
+) -> Option<MutationAnomaly> {
+    if cand.status == 0 || !cand.error.is_empty() {
+        return None;
+    }
+
+    let sentinel_hits: Vec<String> = sentinels
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && cand.body_preview.contains(*s))
+        .map(str::to_string)
+        .collect();
+
+    let mut base_paths = std::collections::BTreeMap::new();
+    let mut cand_paths = std::collections::BTreeMap::new();
+    let base_json = serde_json::from_str::<Value>(base.body_preview.trim()).ok();
+    let cand_json = serde_json::from_str::<Value>(cand.body_preview.trim()).ok();
+    if let Some(ref bv) = base_json {
+        flatten_json_paths(bv, "", 0, &mut base_paths);
+    }
+    if let Some(ref cv) = cand_json {
+        flatten_json_paths(cv, "", 0, &mut cand_paths);
+    }
+
+    let added_paths: Vec<String> = cand_paths
+        .keys()
+        .filter(|k| !volatile_paths.contains(*k) && !base_paths.contains_key(*k))
+        .take(16)
+        .cloned()
+        .collect();
+    let changed_paths: Vec<String> = cand_paths
+        .iter()
+        .filter(|(k, cv)| {
+            !volatile_paths.contains(*k) && base_paths.get(*k).is_some_and(|bv| bv != *cv)
+        })
+        .map(|(k, _)| k.clone())
+        .take(16)
+        .collect();
+
+    if !sentinel_hits.is_empty() {
+        return Some((
+            "SENTINEL_LEAK".to_string(),
+            format!("HTTP {} leaked sentinel(s)", cand.status),
+            added_paths,
+            changed_paths,
+            sentinel_hits,
+        ));
+    }
+
+    let low_body = cand.body_preview.to_ascii_lowercase();
+    let is_pseudo_denial = [
+        "unauthorized",
+        "forbidden",
+        "access denied",
+        "permission denied",
+        "login required",
+    ]
+    .iter()
+    .any(|kw| low_body.contains(kw));
+
+    if matches!(base.status, 401 | 403 | 404 | 405)
+        && (200..300).contains(&cand.status)
+        && !is_pseudo_denial
+    {
+        return Some((
+            "AUTH_OR_ROUTE_BYPASS".to_string(),
+            format!(
+                "Baseline HTTP {} flipped to HTTP {} under `{label}`",
+                base.status, cand.status
+            ),
+            added_paths,
+            changed_paths,
+            sentinel_hits,
+        ));
+    }
+
+    if class_name == "graphql_batch_alias" && (200..300).contains(&cand.status) {
+        let batch_ok = cand_json
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.len() >= 2);
+        let alias_ok = cand.body_preview.contains("ap_a1") && cand.body_preview.contains("ap_a2");
+        if batch_ok || alias_ok {
+            return Some((
+                "GRAPHQL_BATCH_OR_ALIAS_ALLOWED".to_string(),
+                format!("HTTP {} accepted `{label}`", cand.status),
+                added_paths,
+                changed_paths,
+                sentinel_hits,
+            ));
+        }
+    }
+
+    if label == "mass_assign:role_admin" && (200..300).contains(&cand.status) {
+        let echoed_admin = (cand.body_preview.contains("\"role\"")
+            && cand.body_preview.contains("\"admin\"")
+            && !base.body_preview.contains("\"admin\""))
+            || (cand.body_preview.contains("\"isAdmin\":true")
+                && !base.body_preview.contains("\"isAdmin\":true"))
+            || !(200..300).contains(&base.status);
+        if echoed_admin {
+            return Some((
+                "PARSER_DESYNC_ECHO".to_string(),
+                "Response accepted/echoed injected admin mass-assignment keys".to_string(),
+                added_paths,
+                changed_paths,
+                sentinel_hits,
+            ));
+        }
+    }
+
+    if label.starts_with("json:dup_key:")
+        && (200..300).contains(&cand.status)
+        && cand.body_preview.contains(alt)
+        && !base.body_preview.contains(alt)
+    {
+        return Some((
+            "PARSER_DESYNC_ECHO".to_string(),
+            format!("Duplicate JSON key `{label}` echoed override `{alt}`"),
+            added_paths,
+            changed_paths,
+            sentinel_hits,
+        ));
+    }
+
+    if class_name == "identity_desync"
+        && (200..300).contains(&base.status)
+        && (200..300).contains(&cand.status)
+        && !is_pseudo_denial
+    {
+        return Some((
+            "PARSER_DESYNC_ECHO".to_string(),
+            format!(
+                "Identity header mutation `{label}` still returned HTTP {}",
+                cand.status
+            ),
+            added_paths,
+            changed_paths,
+            sentinel_hits,
+        ));
+    }
+
+    if !(500..600).contains(&base.status) && (500..600).contains(&cand.status) {
+        return Some((
+            "SERVER_FAULT_5XX".to_string(),
+            format!(
+                "Baseline HTTP {} triggered HTTP {} on `{label}`",
+                base.status, cand.status
+            ),
+            added_paths,
+            changed_paths,
+            sentinel_hits,
+        ));
+    }
+
+    if base.status != cand.status && !added_paths.is_empty() {
+        return Some((
+            "STRUCTURAL_DIFF".to_string(),
+            format!(
+                "HTTP {} -> {} with {} new non-volatile JSON path(s)",
+                base.status,
+                cand.status,
+                added_paths.len()
+            ),
+            added_paths,
+            changed_paths,
+            sentinel_hits,
+        ));
+    }
+
+    None
+}
+
+/// Bounded 7-class HTTP semantic mutation & parser/gateway differential oracle.
+/// Runs baseline twice to isolate volatile JSON keys, then probes normalized/override/parser variants.
+#[allow(clippy::too_many_arguments)]
+pub fn run_http_mutate_matrix(
+    req_file: Option<&std::path::Path>,
+    url_opt: Option<&str>,
+    method: &str,
+    headers: &[String],
+    body: Option<&str>,
+    alt_value: Option<&str>,
+    rate_ms: u64,
+    max_variants: usize,
+    dry_run: bool,
+    cdp_cookies_port: Option<u16>,
+    sentinels: &[String],
+    timeout_sec: u64,
+    insecure: bool,
+    follow: bool,
+    as_json: bool,
+) -> i32 {
+    let (m, u, mut hdrs, b) = if let Some(rf) = req_file {
+        match load_saved_request(rf) {
+            Ok(spec) => spec,
+            Err(e) => {
+                eprintln!("[probe http mutate-matrix] {e}");
+                return 2;
+            }
+        }
+    } else if let Some(url) = url_opt.filter(|s| !s.trim().is_empty()) {
+        (
+            method.to_ascii_uppercase(),
+            url.to_string(),
+            Vec::new(),
+            body.map(str::to_string),
+        )
+    } else {
+        eprintln!("[probe http mutate-matrix] Provide a URL or `--vary-request <file>`.");
+        return 2;
+    };
+    hdrs.extend(headers.iter().cloned());
+    if !dry_run {
+        if let Some(port) = cdp_cookies_port {
+            if !has_header_name(&hdrs, "cookie") {
+                match resolve_cdp_cookie_header(port, &u) {
+                    Ok((Some(ch), _)) => hdrs.push(ch),
+                    Ok((None, _)) => {}
+                    Err(e) => {
+                        eprintln!("[probe http mutate-matrix] cdp-cookies:{port}: {e}");
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let alt = alt_value.unwrap_or("alt_probe");
+    let matrix =
+        build_semantic_mutation_matrix(&m, &u, &hdrs, b.as_deref(), Some(alt), max_variants);
+    if dry_run {
+        let preview: Vec<Value> = matrix
+            .iter()
+            .map(|(cls, sp)| {
+                json!({
+                    "class": cls,
+                    "label": sp.label,
+                    "method": sp.method,
+                    "url": sp.url,
+                    "body": sp.body,
+                })
+            })
+            .collect();
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "dry_run": true,
+                    "mode": "http_mutate_matrix",
+                    "target": u,
+                    "count": preview.len(),
+                    "variants": preview,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            println!(
+                "[probe http mutate-matrix] DRY-RUN generated {} semantic mutation(s):",
+                preview.len()
+            );
+            for (i, (cls, sp)) in matrix.iter().enumerate() {
+                println!("  {}. [{cls}/{}] {} {}", i + 1, sp.label, sp.method, sp.url);
+            }
+        }
+        return 0;
+    }
+
+    // Run baseline twice to automatically discover volatile JSON fields (timestamps/request_id/nonces)
+    let base1 = execute_http_probe(&m, &u, &hdrs, b.as_deref(), timeout_sec, insecure, follow);
+    let base2 = execute_http_probe(&m, &u, &hdrs, b.as_deref(), timeout_sec, insecure, follow);
+    let mut volatile_paths = std::collections::HashSet::new();
+    if let (Ok(v1), Ok(v2)) = (
+        serde_json::from_str::<Value>(base1.body_preview.trim()),
+        serde_json::from_str::<Value>(base2.body_preview.trim()),
+    ) {
+        let mut p1 = std::collections::BTreeMap::new();
+        let mut p2 = std::collections::BTreeMap::new();
+        flatten_json_paths(&v1, "", 0, &mut p1);
+        flatten_json_paths(&v2, "", 0, &mut p2);
+        for (k, val1) in &p1 {
+            if p2.get(k) != Some(val1) {
+                volatile_paths.insert(k.clone());
+            }
+        }
+        for k in p2.keys() {
+            if !p1.contains_key(k) {
+                volatile_paths.insert(k.clone());
+            }
+        }
+    }
+
+    let mut anomalies: Vec<Value> = Vec::new();
+    let mut suppressed_count = 0usize;
+    for (idx, (cls, spec)) in matrix.iter().enumerate() {
+        if idx > 0 && rate_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(rate_ms.min(5000)));
+        }
+        let cand = execute_http_probe(
+            &spec.method,
+            &spec.url,
+            &spec.headers,
+            spec.body.as_deref(),
+            timeout_sec,
+            insecure,
+            follow,
+        );
+        if let Some((kind, detail, added, changed, s_hits)) = classify_mutation_anomaly(
+            &base1,
+            &cand,
+            cls,
+            &spec.label,
+            alt,
+            &volatile_paths,
+            sentinels,
+        ) {
+            anomalies.push(json!({
+                "class": cls,
+                "label": spec.label,
+                "method": cand.method,
+                "url": cand.url,
+                "status": cand.status,
+                "kind": kind,
+                "detail": detail,
+                "added_paths": added,
+                "changed_paths": changed,
+                "sentinel_hits": s_hits,
+                "body_preview": cand.body_preview.chars().take(240).collect::<String>(),
+            }));
+        } else {
+            suppressed_count += 1;
+        }
+    }
+
+    let vol_vec: Vec<String> = volatile_paths.into_iter().take(20).collect();
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "mode": "http_mutate_matrix",
+                "target": u,
+                "baseline_status": base1.status,
+                "volatile_keys": vol_vec,
+                "variants_run": matrix.len(),
+                "suppressed_count": suppressed_count,
+                "anomaly_count": anomalies.len(),
+                "anomalies": anomalies,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "[probe http mutate-matrix] baseline=HTTP {}, run={}, anomalies={}, suppressed={} (volatile_keys={}):",
+            base1.status,
+            matrix.len(),
+            anomalies.len(),
+            suppressed_count,
+            vol_vec.len()
+        );
+        for a in &anomalies {
+            println!(
+                "  ! [{}] ({}) HTTP {} — {}",
+                a["kind"].as_str().unwrap_or(""),
+                a["label"].as_str().unwrap_or(""),
+                a["status"].as_u64().unwrap_or(0),
+                a["detail"].as_str().unwrap_or("")
+            );
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2719,5 +3455,157 @@ mod tests {
             "{}",
             hrep.reason
         );
+    }
+
+    #[test]
+    fn semantic_mutation_matrix_builds_7_classes_and_detects_anomalies_without_volatile_noise() {
+        let headers = vec![
+            "Content-Type: application/json".to_string(),
+            "X-User-Id: user_1001".to_string(),
+        ];
+        let body = r#"{"amount":10,"userId":"user_1001"}"#;
+        let specs = build_semantic_mutation_matrix(
+            "POST",
+            "https://api.example/v1/admin/transfer?id=1",
+            &headers,
+            Some(body),
+            Some("user_1002"),
+            32,
+        );
+        let classes: std::collections::HashSet<&str> =
+            specs.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(classes.contains("path_normalization"), "{classes:?}");
+        assert!(classes.contains("method_override"), "{classes:?}");
+        assert!(classes.contains("content_type_switch"), "{classes:?}");
+        assert!(classes.contains("json_desync"), "{classes:?}");
+        assert!(classes.contains("mass_assignment"), "{classes:?}");
+        assert!(classes.contains("identity_desync"), "{classes:?}");
+
+        let gql_specs = build_semantic_mutation_matrix(
+            "POST",
+            "https://api.example/graphql",
+            &["Content-Type: application/json".to_string()],
+            Some(r#"{"query":"{ viewer { id } }"}"#),
+            None,
+            32,
+        );
+        assert!(gql_specs.iter().any(|(c, _)| c == "graphql_batch_alias"));
+        assert!(gql_specs
+            .iter()
+            .any(|(_, s)| s.label == "graphql:dup_alias"));
+
+        let base1 = HttpProbeResult {
+            method: "POST".to_string(),
+            url: "https://api.example/v1/admin/transfer".to_string(),
+            status: 403,
+            elapsed_ms: 5.0,
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body_preview: r#"{"error":"forbidden","request_id":"r1","ts":100}"#.to_string(),
+            error: String::new(),
+        };
+        let base2 = HttpProbeResult {
+            body_preview: r#"{"error":"forbidden","request_id":"r2","ts":101}"#.to_string(),
+            ..base1.clone()
+        };
+        let mut volatile = std::collections::HashSet::new();
+        let mut p1 = std::collections::BTreeMap::new();
+        let mut p2 = std::collections::BTreeMap::new();
+        flatten_json_paths(
+            &serde_json::from_str(&base1.body_preview).unwrap(),
+            "",
+            0,
+            &mut p1,
+        );
+        flatten_json_paths(
+            &serde_json::from_str(&base2.body_preview).unwrap(),
+            "",
+            0,
+            &mut p2,
+        );
+        for (k, v1) in &p1 {
+            if p2.get(k) != Some(v1) {
+                volatile.insert(k.clone());
+            }
+        }
+        assert!(volatile.contains("request_id"));
+        assert!(volatile.contains("ts"));
+
+        // Volatile-only noise on identical 403 -> suppressed (None)
+        let noisy_same = HttpProbeResult {
+            body_preview: r#"{"error":"forbidden","request_id":"r99","ts":999}"#.to_string(),
+            ..base1.clone()
+        };
+        assert!(classify_mutation_anomaly(
+            &base1,
+            &noisy_same,
+            "path_norm",
+            "path:trailing_slash",
+            "user_1002",
+            &volatile,
+            &[],
+        )
+        .is_none());
+
+        // 403 -> 200 dot-segment route bypass -> AUTH_OR_ROUTE_BYPASS
+        let bypass = HttpProbeResult {
+            status: 200,
+            body_preview: r#"{"ok":true,"granted":"yes","request_id":"r3","ts":102}"#.to_string(),
+            ..base1.clone()
+        };
+        let (kind, _, added, _, _) = classify_mutation_anomaly(
+            &base1,
+            &bypass,
+            "path_norm",
+            "path:dot_segment",
+            "user_1002",
+            &volatile,
+            &[],
+        )
+        .expect("bypass detected");
+        assert_eq!(kind, "AUTH_OR_ROUTE_BYPASS");
+        assert!(added.contains(&"ok".to_string()));
+        assert!(!added.contains(&"request_id".to_string()));
+
+        // Mass assignment echo on 200 baseline -> PARSER_DESYNC_ECHO
+        let ok_base = HttpProbeResult {
+            status: 200,
+            body_preview: r#"{"ok":true,"role":"user"}"#.to_string(),
+            ..base1.clone()
+        };
+        let ma_echo = HttpProbeResult {
+            status: 200,
+            body_preview: r#"{"ok":true,"role":"admin"}"#.to_string(),
+            ..base1.clone()
+        };
+        let (mak, _, _, _, _) = classify_mutation_anomaly(
+            &ok_base,
+            &ma_echo,
+            "mass_assign",
+            "mass_assign:role_admin",
+            "user_1002",
+            &volatile,
+            &[],
+        )
+        .expect("mass assignment detected");
+        assert_eq!(mak, "PARSER_DESYNC_ECHO");
+
+        // GraphQL alias allowed -> GRAPHQL_BATCH_OR_ALIAS_ALLOWED
+        let gql_alias = HttpProbeResult {
+            status: 200,
+            body_preview: r#"{"data":{"ap_a1":{"id":1},"ap_a2":{"id":1}}}"#.to_string(),
+            ..base1
+        };
+        let (gk, _, _, _, _) = classify_mutation_anomaly(
+            &ok_base,
+            &gql_alias,
+            "graphql_batch_alias",
+            "graphql:dup_alias",
+            "user_1002",
+            &volatile,
+            &[],
+        )
+        .expect("graphql alias detected");
+        assert_eq!(gk, "GRAPHQL_BATCH_OR_ALIAS_ALLOWED");
     }
 }

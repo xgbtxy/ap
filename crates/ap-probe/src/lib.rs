@@ -171,6 +171,9 @@ struct HttpArgs {
     /// Synchronized Barrier concurrency/TOCTOU race burst count (2..=32 parallel threads firing simultaneously)
     #[arg(long, default_value_t = 0)]
     race: usize,
+    /// Run bounded 7-class HTTP semantic mutation & parser/gateway differential matrix vs volatile-filtered baseline
+    #[arg(long)]
+    mutate_matrix: bool,
     /// Ordered stateful multi-step HTTP flow JSON file (or `-` for stdin) with `{{var}}` extraction & cross-step assertions
     #[arg(long)]
     flow: Option<String>,
@@ -667,6 +670,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 select,
                 audit_headers,
                 race,
+                mutate_matrix,
                 flow,
                 sentinels,
                 json,
@@ -674,6 +678,25 @@ pub fn run_cli(args: &[String]) -> i32 {
             if let Some(fl) = flow.as_deref().filter(|s| !s.trim().is_empty()) {
                 return http_probe::run_http_flow(
                     fl, &headers, &sentinels, timeout, insecure, follow, json,
+                );
+            }
+            if mutate_matrix {
+                return http_probe::run_http_mutate_matrix(
+                    vary_request.as_deref(),
+                    url.as_deref(),
+                    &method,
+                    &headers,
+                    body.as_deref(),
+                    alt_value.as_deref(),
+                    rate_ms,
+                    if max_variants == 20 { 18 } else { max_variants },
+                    dry_run,
+                    cdp_cookies,
+                    &sentinels,
+                    timeout,
+                    insecure,
+                    follow,
+                    json,
                 );
             }
             if race >= 2 {
