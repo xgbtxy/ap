@@ -2576,3 +2576,77 @@ fn corpus_15_routes_mutating_ioctl_pipes_and_cdp_export_role() {
         }
     }
 }
+
+#[test]
+fn corpus_16_ioctl_ntstatus_filter_and_msvc_sub_chain() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // Synthetic PE64 driver mixing NTSTATUS/HRESULT noise with an MSVC x64 `sub eax, delta` switch chain:
+    //   mov eax, 0xC000000D  (NTSTATUS STATUS_INVALID_PARAMETER — MUST be filtered)
+    //   cmp ecx, 0x80000005  (NTSTATUS warning STATUS_BUFFER_OVERFLOW — MUST be filtered)
+    //   cmp edx, 0x40000001  (NTSTATUS informational — MUST be filtered)
+    //   sub eax, 0x00220004  (base IOCTL -> cmp_imm)
+    //   je +0x04
+    //   nop; nop; nop; nop
+    //   sub eax, 0x04        (-> 0x00220008, msvc_sub_chain)
+    //   je +0x02
+    //   nop; nop
+    //   sub eax, 0x04        (-> 0x0022000c, msvc_sub_chain)
+    //   sub eax, 0x10        (-> 0x0022001c, msvc_sub_chain)
+    //   ret
+    let code: Vec<u8> = vec![
+        0xB8, 0x0D, 0x00, 0x00, 0xC0, // mov eax, 0xC000000D
+        0x81, 0xF9, 0x05, 0x00, 0x00, 0x80, // cmp ecx, 0x80000005
+        0x81, 0xFA, 0x01, 0x00, 0x00, 0x40, // cmp edx, 0x40000001
+        0x2D, 0x04, 0x00, 0x22, 0x00, // sub eax, 0x00220004
+        0x74, 0x04, // je +4
+        0x90, 0x90, 0x90, 0x90, // nop pad
+        0x83, 0xE8, 0x04, // sub eax, 4
+        0x74, 0x02, // je +2
+        0x90, 0x90, // nop pad
+        0x83, 0xE8, 0x04, // sub eax, 4
+        0x83, 0xE8, 0x10, // sub eax, 0x10
+        0xC3, // ret
+    ];
+    let sys_path = root.join("switch_chain_drv.sys");
+    fs::write(&sys_path, build_synthetic_pe64_driver(&code, b"")).unwrap();
+
+    let out = run_ap(
+        root,
+        &["read", sys_path.to_str().unwrap(), "--ioctl", "--json"],
+        None,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let jv: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(jv["format"], "binary-ioctl-pipes", "{jv}");
+    let ioctls = jv["ioctl_codes"].as_array().unwrap();
+
+    for bad in ["0xc000000d", "0x80000005", "0x40000001"] {
+        assert!(
+            !ioctls.iter().any(|c| c["code"] == bad),
+            "unexpected NTSTATUS noise {bad} in {jv}"
+        );
+    }
+    assert!(
+        ioctls
+            .iter()
+            .any(|c| c["code"] == "0x00220004" && c["source"] == "cmp_imm"),
+        "missing base 0x00220004 in {jv}"
+    );
+    for expected in ["0x00220008", "0x0022000c", "0x0022001c"] {
+        assert!(
+            ioctls.iter().any(|c| c["code"] == expected
+                && c["source"] == "msvc_sub_chain"
+                && c["device_type"] == "0x0022"
+                && c["method"] == "METHOD_BUFFERED"
+                && c["access"] == "FILE_ANY_ACCESS"),
+            "missing MSVC sub-chain arm {expected} in {jv}"
+        );
+    }
+}

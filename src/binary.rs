@@ -6226,12 +6226,583 @@ fn decode_ctl_code(code: u32) -> Value {
 fn is_plausible_ctl_code(code: u32) -> bool {
     let dev_type = (code >> 16) & 0xFFFF;
     let func = (code >> 2) & 0xFFF;
-    let valid_dev = (0x0011..=0x0055).contains(&dev_type) || (0x8000..=0xFFFE).contains(&dev_type);
-    if !valid_dev || (dev_type != 0x0022 && func == 0) {
+    // Standard Windows FILE_DEVICE_* (0x0001..=0x007A, including ASCII types like 'm'=0x6D)
+    // and custom vendor device types (0x8000..=0x8FFF). Excludes 0x4000xxxx/0xC000xxxx NTSTATUS
+    // and compiler division magic constants (0x55555556, 0xAAAAAAAB, 0xCCCCCCCD).
+    let valid_dev = (0x0001..=0x007A).contains(&dev_type) || (0x8000..=0x8FFF).contains(&dev_type);
+    if !valid_dev || (dev_type != 0x0022 && func == 0) || code == 0x0022_0000 {
+        return false;
+    }
+    // Exclude 0x8000xxxx warning NTSTATUS (0x80000000..0x800003FF) and COM E_* HRESULTs,
+    // plus Win32/OLE HRESULT blocks (0x80070000..0x800704FF, 0x80040000..0x800402FF),
+    // while keeping genuine custom vendor IOCTLs like 0x80002004.
+    if dev_type == 0x8000
+        && (func < 0x100 || (0x8000_4000..=0x8000_4FFF).contains(&code) || code == 0x8000_FFFF)
+    {
+        return false;
+    }
+    if (0x8007_0000..=0x8007_04FF).contains(&code) || (0x8004_0000..=0x8004_02FF).contains(&code) {
         return false;
     }
     // Filter out printable 4-byte ASCII constants like 'TEST' / 'DATA'
     !code.to_le_bytes().iter().all(|b| (0x20..=0x7E).contains(b))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum X86InsnKind {
+    MovImm32 { reg: u8, imm: u32 },
+    SubImm { reg: u8, delta: u32 },
+    CmpImm { reg: u8, delta: u32 },
+    Jne { target: Option<usize> },
+    Jcc,
+    Jmp,
+    Call,
+    Stop,
+    WritesReg(u8),
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodedX86Insn {
+    len: usize,
+    kind: X86InsnKind,
+}
+
+fn modrm_len_and_fields(
+    code: &[u8],
+    modrm_pos: usize,
+    has_67: bool,
+    is_64: bool,
+) -> Option<(usize, u8, u8, u8)> {
+    let modrm = *code.get(modrm_pos)?;
+    let md = modrm >> 6;
+    let reg_f = (modrm >> 3) & 7;
+    let rm = modrm & 7;
+    let mut extra = 1usize;
+    if md != 3 {
+        if !is_64 && has_67 {
+            if (md == 0 && rm == 6) || md == 2 {
+                extra += 2;
+            } else if md == 1 {
+                extra += 1;
+            }
+        } else {
+            if rm == 4 {
+                let sib = *code.get(modrm_pos + 1)?;
+                extra += 1;
+                if md == 0 && (sib & 7) == 5 {
+                    extra += 4;
+                }
+            } else if md == 0 && rm == 5 {
+                extra += 4;
+            }
+            if md == 1 {
+                extra += 1;
+            } else if md == 2 {
+                extra += 4;
+            }
+        }
+    }
+    if modrm_pos + extra > code.len() {
+        return None;
+    }
+    Some((extra, md, reg_f, rm))
+}
+
+fn decode_x86_insn(code: &[u8], pos: usize, is_64: bool) -> Option<DecodedX86Insn> {
+    if pos >= code.len() {
+        return None;
+    }
+    let mut p = pos;
+    let mut has_66 = false;
+    let mut has_67 = false;
+    for _ in 0..4 {
+        let b = *code.get(p)?;
+        match b {
+            0x66 => {
+                has_66 = true;
+                p += 1;
+            }
+            0x67 => {
+                has_67 = true;
+                p += 1;
+            }
+            0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => {
+                p += 1;
+            }
+            _ => break,
+        }
+    }
+
+    let mut has_rex = false;
+    let mut rex_w = false;
+    let mut rex_r = false;
+    let mut rex_b = false;
+    if is_64 {
+        if let Some(&b) = code.get(p) {
+            if (0x40..=0x4F).contains(&b) {
+                has_rex = true;
+                rex_w = (b & 0x08) != 0;
+                rex_r = (b & 0x04) != 0;
+                rex_b = (b & 0x01) != 0;
+                p += 1;
+            }
+        }
+    }
+
+    let op = *code.get(p)?;
+    p += 1;
+
+    // 2-byte / 3-byte VEX prefixes (AVX) when no REX prefix was seen
+    if is_64 && !has_rex && (op == 0xC5 || op == 0xC4) {
+        let (map, imm_extra) = if op == 0xC5 {
+            let _p1 = *code.get(p)?;
+            p += 1;
+            (1u8, 0usize)
+        } else {
+            let p1 = *code.get(p)?;
+            let _p2 = *code.get(p + 1)?;
+            p += 2;
+            let m = p1 & 0x1F;
+            (m, if m == 3 { 1 } else { 0 })
+        };
+        let _vop = *code.get(p)?;
+        p += 1;
+        if map == 0 {
+            return None;
+        }
+        let (m_len, _, _, _) = modrm_len_and_fields(code, p, has_67, is_64)?;
+        let end = p + m_len + imm_extra;
+        if end > code.len() {
+            return None;
+        }
+        return Some(DecodedX86Insn {
+            len: end - pos,
+            kind: X86InsnKind::Other,
+        });
+    }
+
+    let ext_r = |r: u8| r + if rex_r { 8 } else { 0 };
+    let ext_b = |r: u8| r + if rex_b { 8 } else { 0 };
+    let imm_wv_sz = || if has_66 { 2usize } else { 4usize };
+
+    let rel_target = |next_ip: usize, rel: i32| -> Option<usize> {
+        let tgt = (next_ip as isize) + (rel as isize);
+        if tgt >= 0 && (tgt as usize) < code.len() {
+            Some(tgt as usize)
+        } else {
+            None
+        }
+    };
+
+    if op == 0x0F {
+        let op2 = *code.get(p)?;
+        p += 1;
+        return match op2 {
+            0x05 | 0x07..=0x09 | 0x0B | 0x31 | 0x77 | 0xA0..=0xA2 | 0xA8..=0xAA | 0xC8..=0xCF => {
+                Some(DecodedX86Insn {
+                    len: p - pos,
+                    kind: X86InsnKind::Other,
+                })
+            }
+            0x80..=0x8F => {
+                let sz = if !is_64 && has_66 { 2 } else { 4 };
+                if p + sz > code.len() {
+                    return None;
+                }
+                let next_ip = p + sz;
+                let kind = if sz == 4 {
+                    let rel = i32::from_le_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
+                    if op2 == 0x85 {
+                        X86InsnKind::Jne {
+                            target: rel_target(next_ip, rel),
+                        }
+                    } else {
+                        X86InsnKind::Jcc
+                    }
+                } else {
+                    X86InsnKind::Jcc
+                };
+                Some(DecodedX86Insn {
+                    len: next_ip - pos,
+                    kind,
+                })
+            }
+            0x38 | 0x3A => {
+                let _op3 = *code.get(p)?;
+                p += 1;
+                let (m_len, _, _, _) = modrm_len_and_fields(code, p, has_67, is_64)?;
+                let imm = if op2 == 0x3A { 1 } else { 0 };
+                let end = p + m_len + imm;
+                if end > code.len() {
+                    return None;
+                }
+                Some(DecodedX86Insn {
+                    len: end - pos,
+                    kind: X86InsnKind::Other,
+                })
+            }
+            _ => {
+                let (m_len, md, reg_f, rm) = modrm_len_and_fields(code, p, has_67, is_64)?;
+                let imm = match op2 {
+                    0x70..=0x73 | 0xA4 | 0xAC | 0xBA | 0xC2 | 0xC4..=0xC6 => 1usize,
+                    _ => 0usize,
+                };
+                let end = p + m_len + imm;
+                if end > code.len() {
+                    return None;
+                }
+                let kind = match op2 {
+                    0x40..=0x4F | 0xAF | 0xB6 | 0xB7 | 0xBE | 0xBF | 0xBC | 0xBD => {
+                        X86InsnKind::WritesReg(ext_r(reg_f))
+                    }
+                    0x90..=0x9F if md == 3 => X86InsnKind::WritesReg(ext_b(rm)),
+                    _ => X86InsnKind::Other,
+                };
+                Some(DecodedX86Insn {
+                    len: end - pos,
+                    kind,
+                })
+            }
+        };
+    }
+
+    match op {
+        0x04
+        | 0x0C
+        | 0x14
+        | 0x1C
+        | 0x24
+        | 0x2C
+        | 0x34
+        | 0x3C
+        | 0xA8
+        | 0x6A
+        | 0xCD
+        | 0xE0..=0xE7 => {
+            if p + 1 > code.len() {
+                return None;
+            }
+            let kind = if op != 0x3C && op != 0xA8 && op != 0x6A && op != 0xCD && op < 0xE0 {
+                X86InsnKind::WritesReg(0)
+            } else {
+                X86InsnKind::Other
+            };
+            Some(DecodedX86Insn {
+                len: p + 1 - pos,
+                kind,
+            })
+        }
+        0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D | 0xA9 => {
+            let sz = imm_wv_sz();
+            if p + sz > code.len() {
+                return None;
+            }
+            let kind = if sz == 4 && (op == 0x2D || op == 0x3D) {
+                let val = u32::from_le_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
+                if op == 0x2D {
+                    X86InsnKind::SubImm { reg: 0, delta: val }
+                } else {
+                    X86InsnKind::CmpImm { reg: 0, delta: val }
+                }
+            } else if op != 0xA9 && op != 0x3D {
+                X86InsnKind::WritesReg(0)
+            } else {
+                X86InsnKind::Other
+            };
+            Some(DecodedX86Insn {
+                len: p + sz - pos,
+                kind,
+            })
+        }
+        0x68 => {
+            let sz = imm_wv_sz();
+            if p + sz > code.len() {
+                return None;
+            }
+            Some(DecodedX86Insn {
+                len: p + sz - pos,
+                kind: X86InsnKind::Other,
+            })
+        }
+        0x70..=0x7F => {
+            let rel = *code.get(p)? as i8 as i32;
+            let next_ip = p + 1;
+            let kind = if op == 0x75 {
+                X86InsnKind::Jne {
+                    target: rel_target(next_ip, rel),
+                }
+            } else {
+                X86InsnKind::Jcc
+            };
+            Some(DecodedX86Insn {
+                len: next_ip - pos,
+                kind,
+            })
+        }
+        0xEB => {
+            if p + 1 > code.len() {
+                return None;
+            }
+            Some(DecodedX86Insn {
+                len: p + 1 - pos,
+                kind: X86InsnKind::Jmp,
+            })
+        }
+        0xE8 | 0xE9 => {
+            let sz = if !is_64 && has_66 { 2 } else { 4 };
+            if p + sz > code.len() {
+                return None;
+            }
+            Some(DecodedX86Insn {
+                len: p + sz - pos,
+                kind: if op == 0xE8 {
+                    X86InsnKind::Call
+                } else {
+                    X86InsnKind::Jmp
+                },
+            })
+        }
+        0xC3 | 0xCC => Some(DecodedX86Insn {
+            len: p - pos,
+            kind: X86InsnKind::Stop,
+        }),
+        0xC2 => {
+            if p + 2 > code.len() {
+                return None;
+            }
+            Some(DecodedX86Insn {
+                len: p + 2 - pos,
+                kind: X86InsnKind::Stop,
+            })
+        }
+        0xC8 => {
+            if p + 3 > code.len() {
+                return None;
+            }
+            Some(DecodedX86Insn {
+                len: p + 3 - pos,
+                kind: X86InsnKind::Other,
+            })
+        }
+        0xA0..=0xA3 => {
+            let sz = if is_64 && !has_67 { 8 } else { 4 };
+            if p + sz > code.len() {
+                return None;
+            }
+            Some(DecodedX86Insn {
+                len: p + sz - pos,
+                kind: if op <= 0xA1 {
+                    X86InsnKind::WritesReg(0)
+                } else {
+                    X86InsnKind::Other
+                },
+            })
+        }
+        0xB0..=0xB7 => {
+            if p + 1 > code.len() {
+                return None;
+            }
+            let r = if has_rex {
+                ext_b(op - 0xB0)
+            } else {
+                (op - 0xB0) & 3
+            };
+            Some(DecodedX86Insn {
+                len: p + 1 - pos,
+                kind: X86InsnKind::WritesReg(r),
+            })
+        }
+        0xB8..=0xBF => {
+            let sz = if rex_w { 8 } else { imm_wv_sz() };
+            if p + sz > code.len() {
+                return None;
+            }
+            let reg = ext_b(op - 0xB8);
+            let kind = if sz == 4 {
+                let imm = u32::from_le_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
+                X86InsnKind::MovImm32 { reg, imm }
+            } else {
+                X86InsnKind::WritesReg(reg)
+            };
+            Some(DecodedX86Insn {
+                len: p + sz - pos,
+                kind,
+            })
+        }
+        0x40..=0x4F if !is_64 => Some(DecodedX86Insn {
+            len: p - pos,
+            kind: X86InsnKind::WritesReg(op & 7),
+        }),
+        0x58..=0x5F => Some(DecodedX86Insn {
+            len: p - pos,
+            kind: X86InsnKind::WritesReg(ext_b(op - 0x58)),
+        }),
+        0x90..=0x97 => Some(DecodedX86Insn {
+            len: p - pos,
+            kind: if op == 0x90 && !rex_b {
+                X86InsnKind::Other
+            } else {
+                X86InsnKind::WritesReg(0)
+            },
+        }),
+        0x50..=0x57
+        | 0x98..=0x9F
+        | 0xA4..=0xA7
+        | 0xAA..=0xAF
+        | 0xC9
+        | 0xD7
+        | 0xEC..=0xEF
+        | 0xF4
+        | 0xF5
+        | 0xF8..=0xFD => Some(DecodedX86Insn {
+            len: p - pos,
+            kind: X86InsnKind::Other,
+        }),
+        // ModRM instructions
+        0x00..=0x03
+        | 0x08..=0x0B
+        | 0x10..=0x13
+        | 0x18..=0x1B
+        | 0x20..=0x23
+        | 0x28..=0x2B
+        | 0x30..=0x33
+        | 0x38..=0x3B
+        | 0x63
+        | 0x69
+        | 0x6B
+        | 0x80..=0x8E
+        | 0x8F
+        | 0xC0..=0xC1
+        | 0xC6..=0xC7
+        | 0xD0..=0xD3
+        | 0xD8..=0xDF
+        | 0xF6..=0xF7
+        | 0xFE..=0xFF => {
+            let (m_len, md, reg_f, rm) = modrm_len_and_fields(code, p, has_67, is_64)?;
+            let imm_pos = p + m_len;
+            let imm_sz = match op {
+                0x6B | 0x80 | 0x82 | 0x83 | 0xC0 | 0xC1 | 0xC6 => 1usize,
+                0x69 | 0x81 | 0xC7 => imm_wv_sz(),
+                0xF6 if reg_f <= 1 => 1usize,
+                0xF7 if reg_f <= 1 => imm_wv_sz(),
+                _ => 0usize,
+            };
+            let end = imm_pos + imm_sz;
+            if end > code.len() {
+                return None;
+            }
+            let kind = match op {
+                0x81 if !has_66 && md == 3 && reg_f == 5 => {
+                    let delta = u32::from_le_bytes([
+                        code[imm_pos],
+                        code[imm_pos + 1],
+                        code[imm_pos + 2],
+                        code[imm_pos + 3],
+                    ]);
+                    X86InsnKind::SubImm {
+                        reg: ext_b(rm),
+                        delta,
+                    }
+                }
+                0x81 if !has_66 && md == 3 && reg_f == 7 => {
+                    let delta = u32::from_le_bytes([
+                        code[imm_pos],
+                        code[imm_pos + 1],
+                        code[imm_pos + 2],
+                        code[imm_pos + 3],
+                    ]);
+                    X86InsnKind::CmpImm {
+                        reg: ext_b(rm),
+                        delta,
+                    }
+                }
+                0x83 if !has_66 && md == 3 && reg_f == 5 => {
+                    let delta = (code[imm_pos] as i8 as i32) as u32;
+                    X86InsnKind::SubImm {
+                        reg: ext_b(rm),
+                        delta,
+                    }
+                }
+                0x83 if !has_66 && md == 3 && reg_f == 7 => {
+                    let delta = (code[imm_pos] as i8 as i32) as u32;
+                    X86InsnKind::CmpImm {
+                        reg: ext_b(rm),
+                        delta,
+                    }
+                }
+                0x81 | 0x83 if md == 3 => X86InsnKind::WritesReg(ext_b(rm)),
+                0x03 | 0x0B | 0x13 | 0x1B | 0x23 | 0x2B | 0x33 | 0x63 | 0x69 | 0x6B | 0x8B
+                | 0x8D => X86InsnKind::WritesReg(ext_r(reg_f)),
+                0x01
+                | 0x09
+                | 0x11
+                | 0x19
+                | 0x21
+                | 0x29
+                | 0x31
+                | 0x89
+                | 0x8F
+                | 0xC0
+                | 0xC1
+                | 0xC7
+                | 0xD0..=0xD3
+                    if md == 3 =>
+                {
+                    X86InsnKind::WritesReg(ext_b(rm))
+                }
+                0xF7 if md == 3 && reg_f >= 2 => X86InsnKind::WritesReg(ext_b(rm)),
+                0xFF if reg_f == 2 => X86InsnKind::Call,
+                0xFF if reg_f == 4 => X86InsnKind::Jmp,
+                0xFF if md == 3 && reg_f <= 1 => X86InsnKind::WritesReg(ext_b(rm)),
+                _ => X86InsnKind::Other,
+            };
+            Some(DecodedX86Insn {
+                len: end - pos,
+                kind,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_pe64_pdata_ranges(bytes: &[u8], pe_off: usize, secs: &[PeSection]) -> Vec<(u32, u32)> {
+    let opt_sz = read_u16_le(bytes, pe_off + 20).unwrap_or(0) as usize;
+    let opt_off = pe_off + 24;
+    if opt_sz < 144 || read_u16_le(bytes, opt_off).unwrap_or(0) != 0x020B {
+        return Vec::new();
+    }
+    if read_u32_le(bytes, opt_off + 108).unwrap_or(0) < 4 {
+        return Vec::new();
+    }
+    let exc_rva = read_u32_le(bytes, opt_off + 136).unwrap_or(0);
+    let exc_sz = read_u32_le(bytes, opt_off + 140).unwrap_or(0) as usize;
+    if exc_rva == 0 || exc_sz < 12 {
+        return Vec::new();
+    }
+    let Some(exc_off) = rva_to_file_offset(exc_rva, secs) else {
+        return Vec::new();
+    };
+    let count = exc_sz.min(2 * 1024 * 1024) / 12;
+    let mut ranges = Vec::with_capacity(count.min(4096));
+    for idx in 0..count {
+        let base = exc_off + idx * 12;
+        if base + 12 > bytes.len() {
+            break;
+        }
+        let begin_rva = read_u32_le(bytes, base).unwrap_or(0);
+        let end_rva = read_u32_le(bytes, base + 4).unwrap_or(0);
+        if begin_rva > 0 && end_rva > begin_rva && end_rva - begin_rva <= 0x20_0000 {
+            ranges.push((begin_rva, end_rva));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+fn is_win64_volatile_reg(reg: u8) -> bool {
+    matches!(reg, 0 | 1 | 2 | 8 | 9 | 10 | 11)
 }
 
 fn is_pipe_or_device_artifact(s: &str) -> bool {
@@ -6262,6 +6833,7 @@ pub fn inspect_pe_ioctl_and_pipes(
 
     let mut dummy_hdr = Vec::new();
     let mut pe_ctx: Option<PeContext> = None;
+    let mut pdata_funcs: Vec<(u32, u32)> = Vec::new();
     let mut arch = "unknown";
     if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
         let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
@@ -6273,7 +6845,9 @@ pub fn inspect_pe_ioctl_and_pipes(
                 0xaa64 => "ARM64",
                 _ => "pe",
             };
-            pe_ctx = Some(parse_pe_details(bytes, pe_off, &mut dummy_hdr));
+            let parsed = parse_pe_details(bytes, pe_off, &mut dummy_hdr);
+            pdata_funcs = extract_pe64_pdata_ranges(bytes, pe_off, &parsed.secs);
+            pe_ctx = Some(parsed);
         }
     }
 
@@ -6295,7 +6869,43 @@ pub fn inspect_pe_ioctl_and_pipes(
             }
             ioctl_iat_xrefs = scan_pe64_xrefs(bytes, pe, &[], Some(&ioctl_re), 40);
 
+            #[derive(Clone, Copy)]
+            struct SubChainState {
+                reg: u8,
+                acc: u32,
+                arms: usize,
+                non_sub_insns: usize,
+            }
+
+            const MAX_IOCTL_CODES: usize = 160;
             let mut seen_codes = std::collections::HashSet::<u32>::new();
+            let push_ctl = |ioctl_codes: &mut Vec<Value>,
+                            seen_codes: &mut std::collections::HashSet<u32>,
+                            cand: u32,
+                            sec_name: &str,
+                            file_off: usize,
+                            insn_rva: u32,
+                            func_rva: u32,
+                            source: &str| {
+                if ioctl_codes.len() >= MAX_IOCTL_CODES || !is_plausible_ctl_code(cand) {
+                    return;
+                }
+                let code_hex = format!("0x{cand:08x}");
+                if q_re.as_ref().map(|r| r.is_match(&code_hex)).unwrap_or(true)
+                    && seen_codes.insert(cand)
+                {
+                    let mut obj = decode_ctl_code(cand);
+                    if let Some(m) = obj.as_object_mut() {
+                        m.insert("section".to_string(), json!(sec_name));
+                        m.insert("file_offset".to_string(), json!(format!("0x{file_off:x}")));
+                        m.insert("insn_rva".to_string(), json!(format!("0x{insn_rva:x}")));
+                        m.insert("func_rva".to_string(), json!(format!("0x{func_rva:x}")));
+                        m.insert("source".to_string(), json!(source));
+                    }
+                    ioctl_codes.push(obj);
+                }
+            };
+
             for s in &pe.secs {
                 if (s.chars & 0x2000_0000) == 0 || s.raw_size < 5 {
                     continue;
@@ -6306,87 +6916,280 @@ pub fn inspect_pe_ioctl_and_pipes(
                 else {
                     continue;
                 };
-                let mut i = 0usize;
-                while i + 5 <= code.len() && ioctl_codes.len() < 80 {
-                    let b0 = code[i];
-                    let imm_pair: Option<(u32, usize)> =
-                        if (b0 == 0x3D || b0 == 0x2D || (0xB8..=0xBF).contains(&b0))
-                            && i + 5 <= code.len()
-                        {
-                            Some((
-                                u32::from_le_bytes([
-                                    code[i + 1],
-                                    code[i + 2],
-                                    code[i + 3],
-                                    code[i + 4],
-                                ]),
-                                5,
-                            ))
-                        } else if i + 6 <= code.len()
-                            && ((b0 == 0x41 && (0xB8..=0xBF).contains(&code[i + 1]))
-                                || (b0 == 0x81 && (0xE8..=0xFF).contains(&code[i + 1])))
-                        {
-                            Some((
-                                u32::from_le_bytes([
-                                    code[i + 2],
-                                    code[i + 3],
-                                    code[i + 4],
-                                    code[i + 5],
-                                ]),
-                                6,
-                            ))
-                        } else if (b0 == 0x41 || b0 == 0x48 || b0 == 0x49)
-                            && i + 7 <= code.len()
-                            && code[i + 1] == 0x81
-                            && (0xE8..=0xFF).contains(&code[i + 2])
-                        {
-                            Some((
-                                u32::from_le_bytes([
-                                    code[i + 3],
-                                    code[i + 4],
-                                    code[i + 5],
-                                    code[i + 6],
-                                ]),
-                                7,
-                            ))
-                        } else {
-                            None
-                        };
-                    if let Some((cand, step)) = imm_pair {
-                        if is_plausible_ctl_code(cand) {
-                            let code_hex = format!("0x{cand:08x}");
-                            if q_re.as_ref().map(|r| r.is_match(&code_hex)).unwrap_or(true)
-                                && seen_codes.insert(cand)
-                            {
-                                let insn_rva = s.vaddr.saturating_add(i as u32);
-                                let func_rva = if pe.is_pe64 {
-                                    find_enclosing_x64_func_rva(code, s.vaddr, i)
-                                } else {
-                                    insn_rva
-                                };
-                                let mut obj = decode_ctl_code(cand);
-                                if let Some(m) = obj.as_object_mut() {
-                                    m.insert("section".to_string(), json!(s.name));
-                                    m.insert(
-                                        "file_offset".to_string(),
-                                        json!(format!("0x{:x}", start + i)),
-                                    );
-                                    m.insert(
-                                        "insn_rva".to_string(),
-                                        json!(format!("0x{insn_rva:x}")),
-                                    );
-                                    m.insert(
-                                        "func_rva".to_string(),
-                                        json!(format!("0x{func_rva:x}")),
-                                    );
-                                }
-                                ioctl_codes.push(obj);
-                                i += step;
-                                continue;
+                let sec_end_rva = s.vaddr.saturating_add(code.len() as u32);
+                let mut windows: Vec<(usize, usize, Option<u32>)> = Vec::new();
+                if !pdata_funcs.is_empty() && pe.is_pe64 {
+                    for &(b_rva, e_rva) in &pdata_funcs {
+                        if b_rva >= s.vaddr && b_rva < sec_end_rva {
+                            let ws = (b_rva - s.vaddr) as usize;
+                            let we = (e_rva.min(sec_end_rva) - s.vaddr) as usize;
+                            if we > ws {
+                                windows.push((ws, we, Some(b_rva)));
                             }
                         }
                     }
-                    i += 1;
+                }
+                if windows.is_empty() {
+                    windows.push((0, code.len(), None));
+                }
+
+                for (ws, we, known_func_rva) in windows {
+                    if ioctl_codes.len() >= MAX_IOCTL_CODES {
+                        break;
+                    }
+                    let mut pc = ws;
+                    let mut chain: Option<SubChainState> = None;
+                    let mut jne_followed = std::collections::HashSet::<usize>::new();
+                    while pc < we && ioctl_codes.len() < MAX_IOCTL_CODES {
+                        if chain.is_none() && (code[pc] == 0xCC || code[pc] == 0x90) {
+                            pc += 1;
+                            continue;
+                        }
+                        let Some(insn) = decode_x86_insn(&code[..we], pc, pe.is_pe64) else {
+                            chain = None;
+                            pc += 1;
+                            continue;
+                        };
+                        let insn_rva = s.vaddr.saturating_add(pc as u32);
+                        let func_rva = known_func_rva.unwrap_or_else(|| {
+                            if pe.is_pe64 {
+                                find_enclosing_x64_func_rva(code, s.vaddr, pc)
+                            } else {
+                                insn_rva
+                            }
+                        });
+                        let next_pc = pc + insn.len;
+                        match insn.kind {
+                            X86InsnKind::MovImm32 { reg, imm } => {
+                                if is_plausible_ctl_code(imm) {
+                                    push_ctl(
+                                        &mut ioctl_codes,
+                                        &mut seen_codes,
+                                        imm,
+                                        &s.name,
+                                        start + pc,
+                                        insn_rva,
+                                        func_rva,
+                                        "cmp_imm",
+                                    );
+                                }
+                                if chain.is_some_and(|c| c.reg == reg) {
+                                    chain = None;
+                                }
+                            }
+                            X86InsnKind::SubImm { reg, delta } => {
+                                if is_plausible_ctl_code(delta) {
+                                    push_ctl(
+                                        &mut ioctl_codes,
+                                        &mut seen_codes,
+                                        delta,
+                                        &s.name,
+                                        start + pc,
+                                        insn_rva,
+                                        func_rva,
+                                        "cmp_imm",
+                                    );
+                                    chain = Some(SubChainState {
+                                        reg,
+                                        acc: delta,
+                                        arms: 1,
+                                        non_sub_insns: 0,
+                                    });
+                                } else if let Some(mut st) = chain {
+                                    if st.reg == reg && st.arms < 32 && delta > 0 && delta <= 0xFFFF
+                                    {
+                                        let cand = st.acc.wrapping_add(delta);
+                                        if is_plausible_ctl_code(cand) {
+                                            push_ctl(
+                                                &mut ioctl_codes,
+                                                &mut seen_codes,
+                                                cand,
+                                                &s.name,
+                                                start + pc,
+                                                insn_rva,
+                                                func_rva,
+                                                "msvc_sub_chain",
+                                            );
+                                            st.acc = cand;
+                                            st.arms += 1;
+                                            st.non_sub_insns = 0;
+                                            chain = Some(st);
+                                        } else {
+                                            chain = None;
+                                        }
+                                    } else if st.reg == reg {
+                                        chain = None;
+                                    }
+                                }
+                            }
+                            X86InsnKind::CmpImm { reg, delta } => {
+                                if is_plausible_ctl_code(delta) {
+                                    push_ctl(
+                                        &mut ioctl_codes,
+                                        &mut seen_codes,
+                                        delta,
+                                        &s.name,
+                                        start + pc,
+                                        insn_rva,
+                                        func_rva,
+                                        "cmp_imm",
+                                    );
+                                    if chain.is_some_and(|c| c.reg == reg) {
+                                        chain = None;
+                                    }
+                                } else if let Some(st) = chain {
+                                    if st.reg == reg
+                                        && st.arms < 32
+                                        && delta > 0
+                                        && delta <= 0xFFFF
+                                        && st.non_sub_insns <= 4
+                                    {
+                                        let cand = st.acc.wrapping_add(delta);
+                                        if is_plausible_ctl_code(cand) {
+                                            push_ctl(
+                                                &mut ioctl_codes,
+                                                &mut seen_codes,
+                                                cand,
+                                                &s.name,
+                                                start + pc,
+                                                insn_rva,
+                                                func_rva,
+                                                "msvc_sub_chain",
+                                            );
+                                        }
+                                        chain = None;
+                                    }
+                                }
+                            }
+                            X86InsnKind::Jne {
+                                target: Some(mut t),
+                            } if chain.is_some_and(|st| st.non_sub_insns == 0) => {
+                                // Follow forward `jne next_case` chain across inline case bodies
+                                // while allowing the main `pc` loop to continue scanning normally.
+                                let mut f_st = chain.unwrap();
+                                while t > next_pc
+                                    && t < we
+                                    && t - pc <= 4096
+                                    && f_st.arms < 32
+                                    && ioctl_codes.len() < MAX_IOCTL_CODES
+                                    && jne_followed.insert(t)
+                                {
+                                    let Some(t_insn) = decode_x86_insn(&code[..we], t, pe.is_pe64)
+                                    else {
+                                        break;
+                                    };
+                                    let t_rva = s.vaddr.saturating_add(t as u32);
+                                    let t_func_rva = known_func_rva.unwrap_or_else(|| {
+                                        if pe.is_pe64 {
+                                            find_enclosing_x64_func_rva(code, s.vaddr, t)
+                                        } else {
+                                            t_rva
+                                        }
+                                    });
+                                    match t_insn.kind {
+                                        X86InsnKind::SubImm { reg, delta }
+                                            if reg == f_st.reg
+                                                && delta > 0
+                                                && delta <= 0xFFFF
+                                                && !is_plausible_ctl_code(delta) =>
+                                        {
+                                            let cand = f_st.acc.wrapping_add(delta);
+                                            if !is_plausible_ctl_code(cand) {
+                                                break;
+                                            }
+                                            push_ctl(
+                                                &mut ioctl_codes,
+                                                &mut seen_codes,
+                                                cand,
+                                                &s.name,
+                                                start + t,
+                                                t_rva,
+                                                t_func_rva,
+                                                "msvc_sub_chain",
+                                            );
+                                            f_st.acc = cand;
+                                            f_st.arms += 1;
+                                            let after_t = t + t_insn.len;
+                                            if let Some(j_insn) =
+                                                decode_x86_insn(&code[..we], after_t, pe.is_pe64)
+                                            {
+                                                if let X86InsnKind::Jne { target: Some(nt) } =
+                                                    j_insn.kind
+                                                {
+                                                    if nt > after_t + j_insn.len {
+                                                        t = nt;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        X86InsnKind::CmpImm { reg, delta }
+                                            if reg == f_st.reg
+                                                && delta > 0
+                                                && delta <= 0xFFFF
+                                                && !is_plausible_ctl_code(delta) =>
+                                        {
+                                            let cand = f_st.acc.wrapping_add(delta);
+                                            if is_plausible_ctl_code(cand) {
+                                                push_ctl(
+                                                    &mut ioctl_codes,
+                                                    &mut seen_codes,
+                                                    cand,
+                                                    &s.name,
+                                                    start + t,
+                                                    t_rva,
+                                                    t_func_rva,
+                                                    "msvc_sub_chain",
+                                                );
+                                            }
+                                            break;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                chain = None;
+                            }
+                            X86InsnKind::Stop | X86InsnKind::Jmp => {
+                                chain = None;
+                            }
+                            X86InsnKind::Call => {
+                                if chain.is_some_and(|st| is_win64_volatile_reg(st.reg)) {
+                                    chain = None;
+                                } else if let Some(mut st) = chain {
+                                    st.non_sub_insns += 1;
+                                    chain = if st.non_sub_insns > 16 {
+                                        None
+                                    } else {
+                                        Some(st)
+                                    };
+                                }
+                            }
+                            X86InsnKind::WritesReg(r) => {
+                                if chain.is_some_and(|st| st.reg == r) {
+                                    chain = None;
+                                } else if let Some(mut st) = chain {
+                                    st.non_sub_insns += 1;
+                                    chain = if st.non_sub_insns > 16 {
+                                        None
+                                    } else {
+                                        Some(st)
+                                    };
+                                }
+                            }
+                            X86InsnKind::Jne { .. } | X86InsnKind::Jcc | X86InsnKind::Other => {
+                                if let Some(mut st) = chain {
+                                    st.non_sub_insns += 1;
+                                    chain = if st.non_sub_insns > 16 {
+                                        None
+                                    } else {
+                                        Some(st)
+                                    };
+                                }
+                            }
+                        }
+                        pc = next_pc;
+                    }
                 }
             }
         }
@@ -6507,14 +7310,15 @@ pub fn inspect_pe_ioctl_and_pipes(
             "\n## Candidate CTL_CODE Constants ({})",
             ioctl_codes.len()
         ));
-        for c in ioctl_codes.iter().take(25) {
+        for c in ioctl_codes.iter().take(40) {
             md.push(format!(
-                "- `{}` dev=`{}` fn=`{}` `{}` `{}` (insn={}, func={})",
+                "- `{}` dev=`{}` fn=`{}` `{}` `{}` [{}] (insn={}, func={})",
                 c["code"].as_str().unwrap_or(""),
                 c["device_type"].as_str().unwrap_or(""),
                 c["function"].as_str().unwrap_or(""),
                 c["method"].as_str().unwrap_or(""),
                 c["access"].as_str().unwrap_or(""),
+                c["source"].as_str().unwrap_or("cmp_imm"),
                 c["insn_rva"].as_str().unwrap_or(""),
                 c["func_rva"].as_str().unwrap_or(""),
             ));
@@ -7422,6 +8226,108 @@ axios.get('/api/v1/quota/:id');
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn filters_ntstatus_noise_and_decodes_msvc_sub_chains() {
+        // 1. Plausibility filter: NTSTATUS/HRESULT/magic constants rejected; genuine CTL_CODEs kept
+        assert!(!is_plausible_ctl_code(0xC000_000D));
+        assert!(!is_plausible_ctl_code(0xC000_0016));
+        assert!(!is_plausible_ctl_code(0x8000_0005));
+        assert!(!is_plausible_ctl_code(0x8000_4005));
+        assert!(!is_plausible_ctl_code(0x8007_0005));
+        assert!(!is_plausible_ctl_code(0x4000_0001));
+        assert!(!is_plausible_ctl_code(0xAAAA_AAAB));
+        assert!(!is_plausible_ctl_code(0x5555_5556));
+        assert!(is_plausible_ctl_code(0x0022_0003));
+        assert!(is_plausible_ctl_code(0x0022_0004));
+        assert!(is_plausible_ctl_code(0x006D_0008));
+        assert!(is_plausible_ctl_code(0x8000_2004));
+
+        // 2. Build a minimal PE64 with .text containing:
+        //    - NTSTATUS noise: mov eax, 0xC000000D; cmp ecx, 0x80000005; cmp edx, 0x40000001
+        //    - Chain A (r8d with je + cmp leaf):
+        //      41 81 E8 04 00 22 00  (sub r8d, 0x00220004)
+        //      74 05                 (je +5)
+        //      41 83 E8 04           (sub r8d, 4  -> 0x00220008)
+        //      74 05                 (je +5)
+        //      41 83 F8 10           (cmp r8d, 0x10 -> 0x00220018 leaf)
+        //    - Clobber test (mov eax, 1 stops chain before sub eax, 4):
+        //      2D 04 00 22 00        (sub eax, 0x00220004 -> already seen)
+        //      B8 01 00 00 00        (mov eax, 1 -> clobber)
+        //      83 E8 04              (sub eax, 4 -> must NOT emit 0x00220008 from clobbered chain)
+        //    - Chain B (edx with jne skipping inline case body):
+        //      81 EA 08 00 6D 00     (sub edx, 0x006D0008)
+        //      75 03                 (jne +3)
+        //      33 C0 C3              (xor eax, eax; ret -- inline case body)
+        //      83 EA 28              (sub edx, 0x28 -> 0x006D0030)
+        //      C3                    (ret)
+        let mut code: Vec<u8> = vec![
+            0xB8, 0x0D, 0x00, 0x00, 0xC0, // mov eax, 0xC000000D
+            0x81, 0xF9, 0x05, 0x00, 0x00, 0x80, // cmp ecx, 0x80000005
+            0x81, 0xFA, 0x01, 0x00, 0x00, 0x40, // cmp edx, 0x40000001
+            // Chain A (r8d):
+            0x41, 0x81, 0xE8, 0x04, 0x00, 0x22, 0x00, // sub r8d, 0x00220004
+            0x74, 0x05, // je +5
+            0x41, 0x83, 0xE8, 0x04, // sub r8d, 4
+            0x74, 0x05, // je +5
+            0x41, 0x83, 0xF8, 0x10, // cmp r8d, 0x10
+            // Clobber check (use separate base 0x00220100):
+            0x2D, 0x00, 0x01, 0x22, 0x00, // sub eax, 0x00220100
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (clobber)
+            0x83, 0xE8, 0x04, // sub eax, 4 (should NOT emit 0x00220104)
+            // Chain B (edx + jne):
+            0x81, 0xEA, 0x08, 0x00, 0x6D, 0x00, // sub edx, 0x006D0008
+            0x75, 0x03, // jne +3
+            0x33, 0xC0, 0xC3, // xor eax, eax; ret
+            0x83, 0xEA, 0x28, // sub edx, 0x28 -> 0x006D0030
+            0xC3, // ret
+        ];
+        // Also prepend a RIP-relative LEA/MOV with 0x2D ModRM (`48 8B 2D 04 00 22 00`) to ensure
+        // `[rip + disp32]` ModRM=0x2D is NOT misdecoded as `sub eax, imm32` (0x00220004 via `2D` byte).
+        let mut prefix = vec![0x48, 0x8B, 0x2D, 0x00, 0x20, 0x22, 0x00]; // mov rbp, [rip+0x00222000]
+        prefix.append(&mut code);
+
+        let text_raw_sz = prefix.len().div_ceil(0x200) * 0x200;
+        let mut pe = vec![0u8; 0x200 + text_raw_sz];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+        let opt = 0x98usize;
+        pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes());
+        pe[opt + 24..opt + 32].copy_from_slice(&0x0001_4000_0000u64.to_le_bytes());
+        let sh = opt + 0xF0;
+        pe[sh..sh + 5].copy_from_slice(b".text");
+        pe[sh + 8..sh + 12].copy_from_slice(&(prefix.len() as u32).to_le_bytes());
+        pe[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[sh + 16..sh + 20].copy_from_slice(&(text_raw_sz as u32).to_le_bytes());
+        pe[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        pe[0x200..0x200 + prefix.len()].copy_from_slice(&prefix);
+
+        let (_md, jv) = inspect_pe_ioctl_and_pipes(&pe, "unit.sys", true, false, None);
+        let ioctls = jv["ioctl_codes"].as_array().unwrap();
+        let has = |hex: &str, src: &str| {
+            ioctls
+                .iter()
+                .any(|c| c["code"] == hex && c["source"] == src)
+        };
+        assert!(has("0x00220004", "cmp_imm"), "{jv}");
+        assert!(has("0x00220008", "msvc_sub_chain"), "{jv}");
+        assert!(has("0x00220018", "msvc_sub_chain"), "{jv}");
+        assert!(has("0x00220100", "cmp_imm"), "{jv}");
+        assert!(has("0x006d0008", "cmp_imm"), "{jv}");
+        assert!(has("0x006d0030", "msvc_sub_chain"), "{jv}");
+        assert!(
+            !ioctls.iter().any(|c| matches!(
+                c["code"].as_str(),
+                Some("0xc000000d" | "0x80000005" | "0x40000001" | "0x00220104" | "0x00222000")
+            )),
+            "unexpected noise or post-clobber/ModRM leak in {jv}"
         );
     }
 }
