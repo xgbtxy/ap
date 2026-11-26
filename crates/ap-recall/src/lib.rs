@@ -1,18 +1,29 @@
 use clap::{Parser, Subcommand};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn default_weight() -> f64 {
+    1.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleMatch {
     pub id: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub section: String,
     pub triggers: String,
     pub rule: String,
     pub score: f64,
@@ -23,6 +34,19 @@ pub struct RuleMatch {
     pub stale: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stale_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReport {
+    pub ok: bool,
+    pub store: String,
+    pub root: String,
+    pub scanned_files: usize,
+    pub indexed_files: usize,
+    pub skipped_unchanged: usize,
+    pub pruned_files: usize,
+    pub indexed_entries: usize,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +82,9 @@ pub struct VaultStats {
     about = "Sub-millisecond triggered micro-memory vault (bundled SQLite FTS5)"
 )]
 struct Cli {
+    /// Optional custom SQLite vault path (file or directory; overrides RECALL_HOME and .recall/vault.db)
+    #[arg(long, global = true)]
+    store: Option<PathBuf>,
     #[command(subcommand)]
     subcmd: SubCmd,
 }
@@ -74,6 +101,15 @@ enum SubCmd {
         kind: String,
         #[arg(long = "file", default_value = "")]
         source_file: String,
+        /// Optional namespace scope tag(s), comma-separated (e.g. 'backend,auth')
+        #[arg(long, default_value = "")]
+        scope: String,
+        /// Optional relevance boost multiplier (default: 1.0, range 0.05..=100.0)
+        #[arg(long, default_value_t = 1.0)]
+        weight: f64,
+        /// Optional heading/section label
+        #[arg(long, default_value = "")]
+        section: String,
     },
     /// Retrieve top-K matching rules in <1ms
     Match {
@@ -86,9 +122,35 @@ enum SubCmd {
         /// Optional rule kind filter (e.g. 'gotcha', 'pattern', 'negative', 'deadend')
         #[arg(long, default_value = "")]
         kind: String,
+        /// Optional namespace scope filter (comma-separated tag(s); strict match)
+        #[arg(long, default_value = "")]
+        scope: String,
         /// Optional total character budget across emitted rules (0 = unlimited)
         #[arg(long, default_value_t = 0)]
         max_chars: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Incrementally sync Markdown/JSON/JSONL knowledge files into the SQLite FTS5 vault
+    Sync {
+        /// File or directory path to ingest
+        path: PathBuf,
+        /// Filename glob pattern(s), repeatable or comma-separated (default: *.md,*.markdown,*.json,*.jsonl)
+        #[arg(long = "glob")]
+        globs: Vec<String>,
+        /// Optional namespace scope tag(s) applied to ingested entries (comma-separated)
+        #[arg(long, default_value = "")]
+        scope: String,
+        /// Default rule kind for ingested entries
+        #[arg(long, default_value = "note")]
+        kind: String,
+        /// Default relevance weight multiplier for ingested entries
+        #[arg(long, default_value_t = 1.0)]
+        weight: f64,
+        /// Prune previously synced entries whose source files no longer exist
+        #[arg(long)]
+        prune: bool,
+        /// Emit structured JSON output
         #[arg(long)]
         json: bool,
     },
@@ -115,6 +177,46 @@ fn is_cjk(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 
+fn split_ascii_subtokens(word: &str, out: &mut Vec<String>) {
+    if word.is_empty() {
+        return;
+    }
+    out.push(word.to_string());
+    // Split on separators (_, -, ., /, :, \) and camelCase boundaries for bilingual identifier recall
+    for seg in word.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg != word && seg.len() >= 2 {
+            out.push(seg.to_string());
+        }
+        let chars: Vec<char> = seg.chars().collect();
+        let mut start = 0usize;
+        for i in 1..chars.len() {
+            let prev = chars[i - 1];
+            let cur = chars[i];
+            let next_is_lower = chars.get(i + 1).is_some_and(|c| c.is_ascii_lowercase());
+            let boundary = (prev.is_ascii_lowercase() && cur.is_ascii_uppercase())
+                || (prev.is_ascii_uppercase() && cur.is_ascii_uppercase() && next_is_lower)
+                || (prev.is_ascii_alphabetic() && cur.is_ascii_digit())
+                || (prev.is_ascii_digit() && cur.is_ascii_alphabetic());
+            if boundary {
+                let part: String = chars[start..i].iter().collect();
+                if part.len() >= 2 && part != seg && part != word {
+                    out.push(part);
+                }
+                start = i;
+            }
+        }
+        if start > 0 && start < chars.len() {
+            let tail: String = chars[start..].iter().collect();
+            if tail.len() >= 2 && tail != seg && tail != word {
+                out.push(tail);
+            }
+        }
+    }
+}
+
 pub fn tokenize_cjk_hybrid(text: &str) -> String {
     let mut out_tokens: Vec<String> = Vec::new();
     let mut cur_ascii = String::new();
@@ -124,7 +226,7 @@ pub fn tokenize_cjk_hybrid(text: &str) -> String {
         if !buf.is_empty() {
             for w in buf.split_whitespace() {
                 if !w.is_empty() {
-                    out.push(w.to_string());
+                    split_ascii_subtokens(w, out);
                 }
             }
             buf.clear();
@@ -160,6 +262,37 @@ pub fn tokenize_cjk_hybrid(text: &str) -> String {
     out_tokens.join(" ")
 }
 
+pub fn normalize_scopes(raw: &str) -> String {
+    let mut tags: Vec<String> = raw
+        .split([',', ';'])
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    tags.sort();
+    tags.dedup();
+    tags.join(",")
+}
+
+fn scope_matches(row_scope: &str, requested_scopes: &[String]) -> bool {
+    if requested_scopes.is_empty() {
+        return true;
+    }
+    if requested_scopes.iter().any(|r| r == "*" || r == "all") {
+        return true;
+    }
+    let row_tags: Vec<String> = row_scope
+        .split([',', ';'])
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if row_tags.iter().any(|t| t == "*" || t == "all") {
+        return true;
+    }
+    row_tags
+        .iter()
+        .any(|t| requested_scopes.iter().any(|req| req == t))
+}
+
 pub fn vault_path(cwd: &Path) -> PathBuf {
     let base = match std::env::var("RECALL_HOME") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
@@ -168,9 +301,88 @@ pub fn vault_path(cwd: &Path) -> PathBuf {
     let _ = fs::create_dir_all(&base);
     let gi = base.join(".gitignore");
     if !gi.exists() {
-        let _ = fs::write(&gi, "*.db-journal\n*.db-wal\n*.db-shm\n");
+        let _ = fs::write(&gi, "*.db-journal\n*.db-wal\n*.db-shm\n*.lock\n");
     }
     base.join("vault.db")
+}
+
+pub fn resolve_vault_path(cwd: &Path, store: Option<&Path>) -> PathBuf {
+    let Some(raw) = store.filter(|p| !p.as_os_str().is_empty()) else {
+        return vault_path(cwd);
+    };
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+    if resolved.is_dir() {
+        return resolved.join("vault.db");
+    }
+    if let Some(parent) = resolved.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    resolved
+}
+
+struct VaultLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for VaultLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_vault_lock(db_path: &Path) -> Result<VaultLockGuard, String> {
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(".lock");
+    let lock_path = PathBuf::from(os);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid = std::process::id();
+    let mut attempt = 0u64;
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                let _ = writeln!(f, "pid={pid}");
+                return Ok(VaultLockGuard { lock_path });
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || (cfg!(windows)
+                        && (e.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(5) | Some(32)))) =>
+            {
+                if let Ok(meta) = fs::metadata(&lock_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(age) = SystemTime::now().duration_since(mtime) {
+                            if age > Duration::from_secs(15) {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timed out waiting for recall vault lock {}: {e}",
+                        lock_path.display()
+                    ));
+                }
+                attempt += 1;
+                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 7) % 13;
+                std::thread::sleep(Duration::from_millis(8 + jitter));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
@@ -178,8 +390,9 @@ pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
         let _ = fs::create_dir_all(parent);
     }
     let conn = Connection::open(db_path)?;
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
+    let _ = conn.busy_timeout(Duration::from_millis(5000));
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS rules (
             id TEXT PRIMARY KEY,
@@ -192,12 +405,24 @@ pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
             last_hit_at INTEGER NOT NULL DEFAULT 0,
             source_file TEXT NOT NULL DEFAULT '',
             source_hash TEXT NOT NULL DEFAULT '',
-            git_commit TEXT NOT NULL DEFAULT ''
+            git_commit TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '',
+            weight REAL NOT NULL DEFAULT 1.0,
+            section TEXT NOT NULL DEFAULT ''
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS rules_fts USING fts5(
             id UNINDEXED,
             search_tokens,
             tokenize='unicode61'
+        );
+        CREATE TABLE IF NOT EXISTS sync_files (
+            file_path TEXT PRIMARY KEY,
+            mtime_ns INTEGER NOT NULL DEFAULT 0,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '',
+            entry_count INTEGER NOT NULL DEFAULT 0,
+            synced_at INTEGER NOT NULL DEFAULT 0
         );",
     )?;
     let mut existing_cols: HashSet<String> = HashSet::new();
@@ -220,6 +445,18 @@ pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
         (
             "git_commit",
             "ALTER TABLE rules ADD COLUMN git_commit TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "scope",
+            "ALTER TABLE rules ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "weight",
+            "ALTER TABLE rules ADD COLUMN weight REAL NOT NULL DEFAULT 1.0",
+        ),
+        (
+            "section",
+            "ALTER TABLE rules ADD COLUMN section TEXT NOT NULL DEFAULT ''",
         ),
     ] {
         if !existing_cols.contains(col) {
@@ -302,6 +539,21 @@ pub fn add_rule_with_provenance(
     kind: &str,
     source_file: &str,
 ) -> rusqlite::Result<String> {
+    add_rule_full(conn, cwd, triggers, rule, kind, source_file, "", 1.0, "")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_rule_full(
+    conn: &Connection,
+    cwd: &Path,
+    triggers: &str,
+    rule: &str,
+    kind: &str,
+    source_file: &str,
+    scope: &str,
+    weight: f64,
+    section: &str,
+) -> rusqlite::Result<String> {
     let norm_rule = rule.split_whitespace().collect::<Vec<_>>().join(" ");
     let norm_trig = triggers
         .split(',')
@@ -310,6 +562,13 @@ pub fn add_rule_with_provenance(
         .collect::<Vec<_>>()
         .join(",");
     let norm_src = normalize_source_file(source_file);
+    let norm_scope = normalize_scopes(scope);
+    let norm_section = section.trim().to_string();
+    let eff_weight = if weight.is_finite() {
+        weight.clamp(0.05, 100.0)
+    } else {
+        1.0
+    };
     let (src_hash, git_commit) = if norm_src.is_empty() {
         (String::new(), String::new())
     } else {
@@ -320,17 +579,22 @@ pub fn add_rule_with_provenance(
         )
     };
     let mut hasher = Sha256::new();
-    hasher.update(format!("{norm_trig}::{norm_rule}").as_bytes());
+    if norm_scope.is_empty() && norm_section.is_empty() {
+        hasher.update(format!("{norm_trig}::{norm_rule}").as_bytes());
+    } else {
+        hasher.update(format!("{norm_scope}::{norm_section}::{norm_trig}::{norm_rule}").as_bytes());
+    }
     let rule_id = format!("{:x}", hasher.finalize())[..10].to_string();
     let now = now_epoch();
     let tokens = tokenize_cjk_hybrid(&format!(
-        "{} {norm_rule} {kind}",
-        norm_trig.replace(',', " ")
+        "{} {norm_section} {norm_rule} {kind} {}",
+        norm_trig.replace(',', " "),
+        norm_scope.replace(',', " ")
     ));
 
     conn.execute(
-        "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9)
+        "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit, scope, weight, section)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(id) DO UPDATE SET
              kind=excluded.kind,
              triggers=excluded.triggers,
@@ -338,9 +602,23 @@ pub fn add_rule_with_provenance(
              search_tokens=excluded.search_tokens,
              source_file=excluded.source_file,
              source_hash=excluded.source_hash,
-             git_commit=excluded.git_commit",
+             git_commit=excluded.git_commit,
+             scope=excluded.scope,
+             weight=excluded.weight,
+             section=excluded.section",
         params![
-            rule_id, kind, norm_trig, norm_rule, tokens, now, norm_src, src_hash, git_commit
+            rule_id,
+            kind,
+            norm_trig,
+            norm_rule,
+            tokens,
+            now,
+            norm_src,
+            src_hash,
+            git_commit,
+            norm_scope,
+            eff_weight,
+            norm_section
         ],
     )?;
     conn.execute("DELETE FROM rules_fts WHERE id = ?1", params![rule_id])?;
@@ -406,6 +684,9 @@ fn contains_token_bounded(haystack: &str, needle: &str, block_left_slash: bool) 
 
 struct StoredRow {
     kind: String,
+    scope: String,
+    weight: f64,
+    section: String,
     triggers: String,
     rule: String,
     hits: i64,
@@ -451,6 +732,20 @@ pub fn match_rules_with_opts(
     kind_filter: Option<&str>,
     max_chars: usize,
 ) -> rusqlite::Result<(Vec<RuleMatch>, f64)> {
+    match_rules_scoped(conn, cwd, query, files, top_k, kind_filter, None, max_chars)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn match_rules_scoped(
+    conn: &Connection,
+    cwd: &Path,
+    query: &str,
+    files: &[String],
+    top_k: usize,
+    kind_filter: Option<&str>,
+    scope_filter: Option<&str>,
+    max_chars: usize,
+) -> rusqlite::Result<(Vec<RuleMatch>, f64)> {
     let t0 = Instant::now();
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut rows_by_id: HashMap<String, StoredRow> = HashMap::new();
@@ -459,6 +754,12 @@ pub fn match_rules_with_opts(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase());
+    let requested_scopes: Vec<String> = scope_filter
+        .unwrap_or("")
+        .split([',', ';'])
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
     let q_lower = query.to_lowercase();
     let norm_files: Vec<String> = files
         .iter()
@@ -474,7 +775,7 @@ pub fn match_rules_with_opts(
 
     {
         let mut stmt = conn.prepare(
-            "SELECT id, kind, triggers, rule, hits, created_at, source_file, source_hash FROM rules",
+            "SELECT id, kind, triggers, rule, hits, created_at, source_file, source_hash, scope, weight, section FROM rules",
         )?;
         let iter = stmt.query_map([], |r| {
             Ok((
@@ -487,6 +788,9 @@ pub fn match_rules_with_opts(
                     created_at: r.get(5)?,
                     source_file: r.get(6)?,
                     source_hash: r.get(7)?,
+                    scope: r.get(8).unwrap_or_default(),
+                    weight: r.get(9).unwrap_or(1.0),
+                    section: r.get(10).unwrap_or_default(),
                 },
             ))
         })?;
@@ -496,6 +800,9 @@ pub fn match_rules_with_opts(
                 if !row.kind.to_ascii_lowercase().contains(kr.as_str()) {
                     continue;
                 }
+            }
+            if !scope_matches(&row.scope, &requested_scopes) {
+                continue;
             }
             let mut sc = 0.0;
             for trig in row
@@ -557,7 +864,7 @@ pub fn match_rules_with_opts(
             .collect::<Vec<_>>()
             .join(" OR ");
         if let Ok(mut fts_stmt) = conn.prepare(
-            "SELECT id, bm25(rules_fts) AS rank FROM rules_fts WHERE rules_fts MATCH ?1 ORDER BY rank LIMIT 20",
+            "SELECT id, bm25(rules_fts) AS rank FROM rules_fts WHERE rules_fts MATCH ?1 ORDER BY rank LIMIT 64",
         ) {
             if let Ok(rows) = fts_stmt.query_map(params![fts_expr], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
@@ -592,6 +899,12 @@ pub fn match_rules_with_opts(
                         0.65
                     };
                 }
+                let eff_w = if r.weight.is_finite() {
+                    r.weight.clamp(0.05, 100.0)
+                } else {
+                    1.0
+                };
+                *sc = (*sc).max(0.05) * eff_w;
                 provenance_by_id.insert(rid.clone(), (is_stale, reason));
             }
         }
@@ -618,6 +931,9 @@ pub fn match_rules_with_opts(
             results.push(RuleMatch {
                 id: rid,
                 kind: r.kind.clone(),
+                scope: r.scope.clone(),
+                weight: r.weight,
+                section: r.section.clone(),
                 triggers: r.triggers.clone(),
                 rule: r.rule.clone(),
                 score: (sc * 100.0).round() / 100.0,
@@ -631,6 +947,616 @@ pub fn match_rules_with_opts(
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     Ok((results, elapsed_ms))
+}
+
+struct SyncEntryDraft {
+    triggers: String,
+    rule: String,
+    kind: String,
+    scope: String,
+    weight: f64,
+    section: String,
+}
+
+fn expand_globs(globs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in globs {
+        for part in raw.split(',') {
+            let clean = part.trim().to_ascii_lowercase();
+            if !clean.is_empty() && !out.contains(&clean) {
+                out.push(clean);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.extend([
+            "*.md".to_string(),
+            "*.markdown".to_string(),
+            "*.json".to_string(),
+            "*.jsonl".to_string(),
+        ]);
+    }
+    out
+}
+
+fn matches_any_glob(rel_path: &str, file_name: &str, globs: &[String]) -> bool {
+    let rel_low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let name_low = file_name.to_ascii_lowercase();
+    globs
+        .iter()
+        .any(|g| wildcard_match(g, &name_low) || wildcard_match(g, &rel_low))
+}
+
+fn collect_sync_files(root: &Path, globs: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return out;
+    }
+    let skip_dirs = [
+        ".git",
+        "node_modules",
+        "target",
+        ".recall",
+        ".sieve",
+        ".baton",
+        ".guard",
+        "__pycache__",
+        ".venv",
+        "venv",
+    ];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let fname = ent.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if !skip_dirs.iter().any(|s| s.eq_ignore_ascii_case(&fname)) {
+                    stack.push(p);
+                }
+            } else if p.is_file() {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if matches_any_glob(&rel, &fname, globs) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn derive_markdown_triggers(stem: &str, heading: &str) -> String {
+    let mut toks: Vec<String> = Vec::new();
+    for raw in [stem, heading] {
+        for part in raw.split(|c: char| !c.is_alphanumeric() && !is_cjk(c) && c != '_') {
+            let clean = part.trim();
+            if clean.chars().count() >= 2 && !toks.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                toks.push(clean.to_string());
+                if toks.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+    if toks.is_empty() {
+        stem.to_string()
+    } else {
+        toks.join(",")
+    }
+}
+
+fn compact_text_clip(raw: &str, max_chars: usize) -> String {
+    let joined = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= max_chars {
+        joined
+    } else {
+        let mut s: String = joined.chars().take(max_chars).collect();
+        s.push_str("...");
+        s
+    }
+}
+
+fn parse_markdown_entries(
+    file_path: &Path,
+    text: &str,
+    default_scope: &str,
+    default_kind: &str,
+    default_weight: f64,
+) -> Vec<SyncEntryDraft> {
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("doc");
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let mut cur_heading = stem.to_string();
+    let mut cur_lines: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            let trimmed_h = t.trim_start_matches('#').trim();
+            if !trimmed_h.is_empty()
+                && t.as_bytes().get(t.len() - trimmed_h.len() - 1) == Some(&b' ')
+            {
+                if !cur_lines.is_empty() {
+                    sections.push((cur_heading.clone(), std::mem::take(&mut cur_lines)));
+                }
+                cur_heading = trimmed_h.to_string();
+                continue;
+            }
+        }
+        if !t.is_empty() {
+            cur_lines.push(t.to_string());
+        }
+    }
+    if !cur_lines.is_empty() {
+        sections.push((cur_heading, cur_lines));
+    }
+
+    let mut entries = Vec::new();
+    for (heading, lines) in sections {
+        let body = compact_text_clip(&lines.join(" "), 760);
+        if body.len() < 4 {
+            continue;
+        }
+        let triggers = derive_markdown_triggers(stem, &heading);
+        entries.push(SyncEntryDraft {
+            triggers,
+            rule: body,
+            kind: default_kind.to_string(),
+            scope: default_scope.to_string(),
+            weight: default_weight,
+            section: heading,
+        });
+    }
+    entries
+}
+
+fn parse_json_obj_entry(
+    obj: &serde_json::Map<String, Value>,
+    stem: &str,
+    default_scope: &str,
+    default_kind: &str,
+    default_weight: f64,
+) -> Option<SyncEntryDraft> {
+    let rule = ["rule", "text", "content", "summary", "snippet", "body"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+        .map(|s| compact_text_clip(s, 760))
+        .filter(|s| !s.is_empty())?;
+    let section = ["section", "title", "heading", "name", "id"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let triggers = if let Some(v) = obj
+        .get("triggers")
+        .or_else(|| obj.get("tags"))
+        .or_else(|| obj.get("keywords"))
+    {
+        if let Some(s) = v.as_str() {
+            s.trim().to_string()
+        } else if let Some(arr) = v.as_array() {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let triggers = if triggers.is_empty() {
+        derive_markdown_triggers(stem, if section.is_empty() { &rule } else { &section })
+    } else {
+        triggers
+    };
+    let kind = obj
+        .get("kind")
+        .or_else(|| obj.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_kind)
+        .to_string();
+    let item_scope = if let Some(v) = obj.get("scope").or_else(|| obj.get("scopes")) {
+        if let Some(s) = v.as_str() {
+            s.to_string()
+        } else if let Some(arr) = v.as_array() {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let merged_scope = normalize_scopes(&format!("{default_scope},{item_scope}"));
+    let weight = obj
+        .get("weight")
+        .and_then(Value::as_f64)
+        .unwrap_or(default_weight);
+    Some(SyncEntryDraft {
+        triggers,
+        rule,
+        kind,
+        scope: merged_scope,
+        weight,
+        section,
+    })
+}
+
+fn parse_json_entries(
+    file_path: &Path,
+    text: &str,
+    default_scope: &str,
+    default_kind: &str,
+    default_weight: f64,
+) -> Vec<SyncEntryDraft> {
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data");
+    let mut out = Vec::new();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "jsonl" {
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(t) {
+                if let Some(d) =
+                    parse_json_obj_entry(&obj, stem, default_scope, default_kind, default_weight)
+                {
+                    out.push(d);
+                }
+            }
+        }
+        return out;
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(text) {
+        let items_opt = val.as_array().or_else(|| {
+            ["items", "rules", "entries", "cards", "records"]
+                .iter()
+                .find_map(|k| val.get(*k).and_then(Value::as_array))
+        });
+        if let Some(arr) = items_opt {
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    if let Some(d) =
+                        parse_json_obj_entry(obj, stem, default_scope, default_kind, default_weight)
+                    {
+                        out.push(d);
+                    }
+                }
+            }
+        } else if let Some(obj) = val.as_object() {
+            if let Some(d) =
+                parse_json_obj_entry(obj, stem, default_scope, default_kind, default_weight)
+            {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+fn file_mtime_ns_and_size(path: &Path) -> (i64, i64) {
+    let Ok(meta) = fs::metadata(path) else {
+        return (0, 0);
+    };
+    let sz = meta.len() as i64;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    (mtime_ns, sz)
+}
+
+fn normalize_sync_key(cwd: &Path, file_path: &Path) -> String {
+    let cwd_c = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let file_c = fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
+    if let Ok(rel) = file_c.strip_prefix(&cwd_c) {
+        return normalize_source_file(&rel.to_string_lossy());
+    }
+    let s = file_c.to_string_lossy().to_string();
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    normalize_source_file(stripped)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sync_path(
+    db_path: &Path,
+    cwd: &Path,
+    target_path: &Path,
+    globs: &[String],
+    scope: &str,
+    kind: &str,
+    weight: f64,
+    prune: bool,
+) -> Result<SyncReport, String> {
+    let t0 = Instant::now();
+    let resolved_root = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        cwd.join(target_path)
+    };
+    if !resolved_root.exists() {
+        return Err(format!("sync path not found: {}", resolved_root.display()));
+    }
+    let _lock = acquire_vault_lock(db_path)?;
+    let mut conn = open_vault(db_path).map_err(|e| e.to_string())?;
+    let eff_globs = expand_globs(globs);
+    let norm_scope = normalize_scopes(scope);
+    let eff_weight = if weight.is_finite() {
+        weight.clamp(0.05, 100.0)
+    } else {
+        1.0
+    };
+    let files = collect_sync_files(&resolved_root, &eff_globs);
+    let scanned_files = files.len();
+
+    let mut existing_sync: HashMap<String, (i64, i64, String, String, usize)> = HashMap::new();
+    {
+        let mut st = conn
+            .prepare("SELECT file_path, mtime_ns, size_bytes, sha256, scope, entry_count FROM sync_files")
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)? as usize,
+                    ),
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for pair in rows.flatten() {
+            existing_sync.insert(pair.0, pair.1);
+        }
+    }
+
+    let now = now_epoch();
+    let git_commit = git_head_short(cwd);
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut indexed_files = 0usize;
+    let mut skipped_unchanged = 0usize;
+    let mut indexed_entries = 0usize;
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+
+    for fp in &files {
+        let key = normalize_sync_key(cwd, fp);
+        seen_keys.insert(key.clone());
+        let (mtime_ns, size_bytes) = file_mtime_ns_and_size(fp);
+        if let Some((prev_m, prev_sz, _prev_sha, prev_scope, _cnt)) = existing_sync.get(&key) {
+            if *prev_m == mtime_ns && *prev_sz == size_bytes && prev_scope == &norm_scope {
+                skipped_unchanged += 1;
+                continue;
+            }
+        }
+        let Ok(bytes) = fs::read(fp) else {
+            continue;
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let full_sha = format!("{:x}", hasher.finalize());
+        let short_sha = full_sha[..16].to_string();
+
+        if let Some((_prev_m, _prev_sz, prev_sha, prev_scope, _cnt)) = existing_sync.get(&key) {
+            if prev_sha == &full_sha && prev_scope == &norm_scope {
+                let _ = tx.execute(
+                    "UPDATE sync_files SET mtime_ns = ?1, size_bytes = ?2, synced_at = ?3 WHERE file_path = ?4",
+                    params![mtime_ns, size_bytes, now, key],
+                );
+                skipped_unchanged += 1;
+                continue;
+            }
+        }
+
+        let text = String::from_utf8_lossy(&bytes);
+        let ext = fp
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let drafts = if ext == "json" || ext == "jsonl" {
+            parse_json_entries(fp, &text, &norm_scope, kind, eff_weight)
+        } else {
+            parse_markdown_entries(fp, &text, &norm_scope, kind, eff_weight)
+        };
+
+        // Atomically replace all rules previously indexed from this source_file
+        let old_ids: Vec<String> = {
+            let mut st = tx
+                .prepare("SELECT id FROM rules WHERE source_file = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map(params![key], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        for oid in &old_ids {
+            let _ = tx.execute("DELETE FROM rules WHERE id = ?1", params![oid]);
+            let _ = tx.execute("DELETE FROM rules_fts WHERE id = ?1", params![oid]);
+        }
+
+        let mut inserted_for_file = 0usize;
+        for d in drafts {
+            let norm_rule = d.rule.split_whitespace().collect::<Vec<_>>().join(" ");
+            if norm_rule.is_empty() {
+                continue;
+            }
+            let norm_trig = d
+                .triggers
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            let d_scope = normalize_scopes(&d.scope);
+            let d_weight = if d.weight.is_finite() {
+                d.weight.clamp(0.05, 100.0)
+            } else {
+                1.0
+            };
+            let mut id_h = Sha256::new();
+            id_h.update(format!("{key}::{}::{}::{norm_rule}", d.section, d_scope).as_bytes());
+            let rid = format!("{:x}", id_h.finalize())[..10].to_string();
+            let tokens = tokenize_cjk_hybrid(&format!(
+                "{} {} {norm_rule} {} {}",
+                norm_trig.replace(',', " "),
+                d.section,
+                d.kind,
+                d_scope.replace(',', " ")
+            ));
+            tx.execute(
+                "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit, scope, weight, section)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET
+                     kind=excluded.kind,
+                     triggers=excluded.triggers,
+                     rule=excluded.rule,
+                     search_tokens=excluded.search_tokens,
+                     source_file=excluded.source_file,
+                     source_hash=excluded.source_hash,
+                     git_commit=excluded.git_commit,
+                     scope=excluded.scope,
+                     weight=excluded.weight,
+                     section=excluded.section",
+                params![
+                    rid,
+                    d.kind,
+                    norm_trig,
+                    norm_rule,
+                    tokens,
+                    now,
+                    key,
+                    short_sha,
+                    git_commit,
+                    d_scope,
+                    d_weight,
+                    d.section
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            let _ = tx.execute("DELETE FROM rules_fts WHERE id = ?1", params![rid]);
+            tx.execute(
+                "INSERT INTO rules_fts (id, search_tokens) VALUES (?1, ?2)",
+                params![rid, tokens],
+            )
+            .map_err(|e| e.to_string())?;
+            inserted_for_file += 1;
+        }
+
+        tx.execute(
+            "INSERT INTO sync_files (file_path, mtime_ns, size_bytes, sha256, scope, entry_count, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(file_path) DO UPDATE SET
+                 mtime_ns=excluded.mtime_ns,
+                 size_bytes=excluded.size_bytes,
+                 sha256=excluded.sha256,
+                 scope=excluded.scope,
+                 entry_count=excluded.entry_count,
+                 synced_at=excluded.synced_at",
+            params![
+                key,
+                mtime_ns,
+                size_bytes,
+                full_sha,
+                norm_scope,
+                inserted_for_file as i64,
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        indexed_files += 1;
+        indexed_entries += inserted_for_file;
+    }
+
+    let mut pruned_files = 0usize;
+    if prune {
+        let root_key = normalize_sync_key(cwd, &resolved_root);
+        let root_prefix = if resolved_root.is_dir() && !root_key.is_empty() && root_key != "." {
+            format!("{}/", root_key.trim_end_matches('/'))
+        } else {
+            String::new()
+        };
+        for tracked_fp in existing_sync.keys() {
+            if seen_keys.contains(tracked_fp) {
+                continue;
+            }
+            let in_scope_tree = if resolved_root.is_file() {
+                tracked_fp == &root_key
+            } else if root_prefix.is_empty() {
+                true
+            } else {
+                tracked_fp.starts_with(&root_prefix) || tracked_fp == &root_key
+            };
+            let missing_on_disk = !resolve_provenance_path(cwd, tracked_fp).exists();
+            if in_scope_tree || missing_on_disk {
+                let old_ids: Vec<String> = {
+                    let mut st = tx
+                        .prepare("SELECT id FROM rules WHERE source_file = ?1")
+                        .map_err(|e| e.to_string())?;
+                    let rows = st
+                        .query_map(params![tracked_fp], |r| r.get::<_, String>(0))
+                        .map_err(|e| e.to_string())?;
+                    rows.flatten().collect()
+                };
+                for oid in &old_ids {
+                    let _ = tx.execute("DELETE FROM rules WHERE id = ?1", params![oid]);
+                    let _ = tx.execute("DELETE FROM rules_fts WHERE id = ?1", params![oid]);
+                }
+                let _ = tx.execute(
+                    "DELETE FROM sync_files WHERE file_path = ?1",
+                    params![tracked_fp],
+                );
+                pruned_files += 1;
+            }
+        }
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+    Ok(SyncReport {
+        ok: true,
+        store: db_path.to_string_lossy().replace('\\', "/"),
+        root: resolved_root.to_string_lossy().replace('\\', "/"),
+        scanned_files,
+        indexed_files,
+        skipped_unchanged,
+        pruned_files,
+        indexed_entries,
+        elapsed_ms,
+    })
 }
 
 pub fn verify_vault(
@@ -728,7 +1654,51 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let conn = match open_vault(&vault_path(&cwd)) {
+    let db_path = resolve_vault_path(&cwd, cli.store.as_deref());
+
+    if let SubCmd::Sync {
+        path,
+        globs,
+        scope,
+        kind,
+        weight,
+        prune,
+        json: as_json,
+    } = cli.subcmd
+    {
+        return match sync_path(&db_path, &cwd, &path, &globs, &scope, &kind, weight, prune) {
+            Ok(rep) => {
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+                } else {
+                    println!(
+                        "[recall sync] scanned={} indexed={} skipped={} pruned={} entries={} ({:.2}ms)",
+                        rep.scanned_files,
+                        rep.indexed_files,
+                        rep.skipped_unchanged,
+                        rep.pruned_files,
+                        rep.indexed_entries,
+                        rep.elapsed_ms
+                    );
+                }
+                0
+            }
+            Err(e) => {
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({"ok": false, "error": e}))
+                            .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("[recall sync] failed: {e}");
+                }
+                1
+            }
+        };
+    }
+
+    let conn = match open_vault(&db_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[recall] failed to open SQLite vault: {e}");
@@ -742,15 +1712,32 @@ pub fn run_cli(args: &[String]) -> i32 {
             rule,
             kind,
             source_file,
-        } => match add_rule_with_provenance(&conn, &cwd, &triggers, &rule, &kind, &source_file) {
+            scope,
+            weight,
+            section,
+        } => match add_rule_full(
+            &conn,
+            &cwd,
+            &triggers,
+            &rule,
+            &kind,
+            &source_file,
+            &scope,
+            weight,
+            &section,
+        ) {
             Ok(rid) => {
-                if source_file.trim().is_empty() {
-                    println!("[recall] stored id={rid} kind={kind} triggers='{triggers}'");
-                } else {
-                    println!(
-                        "[recall] stored id={rid} kind={kind} triggers='{triggers}' file='{source_file}'"
-                    );
+                let mut extra = String::new();
+                if !source_file.trim().is_empty() {
+                    extra.push_str(&format!(" file='{source_file}'"));
                 }
+                if !scope.trim().is_empty() {
+                    extra.push_str(&format!(" scope='{}'", normalize_scopes(&scope)));
+                }
+                if (weight - 1.0).abs() > f64::EPSILON {
+                    extra.push_str(&format!(" weight={weight:.2}"));
+                }
+                println!("[recall] stored id={rid} kind={kind} triggers='{triggers}'{extra}");
                 0
             }
             Err(e) => {
@@ -763,6 +1750,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             files,
             top,
             kind,
+            scope,
             max_chars,
             json: as_json,
         } => {
@@ -773,7 +1761,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                 .map(String::from)
                 .collect();
             let kind_opt = (!kind.trim().is_empty()).then_some(kind.as_str());
-            match match_rules_with_opts(&conn, &cwd, &query, &file_list, top, kind_opt, max_chars) {
+            let scope_opt = (!scope.trim().is_empty()).then_some(scope.as_str());
+            match match_rules_scoped(
+                &conn, &cwd, &query, &file_list, top, kind_opt, scope_opt, max_chars,
+            ) {
                 Ok((hits, elapsed_ms)) => {
                     let negative_constraints: Vec<&RuleMatch> =
                         hits.iter().filter(|h| is_negative_kind(&h.kind)).collect();
@@ -783,6 +1774,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
+                                "ok": true,
                                 "elapsed_ms": (elapsed_ms * 100.0).round() / 100.0,
                                 "negative_constraints": negative_constraints,
                                 "rules": positive_rules,
@@ -808,8 +1800,13 @@ pub fn run_cli(args: &[String]) -> i32 {
                             } else {
                                 String::new()
                             };
+                            let scope_note = if h.scope.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [scope:{}]", h.scope)
+                            };
                             println!(
-                                "- **[{}]** (`{}`): {}{stale_note}",
+                                "- **[{}]**{scope_note} (`{}`): {}{stale_note}",
                                 h.kind, h.triggers, h.rule
                             );
                         }
@@ -820,8 +1817,13 @@ pub fn run_cli(args: &[String]) -> i32 {
                         } else {
                             String::new()
                         };
+                        let scope_note = if h.scope.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [scope:{}]", h.scope)
+                        };
                         println!(
-                            "- **[{}]** (`{}`): {}{stale_note}",
+                            "- **[{}]**{scope_note} (`{}`): {}{stale_note}",
                             h.kind, h.triggers, h.rule
                         );
                     }
@@ -833,6 +1835,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 }
             }
         }
+        SubCmd::Sync { .. } => unreachable!(),
         SubCmd::Verify {
             prune_stale,
             json: as_json,
@@ -987,6 +1990,173 @@ mod tests {
             match_rules_with_opts(&conn, &dir, "auth oauth", &[], 5, None, 60).unwrap();
         assert_eq!(capped.len(), 1, "max_chars=60 should cap to 1 rule");
         drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_store_scope_weight_and_bilingual_sync_incremental_prune() {
+        let dir = std::env::temp_dir().join(format!("ap_recall_sync_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("docs")).unwrap();
+        let store_path = dir.join("custom_store/my_vault.sqlite");
+
+        // Test custom --store + --scope + --weight + bilingual camelCase/CJK tokenization
+        let resolved = resolve_vault_path(&dir, Some(&store_path));
+        let conn = open_vault(&resolved).unwrap();
+        add_rule_full(
+            &conn,
+            &dir,
+            "token,cache",
+            "Refresh accessToken before TTL expires in webAuthFlow",
+            "pattern",
+            "",
+            "web,auth",
+            3.0,
+            "Token Refresh",
+        )
+        .unwrap();
+        add_rule_full(
+            &conn,
+            &dir,
+            "token,cache",
+            "Use ephemeral token in cli runner",
+            "pattern",
+            "",
+            "cli",
+            1.0,
+            "CLI Token",
+        )
+        .unwrap();
+        add_rule_full(
+            &conn,
+            &dir,
+            "编码,windows",
+            "Windows子进程必须开启UTF8模式防止中文乱码",
+            "gotcha",
+            "",
+            "win,ops",
+            2.0,
+            "中文编码",
+        )
+        .unwrap();
+
+        // Scope filter strictly isolates namespaces
+        let (web_hits, _) =
+            match_rules_scoped(&conn, &dir, "token", &[], 5, None, Some("web"), 0).unwrap();
+        assert_eq!(web_hits.len(), 1);
+        assert_eq!(web_hits[0].scope, "auth,web");
+        assert!((web_hits[0].weight - 3.0).abs() < 1e-6);
+
+        // Weight boost ranks weight=3.0 above weight=1.0 for same triggers
+        let (all_tok, _) = match_rules_scoped(&conn, &dir, "token", &[], 5, None, None, 0).unwrap();
+        assert!(all_tok.len() >= 2);
+        assert!(all_tok[0].score > all_tok[1].score);
+        assert_eq!(all_tok[0].section, "Token Refresh");
+
+        // Bilingual CJK + camelCase subtoken recall
+        let (camel_hits, _) =
+            match_rules_scoped(&conn, &dir, "access flow", &[], 5, None, Some("auth"), 0).unwrap();
+        assert_eq!(camel_hits.len(), 1);
+        let (cjk_hits, _) =
+            match_rules_scoped(&conn, &dir, "中文乱码", &[], 5, None, Some("win"), 0).unwrap();
+        assert_eq!(cjk_hits.len(), 1);
+        drop(conn);
+
+        // Incremental Markdown + JSON sync with mtime/SHA-256 skip and --prune
+        let md_p = dir.join("docs/guide.md");
+        fs::write(
+            &md_p,
+            "# Timeout Budget\nKeep network timeout under 30 seconds.\n\n## 中文缓存策略\n保持系统前缀稳定以复用缓存。\n",
+        )
+        .unwrap();
+        let json_p = dir.join("docs/cards.json");
+        fs::write(
+            &json_p,
+            r#"{"items":[{"title":"Pool Limit","triggers":["pool","socket"],"rule":"Recycle idle keepalive sockets before upstream timeout","kind":"pattern","scope":"net","weight":2.5}]}"#,
+        )
+        .unwrap();
+
+        let rep1 = sync_path(
+            &resolved,
+            &dir,
+            &dir.join("docs"),
+            &[],
+            "shared",
+            "note",
+            1.0,
+            false,
+        )
+        .unwrap();
+        assert!(rep1.ok);
+        assert_eq!(rep1.scanned_files, 2);
+        assert_eq!(rep1.indexed_files, 2);
+        assert_eq!(rep1.skipped_unchanged, 0);
+        assert_eq!(rep1.indexed_entries, 3);
+
+        // Second sync without modifications skips both files cleanly
+        let rep2 = sync_path(
+            &resolved,
+            &dir,
+            &dir.join("docs"),
+            &[],
+            "shared",
+            "note",
+            1.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rep2.indexed_files, 0);
+        assert_eq!(rep2.skipped_unchanged, 2);
+
+        // Query synced entries across scopes
+        let conn2 = open_vault(&resolved).unwrap();
+        let (net_hits, _) = match_rules_scoped(
+            &conn2,
+            &dir,
+            "keepalive socket",
+            &[],
+            5,
+            None,
+            Some("net"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(net_hits.len(), 1);
+        assert_eq!(net_hits[0].section, "Pool Limit");
+        let (zh_hits, _) =
+            match_rules_scoped(&conn2, &dir, "前缀 缓存", &[], 5, None, Some("shared"), 0).unwrap();
+        assert!(!zh_hits.is_empty());
+        drop(conn2);
+
+        // Delete cards.json and run sync --prune -> removes pruned file's entries
+        fs::remove_file(&json_p).unwrap();
+        let rep3 = sync_path(
+            &resolved,
+            &dir,
+            &dir.join("docs"),
+            &[],
+            "shared",
+            "note",
+            1.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(rep3.pruned_files, 1);
+
+        let conn3 = open_vault(&resolved).unwrap();
+        let (after_prune, _) = match_rules_scoped(
+            &conn3,
+            &dir,
+            "keepalive socket",
+            &[],
+            5,
+            None,
+            Some("net"),
+            0,
+        )
+        .unwrap();
+        assert!(after_prune.is_empty());
+        drop(conn3);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,7 @@
 use crate::http_probe::{classify_auth_matrix_diff_deep, execute_http_probe, HttpProbeResult};
-use crate::net_probe::{run_ws_cli, run_ws_origin_matrix};
+use crate::net_probe::{
+    probe_ws_origin_matrix_result, probe_ws_result, run_ws_cli, run_ws_origin_matrix,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -639,6 +641,7 @@ pub fn run_http_from_har(cfg: HarProbeConfig<'_>) -> i32 {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
                 "har_path": har_path,
                 "dry_run": dry_run,
                 "fuzz_schema": fuzz_schema,
@@ -712,24 +715,106 @@ pub fn run_ws_replay_har(
     let raw = match fs::read_to_string(Path::new(har_path)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ap probe ws --replay-har: failed to read `{har_path}`: {e}");
+            let msg = format!("ap probe ws --replay-har: failed to read `{har_path}`: {e}");
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "har_path": har_path,
+                        "error": msg,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 2;
         }
     };
     let parsed = match parse_har_or_jsonl(&raw) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ap probe ws --replay-har: {e}");
+            let msg = format!("ap probe ws --replay-har: {e}");
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "har_path": har_path,
+                        "error": msg,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 2;
         }
     };
     if parsed.ws_flows.is_empty() {
         if as_json {
-            println!("{}", json!({ "har_path": har_path, "ws_flows": 0 }));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "har_path": har_path,
+                    "ws_flows": 0,
+                    "flows": [],
+                }))
+                .unwrap_or_default()
+            );
         } else {
             println!("No WebSocket handshakes or frames found in `{har_path}`.");
         }
         return 0;
+    }
+
+    if as_json {
+        let mut worst_exit = 0i32;
+        let mut flow_results = Vec::with_capacity(parsed.ws_flows.len());
+        for flow in &parsed.ws_flows {
+            let mut frames = flow.sample_frames.clone();
+            frames.extend(send_extra.iter().cloned());
+            let (rc, val) = if origin_matrix || !origins.is_empty() {
+                probe_ws_origin_matrix_result(&flow.url, &frames, &flow.headers, origins, wait_ms)
+            } else {
+                probe_ws_result(&flow.url, &frames, &flow.headers, wait_ms)
+            };
+            if rc != 0 {
+                worst_exit = rc;
+            }
+            flow_results.push(val);
+        }
+        if flow_results.len() == 1 {
+            let mut single = flow_results.remove(0);
+            if let Some(obj) = single.as_object_mut() {
+                obj.entry("har_path".to_string())
+                    .or_insert_with(|| json!(har_path));
+                obj.entry("ws_flows".to_string())
+                    .or_insert_with(|| json!(1));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&single).unwrap_or_default()
+            );
+        } else {
+            let all_ok = worst_exit == 0
+                && flow_results
+                    .iter()
+                    .all(|v| v.get("ok").and_then(Value::as_bool) == Some(true));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": all_ok,
+                    "har_path": har_path,
+                    "ws_flows": flow_results.len(),
+                    "flows": flow_results,
+                }))
+                .unwrap_or_default()
+            );
+        }
+        return worst_exit;
     }
 
     let mut worst_exit = 0i32;
@@ -738,12 +823,12 @@ pub fn run_ws_replay_har(
         frames.extend(send_extra.iter().cloned());
         if origin_matrix || !origins.is_empty() {
             let rc =
-                run_ws_origin_matrix(&flow.url, &frames, &flow.headers, origins, wait_ms, as_json);
+                run_ws_origin_matrix(&flow.url, &frames, &flow.headers, origins, wait_ms, false);
             if rc != 0 {
                 worst_exit = rc;
             }
         } else {
-            let rc = run_ws_cli(&flow.url, &frames, &flow.headers, wait_ms, as_json);
+            let rc = run_ws_cli(&flow.url, &frames, &flow.headers, wait_ms, false);
             if rc != 0 {
                 worst_exit = rc;
             }

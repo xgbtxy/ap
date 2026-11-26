@@ -40,7 +40,8 @@ mod win_replace {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        for attempt in 0..16u64 {
+        let pid = std::process::id() as u64;
+        for attempt in 0..20u64 {
             let ok = unsafe {
                 MoveFileExW(
                     src_w.as_mut_ptr(),
@@ -52,9 +53,10 @@ mod win_replace {
                 return Ok(());
             }
             let err = unsafe { GetLastError() };
-            // Retry on transient ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32)
-            if (err == 5 || err == 32) && attempt < 15 {
-                std::thread::sleep(std::time::Duration::from_millis(8 + attempt * 4));
+            // Jittered retry on transient ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32)
+            if (err == 5 || err == 32) && attempt < 19 {
+                let jitter = (pid.wrapping_mul(29) + attempt * 13) % 17;
+                std::thread::sleep(std::time::Duration::from_millis(6 + attempt * 4 + jitter));
                 continue;
             }
             return Err(format!("MoveFileExW failed (win32_err={err})"));
@@ -72,7 +74,7 @@ mod win_replace {
     }
 }
 
-struct FrontierLockGuard {
+pub struct FrontierLockGuard {
     lock_path: PathBuf,
 }
 
@@ -82,9 +84,16 @@ impl Drop for FrontierLockGuard {
     }
 }
 
-fn acquire_frontier_lock(store_path: &Path) -> Result<FrontierLockGuard, String> {
-    let lock_path = store_path.with_extension("json.lock");
-    let deadline = SystemTime::now() + Duration::from_secs(4);
+pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String> {
+    if let Some(parent) = store_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut os = store_path.as_os_str().to_os_string();
+    os.push(".lock");
+    let lock_path = PathBuf::from(os);
+    let deadline = SystemTime::now() + Duration::from_secs(5);
+    let pid = std::process::id();
+    let mut attempt = 0u64;
     loop {
         match OpenOptions::new()
             .write(true)
@@ -92,7 +101,7 @@ fn acquire_frontier_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
             .open(&lock_path)
         {
             Ok(mut f) => {
-                let _ = writeln!(f, "pid={}", std::process::id());
+                let _ = writeln!(f, "pid={pid}");
                 return Ok(FrontierLockGuard { lock_path });
             }
             Err(e)
@@ -113,15 +122,111 @@ fn acquire_frontier_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
                 }
                 if SystemTime::now() >= deadline {
                     return Err(format!(
-                        "Timed out waiting for frontier lock {}: {e}",
+                        "Timed out waiting for lock {}: {e}",
                         lock_path.display()
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(8));
+                attempt += 1;
+                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 7) % 17;
+                std::thread::sleep(Duration::from_millis(6 + jitter));
             }
             Err(e) => return Err(e.to_string()),
         }
     }
+}
+
+pub fn atomic_write_text(dst: &Path, body: &str) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let seq = FRONTIER_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut os = dst.as_os_str().to_os_string();
+    os.push(format!(".{}.{nanos}.{seq}.tmp", std::process::id()));
+    let tmp = PathBuf::from(os);
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        let _ = f.sync_all();
+    }
+    if let Err(e) = win_replace::replace_atomic(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+pub fn load_exclude_file(path: &Path) -> Result<Vec<String>, String> {
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect())
+}
+
+fn glob_match_ci(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+pub fn item_matches_exclude(item: &FrontierItem, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let target_low = item.target.replace('\\', "/").to_ascii_lowercase();
+    let fname_low = target_low.rsplit('/').next().unwrap_or(&target_low);
+    let module_low = item.module.replace('\\', "/").to_ascii_lowercase();
+    let symbol_low = item.symbol.to_ascii_lowercase();
+    let axis_low = item.axis.to_ascii_lowercase();
+    for raw in excludes {
+        let pat = raw.trim().replace('\\', "/").to_ascii_lowercase();
+        if pat.is_empty() || pat.starts_with('#') {
+            continue;
+        }
+        if pat.contains('*') || pat.contains('?') {
+            if glob_match_ci(&pat, &target_low)
+                || glob_match_ci(&pat, fname_low)
+                || glob_match_ci(&pat, &module_low)
+                || glob_match_ci(&pat, &symbol_low)
+            {
+                return true;
+            }
+        } else if target_low.contains(&pat)
+            || module_low.contains(&pat)
+            || symbol_low.contains(&pat)
+            || axis_low == pat
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,29 +340,15 @@ pub fn load_frontier(store_path: &Path) -> FrontierState {
     FrontierState::default()
 }
 
-pub fn save_frontier(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
-    if let Some(parent) = store_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let _lock = acquire_frontier_lock(store_path)?;
+pub fn save_frontier_unlocked(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
     state.updated_at = now_iso_utc();
-    let seq = FRONTIER_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = store_path.with_extension(format!("json.{}.{nanos}.{seq}.tmp", std::process::id()));
     let body = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    {
-        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
-        let _ = f.sync_all();
-    }
-    if let Err(e) = win_replace::replace_atomic(&tmp, store_path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    atomic_write_text(store_path, &body)
+}
+
+pub fn save_frontier(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
+    let _lock = acquire_file_lock(store_path)?;
+    save_frontier_unlocked(store_path, state)
 }
 
 fn upsert_item(state: &mut FrontierState, item: FrontierItem) -> bool {
@@ -305,6 +396,15 @@ fn upsert_item(state: &mut FrontierState, item: FrontierItem) -> bool {
 }
 
 pub fn seed_from_json_str(state: &mut FrontierState, raw: &str) -> Result<(usize, usize), String> {
+    let (added, skipped, _) = seed_from_json_str_with_excludes(state, raw, &[])?;
+    Ok((added, skipped))
+}
+
+pub fn seed_from_json_str_with_excludes(
+    state: &mut FrontierState,
+    raw: &str,
+    excludes: &[String],
+) -> Result<(usize, usize, usize), String> {
     let val: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     if let Some(root) = val
         .get("root")
@@ -325,6 +425,7 @@ pub fn seed_from_json_str(state: &mut FrontierState, raw: &str) -> Result<(usize
     let now = now_iso_utc();
     let mut added = 0usize;
     let mut skipped = 0usize;
+    let mut filtered = 0usize;
     for row in arr {
         let axis = row
             .get("axis")
@@ -385,31 +486,32 @@ pub fn seed_from_json_str(state: &mut FrontierState, raw: &str) -> Result<(usize
                     ))
                 )
             });
-        let inserted = upsert_item(
-            state,
-            FrontierItem {
-                id,
-                axis,
-                module,
-                target,
-                line,
-                symbol,
-                snippet,
-                guard_hint,
-                score,
-                status: FrontierStatus::Unvisited,
-                reason: String::new(),
-                evidence_ref: String::new(),
-                updated_at: now.clone(),
-            },
-        );
-        if inserted {
+        let item = FrontierItem {
+            id,
+            axis,
+            module,
+            target,
+            line,
+            symbol,
+            snippet,
+            guard_hint,
+            score,
+            status: FrontierStatus::Unvisited,
+            reason: String::new(),
+            evidence_ref: String::new(),
+            updated_at: now.clone(),
+        };
+        if item_matches_exclude(&item, excludes) {
+            filtered += 1;
+            continue;
+        }
+        if upsert_item(state, item) {
             added += 1;
         } else {
             skipped += 1;
         }
     }
-    Ok((added, skipped))
+    Ok((added, skipped, filtered))
 }
 
 pub fn pick_next_diverse<'a>(
@@ -1702,6 +1804,16 @@ pub fn ingest_tool_json_str(
     raw: &str,
     kind_hint: Option<&str>,
 ) -> Result<(String, usize, usize), String> {
+    let (kind, added, skipped, _) = ingest_tool_json_str_with_excludes(state, raw, kind_hint, &[])?;
+    Ok((kind, added, skipped))
+}
+
+pub fn ingest_tool_json_str_with_excludes(
+    state: &mut FrontierState,
+    raw: &str,
+    kind_hint: Option<&str>,
+    excludes: &[String],
+) -> Result<(String, usize, usize, usize), String> {
     let val: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     let hint = kind_hint
         .map(|s| s.trim().to_ascii_lowercase())
@@ -1743,8 +1855,14 @@ pub fn ingest_tool_json_str(
 
     let mut added = 0usize;
     let mut skipped = 0usize;
+    let mut filtered = 0usize;
     let mut push_item = |d: ItemDraft<'_>| {
-        if upsert_item(state, make_frontier_item(d)) {
+        let item = make_frontier_item(d);
+        if item_matches_exclude(&item, excludes) {
+            filtered += 1;
+            return;
+        }
+        if upsert_item(state, item) {
             added += 1;
         } else {
             skipped += 1;
@@ -1802,7 +1920,7 @@ pub fn ingest_tool_json_str(
                 });
             }
         }
-        return Ok(("variants".to_string(), added, skipped));
+        return Ok(("variants".to_string(), added, skipped, filtered));
     }
 
     if is_http_mutate {
@@ -1840,7 +1958,7 @@ pub fn ingest_tool_json_str(
                 score,
             });
         }
-        return Ok(("http_mutate_matrix".to_string(), added, skipped));
+        return Ok(("http_mutate_matrix".to_string(), added, skipped, filtered));
     }
 
     if is_ai_surface {
@@ -1880,7 +1998,7 @@ pub fn ingest_tool_json_str(
                 score,
             });
         }
-        return Ok(("ai_surface".to_string(), added, skipped));
+        return Ok(("ai_surface".to_string(), added, skipped, filtered));
     }
 
     if is_archive_surface {
@@ -1986,7 +2104,7 @@ pub fn ingest_tool_json_str(
         if let Some(js) = surf_inner.get("js_surface").filter(|v| v.is_object()) {
             ingest_js_surface_obj(js, arch_label, &mut push_item);
         }
-        return Ok(("archive_surface".to_string(), added, skipped));
+        return Ok(("archive_surface".to_string(), added, skipped, filtered));
     }
 
     if is_bin_surface {
@@ -2054,7 +2172,7 @@ pub fn ingest_tool_json_str(
                 });
             }
         }
-        return Ok(("binary_surface".to_string(), added, skipped));
+        return Ok(("binary_surface".to_string(), added, skipped, filtered));
     }
 
     if is_routes {
@@ -2065,11 +2183,11 @@ pub fn ingest_tool_json_str(
             .unwrap_or("bundle")
             .trim();
         let kind = ingest_js_surface_obj(surf_inner, src_label, &mut push_item);
-        return Ok((kind.to_string(), added, skipped));
+        return Ok((kind.to_string(), added, skipped, filtered));
     }
 
-    let (a, s) = seed_from_json_str(state, raw)?;
-    Ok(("frontier_items".to_string(), a, s))
+    let (a, s, f) = seed_from_json_str_with_excludes(state, raw, excludes)?;
+    Ok(("frontier_items".to_string(), a, s, f))
 }
 
 pub struct FrontierSeedOpts<'a> {
@@ -2081,35 +2199,42 @@ pub struct FrontierSeedOpts<'a> {
     pub module: Option<&'a str>,
     pub note: Option<&'a str>,
     pub score: u32,
+    pub excludes: &'a [String],
     pub as_json: bool,
 }
 
 pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
     let store_path = resolve_store_path(cwd, opts.store);
-    let mut state = load_frontier(&store_path);
-    let (added, skipped) = if opts.from_stdin {
+    let raw_input: Option<String> = if opts.from_stdin {
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
             eprintln!("[baton frontier] failed to read stdin");
             return 1;
         }
-        match seed_from_json_str(&mut state, &buf) {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("[baton frontier] {e}");
-                return 1;
-            }
-        }
+        Some(buf)
     } else if let Some(path_str) = opts.from_json {
-        let raw = match fs::read_to_string(path_str) {
-            Ok(s) => s,
+        match fs::read_to_string(path_str) {
+            Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("[baton frontier] cannot read {path_str}: {e}");
                 return 1;
             }
-        };
-        match seed_from_json_str(&mut state, &raw) {
-            Ok(pair) => pair,
+        }
+    } else {
+        None
+    };
+
+    let _lock = match acquire_file_lock(&store_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[baton frontier] lock failed: {e}");
+            return 1;
+        }
+    };
+    let mut state = load_frontier(&store_path);
+    let (added, skipped, filtered) = if let Some(raw) = raw_input {
+        match seed_from_json_str_with_excludes(&mut state, &raw, opts.excludes) {
+            Ok(triple) => triple,
             Err(e) => {
                 eprintln!("[baton frontier] {e}");
                 return 1;
@@ -2122,35 +2247,34 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
             .filter(|s| !s.is_empty())
             .unwrap_or("general");
         let id = format!("{}:{}", ax, fnv1a_hex(&format!("{ax}|{tgt}")));
-        let ins = upsert_item(
-            &mut state,
-            FrontierItem {
-                id,
-                axis: ax.to_string(),
-                module: opts.module.unwrap_or("").trim().to_string(),
-                target: tgt.to_string(),
-                line: 0,
-                symbol: String::new(),
-                snippet: clip(opts.note.unwrap_or(""), 180),
-                guard_hint: String::new(),
-                score: opts.score,
-                status: FrontierStatus::Unvisited,
-                reason: String::new(),
-                evidence_ref: String::new(),
-                updated_at: now_iso_utc(),
-            },
-        );
-        if ins {
-            (1, 0)
+        let item = FrontierItem {
+            id,
+            axis: ax.to_string(),
+            module: opts.module.unwrap_or("").trim().to_string(),
+            target: tgt.to_string(),
+            line: 0,
+            symbol: String::new(),
+            snippet: clip(opts.note.unwrap_or(""), 180),
+            guard_hint: String::new(),
+            score: opts.score,
+            status: FrontierStatus::Unvisited,
+            reason: String::new(),
+            evidence_ref: String::new(),
+            updated_at: now_iso_utc(),
+        };
+        if item_matches_exclude(&item, opts.excludes) {
+            (0, 0, 1)
+        } else if upsert_item(&mut state, item) {
+            (1, 0, 0)
         } else {
-            (0, 1)
+            (0, 1, 0)
         }
     } else {
         eprintln!("[baton frontier] seed requires --from-json, --stdin, or --target");
         return 2;
     };
 
-    if let Err(e) = save_frontier(&store_path, &mut state) {
+    if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
         eprintln!("[baton frontier] save failed: {e}");
         return 1;
     }
@@ -2161,6 +2285,7 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
                 "ok": true,
                 "added": added,
                 "skipped_existing": skipped,
+                "filtered_excluded": filtered,
                 "total": state.items.len(),
                 "store": store_path.to_string_lossy(),
             }))
@@ -2168,7 +2293,7 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
         );
     } else {
         println!(
-            "[baton frontier] seeded +{added} new ({skipped} existing kept), total={}",
+            "[baton frontier] seeded +{added} new ({skipped} existing kept, {filtered} excluded), total={}",
             state.items.len()
         );
     }
@@ -2189,6 +2314,13 @@ pub fn run_frontier_mark(
         return 2;
     };
     let store_path = resolve_store_path(cwd, store);
+    let _lock = match acquire_file_lock(&store_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[baton frontier] lock failed: {e}");
+            return 1;
+        }
+    };
     let mut state = load_frontier(&store_path);
     let q_low = query.trim().to_ascii_lowercase();
     let now = now_iso_utc();
@@ -2219,7 +2351,7 @@ pub fn run_frontier_mark(
         }
         return 1;
     }
-    if let Err(e) = save_frontier(&store_path, &mut state) {
+    if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
         eprintln!("[baton frontier] save failed: {e}");
         return 1;
     }
@@ -2315,17 +2447,31 @@ pub fn run_frontier_sync_stopped(
     as_json: bool,
 ) -> i32 {
     let store_path = resolve_store_path(cwd, store);
+    let mut loaded_texts = Vec::new();
+    for tf in text_files {
+        if let Ok(txt) = fs::read_to_string(tf) {
+            let label = tf
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("notes")
+                .to_string();
+            loaded_texts.push((label, txt));
+        }
+    }
+    let _lock = match acquire_file_lock(&store_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[baton frontier] lock failed: {e}");
+            return 1;
+        }
+    };
     let mut state = load_frontier(&store_path);
     let mut total_marked = 0usize;
-    for tf in text_files {
-        let Ok(txt) = fs::read_to_string(tf) else {
-            continue;
-        };
-        let label = tf.file_name().and_then(|s| s.to_str()).unwrap_or("notes");
-        total_marked += sync_stopped_from_text(&mut state, label, &txt);
+    for (label, txt) in &loaded_texts {
+        total_marked += sync_stopped_from_text(&mut state, label, txt);
     }
     if total_marked > 0 {
-        let _ = save_frontier(&store_path, &mut state);
+        let _ = save_frontier_unlocked(&store_path, &mut state);
     }
     if as_json {
         println!(
@@ -2381,8 +2527,20 @@ pub fn run_frontier_ingest(
     kind_hint: Option<&str>,
     as_json: bool,
 ) -> i32 {
+    run_frontier_ingest_with_excludes(cwd, store, from_file, from_stdin, kind_hint, &[], as_json)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_frontier_ingest_with_excludes(
+    cwd: &Path,
+    store: Option<&str>,
+    from_file: Option<&str>,
+    from_stdin: bool,
+    kind_hint: Option<&str>,
+    excludes: &[String],
+    as_json: bool,
+) -> i32 {
     let store_path = resolve_store_path(cwd, store);
-    let mut state = load_frontier(&store_path);
     let raw = if from_stdin {
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
@@ -2403,14 +2561,23 @@ pub fn run_frontier_ingest(
         return 2;
     };
 
-    let (detected_kind, added, skipped) = match ingest_tool_json_str(&mut state, &raw, kind_hint) {
-        Ok(res) => res,
+    let _lock = match acquire_file_lock(&store_path) {
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("[baton frontier] {e}");
+            eprintln!("[baton frontier] lock failed: {e}");
             return 1;
         }
     };
-    if let Err(e) = save_frontier(&store_path, &mut state) {
+    let mut state = load_frontier(&store_path);
+    let (detected_kind, added, skipped, filtered) =
+        match ingest_tool_json_str_with_excludes(&mut state, &raw, kind_hint, excludes) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("[baton frontier] {e}");
+                return 1;
+            }
+        };
+    if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
         eprintln!("[baton frontier] save failed: {e}");
         return 1;
     }
@@ -2423,6 +2590,7 @@ pub fn run_frontier_ingest(
                 "detected_kind": detected_kind,
                 "added": added,
                 "skipped_existing": skipped,
+                "filtered_excluded": filtered,
                 "total": state.items.len(),
                 "store": store_path.to_string_lossy(),
                 "coverage_summary": cov,
@@ -2431,7 +2599,7 @@ pub fn run_frontier_ingest(
         );
     } else {
         println!(
-            "[baton frontier] ingested {detected_kind}: +{added} new ({skipped} existing kept), total={}, verdict={}",
+            "[baton frontier] ingested {detected_kind}: +{added} new ({skipped} existing kept, {filtered} excluded), total={}, verdict={}",
             state.items.len(),
             cov["exhaustion_verdict"].as_str().unwrap_or("UNKNOWN"),
         );
@@ -2843,6 +3011,98 @@ mod tests {
             }
         });
         assert!(!fp.with_extension("json.lock").exists(), "lock leaked");
+        let _ = fs::remove_dir_all(&td);
+    }
+
+    #[test]
+    fn seed_and_ingest_excludes_and_concurrent_locked_rmw() {
+        let td = std::env::temp_dir().join(format!(
+            "ap_frontier_excl_rmw_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&td);
+        fs::create_dir_all(&td).unwrap();
+
+        let excl_file = td.join("excludes.txt");
+        fs::write(&excl_file, "# noise filters\n*vcruntime*\n*.d.ts\n").unwrap();
+        let excludes = load_exclude_file(&excl_file).unwrap();
+        assert_eq!(excludes.len(), 2);
+
+        let mut st = FrontierState::default();
+        let seed_json = json!({
+            "items": [
+                {"axis": "binary_surface", "module": "bin", "target": "bin/vcruntime140.dll", "symbol": "init"},
+                {"axis": "web_api_route", "module": "types", "target": "types/index.d.ts", "symbol": "decl"},
+                {"axis": "web_api_route", "module": "api", "target": "src/api/admin.ts", "symbol": "deleteUser"}
+            ]
+        });
+        let (added, skipped, filtered) =
+            seed_from_json_str_with_excludes(&mut st, &seed_json.to_string(), &excludes).unwrap();
+        assert_eq!((added, skipped, filtered), (1, 0, 2));
+        assert_eq!(st.items.len(), 1);
+        assert_eq!(st.items[0].target, "src/api/admin.ts");
+
+        let variants_json = json!({
+            "target_sinks": ["exec"],
+            "siblings": [
+                {"file": "vendor/vcruntime_helper.c", "function": "f1", "sink": "exec", "sink_line": 10, "arg_taint": "PARAM_TAINTED", "guard_placement": "UNGUARDED", "is_outlier": true},
+                {"file": "src/worker/run.ts", "function": "runJob", "sink": "exec", "sink_line": 22, "arg_taint": "PARAM_TAINTED", "guard_placement": "UNGUARDED", "is_outlier": true}
+            ]
+        });
+        let (kind, i_added, i_skip, i_filt) = ingest_tool_json_str_with_excludes(
+            &mut st,
+            &variants_json.to_string(),
+            Some("variants"),
+            &excludes,
+        )
+        .unwrap();
+        assert_eq!(kind, "variants");
+        assert_eq!((i_added, i_skip, i_filt), (1, 0, 1));
+        assert_eq!(st.items.len(), 2);
+
+        // Multi-thread concurrent locked RMW via run_frontier_seed must preserve every thread's entry
+        let fp = td.join("frontier_rmw.json");
+        let fp_s = fp.to_string_lossy().to_string();
+        let bar = std::sync::Arc::new(std::sync::Barrier::new(6));
+        std::thread::scope(|s| {
+            for wid in 0..6usize {
+                let td_ref = &td;
+                let fp_ref = &fp_s;
+                let bar_c = std::sync::Arc::clone(&bar);
+                s.spawn(move || {
+                    bar_c.wait();
+                    for round in 0..5usize {
+                        let tgt = format!("src/mod_{wid}/ep_{round}.ts");
+                        let rc = run_frontier_seed(
+                            td_ref,
+                            &FrontierSeedOpts {
+                                store: Some(fp_ref.as_str()),
+                                from_json: None,
+                                from_stdin: false,
+                                axis: Some("web_api_route"),
+                                target: Some(&tgt),
+                                module: Some("api"),
+                                note: Some("concurrent seed"),
+                                score: 85,
+                                excludes: &[],
+                                as_json: true,
+                            },
+                        );
+                        assert_eq!(rc, 0);
+                    }
+                });
+            }
+        });
+        let final_st = load_frontier(&fp);
+        assert_eq!(
+            final_st.items.len(),
+            30,
+            "full RMW locking must preserve all 6x5 concurrent seeds without lost updates"
+        );
         let _ = fs::remove_dir_all(&td);
     }
 }

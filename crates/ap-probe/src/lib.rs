@@ -466,6 +466,12 @@ enum SubCmd {
         /// Enumerate live Windows RPC Endpoint Mapper bindings via rpcrt4.dll
         #[arg(long)]
         rpc: bool,
+        /// Enumerate running Windows processes with native Win32 Integrity Level, session ID & elevation
+        #[arg(long)]
+        procs: bool,
+        /// Combined single-shot Windows attack-surface sweep (`--weak-acl` + `--com` + `--rpc` + `--procs`)
+        #[arg(long)]
+        all: bool,
         /// Filter out standard Microsoft / Windows OS baseline pipes, System32 services, core COM DLLs & OS RPC bindings
         #[arg(long = "non-ms", alias = "exclude-microsoft")]
         non_ms: bool,
@@ -1079,11 +1085,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             unquoted,
             com,
             rpc,
+            procs,
+            all,
             non_ms,
             filter,
             max,
             json,
-        } => win::run_win_cli(
+        } => win::run_win_cli_ex(
             pipes,
             reg.as_deref(),
             acl.as_deref(),
@@ -1094,6 +1102,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             unquoted,
             com,
             rpc,
+            procs,
+            all,
             non_ms,
             filter.as_deref(),
             max,

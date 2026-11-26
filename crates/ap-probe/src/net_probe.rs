@@ -885,19 +885,24 @@ try{{$s.Close();$c.Close()}}catch{{}}; \
 }
 
 /// Deadline-bounded non-CDP RFC 6455 WebSocket (`ws://` / `wss://`) send/recv diagnostic client (zero hangs).
-pub fn run_ws_cli(
+pub(crate) fn probe_ws_result(
     url: &str,
     send_msgs: &[String],
     headers: &[String],
     wait_ms: u64,
-    as_json: bool,
-) -> i32 {
+) -> (i32, serde_json::Value) {
     let t0 = Instant::now();
     let (is_tls, host_port, host_only, port, req_path) = match parse_ws_target(url) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[probe ws] Invalid URL `{url}`: {e}");
-            return 2;
+            return (
+                2,
+                json!({
+                    "ok": false,
+                    "url": url,
+                    "error": format!("Invalid URL `{url}`: {e}"),
+                }),
+            );
         }
     };
     let req = build_ws_upgrade_req(&host_port, &req_path, headers, None);
@@ -907,8 +912,14 @@ pub fn run_ws_cli(
         let res = match run_wss_exchange(&host_only, port, &req, send_msgs, clamped_wait) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[probe ws] wss:// connect/exchange failed (`{url}`): {e}");
-                return 1;
+                return (
+                    1,
+                    json!({
+                        "ok": false,
+                        "url": url,
+                        "error": format!("wss:// connect/exchange failed (`{url}`): {e}"),
+                    }),
+                );
             }
         };
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0).round();
@@ -916,23 +927,17 @@ pub fn run_ws_cli(
         let status_line = res["status_line"].as_str().unwrap_or("");
         if !accepted {
             let rej_preview = res["headers_preview"].as_str().unwrap_or("");
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": false,
-                        "url": url,
-                        "handshake": status_line,
-                        "close_reason": "handshake_rejected",
-                        "headers_preview": rej_preview,
-                        "elapsed_ms": elapsed_ms,
-                    }))
-                    .unwrap_or_default()
-                );
-            } else {
-                eprintln!("[probe ws] Handshake rejected: `{status_line}` ({rej_preview})");
-            }
-            return 1;
+            return (
+                1,
+                json!({
+                    "ok": false,
+                    "url": url,
+                    "handshake": status_line,
+                    "close_reason": "handshake_rejected",
+                    "headers_preview": rej_preview,
+                    "elapsed_ms": elapsed_ms,
+                }),
+            );
         }
         let messages: Vec<String> = res["messages"]
             .as_array()
@@ -944,57 +949,69 @@ pub fn run_ws_cli(
             })
             .unwrap_or_default();
         let close_reason = res["close_reason"].as_str().unwrap_or("idle_timeout");
-        if as_json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": true,
-                    "url": url,
-                    "handshake": status_line,
-                    "elapsed_ms": elapsed_ms,
-                    "wait_ms": clamped_wait,
-                    "close_reason": close_reason,
-                    "close_code": res["close_code"],
-                    "close_message": res["close_message"],
-                    "received_count": messages.len(),
-                    "messages": messages,
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!(
-                "[probe ws] CONNECTED `{url}` ({status_line} | {elapsed_ms}ms | close={close_reason} | {} msg(s)):",
-                messages.len()
-            );
-            for (i, m) in messages.iter().enumerate() {
-                println!("  {}. {m}", i + 1);
-            }
-        }
-        return 0;
+        return (
+            0,
+            json!({
+                "ok": true,
+                "url": url,
+                "handshake": status_line,
+                "elapsed_ms": elapsed_ms,
+                "wait_ms": clamped_wait,
+                "close_reason": close_reason,
+                "close_code": res["close_code"],
+                "close_message": res["close_message"],
+                "received_count": messages.len(),
+                "messages": messages,
+            }),
+        );
     }
 
     let connect_target = ws_connect_addr_str(&host_only, port);
     let Ok(mut addrs) = connect_target.to_socket_addrs() else {
-        eprintln!("[probe ws] Failed to resolve `{connect_target}`");
-        return 2;
+        return (
+            2,
+            json!({
+                "ok": false,
+                "url": url,
+                "error": format!("Failed to resolve `{connect_target}`"),
+            }),
+        );
     };
     let Some(sa) = addrs.next() else {
-        eprintln!("[probe ws] No address resolved for `{connect_target}`");
-        return 2;
+        return (
+            2,
+            json!({
+                "ok": false,
+                "url": url,
+                "error": format!("No address resolved for `{connect_target}`"),
+            }),
+        );
     };
     let mut stream = match TcpStream::connect_timeout(&sa, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[probe ws] Connect failed (`{url}`): {e}");
-            return 1;
+            return (
+                1,
+                json!({
+                    "ok": false,
+                    "url": url,
+                    "error": format!("Connect failed (`{url}`): {e}"),
+                }),
+            );
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
 
     if let Err(e) = stream.write_all(req.as_bytes()) {
-        eprintln!("[probe ws] Handshake write error: {e}");
-        return 1;
+        return (
+            1,
+            json!({
+                "ok": false,
+                "url": url,
+                "error": format!("Handshake write error: {e}"),
+            }),
+        );
     }
 
     let mut hbuf = Vec::new();
@@ -1020,29 +1037,29 @@ pub fn run_ws_cli(
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" | ");
-        if as_json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": false,
-                    "url": url,
-                    "handshake": status_line,
-                    "close_reason": "handshake_rejected",
-                    "headers_preview": rej_preview,
-                    "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            eprintln!("[probe ws] Handshake rejected: `{status_line}` ({rej_preview})");
-        }
-        return 1;
+        return (
+            1,
+            json!({
+                "ok": false,
+                "url": url,
+                "handshake": status_line,
+                "close_reason": "handshake_rejected",
+                "headers_preview": rej_preview,
+                "elapsed_ms": (t0.elapsed().as_secs_f64() * 1000.0).round(),
+            }),
+        );
     }
 
     for msg in send_msgs {
         if let Err(e) = ws_write_text_frame(&mut stream, msg) {
-            eprintln!("[probe ws] {e}");
-            return 1;
+            return (
+                1,
+                json!({
+                    "ok": false,
+                    "url": url,
+                    "error": e,
+                }),
+            );
         }
     }
 
@@ -1145,33 +1162,57 @@ pub fn run_ws_cli(
     }
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0).round();
+    (
+        0,
+        json!({
+            "ok": true,
+            "url": url,
+            "handshake": status_line,
+            "elapsed_ms": elapsed_ms,
+            "wait_ms": clamped_wait,
+            "close_reason": close_reason,
+            "close_code": close_code,
+            "close_message": close_message,
+            "received_count": messages.len(),
+            "messages": messages,
+        }),
+    )
+}
+
+pub fn run_ws_cli(
+    url: &str,
+    send_msgs: &[String],
+    headers: &[String],
+    wait_ms: u64,
+    as_json: bool,
+) -> i32 {
+    let (rc, val) = probe_ws_result(url, send_msgs, headers, wait_ms);
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "url": url,
-                "handshake": status_line,
-                "elapsed_ms": elapsed_ms,
-                "wait_ms": clamped_wait,
-                "close_reason": close_reason,
-                "close_code": close_code,
-                "close_message": close_message,
-                "received_count": messages.len(),
-                "messages": messages,
-            }))
-            .unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else if rc != 0 {
+        if let Some(err) = val.get("error").and_then(serde_json::Value::as_str) {
+            eprintln!("[probe ws] {err}");
+        } else {
+            eprintln!(
+                "[probe ws] Handshake rejected: `{}` ({})",
+                val["handshake"].as_str().unwrap_or(""),
+                val["headers_preview"].as_str().unwrap_or("")
+            );
+        }
     } else {
+        let msgs = val["messages"].as_array().map(Vec::as_slice).unwrap_or(&[]);
         println!(
-            "[probe ws] CONNECTED `{url}` ({status_line} | {elapsed_ms}ms | close={close_reason} | {} msg(s)):",
-            messages.len()
+            "[probe ws] CONNECTED `{url}` ({} | {}ms | close={} | {} msg(s)):",
+            val["handshake"].as_str().unwrap_or(""),
+            val["elapsed_ms"].as_f64().unwrap_or(0.0),
+            val["close_reason"].as_str().unwrap_or("idle_timeout"),
+            msgs.len()
         );
-        for (i, m) in messages.iter().enumerate() {
-            println!("  {}. {m}", i + 1);
+        for (i, m) in msgs.iter().enumerate() {
+            println!("  {}. {}", i + 1, m.as_str().unwrap_or(""));
         }
     }
-    0
+    rc
 }
 
 fn ws_handshake_one_origin(
@@ -1357,14 +1398,13 @@ fn ws_handshake_one_origin(
 }
 
 /// Probe Cross-Site WebSocket Hijacking (CSWSH) across untrusted/null/omitted/localhost Origin headers.
-pub fn run_ws_origin_matrix(
+pub(crate) fn probe_ws_origin_matrix_result(
     url: &str,
     send_msgs: &[String],
     headers: &[String],
     custom_origins: &[String],
     wait_ms: u64,
-    as_json: bool,
-) -> i32 {
+) -> (i32, serde_json::Value) {
     let origin_specs: Vec<Option<String>> = if custom_origins.is_empty() {
         vec![
             None,
@@ -1399,19 +1439,32 @@ pub fn run_ws_origin_matrix(
     }
 
     let cswsh_vulnerable = !untrusted_accepted.is_empty();
+    (
+        0,
+        json!({
+            "ok": true,
+            "url": url,
+            "cswsh_vulnerable": cswsh_vulnerable,
+            "untrusted_accepted": untrusted_accepted,
+            "results": rows,
+        }),
+    )
+}
+
+pub fn run_ws_origin_matrix(
+    url: &str,
+    send_msgs: &[String],
+    headers: &[String],
+    custom_origins: &[String],
+    wait_ms: u64,
+    as_json: bool,
+) -> i32 {
+    let (rc, val) = probe_ws_origin_matrix_result(url, send_msgs, headers, custom_origins, wait_ms);
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "url": url,
-                "cswsh_vulnerable": cswsh_vulnerable,
-                "untrusted_accepted": untrusted_accepted,
-                "results": rows,
-            }))
-            .unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
     } else {
+        let cswsh_vulnerable = val["cswsh_vulnerable"].as_bool().unwrap_or(false);
+        let rows = val["results"].as_array().map(Vec::as_slice).unwrap_or(&[]);
         let badge = if cswsh_vulnerable {
             "[POSSIBLE-CSWSH]"
         } else {
@@ -1421,7 +1474,7 @@ pub fn run_ws_origin_matrix(
             "[probe ws origin-matrix] `{url}` {badge} ({} origins tested):",
             rows.len()
         );
-        for r in &rows {
+        for r in rows {
             println!(
                 "  - Origin={:<24} accepted={:<5} ({}) msgs={}",
                 r["origin"].as_str().unwrap_or("?"),
@@ -1431,7 +1484,7 @@ pub fn run_ws_origin_matrix(
             );
         }
     }
-    0
+    rc
 }
 
 /// Cross-platform TLS protocol & X.509 certificate inspector (uses native .NET SslStream on Windows / openssl on Unix).

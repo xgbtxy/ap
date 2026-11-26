@@ -14,6 +14,18 @@ fn ap_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ap"))
 }
 
+fn isolated_test_ap_home(cwd: &Path) -> PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cwd.to_string_lossy().hash(&mut h);
+    std::env::temp_dir().join("ap_test_homes").join(format!(
+        "p{}_{:016x}",
+        std::process::id(),
+        h.finish()
+    ))
+}
+
 fn run_ap(
     cwd: &Path,
     args: &[&str],
@@ -25,6 +37,12 @@ fn run_ap(
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let has_home_override = extra_env
+        .iter()
+        .any(|(k, _)| matches!(*k, "AP_HOME" | "HOME" | "USERPROFILE"));
+    if !has_home_override {
+        cmd.env("AP_HOME", isolated_test_ap_home(cwd));
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

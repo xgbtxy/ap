@@ -386,14 +386,16 @@ fn mcp_tools_schema() -> Value {
     },
     {
         "name": "ap_win",
-        "description": "Zero-subprocess Windows diagnostics inspector (Named Pipes + SDDL DACLs, Registry keys/values, file/dir ACLs, Win32 services, and process token user/IL/privileges) — immune to Git Bash quoting and MSYS2 pathconv.",
+        "description": "Zero-subprocess Windows diagnostics inspector (Named Pipes + PID/IL + SDDL DACLs, Registry, file/dir ACLs, Win32 services, process ILs, COM/RPC, and single-shot `--all` combined mode).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pipes": { "type": "boolean", "description": "Enumerate \\\\.\\pipe\\* and inspect SDDL/non-admin write ACEs" },
+                "pipes": { "type": "boolean", "description": "Enumerate \\\\.\\pipe\\* with server PID/IL and SDDL non-admin write ACEs" },
                 "reg": { "type": "string", "description": "Registry key to inspect, e.g. HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion" },
                 "acl": { "type": "string", "description": "File or directory path whose owner, SDDL DACL & non-admin writability to inspect" },
                 "services": { "type": "boolean", "description": "Enumerate Windows services (state, PID, start_type, bin_path, account)" },
+                "procs": { "type": "boolean", "description": "Enumerate running processes with PID, PPID, exe, session_id & Win32 Integrity Level" },
+                "all": { "type": "boolean", "description": "Run combined pipes+services+procs+weak_acl+unquoted+com+rpc sweep in 1 call" },
                 "whoami": { "type": "boolean", "description": "Inspect current process token user, SID, elevation, integrity level & privileges" },
                 "sig": { "type": "string", "description": "Inspect PE Authenticode signature & Windows catalog trust (signed, valid, subject, issuer, sha256)" },
                 "weak_acl": { "type": "string", "description": "Audit non-admin writable pipes/services/dirs (pass '' for OS sweep or a path)" },
@@ -401,7 +403,7 @@ fn mcp_tools_schema() -> Value {
                 "com": { "type": "boolean", "description": "Audit HKLM\\SOFTWARE\\Classes\\CLSID COM hijacks & AutoElevation" },
                 "rpc": { "type": "boolean", "description": "Enumerate live Windows RPC Endpoint Mapper bindings" },
                 "non_ms": { "type": "boolean", "description": "Filter out standard Microsoft / Windows OS baseline pipes, System32 services, core COM DLLs & OS RPC bindings" },
-                "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services/COM/RPC" },
+                "filter": { "type": "string", "description": "Optional case-insensitive substring filter for pipes/reg/services/procs/COM/RPC" },
                 "max": { "type": "integer", "description": "Max entries to return (default: 60)" }
             }
         }
@@ -635,12 +637,19 @@ fn mcp_tools_schema() -> Value {
         }),
         json!({
             "name": "ap_recall",
-            "description": "Sub-millisecond SQLite FTS5/BM25 triggered micro-memory vault with file-hash/git provenance & staleness invalidation: `match` (retrieve top-K rules for query/files), `add` (save triggers + rule, optionally bound to `--file`), `stats`, or `verify` (detect/prune stale rules).",
+            "description": "Sub-ms SQLite FTS5/BM25 micro-memory vault with scope/weight, custom `--store`, file-hash provenance & incremental doc `sync`: `match`, `add`, `sync`, `stats`, or `verify`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "description": "'match', 'add', 'stats', or 'verify'" },
+                    "action": { "type": "string", "description": "'match', 'add', 'sync', 'stats', or 'verify'" },
                     "cwd": { "type": "string", "description": "Workspace directory (default: '.')" },
+                    "store": { "type": "string", "description": "Optional custom SQLite vault path" },
+                    "scope": { "type": "string", "description": "Optional comma-separated scope tags for add/match/sync isolation" },
+                    "weight": { "type": "number", "description": "Optional ranking weight multiplier (default: 1.0)" },
+                    "section": { "type": "string", "description": "Optional section/heading label for add" },
+                    "path": { "type": "string", "description": "Directory or file path for `sync`" },
+                    "glob": { "type": "string", "description": "Comma-separated filename globs for `sync` (e.g. '*.md,*.json')" },
+                    "prune": { "type": "boolean", "description": "Prune deleted files from vault during `sync`" },
                     "query": { "type": "string", "description": "Task/command query for `match`" },
                     "files": { "type": "string", "description": "Comma-separated active file paths for `match`" },
                     "top": { "type": "integer", "description": "Max rules to retrieve (default: 3)" },
@@ -671,7 +680,7 @@ fn mcp_tools_schema() -> Value {
         }),
         json!({
             "name": "ap_surface",
-            "description": "Multi-axis guard-aware entrypoint & sink surface mapper (<150ms in-process): scans source code, manifests, minified bundles, virtual archives (.asar/.vsix/.zip/.jar) & optional native PE/ELF/SO binaries across 9 orthogonal axes and prioritizes unprotected/post-guard sinks.",
+            "description": "Multi-axis guard-aware entrypoint & sink surface mapper (<150ms in-process): scans source, manifests, minified bundles, archives (.asar/.vsix/.zip/.jar) & optional binaries across 9 axes with noise `--exclude` filtering.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -679,7 +688,9 @@ fn mcp_tools_schema() -> Value {
                     "max_files": { "type": "integer", "description": "Max files to scan (default: 1500)" },
                     "max_per_axis": { "type": "integer", "description": "Max ranked diverse items per axis (default: 12)" },
                     "include_vendor": { "type": "boolean", "description": "Also scan gitignored/vendor directories (default: false)" },
-                    "include_binaries": { "type": "boolean", "description": "Also scan native .exe/.dll/.so/.dylib binary strings/imports (default: false)" }
+                    "include_binaries": { "type": "boolean", "description": "Also scan native .exe/.dll/.so/.dylib binary strings/imports (default: false)" },
+                    "exclude": { "type": "array", "items": { "type": "string" }, "description": "Exclude globs/substrings/re: patterns" },
+                    "exclude_file": { "type": "string", "description": "File with one exclude pattern per line" }
                 }
             }
         }),
@@ -706,6 +717,8 @@ fn mcp_tools_schema() -> Value {
                     "ref": { "type": "string", "description": "For 'mark': evidence file/ref" },
                     "top_k": { "type": "integer", "description": "Max items (default: 5)" },
                     "exclude_axes": { "type": "array", "items": { "type": "string" }, "description": "Axes to deprioritize" },
+                    "exclude": { "type": "array", "items": { "type": "string" }, "description": "Exclude globs/substrings on seed/ingest" },
+                    "exclude_file": { "type": "string", "description": "Exclude pattern file on seed/ingest" },
                     "text_files": { "type": "array", "items": { "type": "string" }, "description": "For 'sync_stopped': note/ledger paths" }
                 },
                 "required": ["action"]
@@ -2655,6 +2668,12 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             if args.get("services").and_then(Value::as_bool) == Some(true) {
                 cli.push("--services".into());
             }
+            if args.get("procs").and_then(Value::as_bool) == Some(true) {
+                cli.push("--procs".into());
+            }
+            if args.get("all").and_then(Value::as_bool) == Some(true) {
+                cli.push("--all".into());
+            }
             if args.get("whoami").and_then(Value::as_bool) == Some(true) {
                 cli.push("--whoami".into());
             }
@@ -3416,7 +3435,57 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .to_ascii_lowercase();
             let cwd_p =
                 std::path::Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or("."));
-            let vp = ap_recall::vault_path(cwd_p);
+            let store_opt = args
+                .get("store")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::path::Path::new);
+            let vp = ap_recall::resolve_vault_path(cwd_p, store_opt);
+            if action == "sync" {
+                let sync_target = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(".");
+                let globs: Vec<String> = if let Some(s) = args.get("glob").and_then(Value::as_str) {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                        .collect()
+                } else if let Some(arr) = args.get("glob").and_then(Value::as_array) {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::trim))
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let scope = args.get("scope").and_then(Value::as_str).unwrap_or("");
+                let kind = args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("doc");
+                let weight = args.get("weight").and_then(Value::as_f64).unwrap_or(1.0);
+                let prune = args.get("prune").and_then(Value::as_bool).unwrap_or(false);
+                return match ap_recall::sync_path(
+                    &vp,
+                    cwd_p,
+                    std::path::Path::new(sync_target),
+                    &globs,
+                    scope,
+                    kind,
+                    weight,
+                    prune,
+                ) {
+                    Ok(rep) => (true, serde_json::to_string_pretty(&rep).unwrap_or_default()),
+                    Err(e) => (false, format!("recall sync failed: {e}")),
+                };
+            }
             let Ok(conn) = ap_recall::open_vault(&vp) else {
                 return (
                     false,
@@ -3439,10 +3508,15 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|s| !s.is_empty());
+                    let scope_opt = args
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
                     let max_chars =
                         args.get("max_chars").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    match ap_recall::match_rules_with_opts(
-                        &conn, cwd_p, q, &file_list, top, kind_opt, max_chars,
+                    match ap_recall::match_rules_scoped(
+                        &conn, cwd_p, q, &file_list, top, kind_opt, scope_opt, max_chars,
                     ) {
                         Ok((hits, elapsed_ms)) => {
                             let negative_constraints: Vec<&ap_recall::RuleMatch> = hits
@@ -3503,13 +3577,19 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         .filter(|s| !s.is_empty())
                         .unwrap_or("gotcha");
                     let source_file = args.get("file").and_then(Value::as_str).unwrap_or("");
-                    match ap_recall::add_rule_with_provenance(
+                    let scope = args.get("scope").and_then(Value::as_str).unwrap_or("");
+                    let weight = args.get("weight").and_then(Value::as_f64).unwrap_or(1.0);
+                    let section = args.get("section").and_then(Value::as_str).unwrap_or("");
+                    match ap_recall::add_rule_full(
                         &conn,
                         cwd_p,
                         triggers,
                         rule,
                         kind,
                         source_file,
+                        scope,
+                        weight,
+                        section,
                     ) {
                         Ok(id) => (
                             true,
@@ -3519,6 +3599,9 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 "kind": kind,
                                 "triggers": triggers,
                                 "file": source_file,
+                                "scope": ap_recall::normalize_scopes(scope),
+                                "weight": weight,
+                                "section": section,
                             }))
                             .unwrap_or_default(),
                         ),
@@ -3541,7 +3624,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 },
                 _ => (
                     false,
-                    "Pass `action`: 'match', 'add', 'stats', or 'verify' to `ap_recall`."
+                    "Pass `action`: 'match', 'add', 'sync', 'stats', or 'verify' to `ap_recall`."
                         .to_string(),
                 ),
             }
@@ -3609,12 +3692,35 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .get("include_binaries")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let map = ap_atlas::surface::build_surface_map(
+            let mut excludes: Vec<String> = args
+                .get("exclude")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(ef) = args
+                .get("exclude_file")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match ap_atlas::surface::load_exclude_file(std::path::Path::new(ef)) {
+                    Ok(more) => excludes.extend(more),
+                    Err(e) => {
+                        return (false, format!("[atlas] cannot read exclude_file {ef}: {e}"))
+                    }
+                }
+            }
+            let map = ap_atlas::surface::build_surface_map_with_excludes(
                 root_p,
                 max_files,
                 max_per_axis,
                 include_vendor,
                 include_binaries,
+                &excludes,
             );
             let js = serde_json::to_string_pretty(&map).unwrap_or_default();
             crate::stats::record_event("surface", 0, js.len() as u64, 0, 1, "mcp-surface");
@@ -3629,10 +3735,40 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .get("action")
                 .and_then(Value::as_str)
                 .unwrap_or("status");
+            let mut item_excludes: Vec<String> = args
+                .get("exclude")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(ef) = args
+                .get("exclude_file")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let ef_p = std::path::Path::new(ef);
+                let resolved_ef = if ef_p.is_absolute() {
+                    ef_p.to_path_buf()
+                } else {
+                    cwd.join(ef_p)
+                };
+                match ap_baton::frontier::load_exclude_file(&resolved_ef) {
+                    Ok(more) => item_excludes.extend(more),
+                    Err(e) => {
+                        return (
+                            false,
+                            format!("[frontier] cannot read exclude_file {ef}: {e}"),
+                        )
+                    }
+                }
+            }
             match action {
                 "seed" => {
-                    let mut state = ap_baton::frontier::load_frontier(&store_path);
-                    let res = if let Some(sp) = args
+                    let seed_raw = if let Some(sp) = args
                         .get("scan_path")
                         .and_then(Value::as_str)
                         .filter(|s| !s.trim().is_empty())
@@ -3641,9 +3777,15 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         if !p.exists() {
                             return (false, format!("[frontier] scan_path not found: {sp}"));
                         }
-                        let map = ap_atlas::surface::build_surface_map(p, 1500, 12, false, false);
-                        let raw = serde_json::to_string(&map).unwrap_or_default();
-                        ap_baton::frontier::seed_from_json_str(&mut state, &raw)
+                        let map = ap_atlas::surface::build_surface_map_with_excludes(
+                            p,
+                            1500,
+                            12,
+                            false,
+                            false,
+                            &item_excludes,
+                        );
+                        serde_json::to_string(&map).unwrap_or_default()
                     } else if let Some(tgt) = args
                         .get("target")
                         .and_then(Value::as_str)
@@ -3655,8 +3797,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                             .unwrap_or("general");
                         let m = args.get("module").and_then(Value::as_str).unwrap_or("");
                         let n = args.get("note").and_then(Value::as_str).unwrap_or("");
-                        let row = json!([{"axis": ax, "target": tgt, "module": m, "note": n}]);
-                        ap_baton::frontier::seed_from_json_str(&mut state, &row.to_string())
+                        json!([{"axis": ax, "target": tgt, "module": m, "note": n}]).to_string()
                     } else {
                         return (
                             false,
@@ -3664,9 +3805,19 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 .to_string(),
                         );
                     };
-                    match res {
-                        Ok((added, skipped)) => {
-                            if let Err(e) = ap_baton::frontier::save_frontier(&store_path, &mut state)
+                    let _lock = match ap_baton::frontier::acquire_file_lock(&store_path) {
+                        Ok(g) => g,
+                        Err(e) => return (false, format!("[frontier] lock failed: {e}")),
+                    };
+                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    match ap_baton::frontier::seed_from_json_str_with_excludes(
+                        &mut state,
+                        &seed_raw,
+                        &item_excludes,
+                    ) {
+                        Ok((added, skipped, filtered)) => {
+                            if let Err(e) =
+                                ap_baton::frontier::save_frontier_unlocked(&store_path, &mut state)
                             {
                                 return (false, format!("[frontier] save failed: {e}"));
                             }
@@ -3674,6 +3825,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 "ok": true,
                                 "added": added,
                                 "skipped_existing": skipped,
+                                "filtered_excluded": filtered,
                                 "total": state.items.len(),
                                 "summary": ap_baton::frontier::status_summary_json(&state, 5),
                             });
@@ -3692,6 +3844,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                             false,
                             format!("Invalid status '{st_s}' (unvisited|probed|stopped|confirmed|deferred)"),
                         );
+                    };
+                    let _lock = match ap_baton::frontier::acquire_file_lock(&store_path) {
+                        Ok(g) => g,
+                        Err(e) => return (false, format!("[frontier] lock failed: {e}")),
                     };
                     let mut state = ap_baton::frontier::load_frontier(&store_path);
                     let q_low = q.trim().to_ascii_lowercase();
@@ -3718,7 +3874,9 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     if ids.is_empty() {
                         return (false, format!("[frontier] no item matched '{q}'"));
                     }
-                    if let Err(e) = ap_baton::frontier::save_frontier(&store_path, &mut state) {
+                    if let Err(e) =
+                        ap_baton::frontier::save_frontier_unlocked(&store_path, &mut state)
+                    {
                         return (false, format!("[frontier] save failed: {e}"));
                     }
                     (
@@ -3764,7 +3922,6 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     )
                 }
                 "sync_stopped" => {
-                    let mut state = ap_baton::frontier::load_frontier(&store_path);
                     let files: Vec<String> = args
                         .get("text_files")
                         .and_then(Value::as_array)
@@ -3774,20 +3931,29 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let mut marked = 0usize;
+                    let mut loaded = Vec::new();
                     for f in files {
                         if let Ok(txt) = std::fs::read_to_string(&f) {
                             let label = std::path::Path::new(&f)
                                 .file_name()
                                 .and_then(|s| s.to_str())
-                                .unwrap_or("notes");
-                            marked += ap_baton::frontier::sync_stopped_from_text(
-                                &mut state, label, &txt,
-                            );
+                                .unwrap_or("notes")
+                                .to_string();
+                            loaded.push((label, txt));
                         }
                     }
+                    let _lock = match ap_baton::frontier::acquire_file_lock(&store_path) {
+                        Ok(g) => g,
+                        Err(e) => return (false, format!("[frontier] lock failed: {e}")),
+                    };
+                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    let mut marked = 0usize;
+                    for (label, txt) in &loaded {
+                        marked +=
+                            ap_baton::frontier::sync_stopped_from_text(&mut state, label, txt);
+                    }
                     if marked > 0 {
-                        let _ = ap_baton::frontier::save_frontier(&store_path, &mut state);
+                        let _ = ap_baton::frontier::save_frontier_unlocked(&store_path, &mut state);
                     }
                     (
                         true,
@@ -3853,10 +4019,20 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 .to_string(),
                         );
                     };
+                    let _lock = match ap_baton::frontier::acquire_file_lock(&store_path) {
+                        Ok(g) => g,
+                        Err(e) => return (false, format!("[frontier] lock failed: {e}")),
+                    };
                     let mut state = ap_baton::frontier::load_frontier(&store_path);
-                    match ap_baton::frontier::ingest_tool_json_str(&mut state, &raw, kind_hint) {
-                        Ok((detected_kind, added, skipped)) => {
-                            if let Err(e) = ap_baton::frontier::save_frontier(&store_path, &mut state)
+                    match ap_baton::frontier::ingest_tool_json_str_with_excludes(
+                        &mut state,
+                        &raw,
+                        kind_hint,
+                        &item_excludes,
+                    ) {
+                        Ok((detected_kind, added, skipped, filtered)) => {
+                            if let Err(e) =
+                                ap_baton::frontier::save_frontier_unlocked(&store_path, &mut state)
                             {
                                 return (false, format!("[frontier] save failed: {e}"));
                             }
@@ -3866,6 +4042,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                                 "detected_kind": detected_kind,
                                 "added": added,
                                 "skipped_existing": skipped,
+                                "filtered_excluded": filtered,
                                 "total": state.items.len(),
                                 "store": store_path.to_string_lossy(),
                                 "coverage_summary": cov,

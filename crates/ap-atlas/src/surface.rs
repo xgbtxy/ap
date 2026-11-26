@@ -52,10 +52,122 @@ pub struct SurfaceMap {
     pub scanned_archives: usize,
     #[serde(default)]
     pub scanned_binaries: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub excluded_files: usize,
     pub axes_present: Vec<String>,
     pub axes_absent: Vec<String>,
     pub axis_summaries: Vec<AxisSummary>,
     pub items: Vec<SurfaceItem>,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
+pub fn load_exclude_file(path: &Path) -> Result<Vec<String>, String> {
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect())
+}
+
+fn glob_match_ci(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+pub struct ExcludeMatcher {
+    globs: Vec<String>,
+    regexes: Vec<Regex>,
+}
+
+impl ExcludeMatcher {
+    pub fn compile(patterns: &[String]) -> Self {
+        let mut globs = Vec::new();
+        let mut regexes = Vec::new();
+        for raw in patterns {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(re_src) = trimmed.strip_prefix("re:") {
+                if let Ok(re) = Regex::new(re_src.trim()) {
+                    regexes.push(re);
+                }
+            } else {
+                globs.push(trimmed.replace('\\', "/").to_ascii_lowercase());
+            }
+        }
+        Self { globs, regexes }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.globs.is_empty() && self.regexes.is_empty()
+    }
+
+    pub fn is_excluded(&self, rel_path: &str) -> bool {
+        let norm = rel_path.replace('\\', "/");
+        let low = norm.to_ascii_lowercase();
+        let fname = low.rsplit('/').next().unwrap_or(&low);
+        // Built-in generic OS CRT / uninstaller / declaration / log noise exclusions
+        if fname.ends_with(".d.ts")
+            || fname.ends_with(".log")
+            || fname.starts_with("api-ms-win-")
+            || fname.starts_with("vcruntime")
+            || fname.starts_with("ucrtbase")
+            || fname.starts_with("msvcp")
+            || fname.starts_with("concrt140")
+            || fname.starts_with("vcomp")
+            || ((fname.starts_with("uninstall") || fname.starts_with("unins"))
+                && fname.ends_with(".exe"))
+            || low.contains("/node_modules/@types/")
+            || low.starts_with("node_modules/@types/")
+            || low.contains("/site-packages/")
+            || low.contains("/dist-packages/")
+        {
+            return true;
+        }
+        for pat in &self.globs {
+            if pat.contains('*') || pat.contains('?') {
+                if glob_match_ci(pat, &low) || glob_match_ci(pat, fname) {
+                    return true;
+                }
+            } else if low.contains(pat.as_str()) {
+                return true;
+            }
+        }
+        for re in &self.regexes {
+            if re.is_match(&norm) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub(crate) fn guard_re() -> &'static Regex {
@@ -544,6 +656,8 @@ fn scan_asar_archive(
     archive_path: &Path,
     rel_archive: &str,
     rules: &[AxisRule],
+    matcher: &ExcludeMatcher,
+    excluded_files: &mut usize,
     acc: &mut ScanAcc,
 ) -> usize {
     let Ok(bytes) = fs::read(archive_path) else {
@@ -574,8 +688,12 @@ fn scan_asar_archive(
         if end > bytes.len() {
             continue;
         }
-        let text = String::from_utf8_lossy(&bytes[start..end]);
         let vpath = format!("{rel_archive}!/{inner_path}");
+        if matcher.is_excluded(&vpath) || matcher.is_excluded(&inner_path) {
+            *excluded_files += 1;
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes[start..end]);
         scan_text_into(&vpath, &text, false, rules, acc);
         scanned += 1;
     }
@@ -586,6 +704,8 @@ fn scan_zip_archive(
     archive_path: &Path,
     rel_archive: &str,
     rules: &[AxisRule],
+    matcher: &ExcludeMatcher,
+    excluded_files: &mut usize,
     acc: &mut ScanAcc,
 ) -> usize {
     let Ok(meta) = archive_path.metadata() else {
@@ -624,12 +744,16 @@ fn scan_zip_archive(
         if !is_scannable_text_ext(&ext, file_name) {
             continue;
         }
+        let vpath = format!("{rel_archive}!/{name}");
+        if matcher.is_excluded(&vpath) || matcher.is_excluded(&name) {
+            *excluded_files += 1;
+            continue;
+        }
         let mut buf = Vec::with_capacity(entry.size().min(512_000) as usize);
         if entry.read_to_end(&mut buf).is_err() {
             continue;
         }
         let text = String::from_utf8_lossy(&buf);
-        let vpath = format!("{rel_archive}!/{name}");
         scan_text_into(&vpath, &text, false, rules, acc);
         scanned += 1;
     }
@@ -643,12 +767,32 @@ pub fn build_surface_map(
     include_vendor: bool,
     include_binaries: bool,
 ) -> SurfaceMap {
+    build_surface_map_with_excludes(
+        root,
+        max_files,
+        max_per_axis,
+        include_vendor,
+        include_binaries,
+        &[],
+    )
+}
+
+pub fn build_surface_map_with_excludes(
+    root: &Path,
+    max_files: usize,
+    max_per_axis: usize,
+    include_vendor: bool,
+    include_binaries: bool,
+    excludes: &[String],
+) -> SurfaceMap {
     let t0 = Instant::now();
     let rules = axis_rules();
+    let matcher = ExcludeMatcher::compile(excludes);
     let mut acc = ScanAcc::new();
     let mut scanned_files = 0usize;
     let mut scanned_archives = 0usize;
     let mut scanned_binaries = 0usize;
+    let mut excluded_files = 0usize;
 
     let hard_skip = [
         ".git",
@@ -673,29 +817,35 @@ pub fn build_surface_map(
             .and_then(|s| s.to_str())
             .unwrap_or("target")
             .to_string();
-        let ext = root
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "asar" {
-            scanned_files += scan_asar_archive(root, &rel, rules, &mut acc);
-            scanned_archives += 1;
-        } else if is_archive_ext(&ext) {
-            scanned_files += scan_zip_archive(root, &rel, rules, &mut acc);
-            scanned_archives += 1;
-        } else if is_native_binary_ext(&ext) {
-            if let Ok(raw) = fs::read(root) {
-                let text = extract_binary_strings(&raw);
-                scan_text_into(&rel, &text, true, rules, &mut acc);
-                scanned_binaries += 1;
+        if matcher.is_excluded(&rel) {
+            excluded_files += 1;
+        } else {
+            let ext = root
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "asar" {
+                scanned_files +=
+                    scan_asar_archive(root, &rel, rules, &matcher, &mut excluded_files, &mut acc);
+                scanned_archives += 1;
+            } else if is_archive_ext(&ext) {
+                scanned_files +=
+                    scan_zip_archive(root, &rel, rules, &matcher, &mut excluded_files, &mut acc);
+                scanned_archives += 1;
+            } else if is_native_binary_ext(&ext) {
+                if let Ok(raw) = fs::read(root) {
+                    let text = extract_binary_strings(&raw);
+                    scan_text_into(&rel, &text, true, rules, &mut acc);
+                    scanned_binaries += 1;
+                    scanned_files += 1;
+                }
+            } else if let Ok(raw) = fs::read(root) {
+                let cap = raw.len().min(1_048_576);
+                let text = String::from_utf8_lossy(&raw[..cap]);
+                scan_text_into(&rel, &text, false, rules, &mut acc);
                 scanned_files += 1;
             }
-        } else if let Ok(raw) = fs::read(root) {
-            let cap = raw.len().min(1_048_576);
-            let text = String::from_utf8_lossy(&raw[..cap]);
-            scan_text_into(&rel, &text, false, rules, &mut acc);
-            scanned_files += 1;
         }
     } else {
         let walker = WalkBuilder::new(root)
@@ -731,6 +881,10 @@ pub fn build_surface_map(
                 .unwrap_or(p)
                 .to_string_lossy()
                 .replace('\\', "/");
+            if matcher.is_excluded(&rel) {
+                excluded_files += 1;
+                continue;
+            }
             let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let ext = p
                 .extension()
@@ -739,12 +893,14 @@ pub fn build_surface_map(
                 .to_ascii_lowercase();
 
             if ext == "asar" && scanned_archives < 16 {
-                scanned_files += scan_asar_archive(p, &rel, rules, &mut acc);
+                scanned_files +=
+                    scan_asar_archive(p, &rel, rules, &matcher, &mut excluded_files, &mut acc);
                 scanned_archives += 1;
                 continue;
             }
             if is_archive_ext(&ext) && scanned_archives < 24 {
-                scanned_files += scan_zip_archive(p, &rel, rules, &mut acc);
+                scanned_files +=
+                    scan_zip_archive(p, &rel, rules, &matcher, &mut excluded_files, &mut acc);
                 scanned_archives += 1;
                 continue;
             }
@@ -854,6 +1010,7 @@ pub fn build_surface_map(
         scanned_files,
         scanned_archives,
         scanned_binaries,
+        excluded_files,
         axes_present,
         axes_absent,
         axis_summaries,
@@ -1041,6 +1198,37 @@ mod tests {
         assert_eq!(map.scanned_archives, 1);
         assert!(map.axes_present.contains(&"webview_browser".to_string()));
         assert!(map.items.iter().any(|it| it.target == "app.asar!/main.js"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn surface_excludes_patterns_exclude_file_and_crt_noise() {
+        let dir = std::env::temp_dir().join(format!("ap_surface_excl_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("scratch")).unwrap();
+        fs::write(dir.join("src/app.js"), "child_process.spawnSync('ls');\n").unwrap();
+        fs::write(
+            dir.join("scratch/demo_probe.js"),
+            "child_process.spawnSync('x');\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/types.d.ts"),
+            "declare function execSync(cmd: string): void;\n",
+        )
+        .unwrap();
+        fs::write(dir.join("vcruntime140.dll"), b"MZCreateProcessW\0").unwrap();
+        let ef = dir.join("excludes.txt");
+        fs::write(&ef, "# comment\nscratch/*\n*_probe.js\n").unwrap();
+
+        let pats = load_exclude_file(&ef).unwrap();
+        let map = build_surface_map_with_excludes(&dir, 100, 10, false, true, &pats);
+        assert!(map.excluded_files >= 3, "expected excluded files: {map:?}");
+        assert!(map.items.iter().any(|i| i.target == "src/app.js"));
+        assert!(!map.items.iter().any(|i| i.target.contains("scratch/")));
+        assert!(!map.items.iter().any(|i| i.target.contains("types.d.ts")));
+        assert!(!map.items.iter().any(|i| i.target.contains("vcruntime140")));
         let _ = fs::remove_dir_all(&dir);
     }
 }

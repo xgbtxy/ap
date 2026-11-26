@@ -70,7 +70,7 @@ impl ModelProfile {
                 recommended_mcp_profile: "core",
                 sieve_threshold_chars: 12_000,
                 kv_safe_sleep_s: 45,
-                mask_high_water_tokens: 210_000,
+                mask_high_water_tokens: 135_000,
                 dsml_recovery: true,
             },
             Self::Fast => ProfileKnobs {
@@ -106,6 +106,12 @@ pub struct ApProfileConfig {
     pub default_mcp_profile: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub harness_mcp_profiles: BTreeMap<String, String>,
+    #[serde(
+        default,
+        alias = "yieldCompact",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub yield_compact: Option<bool>,
 }
 
 impl Default for ApProfileConfig {
@@ -115,6 +121,7 @@ impl Default for ApProfileConfig {
             model_profile: "auto".to_string(),
             default_mcp_profile: None,
             harness_mcp_profiles: BTreeMap::new(),
+            yield_compact: None,
         }
     }
 }
@@ -233,6 +240,8 @@ enum ProfileSubCmd {
         mcp_profile: String,
         #[arg(long, default_value = "")]
         harness: String,
+        #[arg(long = "yield-compact")]
+        yield_compact: Option<bool>,
         #[arg(long)]
         apply: bool,
     },
@@ -270,6 +279,7 @@ fn show_profile_value(home: &Path) -> Value {
         "model_profile": model_prof.as_str(),
         "default_mcp_profile": loaded.as_ref().and_then(|c| c.default_mcp_profile.clone()),
         "harness_mcp_profiles": loaded.as_ref().map(|c| &c.harness_mcp_profiles).cloned().unwrap_or_default(),
+        "yield_compact": loaded.as_ref().and_then(|c| c.yield_compact),
         "knobs": knobs,
         "wired_harnesses": wired,
     })
@@ -310,6 +320,9 @@ pub fn run_cli(args: &[String]) -> i32 {
             if let Some(dm) = val["default_mcp_profile"].as_str() {
                 println!("  Default MCP Profile: {dm}");
             }
+            if let Some(yc) = val["yield_compact"].as_bool() {
+                println!("  Yield Compact      : {yc}");
+            }
             if let Some(arr) = val["wired_harnesses"].as_array() {
                 if arr.is_empty() {
                     println!("  Wired Harnesses    : none (run `ap init` to wire on demand)");
@@ -331,6 +344,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             model,
             mcp_profile,
             harness,
+            yield_compact,
             apply,
         } => {
             let parsed_model = match parse_model_profile_arg(&model) {
@@ -347,13 +361,16 @@ pub fn run_cli(args: &[String]) -> i32 {
                     return 2;
                 }
             };
-            if parsed_model.is_none() && parsed_mcp.is_none() {
-                eprintln!("[ap profile] Provide --model <auto|balanced|deepseek|fast|reasoning|small> and/or --mcp-profile <full|core|deferred>");
+            if parsed_model.is_none() && parsed_mcp.is_none() && yield_compact.is_none() {
+                eprintln!("[ap profile] Provide --model <auto|balanced|deepseek|fast|reasoning|small>, --mcp-profile <full|core|deferred>, and/or --yield-compact <true|false>");
                 return 2;
             }
             let mut cfg = load_profile(&home).unwrap_or_default();
             if let Some(mp) = parsed_model {
                 cfg.model_profile = mp.as_str().to_string();
+            }
+            if let Some(yc) = yield_compact {
+                cfg.yield_compact = Some(yc);
             }
             let target_harness = harness.trim().to_ascii_lowercase();
             if let Some(mcp_p) = parsed_mcp {
@@ -480,7 +497,7 @@ mod tests {
         assert_eq!(small_k.recommended_mcp_profile, "deferred");
         assert_eq!(small_k.sieve_threshold_chars, 10_000);
         let ds_k = ModelProfile::DeepSeek.knobs();
-        assert_eq!(ds_k.mask_high_water_tokens, 210_000);
+        assert_eq!(ds_k.mask_high_water_tokens, 135_000);
         assert!(ds_k.dsml_recovery);
 
         let mut cfg = ApProfileConfig {
@@ -488,6 +505,7 @@ mod tests {
             model_profile: "deepseek".to_string(),
             default_mcp_profile: Some("core".to_string()),
             harness_mcp_profiles: BTreeMap::new(),
+            yield_compact: Some(true),
         };
         cfg.harness_mcp_profiles
             .insert("opencode".to_string(), "deferred".to_string());
@@ -496,6 +514,11 @@ mod tests {
 
         let loaded = load_profile(dir.path()).unwrap();
         assert_eq!(loaded, cfg);
+
+        // Verify camelCase yieldCompact alias deserialization
+        let alias_json = r#"{"schema_version":1,"model_profile":"auto","yieldCompact":true}"#;
+        let alias_cfg: ApProfileConfig = serde_json::from_str(alias_json).unwrap();
+        assert_eq!(alias_cfg.yield_compact, Some(true));
 
         assert!(reset_profile(dir.path()));
         assert!(!reset_profile(dir.path()));
@@ -509,6 +532,7 @@ mod tests {
             model_profile: "small".to_string(),
             default_mcp_profile: None,
             harness_mcp_profiles: BTreeMap::new(),
+            yield_compact: None,
         };
         assert_eq!(
             resolve_mcp_profile_for_harness(Some(&cfg), "opencode", "", ModelProfile::Small),

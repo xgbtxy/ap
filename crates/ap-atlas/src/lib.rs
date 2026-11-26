@@ -277,6 +277,12 @@ enum SubCmd {
         include_vendor: bool,
         #[arg(long)]
         include_binaries: bool,
+        /// Repeatable glob/substring/`re:<regex>` exclusion pattern(s) to filter out noisy paths/targets
+        #[arg(short = 'x', long = "exclude")]
+        exclude: Vec<String>,
+        /// Optional newline-delimited file of exclusion patterns (`#` comments & blank lines ignored)
+        #[arg(long = "exclude-file")]
+        exclude_file: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1646,6 +1652,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             max_per_axis,
             include_vendor,
             include_binaries,
+            exclude,
+            exclude_file,
             json,
         }) => {
             let root_p = PathBuf::from(&root);
@@ -1653,12 +1661,23 @@ pub fn run_cli(args: &[String]) -> i32 {
                 eprintln!("[atlas] path not found: {root}");
                 return 1;
             }
-            let map = surface::build_surface_map(
+            let mut merged_excludes = exclude;
+            if let Some(ref ef) = exclude_file {
+                match surface::load_exclude_file(Path::new(ef)) {
+                    Ok(pats) => merged_excludes.extend(pats),
+                    Err(e) => {
+                        eprintln!("[atlas] cannot read --exclude-file `{ef}`: {e}");
+                        return 2;
+                    }
+                }
+            }
+            let map = surface::build_surface_map_with_excludes(
                 &root_p,
                 max_files,
                 max_per_axis,
                 include_vendor,
                 include_binaries,
+                &merged_excludes,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&map).unwrap_or_default());

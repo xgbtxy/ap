@@ -375,9 +375,14 @@ mod imp {
     const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
 
     const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
     const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
     const OPEN_EXISTING: u32 = 3;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_ACCESS_DENIED: u32 = 5;
 
     const WTD_UI_NONE: u32 = 2;
     const WTD_REVOKE_NONE: u32 = 0;
@@ -626,6 +631,20 @@ mod imp {
         lp_display_name: *mut u16,
     }
 
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH_W],
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn FindFirstFileW(lp_file_name: *const u16, lp_find_data: *mut Win32FindDataW) -> Handle;
@@ -648,6 +667,22 @@ mod imp {
             lp_file_time: *const FileTime,
             lp_system_time: *mut SystemTime,
         ) -> Bool;
+        fn GetNamedPipeServerProcessId(pipe: Handle, server_process_id: *mut u32) -> Bool;
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> Handle;
+        fn Process32FirstW(h_snapshot: Handle, lppe: *mut ProcessEntry32W) -> Bool;
+        fn Process32NextW(h_snapshot: Handle, lppe: *mut ProcessEntry32W) -> Bool;
+        fn OpenProcess(
+            dw_desired_access: u32,
+            b_inherit_handle: Bool,
+            dw_process_id: u32,
+        ) -> Handle;
+        fn QueryFullProcessImageNameW(
+            h_process: Handle,
+            dw_flags: u32,
+            lp_exe_name: *mut u16,
+            lpdw_size: *mut u32,
+        ) -> Bool;
+        fn ProcessIdToSessionId(dw_process_id: u32, p_session_id: *mut u32) -> Bool;
     }
 
     #[link(name = "wintrust")]
@@ -962,16 +997,321 @@ mod imp {
         }
     }
 
-    #[cfg(test)]
-    pub fn query_pipes(filter: Option<&str>, max: usize) -> Value {
-        query_pipes_opts(filter, max, false, true)
+    #[derive(Debug, Clone)]
+    pub struct ProcessIlInfo {
+        pub pid: u32,
+        pub ppid: u32,
+        pub name: String,
+        pub exe: String,
+        pub integrity_level: String,
+        pub session_id: u32,
+        pub elevated: Option<bool>,
+        pub user: String,
     }
 
-    pub fn query_pipes_opts(
+    fn read_token_info_buf(h_tok: Handle, class_id: u32) -> Option<Vec<u8>> {
+        let mut need = 0u32;
+        unsafe { GetTokenInformation(h_tok, class_id, ptr::null_mut(), 0, &mut need) };
+        if need == 0 || need > 262_144 {
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize + 16];
+        let ok = unsafe {
+            GetTokenInformation(
+                h_tok,
+                class_id,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut need,
+            )
+        };
+        if ok != 0 {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    fn integrity_level_from_token(h_tok: Handle) -> String {
+        read_token_info_buf(h_tok, TOKEN_INTEGRITY_LEVEL_CLASS)
+            .map(|b| unsafe {
+                let sa = &*(b.as_ptr() as *const SidAndAttributes);
+                let cnt_ptr = GetSidSubAuthorityCount(sa.sid);
+                if cnt_ptr.is_null() || *cnt_ptr == 0 {
+                    return "Unknown".to_string();
+                }
+                let rid_ptr = GetSidSubAuthority(sa.sid, (*cnt_ptr - 1) as u32);
+                if rid_ptr.is_null() {
+                    return "Unknown".to_string();
+                }
+                let rid = *rid_ptr;
+                if rid >= 0x4000 {
+                    "SYSTEM".to_string()
+                } else if rid >= 0x3000 {
+                    "High".to_string()
+                } else if rid >= 0x2000 {
+                    "Medium".to_string()
+                } else if rid >= 0x1000 {
+                    "Low".to_string()
+                } else {
+                    "Untrusted".to_string()
+                }
+            })
+            .unwrap_or_else(|| "Unknown".to_string())
+    }
+
+    fn inspect_process_il_by_pid(pid: u32) -> (String, String, Option<bool>, String) {
+        if pid == 0 {
+            return (
+                String::new(),
+                "SYSTEM".to_string(),
+                Some(true),
+                String::new(),
+            );
+        }
+        let h_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h_proc.is_null() {
+            let err = unsafe { GetLastError() };
+            let il = if err == ERROR_ACCESS_DENIED {
+                "SYSTEM_OR_PPL(access_denied)".to_string()
+            } else {
+                "Unknown".to_string()
+            };
+            return (String::new(), il, None, String::new());
+        }
+        let mut exe_buf = [0u16; 1024];
+        let mut exe_len = exe_buf.len() as u32;
+        let exe =
+            if unsafe { QueryFullProcessImageNameW(h_proc, 0, exe_buf.as_mut_ptr(), &mut exe_len) }
+                != 0
+                && exe_len > 0
+            {
+                String::from_utf16_lossy(&exe_buf[..exe_len as usize])
+            } else {
+                String::new()
+            };
+
+        let mut h_tok: Handle = ptr::null_mut();
+        let (il, elevated, user) = if unsafe { OpenProcessToken(h_proc, TOKEN_QUERY, &mut h_tok) }
+            != 0
+            && !h_tok.is_null()
+        {
+            let il_s = integrity_level_from_token(h_tok);
+            let elev = read_token_info_buf(h_tok, TOKEN_ELEVATION_CLASS)
+                .and_then(|b| {
+                    (b.len() >= 4).then(|| u32::from_le_bytes(b[..4].try_into().unwrap()))
+                })
+                .map(|v| v != 0);
+            let (usr, _sid) = read_token_info_buf(h_tok, TOKEN_USER_CLASS)
+                .map(|b| unsafe {
+                    let sa = &*(b.as_ptr() as *const SidAndAttributes);
+                    sid_to_account_and_id(sa.sid)
+                })
+                .unwrap_or_default();
+            unsafe {
+                CloseHandle(h_tok);
+            }
+            (il_s, elev, usr)
+        } else {
+            let err = unsafe { GetLastError() };
+            let il_s = if err == ERROR_ACCESS_DENIED {
+                "SYSTEM_OR_PPL(access_denied)".to_string()
+            } else {
+                "Unknown".to_string()
+            };
+            (il_s, None, String::new())
+        };
+        unsafe {
+            CloseHandle(h_proc);
+        }
+        (exe, il, elevated, user)
+    }
+
+    pub fn collect_processes_il() -> Result<Vec<ProcessIlInfo>, String> {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap as isize == INVALID_HANDLE_VALUE || snap.is_null() {
+            return Err(format!(
+                "CreateToolhelp32Snapshot failed (err={})",
+                unsafe { GetLastError() }
+            ));
+        }
+        let mut pe: ProcessEntry32W = unsafe { core::mem::zeroed() };
+        pe.dw_size = core::mem::size_of::<ProcessEntry32W>() as u32;
+        let mut out = Vec::new();
+        if unsafe { Process32FirstW(snap, &mut pe) } != 0 {
+            loop {
+                let pid = pe.th32_process_id;
+                let ppid = pe.th32_parent_process_id;
+                let name = unsafe { read_wide_buf(&pe.sz_exe_file) };
+                let mut session_id = 0u32;
+                let _ = unsafe { ProcessIdToSessionId(pid, &mut session_id) };
+                let (exe, integrity_level, elevated, user) = inspect_process_il_by_pid(pid);
+                out.push(ProcessIlInfo {
+                    pid,
+                    ppid,
+                    name,
+                    exe,
+                    integrity_level,
+                    session_id,
+                    elevated,
+                    user,
+                });
+                if unsafe { Process32NextW(snap, &mut pe) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe {
+            CloseHandle(snap);
+        }
+        Ok(out)
+    }
+
+    pub fn query_procs_opts(
+        filter: Option<&str>,
+        max: usize,
+        non_ms: bool,
+        cached_procs: Option<&[ProcessIlInfo]>,
+    ) -> Value {
+        let owned;
+        let all_procs: &[ProcessIlInfo] = match cached_procs {
+            Some(slice) => slice,
+            None => match collect_processes_il() {
+                Ok(v) => {
+                    owned = v;
+                    &owned
+                }
+                Err(e) => return json!({ "ok": false, "mode": "procs", "error": e }),
+            },
+        };
+        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let cap = max.clamp(1, 200);
+        let mut total_matched = 0usize;
+        let mut items = Vec::new();
+        for p in all_procs {
+            if let Some(ref fl) = f_low {
+                let hit = p.name.to_ascii_lowercase().contains(fl)
+                    || p.exe.to_ascii_lowercase().contains(fl)
+                    || p.integrity_level.to_ascii_lowercase().contains(fl)
+                    || p.user.to_ascii_lowercase().contains(fl);
+                if !hit {
+                    continue;
+                }
+            }
+            if non_ms {
+                let exe_low = p.exe.to_ascii_lowercase();
+                let nm_low = p.name.to_ascii_lowercase();
+                if (!exe_low.is_empty() && super::is_ms_os_path(&exe_low))
+                    || matches!(
+                        nm_low.as_str(),
+                        "system"
+                            | "[system process]"
+                            | "registry"
+                            | "memory compression"
+                            | "secure system"
+                            | "smss.exe"
+                            | "csrss.exe"
+                            | "wininit.exe"
+                            | "services.exe"
+                            | "lsass.exe"
+                            | "svchost.exe"
+                            | "fontdrvhost.exe"
+                            | "dwm.exe"
+                            | "winlogon.exe"
+                    )
+                {
+                    continue;
+                }
+            }
+            total_matched += 1;
+            if items.len() < cap {
+                items.push(json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "name": p.name,
+                    "exe": p.exe,
+                    "integrity_level": p.integrity_level,
+                    "session_id": p.session_id,
+                    "elevated": p.elevated,
+                    "user": p.user,
+                }));
+            }
+        }
+        json!({
+            "ok": true,
+            "mode": "procs",
+            "total_matched": total_matched,
+            "returned": items.len(),
+            "processes": items,
+        })
+    }
+
+    fn is_privileged_il(il: &str) -> bool {
+        il == "SYSTEM" || il == "High" || il.starts_with("SYSTEM_OR_PPL")
+    }
+
+    fn attribute_pipe_server(
+        full_pipe_path: &str,
+        proc_map: Option<&std::collections::HashMap<u32, &ProcessIlInfo>>,
+    ) -> (Option<u32>, Option<String>, Option<String>) {
+        let w_path = to_wide(full_pipe_path);
+        let h = unsafe {
+            CreateFileW(
+                w_path.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_ALL,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if h as isize == INVALID_HANDLE_VALUE || h.is_null() {
+            return (None, None, None);
+        }
+        let mut srv_pid = 0u32;
+        let ok = unsafe { GetNamedPipeServerProcessId(h, &mut srv_pid) };
+        unsafe {
+            CloseHandle(h);
+        }
+        if ok == 0 || srv_pid == 0 {
+            return (None, None, None);
+        }
+        if let Some(map) = proc_map {
+            if let Some(info) = map.get(&srv_pid) {
+                let proc_label = if !info.exe.is_empty() {
+                    info.exe.clone()
+                } else {
+                    info.name.clone()
+                };
+                return (
+                    Some(srv_pid),
+                    Some(proc_label),
+                    Some(info.integrity_level.clone()),
+                );
+            }
+        }
+        let (exe, il, _elev, _usr) = inspect_process_il_by_pid(srv_pid);
+        let proc_label = if exe.is_empty() {
+            format!("pid:{srv_pid}")
+        } else {
+            exe
+        };
+        (Some(srv_pid), Some(proc_label), Some(il))
+    }
+
+    #[cfg(test)]
+    pub fn query_pipes(filter: Option<&str>, max: usize) -> Value {
+        query_pipes_with_cache(filter, max, false, true, None, true)
+    }
+
+    pub fn query_pipes_with_cache(
         filter: Option<&str>,
         max: usize,
         non_ms: bool,
         enforce_200_cap: bool,
+        proc_map: Option<&std::collections::HashMap<u32, &ProcessIlInfo>>,
+        attribute_non_weak: bool,
     ) -> Value {
         let pat_w = to_wide(r"\\.\pipe\*");
         let mut fd: Win32FindDataW = unsafe { core::mem::zeroed() };
@@ -1008,44 +1348,67 @@ mod imp {
         } else {
             max.max(1)
         };
-        let inspect_sddl = true;
         let mut entries = Vec::new();
         for nm in all_names.into_iter().take(cap) {
             let full = format!(r"\\.\pipe\{nm}");
             let mut sddl: Option<String> = None;
             let mut non_admin_write = false;
-            if inspect_sddl {
-                let w_path = to_wide(&full);
-                let mut p_dacl: *mut c_void = ptr::null_mut();
-                let mut p_sd: *mut c_void = ptr::null_mut();
-                let rc = unsafe {
-                    GetNamedSecurityInfoW(
-                        w_path.as_ptr(),
-                        SE_KERNEL_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        &mut p_dacl,
-                        ptr::null_mut(),
-                        &mut p_sd,
-                    )
-                };
-                if rc == 0 && !p_sd.is_null() {
-                    if let Some(s) = unsafe { sd_to_sddl(p_sd, DACL_SECURITY_INFORMATION) } {
-                        let (_prot, aces) = parse_sddl_aces(&s);
-                        non_admin_write = aces.iter().any(|a| a.non_admin_write);
-                        sddl = Some(s);
+            let mut weak_dacl: Vec<String> = Vec::new();
+            let w_path = to_wide(&full);
+            let mut p_dacl: *mut c_void = ptr::null_mut();
+            let mut p_sd: *mut c_void = ptr::null_mut();
+            let rc = unsafe {
+                GetNamedSecurityInfoW(
+                    w_path.as_ptr(),
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut p_dacl,
+                    ptr::null_mut(),
+                    &mut p_sd,
+                )
+            };
+            if rc == 0 && !p_sd.is_null() {
+                if let Some(s) = unsafe { sd_to_sddl(p_sd, DACL_SECURITY_INFORMATION) } {
+                    let (_prot, aces) = parse_sddl_aces(&s);
+                    for a in &aces {
+                        if a.non_admin_write {
+                            non_admin_write = true;
+                            weak_dacl.push(format!("{}:{}", a.trustee, a.rights));
+                        }
                     }
-                    unsafe {
-                        LocalFree(p_sd);
-                    }
+                    sddl = Some(s);
+                }
+                unsafe {
+                    LocalFree(p_sd);
                 }
             }
+            let (server_pid, server_process, server_il) = if non_admin_write || attribute_non_weak {
+                attribute_pipe_server(&full, proc_map)
+            } else {
+                (None, None, None)
+            };
+            let signal = if non_admin_write {
+                if server_il.as_deref().is_some_and(is_privileged_il) {
+                    Some("CROSS_IL_PIPE_EOP_CANDIDATE")
+                } else {
+                    Some("NAMED_PIPE_WEAK_DACL")
+                }
+            } else {
+                None
+            };
             entries.push(json!({
                 "name": nm,
                 "path": full,
+                "pipe": full,
                 "sddl": sddl,
                 "non_admin_write": non_admin_write,
+                "weak_dacl": weak_dacl,
+                "server_pid": server_pid,
+                "server_process": server_process,
+                "server_il": server_il,
+                "signal": signal,
             }));
         }
         json!({
@@ -2335,10 +2698,20 @@ mod imp {
         }
 
         // OS-wide non-admin write attack-surface sweep (pipes + services/bins/regkeys + unquoted)
-        // Inspect ALL matching pipes cleanly before applying output cap.
+        // Inspect ALL matching pipes cleanly before applying output cap (attributing only weak pipes).
         let eff_filter = filter.or(raw_tgt);
         let f_low = eff_filter.map(|s| s.to_ascii_lowercase());
-        let pipe_res = query_pipes_opts(eff_filter, usize::MAX, non_ms, false);
+        let proc_vec = collect_processes_il().unwrap_or_default();
+        let proc_map: std::collections::HashMap<u32, &ProcessIlInfo> =
+            proc_vec.iter().map(|p| (p.pid, p)).collect();
+        let pipe_res = query_pipes_with_cache(
+            eff_filter,
+            usize::MAX,
+            non_ms,
+            false,
+            Some(&proc_map),
+            false,
+        );
         let mut weak_pipes = Vec::new();
         if let Some(arr) = pipe_res.get("pipes").and_then(Value::as_array) {
             for p in arr {
@@ -2592,9 +2965,9 @@ mod imp {
             });
         }
 
-        // Cross-link all named pipes for `ncacn_np` weak-ACL visibility
+        // Cross-link all named pipes for `ncacn_np` weak-ACL visibility (skip pipe handle open for speed)
         let mut weak_pipe_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(arr) = query_pipes_opts(None, usize::MAX, false, false)
+        if let Some(arr) = query_pipes_with_cache(None, usize::MAX, false, false, None, false)
             .get("pipes")
             .and_then(Value::as_array)
         {
@@ -2755,11 +3128,36 @@ pub fn run_win_cli(
     max: usize,
     as_json: bool,
 ) -> i32 {
+    run_win_cli_ex(
+        pipes, reg, acl, services, whoami, sig, weak_acl, unquoted, com, rpc, false, false, non_ms,
+        filter, max, as_json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_win_cli_ex(
+    pipes: bool,
+    reg: Option<&str>,
+    acl: Option<&str>,
+    services: bool,
+    whoami: bool,
+    sig: Option<&std::path::Path>,
+    weak_acl: Option<&str>,
+    unquoted: bool,
+    com: bool,
+    rpc: bool,
+    procs: bool,
+    all: bool,
+    non_ms: bool,
+    filter: Option<&str>,
+    max: usize,
+    as_json: bool,
+) -> i32 {
     #[cfg(not(windows))]
     {
         let _ = (
-            pipes, reg, acl, services, whoami, sig, weak_acl, unquoted, com, rpc, non_ms, filter,
-            max,
+            pipes, reg, acl, services, whoami, sig, weak_acl, unquoted, com, rpc, procs, all,
+            non_ms, filter, max,
         );
         let out = json!({
             "ok": false,
@@ -2787,9 +3185,10 @@ pub fn run_win_cli(
             + usize::from(weak_acl.is_some())
             + usize::from(unquoted)
             + usize::from(com)
-            + usize::from(rpc);
-        if mode_count == 0 {
-            let msg = "[ap probe win] Pass one of --pipes, --reg <KEY>, --acl <PATH>, --services, --whoami, --sig <PATH>, --weak-acl [PATH], --unquoted, --com, or --rpc";
+            + usize::from(rpc)
+            + usize::from(procs);
+        if mode_count == 0 && !all {
+            let msg = "[ap probe win] Pass one or more of --all, --pipes, --reg <KEY>, --acl <PATH>, --services, --whoami, --sig <PATH>, --weak-acl [PATH], --unquoted, --com, --rpc, or --procs";
             if as_json {
                 println!(
                     "{}",
@@ -2801,26 +3200,200 @@ pub fn run_win_cli(
             }
             return 2;
         }
-        let val = if let Some(wa) = weak_acl {
-            imp::query_weak_acl_opts(Some(wa), filter, max, non_ms)
-        } else if unquoted {
-            imp::query_unquoted_services_opts(filter, max, non_ms)
-        } else if com {
-            imp::query_com_audit_opts(filter, max, non_ms)
-        } else if rpc {
-            imp::query_rpc_endpoints_opts(filter, max, non_ms)
-        } else if let Some(sp) = sig {
-            imp::query_signature(&sp.to_string_lossy())
-        } else if let Some(rk) = reg {
-            imp::query_registry(rk, filter, max)
-        } else if let Some(ap) = acl {
-            imp::query_acl(ap)
-        } else if pipes {
-            imp::query_pipes_opts(filter, max, non_ms, true)
-        } else if services {
-            imp::query_services_opts(filter, max, non_ms)
+        let val = if !all && mode_count == 1 {
+            if let Some(wa) = weak_acl {
+                imp::query_weak_acl_opts(Some(wa), filter, max, non_ms)
+            } else if unquoted {
+                imp::query_unquoted_services_opts(filter, max, non_ms)
+            } else if com {
+                imp::query_com_audit_opts(filter, max, non_ms)
+            } else if rpc {
+                imp::query_rpc_endpoints_opts(filter, max, non_ms)
+            } else if procs {
+                imp::query_procs_opts(filter, max, non_ms, None)
+            } else if let Some(sp) = sig {
+                imp::query_signature(&sp.to_string_lossy())
+            } else if let Some(rk) = reg {
+                imp::query_registry(rk, filter, max)
+            } else if let Some(ap) = acl {
+                imp::query_acl(ap)
+            } else if pipes {
+                let pv = imp::collect_processes_il().unwrap_or_default();
+                let pm: std::collections::HashMap<u32, &imp::ProcessIlInfo> =
+                    pv.iter().map(|p| (p.pid, p)).collect();
+                imp::query_pipes_with_cache(filter, max, non_ms, true, Some(&pm), true)
+            } else if services {
+                imp::query_services_opts(filter, max, non_ms)
+            } else {
+                imp::query_whoami()
+            }
         } else {
-            imp::query_whoami()
+            // Combined single-shot mode (`--all` or >=2 flags): preserve all single-mode top-level keys + `sections`
+            let run_weak_acl = all || weak_acl.is_some();
+            let run_com = all || com;
+            let run_rpc = all || rpc;
+            let run_procs = all || procs;
+
+            let cached_procs = if run_procs || run_weak_acl || pipes {
+                imp::collect_processes_il().ok()
+            } else {
+                None
+            };
+            let proc_map: Option<std::collections::HashMap<u32, &imp::ProcessIlInfo>> =
+                cached_procs
+                    .as_ref()
+                    .map(|v| v.iter().map(|p| (p.pid, p)).collect());
+
+            let mut modes_run: Vec<&str> = Vec::new();
+            let mut sections = serde_json::Map::new();
+            let mut combined = serde_json::Map::new();
+            let mut any_ok = false;
+
+            if run_weak_acl {
+                modes_run.push("weak_acl");
+                let wa_arg = weak_acl.unwrap_or("");
+                let wa = imp::query_weak_acl_opts(Some(wa_arg), filter, max, non_ms);
+                if wa.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                for key in [
+                    "weak_pipes_count",
+                    "weak_services_count",
+                    "exploitable_unquoted_count",
+                    "weak_pipes",
+                    "weak_services",
+                    "exploitable_unquoted",
+                ] {
+                    if let Some(v) = wa.get(key) {
+                        combined.insert(key.to_string(), v.clone());
+                    }
+                }
+                if !run_com {
+                    if let Some(f) = wa.get("findings") {
+                        combined.insert("findings".to_string(), f.clone());
+                    }
+                }
+                sections.insert("weak_acl".to_string(), wa);
+            }
+            if run_com {
+                modes_run.push("com");
+                let c = imp::query_com_audit_opts(filter, max, non_ms);
+                if c.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                if let Some(f) = c.get("findings") {
+                    combined.insert("findings".to_string(), f.clone());
+                }
+                if let Some(sc) = c.get("scanned_clsids") {
+                    combined.insert("scanned_clsids".to_string(), sc.clone());
+                }
+                sections.insert("com".to_string(), c);
+            }
+            if run_rpc {
+                modes_run.push("rpc");
+                let r = imp::query_rpc_endpoints_opts(filter, max, non_ms);
+                if r.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                if let Some(ep) = r.get("endpoints") {
+                    combined.insert("endpoints".to_string(), ep.clone());
+                }
+                sections.insert("rpc".to_string(), r);
+            }
+            if run_procs {
+                modes_run.push("procs");
+                let pr = imp::query_procs_opts(filter, max, non_ms, cached_procs.as_deref());
+                if pr.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                if let Some(arr) = pr.get("processes") {
+                    combined.insert("processes".to_string(), arr.clone());
+                }
+                sections.insert("procs".to_string(), pr);
+            }
+            if pipes {
+                modes_run.push("pipes");
+                let pp =
+                    imp::query_pipes_with_cache(filter, max, non_ms, true, proc_map.as_ref(), true);
+                if pp.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                if let Some(arr) = pp.get("pipes") {
+                    combined.insert("pipes".to_string(), arr.clone());
+                }
+                sections.insert("pipes".to_string(), pp);
+            }
+            if services {
+                modes_run.push("services");
+                let sv = imp::query_services_opts(filter, max, non_ms);
+                if sv.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                if let Some(arr) = sv.get("services") {
+                    combined.insert("services".to_string(), arr.clone());
+                }
+                sections.insert("services".to_string(), sv);
+            }
+            if unquoted {
+                modes_run.push("unquoted");
+                let uq = imp::query_unquoted_services_opts(filter, max, non_ms);
+                if uq.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                if let Some(arr) = uq.get("findings") {
+                    combined.insert("unquoted_findings".to_string(), arr.clone());
+                    if !combined.contains_key("findings") {
+                        combined.insert("findings".to_string(), arr.clone());
+                    }
+                }
+                sections.insert("unquoted".to_string(), uq);
+            }
+            if whoami {
+                modes_run.push("whoami");
+                let wh = imp::query_whoami();
+                if wh.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                combined.insert("whoami".to_string(), wh.clone());
+                sections.insert("whoami".to_string(), wh);
+            }
+            if let Some(rk) = reg {
+                modes_run.push("reg");
+                let rg = imp::query_registry(rk, filter, max);
+                if rg.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                combined.insert("reg".to_string(), rg.clone());
+                sections.insert("reg".to_string(), rg);
+            }
+            if let Some(ap) = acl {
+                modes_run.push("acl");
+                let ac = imp::query_acl(ap);
+                if ac.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                combined.insert("acl".to_string(), ac.clone());
+                sections.insert("acl".to_string(), ac);
+            }
+            if let Some(sp) = sig {
+                modes_run.push("sig");
+                let sg = imp::query_signature(&sp.to_string_lossy());
+                if sg.get("ok").and_then(Value::as_bool) == Some(true) {
+                    any_ok = true;
+                }
+                combined.insert("sig".to_string(), sg.clone());
+                sections.insert("sig".to_string(), sg);
+            }
+
+            combined.insert("ok".to_string(), Value::Bool(any_ok));
+            combined.insert("mode".to_string(), json!("combined"));
+            combined.insert("modes_run".to_string(), json!(modes_run));
+            combined.insert("non_ms".to_string(), Value::Bool(non_ms));
+            if let Some(fl) = filter {
+                combined.insert("filter".to_string(), json!(fl));
+            }
+            combined.insert("sections".to_string(), Value::Object(sections));
+            Value::Object(combined)
         };
         let ok = val.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let serialized = if as_json {
@@ -2940,5 +3513,18 @@ mod tests {
 
         let sig_miss = imp::query_signature(r"C:\__ap_nonexistent_sig_target__.exe");
         assert_eq!(sig_miss["ok"], Value::Bool(false));
+
+        let procs = imp::query_procs_opts(None, 10, false, None);
+        assert_eq!(procs["ok"], Value::Bool(true), "{procs}");
+        assert_eq!(procs["mode"], "procs");
+        let parr = procs["processes"].as_array().unwrap();
+        assert!(!parr.is_empty(), "{procs}");
+        assert!(parr[0].get("integrity_level").is_some(), "{procs}");
+        assert!(parr[0].get("session_id").is_some(), "{procs}");
+
+        let pipes_arr = pipes["pipes"].as_array().unwrap();
+        assert!(pipes_arr[0].get("pipe").is_some(), "{pipes}");
+        assert!(pipes_arr[0].get("weak_dacl").is_some(), "{pipes}");
+        assert!(pipes_arr[0].get("server_pid").is_some(), "{pipes}");
     }
 }

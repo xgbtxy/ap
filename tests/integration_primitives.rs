@@ -13,6 +13,18 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn isolated_test_ap_home(cwd: &Path) -> PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cwd.to_string_lossy().hash(&mut h);
+    std::env::temp_dir().join("ap_test_homes").join(format!(
+        "p{}_{:016x}",
+        std::process::id(),
+        h.finish()
+    ))
+}
+
 fn run_ap(
     cwd: &Path,
     args: &[&str],
@@ -24,6 +36,12 @@ fn run_ap(
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let has_home_override = extra_env
+        .iter()
+        .any(|(k, _)| matches!(*k, "AP_HOME" | "HOME" | "USERPROFILE"));
+    if !has_home_override {
+        cmd.env("AP_HOME", isolated_test_ap_home(cwd));
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -6393,7 +6411,7 @@ fn test_v229_pi_runtime_patches_10_and_deepseek_cache_physics() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 17);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 22);
     }
 }
 
@@ -7157,7 +7175,7 @@ fn test_v244_pi_patch13_quote_safe_grep_ps_backtick_and_loop_sleep() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 17);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 22);
     }
 }
 
@@ -7216,7 +7234,7 @@ fn test_v245_windows_win_probe_msys_shield_tmp_path_and_pi_patch14() {
     let dv: Value = serde_json::from_slice(&doc.stdout).unwrap();
     assert_eq!(dv["pi_runtime"]["accelerator_up_to_date"], true);
     if dv["pi_runtime"]["runtime_patches"]["detected"] == Value::Bool(true) {
-        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 17);
+        assert_eq!(dv["pi_runtime"]["runtime_patches"]["total_count"], 22);
     }
 
     // 3. Verify `ap mcp` discovers `ap_win` across 37 specialist tools
@@ -13635,4 +13653,379 @@ fn test_v278_http_mutate_matrix_and_ai_surface_frontier_ingest() {
         "{}",
         mcp_lines[2]
     );
+}
+
+#[test]
+fn test_wave1_recall_sync_win_combined_excludes_and_har_json_contract() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // 1. `ap recall --store <custom>` with `--scope`, `--weight`, `sync --glob --prune`, bilingual CJK+ASCII
+    let custom_store = root.join("custom_kb").join("vault.db");
+    let docs_dir = root.join("docs_kb");
+    fs::create_dir_all(&docs_dir).unwrap();
+    fs::write(
+        docs_dir.join("storage.md"),
+        "# SQLite WAL 并发锁机制\n\n启用 WAL 模式并设置 busy_timeout 以防止多进程写入冲突。\n\n## Atomic Write\n\n使用原子重命名替换状态文件。\n",
+    )
+    .unwrap();
+    fs::write(
+        docs_dir.join("legacy.md"),
+        "# Legacy Notes\n\nDeprecated workflow archive.\n",
+    )
+    .unwrap();
+
+    let add_out = run_ap(
+        root,
+        &[
+            "recall",
+            "--store",
+            custom_store.to_str().unwrap(),
+            "add",
+            "--triggers",
+            "sqlite,wal,busy_timeout",
+            "--rule",
+            "Always enable WAL and busy_timeout for concurrent SQLite vaults",
+            "--scope",
+            "db,shared",
+            "--weight",
+            "2.5",
+            "--section",
+            "Manual",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        add_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    assert!(custom_store.is_file());
+
+    let sync1 = run_ap(
+        root,
+        &[
+            "recall",
+            "--store",
+            custom_store.to_str().unwrap(),
+            "sync",
+            docs_dir.to_str().unwrap(),
+            "--glob",
+            "*.md",
+            "--scope",
+            "docs",
+            "--prune",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        sync1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync1.stderr)
+    );
+    let s1: Value = serde_json::from_slice(&sync1.stdout).unwrap();
+    assert_eq!(s1["ok"], true, "{s1}");
+    assert_eq!(s1["indexed_files"], 2, "{s1}");
+    assert_eq!(s1["skipped_unchanged"], 0, "{s1}");
+
+    // Second sync without changes -> fast mtime/hash skip
+    let sync2 = run_ap(
+        root,
+        &[
+            "recall",
+            "--store",
+            custom_store.to_str().unwrap(),
+            "sync",
+            docs_dir.to_str().unwrap(),
+            "--glob",
+            "*.md",
+            "--scope",
+            "docs",
+            "--prune",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(sync2.status.success());
+    let s2: Value = serde_json::from_slice(&sync2.stdout).unwrap();
+    assert_eq!(s2["indexed_files"], 0, "{s2}");
+    assert_eq!(s2["skipped_unchanged"], 2, "{s2}");
+
+    // Bilingual query with strict scope isolation
+    let m_docs = run_ap(
+        root,
+        &[
+            "recall",
+            "--store",
+            custom_store.to_str().unwrap(),
+            "match",
+            "--query",
+            "WAL 并发锁机制",
+            "--scope",
+            "docs",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(m_docs.status.success());
+    let md_v: Value = serde_json::from_slice(&m_docs.stdout).unwrap();
+    let hits = md_v["matches"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{md_v}");
+    assert!(hits.iter().all(|h| h["scope"] == "docs"), "{md_v}");
+
+    // Delete legacy.md and verify `--prune` cleans it up
+    fs::remove_file(docs_dir.join("legacy.md")).unwrap();
+    let sync3 = run_ap(
+        root,
+        &[
+            "recall",
+            "--store",
+            custom_store.to_str().unwrap(),
+            "sync",
+            docs_dir.to_str().unwrap(),
+            "--glob",
+            "*.md",
+            "--scope",
+            "docs",
+            "--prune",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(sync3.status.success());
+    let s3: Value = serde_json::from_slice(&sync3.stdout).unwrap();
+    assert_eq!(s3["pruned_files"], 1, "{s3}");
+
+    // 2. `ap atlas surface --exclude / --exclude-file` + `ap baton frontier seed/ingest --exclude`
+    let scan_dir = root.join("scan_app");
+    fs::create_dir_all(scan_dir.join("src")).unwrap();
+    fs::create_dir_all(scan_dir.join("noise")).unwrap();
+    fs::write(
+        scan_dir.join("src/api.ts"),
+        "app.post('/v1/orders', (req, res) => exec(req.body.cmd));\n",
+    )
+    .unwrap();
+    fs::write(
+        scan_dir.join("noise/helper.ts"),
+        "app.post('/v1/noise', (req, res) => exec(req.body.cmd));\n",
+    )
+    .unwrap();
+    let excl_file = root.join("excl.txt");
+    fs::write(&excl_file, "# comment\nnoise/*\n").unwrap();
+
+    let surf = run_ap(
+        root,
+        &[
+            "atlas",
+            "surface",
+            scan_dir.to_str().unwrap(),
+            "--exclude-file",
+            excl_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(surf.status.success());
+    let sv: Value = serde_json::from_slice(&surf.stdout).unwrap();
+    assert!(sv["excluded_files"].as_u64().unwrap() >= 1, "{sv}");
+    let surf_txt = sv.to_string();
+    assert!(!surf_txt.contains("noise/helper.ts"), "{sv}");
+    assert!(surf_txt.contains("src/api.ts"), "{sv}");
+
+    let f_store = root.join("frontier_excl.json");
+    let seed_payload = serde_json::json!({
+        "items": [
+            {"axis": "exec_spawn", "module": "noise", "target": "noise/vcruntime140.dll", "symbol": "run"},
+            {"axis": "exec_spawn", "module": "src", "target": "src/api.ts", "symbol": "exec"}
+        ]
+    });
+    let f_seed = run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "seed",
+            "--store",
+            f_store.to_str().unwrap(),
+            "--stdin",
+            "--exclude",
+            "*vcruntime*",
+            "--json",
+        ],
+        Some(&seed_payload.to_string()),
+        &[],
+    );
+    assert!(f_seed.status.success());
+    let fsv: Value = serde_json::from_slice(&f_seed.stdout).unwrap();
+    assert_eq!(fsv["added"], 1, "{fsv}");
+    assert_eq!(fsv["filtered_excluded"], 1, "{fsv}");
+
+    // 3. `ap probe ws --replay-har --json` with 2 WS flows -> SINGLE valid JSON object; invalid path -> JSON error
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ws_port = listener.local_addr().unwrap().port();
+    let ws_server = std::thread::spawn(move || {
+        use std::io::Read;
+        for _ in 0..2 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(400)));
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: dummy==\r\n\r\n",
+                );
+            }
+        }
+    });
+    let multi_har = root.join("multi_ws.har");
+    fs::write(
+        &multi_har,
+        serde_json::json!({
+            "log": {
+                "entries": [
+                    {
+                        "request": { "method": "GET", "url": format!("ws://127.0.0.1:{ws_port}/s1"), "headers": [] },
+                        "response": { "status": 101 },
+                        "_webSocketMessages": [{ "type": "send", "data": "hi1" }]
+                    },
+                    {
+                        "request": { "method": "GET", "url": format!("ws://127.0.0.1:{ws_port}/s2"), "headers": [] },
+                        "response": { "status": 101 },
+                        "_webSocketMessages": [{ "type": "send", "data": "hi2" }]
+                    }
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ws_multi = run_ap(
+        root,
+        &[
+            "probe",
+            "ws",
+            "--replay-har",
+            multi_har.to_str().unwrap(),
+            "--wait-ms",
+            "120",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    let _ = ws_server.join();
+    assert!(
+        ws_multi.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ws_multi.stderr)
+    );
+    let wmv: Value = serde_json::from_slice(&ws_multi.stdout)
+        .expect("multi-flow --replay-har --json MUST emit a single valid JSON object");
+    assert_eq!(wmv["ws_flows"], 2, "{wmv}");
+    assert_eq!(wmv["flows"].as_array().map(|a| a.len()), Some(2), "{wmv}");
+
+    let ws_missing = run_ap(
+        root,
+        &[
+            "probe",
+            "ws",
+            "--replay-har",
+            root.join("does_not_exist.har").to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(!ws_missing.status.success());
+    let werr: Value = serde_json::from_slice(&ws_missing.stdout)
+        .expect("--replay-har missing file with --json MUST emit valid JSON error");
+    assert_eq!(werr["ok"], false, "{werr}");
+    assert!(werr["error"].is_string(), "{werr}");
+
+    // 4. Windows native `--procs` and `--all` combined mode
+    #[cfg(windows)]
+    {
+        let procs_out = run_ap(
+            root,
+            &["probe", "win", "--procs", "--max", "5", "--json"],
+            None,
+            &[],
+        );
+        assert!(procs_out.status.success());
+        let pv: Value = serde_json::from_slice(&procs_out.stdout).unwrap();
+        assert_eq!(pv["mode"], "procs", "{pv}");
+        let procs = pv["processes"].as_array().unwrap();
+        assert!(!procs.is_empty(), "{pv}");
+        assert!(procs[0]["integrity_level"].is_string(), "{pv}");
+
+        let all_out = run_ap(
+            root,
+            &["probe", "win", "--all", "--non-ms", "--max", "5", "--json"],
+            None,
+            &[],
+        );
+        assert!(all_out.status.success());
+        let av: Value = serde_json::from_slice(&all_out.stdout).unwrap();
+        assert_eq!(av["mode"], "combined", "{av}");
+        assert!(av["weak_pipes"].is_array(), "{av}");
+        assert!(av["weak_services"].is_array(), "{av}");
+        assert!(av["exploitable_unquoted"].is_array(), "{av}");
+        assert!(av["findings"].is_array(), "{av}");
+        assert!(av["endpoints"].is_array(), "{av}");
+        assert!(av["processes"].is_array(), "{av}");
+    }
+
+    // 5. MCP `tools/list` still returns exact 37 tools with new Wave 1 parameters + `ap_recall` sync works
+    let mcp_in = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "ap_recall",
+                "arguments": {
+                    "action": "sync",
+                    "cwd": root.to_string_lossy(),
+                    "store": custom_store.to_string_lossy(),
+                    "path": docs_dir.to_string_lossy(),
+                    "glob": "*.md",
+                    "scope": "mcp-sync"
+                }
+            }
+        })
+        .to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_in), &[]);
+    assert!(mcp_out.status.success());
+    let mlines: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(mlines.len(), 3);
+    let tools = mlines[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 37, "MCP tool count must remain strictly 37");
+    let t_recall = tools.iter().find(|t| t["name"] == "ap_recall").unwrap();
+    assert!(t_recall["inputSchema"]["properties"].get("store").is_some());
+    assert!(t_recall["inputSchema"]["properties"].get("scope").is_some());
+    let t_win = tools.iter().find(|t| t["name"] == "ap_win").unwrap();
+    assert!(t_win["inputSchema"]["properties"].get("procs").is_some());
+    assert!(t_win["inputSchema"]["properties"].get("all").is_some());
+    let t_surf = tools.iter().find(|t| t["name"] == "ap_surface").unwrap();
+    assert!(t_surf["inputSchema"]["properties"].get("exclude").is_some());
+    let t_front = tools.iter().find(|t| t["name"] == "ap_frontier").unwrap();
+    assert!(t_front["inputSchema"]["properties"]
+        .get("exclude")
+        .is_some());
+    assert_eq!(mlines[2]["result"]["isError"], false, "{}", mlines[2]);
 }

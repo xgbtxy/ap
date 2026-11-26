@@ -201,6 +201,12 @@ enum FrontierCmd {
         note: Option<String>,
         #[arg(long, default_value_t = 85)]
         score: u32,
+        /// Repeatable glob/substring exclusion pattern(s) to drop noisy items
+        #[arg(short = 'x', long = "exclude")]
+        exclude: Vec<String>,
+        /// Optional newline-delimited file of exclusion patterns (`#` comments ignored)
+        #[arg(long = "exclude-file")]
+        exclude_file: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -277,6 +283,12 @@ enum FrontierCmd {
         stdin: bool,
         #[arg(long)]
         kind: Option<String>,
+        /// Repeatable glob/substring exclusion pattern(s) to drop noisy items
+        #[arg(short = 'x', long = "exclude")]
+        exclude: Vec<String>,
+        /// Optional newline-delimited file of exclusion patterns (`#` comments ignored)
+        #[arg(long = "exclude-file")]
+        exclude_file: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -616,13 +628,15 @@ pub fn save_state(
 ) -> String {
     state.updated_at = now_iso_utc();
     state.workspace = probe_workspace(cwd);
+    let state_path = base.join("state.json");
+    let _lock = frontier::acquire_file_lock(&state_path).ok();
     if let Ok(js) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(base.join("state.json"), &js);
+        let _ = frontier::atomic_write_text(&state_path, &js);
         if snapshot_history {
             let hist_dir = base.join("history");
             let _ = fs::create_dir_all(&hist_dir);
-            let _ = fs::write(
-                hist_dir.join(format!("baton-{}.json", now_compact_stamp())),
+            let _ = frontier::atomic_write_text(
+                &hist_dir.join(format!("baton-{}.json", now_compact_stamp())),
                 &js,
             );
             if let Ok(rd) = fs::read_dir(&hist_dir) {
@@ -646,7 +660,7 @@ pub fn save_state(
         }
     }
     let md = render_markdown(state);
-    let _ = fs::write(base.join("HANDOFF.md"), &md);
+    let _ = frontier::atomic_write_text(&base.join("HANDOFF.md"), &md);
     md
 }
 
@@ -814,21 +828,36 @@ pub fn run_cli(args: &[String]) -> i32 {
                 module,
                 note,
                 score,
+                exclude,
+                exclude_file,
                 json,
-            } => frontier::run_frontier_seed(
-                &cwd,
-                &frontier::FrontierSeedOpts {
-                    store: store.as_deref(),
-                    from_json: from_json.as_deref(),
-                    from_stdin: stdin,
-                    axis: axis.as_deref(),
-                    target: target.as_deref(),
-                    module: module.as_deref(),
-                    note: note.as_deref(),
-                    score,
-                    as_json: json,
-                },
-            ),
+            } => {
+                let mut merged_excl = exclude;
+                if let Some(ref ef) = exclude_file {
+                    match frontier::load_exclude_file(Path::new(ef)) {
+                        Ok(pats) => merged_excl.extend(pats),
+                        Err(e) => {
+                            eprintln!("[baton frontier] cannot read --exclude-file `{ef}`: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                frontier::run_frontier_seed(
+                    &cwd,
+                    &frontier::FrontierSeedOpts {
+                        store: store.as_deref(),
+                        from_json: from_json.as_deref(),
+                        from_stdin: stdin,
+                        axis: axis.as_deref(),
+                        target: target.as_deref(),
+                        module: module.as_deref(),
+                        note: note.as_deref(),
+                        score,
+                        excludes: &merged_excl,
+                        as_json: json,
+                    },
+                )
+            }
             FrontierCmd::Mark {
                 query,
                 status,
@@ -875,15 +904,30 @@ pub fn run_cli(args: &[String]) -> i32 {
                 from_file,
                 stdin,
                 kind,
+                exclude,
+                exclude_file,
                 json,
-            } => frontier::run_frontier_ingest(
-                &cwd,
-                store.as_deref(),
-                from_file.as_deref(),
-                stdin,
-                kind.as_deref(),
-                json,
-            ),
+            } => {
+                let mut merged_excl = exclude;
+                if let Some(ref ef) = exclude_file {
+                    match frontier::load_exclude_file(Path::new(ef)) {
+                        Ok(pats) => merged_excl.extend(pats),
+                        Err(e) => {
+                            eprintln!("[baton frontier] cannot read --exclude-file `{ef}`: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                frontier::run_frontier_ingest_with_excludes(
+                    &cwd,
+                    store.as_deref(),
+                    from_file.as_deref(),
+                    stdin,
+                    kind.as_deref(),
+                    &merged_excl,
+                    json,
+                )
+            }
         },
     }
 }

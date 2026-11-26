@@ -1,0 +1,3 @@
+[env]
+# Suppress C assert() __FILE__ path embedding (e.g. MSVC _wassert UTF-16LE host paths in bundled C crates)
+CFLAGS = { value = "-DNDEBUG", force = false }

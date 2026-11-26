@@ -1366,11 +1366,12 @@ export interface ApProfileOverrides {{
 	kvSafeSleepSec?: number;
 	maskHighWaterTokens?: number;
 	dsmlRecovery?: boolean;
+	yieldCompact?: boolean;
 }}
 
-const MODEL_PROFILE_KNOBS: Readonly<Record<string, Omit<ApProfileOverrides, "modelProfile">>> = {{
+const MODEL_PROFILE_KNOBS: Readonly<Record<string, Omit<ApProfileOverrides, "modelProfile" | "yieldCompact">>> = {{
 	balanced: {{ sieveHardChars: 20000, kvSafeSleepSec: 60, maskHighWaterTokens: 180000, dsmlRecovery: false }},
-	deepseek: {{ sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 210000, dsmlRecovery: true }},
+	deepseek: {{ sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 135000, dsmlRecovery: true }},
 	fast: {{ sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 140000, dsmlRecovery: false }},
 	reasoning: {{ sieveHardChars: 16000, kvSafeSleepSec: 45, maskHighWaterTokens: 180000, dsmlRecovery: false }},
 	small: {{ sieveHardChars: 10000, kvSafeSleepSec: 45, maskHighWaterTokens: 90000, dsmlRecovery: false }},
@@ -1378,21 +1379,220 @@ const MODEL_PROFILE_KNOBS: Readonly<Record<string, Omit<ApProfileOverrides, "mod
 
 /**
  * Load optional Layer 3 declarative profile overrides (`~/.ap/profile.json`) once on startup.
- * Returns `undefined` when missing or set to `auto` (zero overhead when unused).
+ * Returns `undefined` when missing and no explicit override (`model_profile` != auto or `yield_compact`) is set.
  */
 export function loadApProfile(profilePath?: string): ApProfileOverrides | undefined {{
 	try {{
 		const p = profilePath || join(homedir(), ".ap", "profile.json");
 		if (!existsSync(p)) return undefined;
-		const parsed = JSON.parse(readFileSync(p, "utf8")) as {{ model_profile?: unknown }};
+		const parsed = JSON.parse(readFileSync(p, "utf8")) as {{
+			model_profile?: unknown;
+			yield_compact?: unknown;
+			yieldCompact?: unknown;
+		}};
 		const mp = typeof parsed?.model_profile === "string" ? parsed.model_profile.trim().toLowerCase() : "";
-		if (!mp || mp === "auto") return undefined;
-		const knobs = MODEL_PROFILE_KNOBS[mp];
-		if (!knobs) return undefined;
-		return {{ modelProfile: mp, ...knobs }};
+		const yieldCompact =
+			typeof parsed?.yield_compact === "boolean"
+				? parsed.yield_compact
+				: typeof parsed?.yieldCompact === "boolean"
+					? parsed.yieldCompact
+					: undefined;
+		const knobs = mp && mp !== "auto" ? MODEL_PROFILE_KNOBS[mp] : undefined;
+		if (!knobs && yieldCompact === undefined) return undefined;
+		return {{
+			modelProfile: knobs ? mp : (mp || "auto"),
+			...(knobs ?? {{}}),
+			...(yieldCompact !== undefined ? {{ yieldCompact }} : {{}}),
+		}};
 	}} catch {{
 		return undefined;
 	}}
+}}
+
+/**
+ * Decide whether `zz-ap-accelerator` should yield LLM compaction summarization to an earlier extension or host workflow.
+ * Note: `.baton` checkpointing still runs unconditionally before this yield check.
+ */
+export function shouldYieldCompaction(input: {{
+	compactionClaimed?: boolean;
+	envYieldCompact?: string;
+	profileYieldCompact?: boolean;
+	peerClaimed?: boolean;
+}}): boolean {{
+	return Boolean(
+		input.compactionClaimed ||
+			input.envYieldCompact === "1" ||
+			input.profileYieldCompact === true ||
+			input.peerClaimed,
+	);
+}}
+
+/**
+ * Read active model auto-compaction trigger tokens (`contextWindow - reserveTokens`) from `~/.pi/agent/settings.json`.
+ */
+export function readModelCompactionTriggerTokens(
+	model?: {{ provider?: string; id?: string; contextWindow?: number }},
+	settingsPath?: string,
+): number | undefined {{
+	try {{
+		const p = settingsPath || join(homedir(), ".pi", "agent", "settings.json");
+		if (!existsSync(p)) return undefined;
+		const parsed = JSON.parse(readFileSync(p, "utf8")) as {{
+			compaction?: {{
+				reserveTokens?: unknown;
+				modelOverrides?: Record<string, {{ reserveTokens?: unknown }}>;
+			}};
+		}};
+		const comp = parsed?.compaction;
+		if (!comp || typeof comp !== "object") return undefined;
+		const prov = String(model?.provider ?? "").trim();
+		const id = String(model?.id ?? "").trim();
+		const key = prov && id ? `${{prov}}/${{id}}` : id;
+		const overrides = comp.modelOverrides && typeof comp.modelOverrides === "object" ? comp.modelOverrides : undefined;
+		let reserve: unknown = key && overrides?.[key]?.reserveTokens;
+		if (typeof reserve !== "number" && id === "flash-auto" && overrides?.["deepseek/deepseek-flash"]) {{
+			reserve = overrides["deepseek/deepseek-flash"].reserveTokens;
+		}}
+		if (typeof reserve !== "number") {{
+			reserve = comp.reserveTokens;
+		}}
+		if (typeof reserve !== "number" || !Number.isFinite(reserve) || reserve <= 0) return undefined;
+		const ctxWindow =
+			typeof model?.contextWindow === "number" && model.contextWindow > 0
+				? model.contextWindow
+				: id === "deepseek-flash" || id === "flash-auto"
+					? 1000000
+					: 0;
+		if (ctxWindow <= reserve) return undefined;
+		return ctxWindow - reserve;
+	}} catch {{
+		return undefined;
+	}}
+}}
+
+/**
+ * Compute effective observation-masking high-water threshold, capping safely below active auto-compaction trigger
+ * (`floor(trigger * 0.85)`) so masking actually runs before compaction resets KV-cache.
+ */
+export function resolveEffectiveMaskHighWaterTokens(input: {{
+	deepCacheDiscount?: boolean;
+	profileMaskTokens?: number;
+	compactionTriggerTokens?: number;
+}}): number {{
+	const base =
+		typeof input.profileMaskTokens === "number" && input.profileMaskTokens > 0
+			? input.profileMaskTokens
+			: input.deepCacheDiscount
+				? 210000
+				: MASK_HIGH_WATER_TOKENS;
+	if (typeof input.compactionTriggerTokens === "number" && input.compactionTriggerTokens >= 40000) {{
+		const dynamicCap = Math.max(40000, Math.floor(input.compactionTriggerTokens * 0.85));
+		return Math.min(base, dynamicCap);
+	}}
+	return base;
+}}
+
+/**
+ * Return true for non-retryable billing/auth/request errors (402 insufficient balance, 401/403, 400/422)
+ * that sub-LLM helpers must never retry.
+ */
+export function isNonRetryableSubLlmError(errMsg: string): boolean {{
+	if (!errMsg) return false;
+	return /\b(?:400|401|402|403|404|422)\b|insufficient[\s_-]*balance|quota|billing|payment|invalid[\s_-]*api[\s_-]*key|unauthorized|forbidden|authentication|context[\s_-]*length/i.test(
+		errMsg,
+	);
+}}
+
+export interface SubLlmRetryOptions {{
+	reasoning?: "low" | "medium" | "high" | "max";
+	maxTokens?: number;
+	cacheRetention?: "none" | "short" | "long";
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	maxAttempts?: number;
+	retryDelayMs?: number;
+	unwrapVirtual?: boolean;
+}}
+
+/**
+ * Bounded-timeout, 1-retry jittered sub-LLM caller for compaction / handoff / review helpers.
+ * Optionally unwraps `deepseek/flash-auto` to physical `deepseek/deepseek-flash`, and strictly never
+ * retries 402/billing/auth/400 errors or caller aborts.
+ */
+export async function callSubLlmWithRetry(
+	ctx: {{
+		modelRegistry?: {{
+			find?: (provider: string, id: string) => unknown;
+			streamSimple?: (model: unknown, reqCtx: unknown, opts: unknown) => {{ result: () => Promise<Record<string, unknown>> }};
+			complete?: (model: unknown, reqCtx: unknown, opts: unknown) => Promise<Record<string, unknown>>;
+		}};
+	}},
+	model: {{ provider?: string; id?: string; [k: string]: unknown }},
+	reqCtx: unknown,
+	opts: SubLlmRetryOptions = {{}},
+): Promise<Record<string, unknown> | undefined> {{
+	const targetModel =
+		opts.unwrapVirtual && model?.id === "flash-auto"
+			? (ctx?.modelRegistry?.find?.("deepseek", "deepseek-flash") ?? model)
+			: model;
+	const maxAttempts = Math.max(1, Math.min(3, opts.maxAttempts ?? 2));
+	const timeoutMs = Math.max(1000, opts.timeoutMs ?? 45000);
+	let lastResponse: Record<string, unknown> | undefined;
+	let lastError: unknown;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {{
+		if (opts.signal?.aborted) return undefined;
+		const ac = new AbortController();
+		const onParentAbort = () => ac.abort();
+		opts.signal?.addEventListener("abort", onParentAbort, {{ once: true }});
+		const timer = setTimeout(() => ac.abort(), timeoutMs);
+		try {{
+			const callOpts = {{
+				reasoning: opts.reasoning ?? "low",
+				maxTokens: opts.maxTokens ?? 6144,
+				cacheRetention: opts.cacheRetention ?? "none",
+				signal: ac.signal,
+			}};
+			const resp =
+				typeof ctx?.modelRegistry?.streamSimple === "function"
+					? await ctx.modelRegistry.streamSimple(targetModel, reqCtx, callOpts).result()
+					: typeof ctx?.modelRegistry?.complete === "function"
+						? await ctx.modelRegistry.complete(targetModel, reqCtx, callOpts)
+						: undefined;
+			lastResponse = resp;
+			if (!resp) {{
+				if (attempt >= maxAttempts) return undefined;
+			}} else if (resp.stopReason === "aborted") {{
+				return resp;
+			}} else if (resp.stopReason === "error") {{
+				const errMsg = String(resp.errorMessage ?? resp.error ?? "");
+				if (isNonRetryableSubLlmError(errMsg) || attempt >= maxAttempts) {{
+					return resp;
+				}}
+			}} else {{
+				return resp;
+			}}
+		}} catch (err) {{
+			lastError = err;
+			const errMsg = err instanceof Error ? err.message : String(err);
+			if (opts.signal?.aborted || isNonRetryableSubLlmError(errMsg) || attempt >= maxAttempts) {{
+				throw err;
+			}}
+		}} finally {{
+			clearTimeout(timer);
+			opts.signal?.removeEventListener("abort", onParentAbort);
+		}}
+		const delay =
+			typeof opts.retryDelayMs === "number"
+				? Math.max(0, opts.retryDelayMs)
+				: 400 + Math.floor(Math.random() * 400);
+		if (delay > 0) {{
+			await new Promise((r) => setTimeout(r, delay));
+		}}
+	}}
+	if (lastResponse) return lastResponse;
+	if (lastError) throw lastError;
+	return undefined;
 }}
 
 /**
@@ -2556,7 +2756,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 			outText,
 		)
 	) {{
-		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }} (read (res.output ?? "")), tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined, or use (JSON.stringify(val) ?? "").slice(...)). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
+		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); guard undefined strings with String(res?.output ?? res?.text ?? "").slice(...) before slicing/splitting. tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }}, tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined, or use (JSON.stringify(val) ?? "").slice(...)). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
 	}}
 	if (/Unexpected end of JSON input/i.test(outText)) {{
 		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on non-JSON wrappers.`;
@@ -4437,7 +4637,19 @@ function splitUnquotedPipes(s: string): string[] | undefined {{
 			if (!t) return undefined;
 			parts.push(t);
 			cur = "";
-		}} else if (ch === "&" || (ch === "$" && s[i + 1] === "(")) {{
+		}} else if (ch === "&") {{
+			if (
+				i >= 2 &&
+				s[i - 1] === ">" &&
+				s[i - 2] === "2" &&
+				s[i + 1] === "1" &&
+				(i + 2 >= s.length || /[\s|]/.test(s[i + 2]))
+			) {{
+				cur += ch;
+			}} else {{
+				return undefined;
+			}}
+		}} else if (ch === "$" && s[i + 1] === "(") {{
 			return undefined;
 		}} else {{
 			cur += ch;
@@ -4450,13 +4662,17 @@ function splitUnquotedPipes(s: string): string[] | undefined {{
 	return parts;
 }}
 
-function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
+function accelerateGrepPipeline(
+	cmdTailBody: string,
+	cdLeadPfx: string,
+	allowSingleStage = false,
+): string | undefined {{
 	const stages = splitUnquotedPipes(cmdTailBody.trim());
-	if (!stages || stages.length < 2) return undefined;
-	const grepRaw = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
+	if (!stages || stages.length < (allowSingleStage ? 1 : 2)) return undefined;
+	const grepRaw = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
 	const stripQuotes = (s: string) => s.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
 	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(grepRaw))) return undefined;
-	if (!/^(?:grep|rg)(?:\s|$)/.test(grepRaw)) return undefined;
+	if (!/^(?:grep|egrep|fgrep|rg)(?:\s|$)/.test(grepRaw)) return undefined;
 	const gToks = (grepRaw.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) => {{
 		if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {{
 			return t.slice(1, -1).replace(/\\"/g, '"');
@@ -4464,9 +4680,12 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		return t;
 	}});
 	const isRg = gToks[0] === "rg";
-	if (gToks[0] !== "grep" && !isRg) return undefined;
+	const isEgrep = gToks[0] === "egrep";
+	const isFgrep = gToks[0] === "fgrep";
+	if (gToks[0] !== "grep" && !isEgrep && !isFgrep && !isRg) return undefined;
 	let ignoreCase = false;
-	let fixed = false;
+	let fixed = isFgrep;
+	let extendedRe = isEgrep;
 	let filesOnly = false;
 	let countOnly = false;
 	let wordRe = false;
@@ -4606,7 +4825,7 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 		return undefined;
 	}}
 	const isSingleConcreteFile = !isRg && !gToks.some((t) => /^-[a-zA-Z]*[rR]/.test(t));
-	if (isSingleConcreteFile && (tgtPos === "." || !/[./\\]/.test(tgtPos))) {{
+	if (isSingleConcreteFile && !allowSingleStage && (tgtPos === "." || !/[./\\]/.test(tgtPos))) {{
 		return undefined;
 	}}
 	let cutWidth = 0;
@@ -4650,8 +4869,8 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 			}}
 		}}
 	}}
-	if (sawBareSort || (cutWidth === 0 && maxHits === 0 && !unique)) return undefined;
-	const rustPat = isRg ? patPos : translateGrepBreToRustRegex(patPos, `${{fixed ? "F" : ""}}${{gToks.some((t) => /^-[a-zA-Z]*E/.test(t)) ? "E" : ""}}`);
+	if (sawBareSort || (!allowSingleStage && cutWidth === 0 && maxHits === 0 && !unique)) return undefined;
+	const rustPat = isRg ? patPos : translateGrepBreToRustRegex(patPos, `${{fixed ? "F" : ""}}${{extendedRe || gToks.some((t) => /^-[a-zA-Z]*E/.test(t)) ? "E" : ""}}`);
 	const flags = [
 		cutWidth > 0 ? ` --width ${{cutWidth}}` : "",
 		maxHits > 0 ? ` --max ${{maxHits}}` : "",
@@ -4674,14 +4893,13 @@ function accelerateGrepPipeline(cmdTailBody: string, cdLeadPfx: string): string 
 
 function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
 	const stages = splitUnquotedPipes(cmdTailBody.trim());
-	if (!stages || stages.length !== 2) return undefined;
-	const lhs = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
-	const rhs = stages[1].trim();
-	if (/[;&><{{}}`]|\$\(/.test(lhs) || /[;&><{{}}`]|\$\(/.test(rhs)) return undefined;
-	const headM = rhs.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
-	if (!headM) return undefined;
-	const limit = Number(headM[1] || headM[2]);
-	if (!Number.isInteger(limit) || limit < 1) return undefined;
+	if (!stages || stages.length < 2 || stages.length > 3) return undefined;
+	const lhs = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+	const stripQuotes = (s: string) => s.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
+	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(lhs))) return undefined;
+	for (let si = 1; si < stages.length; si += 1) {{
+		if (/[;&><{{}}`]|\$\(/.test(stripQuotes(stages[si].trim()))) return undefined;
+	}}
 	const toks = (lhs.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) =>
 		(t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")) ? t.slice(1, -1) : t,
 	);
@@ -4693,7 +4911,22 @@ function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | 
 	for (let i = 1; i < toks.length; i += 1) {{
 		const t = toks[i];
 		if (t.startsWith("-") && t.length > 1) {{
-			if (t.startsWith("--")) return undefined;
+			if (t.startsWith("--")) {{
+				if (t === "--all" || t === "--almost-all") {{
+					showAll = true;
+				}} else if (
+					t === "--color=never" ||
+					t === "--color=auto" ||
+					t === "--group-directories-first" ||
+					t === "--classify" ||
+					t === "--human-readable"
+				) {{
+					continue;
+				}} else {{
+					return undefined;
+				}}
+				continue;
+			}}
 			for (const ch of t.slice(1)) {{
 				if ("l1hFp".includes(ch)) continue;
 				else if (ch === "a" || ch === "A") showAll = true;
@@ -4708,7 +4941,31 @@ function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | 
 	}}
 	const esc = (tgt || ".").replace(/"/g, '\\"');
 	const flags = `${{showAll ? " -a" : ""}}${{sortMtime ? " -t" : sortSize ? " -S" : ""}}`;
-	return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 --limit ${{limit}}`;
+	const rhs1 = stages[1].trim();
+	if (stages.length === 2) {{
+		const headM = rhs1.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
+		if (headM) {{
+			const limit = Number(headM[1] || headM[2]);
+			if (!Number.isInteger(limit) || limit < 1) return undefined;
+			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 --limit ${{limit}}`;
+		}}
+		const tailM = rhs1.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
+		if (tailM) {{
+			const n = Number(tailM[1] || tailM[2]);
+			if (!Number.isInteger(n) || n < 1) return undefined;
+			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 | tail -n ${{n}}`;
+		}}
+		if (/^(?:grep|egrep|fgrep)\s+/.test(rhs1)) {{
+			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 | ${{rhs1}}`;
+		}}
+		return undefined;
+	}}
+	// 3-stage: `ls ... | grep ... | head -n N`
+	const rhs2 = stages[2].trim();
+	if (/^(?:grep|egrep|fgrep)\s+/.test(rhs1) && /^head\s+(?:-n\s*\d+|-\d+)$/.test(rhs2)) {{
+		return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 | ${{rhs1}} | ${{rhs2}}`;
+	}}
+	return undefined;
 }}
 
 function parseSedLineRanges(expr: string): string | undefined {{
@@ -4828,7 +5085,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 	if (toolName === "bash") {{
 		const trimmedTail = cmdTailBody.trim();
 		const qPathOk = (f: string) => Boolean(f) && f !== "-" && !/[*?,]/.test(f);
-		const stripErr = (s: string) => s.replace(/\s+2>\s*(?:\/dev\/null|NUL)\s*$/i, "").trim();
+		const stripErr = (s: string) => s.replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
 		const cutOnlyM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
 		const sliceCore = stripErr(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
 		const sliceWidth = cutOnlyM && Number(cutOnlyM[2]) >= 1 ? Number(cutOnlyM[2]) : 0;
@@ -4905,18 +5162,20 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 			}}
 		}}
 		const catStages = splitUnquotedPipes(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
-		if (catStages && catStages.length === 2) {{
+		if (catStages && catStages.length >= 2) {{
 			const catLhs = stripErr(catStages[0]);
-			const rhs = catStages[1].trim();
-			if (!/[|;&><{{}}`]|\$\(/.test(catLhs) && !hasUnsafeOutsideQuotes(rhs)) {{
-				const catM = catLhs.match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/);
-				const f = catM ? catM[1] || catM[2] || catM[3] || "" : "";
-				if (qPathOk(f)) {{
-					const rHead = rhs.match(/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))$/);
-					const rTail = rhs.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
-					const rSed = rhs.match(/^sed\s+-n\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))$/);
+			const catM = !/[|;&><{{}}`]|\$\(/.test(catLhs)
+				? catLhs.match(/^cat\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&-]+))$/)
+				: null;
+			const f = catM ? catM[1] || catM[2] || catM[3] || "" : "";
+			if (qPathOk(f)) {{
+				const esc = f.replace(/"/g, '\\"');
+				const rhs1 = stripErr(catStages[1]);
+				if (catStages.length === 2 && !hasUnsafeOutsideQuotes(rhs1)) {{
+					const rHead = rhs1.match(/^head\s+(?:(-c)\s*(\d+)|-n\s*(\d+)|-(\d+))$/);
+					const rTail = rhs1.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
+					const rSed = rhs1.match(/^sed\s+-n\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))$/);
 					const rSedRanges = rSed ? parseSedLineRanges(rSed[1] || rSed[2] || rSed[3] || "") : undefined;
-					const esc = f.replace(/"/g, '\\"');
 					if (rHead) {{
 						const isBytes = Boolean(rHead[1]);
 						const n = Number(rHead[2] || rHead[3] || rHead[4]);
@@ -4931,6 +5190,15 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 					}} else if (rSed && rSedRanges) {{
 						return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{rSedRanges}}${{sliceWidthFlag}}`;
 					}}
+				}}
+				if (/^(?:grep|egrep|fgrep)(?:\s|$)/.test(rhs1) && !hasUnsafeOutsideQuotes(rhs1)) {{
+					const tailParts = [
+						`${{rhs1}} "${{esc}}"`,
+						...catStages.slice(2).map((s) => s.trim()),
+						...(sliceWidth > 0 ? [`cut -c 1-${{sliceWidth}}`] : []),
+					];
+					const catGrepOut = accelerateGrepPipeline(tailParts.join(" | "), cdLeadPfx, true);
+					if (catGrepOut) return catGrepOut;
 				}}
 			}}
 		}}
@@ -5669,18 +5937,34 @@ const HALLUCINATED_TOOL_ALIASES: Readonly<Record<string, string>> = {{
 	code: "codemode",
 	codemap: "codemode",
 	codemap_placeholder: "codemode",
+	js_eval: "codemode",
+	eval_js: "codemode",
+	run_js: "codemode",
 	read_file: "read",
+	readfile: "read",
 	view_file: "read",
 	edit_file: "edit",
+	editfile: "edit",
 	replace_in_file: "edit",
+	str_replace: "edit",
+	str_replace_editor: "edit",
 	write_file: "write",
+	writefile: "write",
 	create_file: "write",
 	grep_search: "grep",
+	search_files: "grep",
+	find_files: "find",
+	list_files: "ls",
 	bashexec: "bash",
 	bash_run: "bash",
+	run_bash: "bash",
+	bash_command: "bash",
 	run_command: "bash",
 	run_shell: "bash",
 	shell: "bash",
+	terminal: "bash",
+	exec: "bash",
+	execute_shell: "bash",
 	execute_command: "bash",
 	exec_command: "bash",
 }};
@@ -5758,38 +6042,138 @@ export function normalizeRepairedToolArgs(
 			? {{ ...(rawArgs as Record<string, unknown>) }}
 			: {{}};
 	let changed = false;
-	if (targetName === "bash" && typeof args.command !== "string" && typeof args.cmd === "string") {{
-		args.command = args.cmd;
-		delete args.cmd;
-		changed = true;
+	if (targetName === "bash" && typeof args.command !== "string") {{
+		const altCmd =
+			typeof args.cmd === "string"
+				? args.cmd
+				: typeof args.shell_command === "string"
+					? args.shell_command
+					: typeof args.script === "string"
+						? args.script
+						: undefined;
+		if (altCmd !== undefined) {{
+			args.command = altCmd;
+			delete args.cmd;
+			delete args.shell_command;
+			delete args.script;
+			changed = true;
+		}}
 	}} else if (targetName === "read" || targetName === "edit" || targetName === "write") {{
 		if (typeof args.path !== "string") {{
-			const altPath = typeof args.file_path === "string" ? args.file_path : typeof args.filePath === "string" ? args.filePath : undefined;
+			const altPath =
+				typeof args.file_path === "string"
+					? args.file_path
+					: typeof args.filePath === "string"
+						? args.filePath
+						: typeof args.file === "string"
+							? args.file
+							: typeof args.filename === "string"
+								? args.filename
+								: undefined;
 			if (altPath !== undefined) {{
 				args.path = altPath;
 				delete args.file_path;
 				delete args.filePath;
+				delete args.file;
+				delete args.filename;
 				changed = true;
 			}}
 		}}
 		if (targetName === "edit") {{
-			if (typeof args.oldText !== "string" && typeof args.old_string === "string") {{
-				args.oldText = args.old_string;
-				delete args.old_string;
-				changed = true;
+			if (typeof args.oldText !== "string") {{
+				const altOld =
+					typeof args.old_string === "string"
+						? args.old_string
+						: typeof args.old_text === "string"
+							? args.old_text
+							: typeof args.old === "string"
+								? args.old
+								: undefined;
+				if (altOld !== undefined) {{
+					args.oldText = altOld;
+					delete args.old_string;
+					delete args.old_text;
+					delete args.old;
+					changed = true;
+				}}
 			}}
-			if (typeof args.newText !== "string" && typeof args.new_string === "string") {{
-				args.newText = args.new_string;
-				delete args.new_string;
+			if (typeof args.newText !== "string") {{
+				const altNew =
+					typeof args.new_string === "string"
+						? args.new_string
+						: typeof args.new_text === "string"
+							? args.new_text
+							: typeof args.new === "string"
+								? args.new
+								: undefined;
+				if (altNew !== undefined) {{
+					args.newText = altNew;
+					delete args.new_string;
+					delete args.new_text;
+					delete args.new;
+					changed = true;
+				}}
+			}}
+		}} else if (targetName === "write" && typeof args.content !== "string") {{
+			const altContent =
+				typeof args.text === "string"
+					? args.text
+					: typeof args.body === "string"
+						? args.body
+						: undefined;
+			if (altContent !== undefined) {{
+				args.content = altContent;
+				delete args.text;
+				delete args.body;
 				changed = true;
 			}}
 		}}
-	}} else if (targetName === "codemode" && typeof args.code !== "string" && typeof args.script === "string") {{
-		args.code = args.script;
-		delete args.script;
-		changed = true;
+	}} else if (targetName === "codemode" && typeof args.code !== "string") {{
+		const altCode =
+			typeof args.script === "string"
+				? args.script
+				: typeof args.js === "string"
+					? args.js
+					: typeof args.source === "string"
+						? args.source
+						: undefined;
+		if (altCode !== undefined) {{
+			args.code = altCode;
+			delete args.script;
+			delete args.js;
+			delete args.source;
+			changed = true;
+		}}
+	}} else if (targetName === "grep" && typeof args.pattern !== "string") {{
+		const altPat =
+			typeof args.query === "string"
+				? args.query
+				: typeof args.regex === "string"
+					? args.regex
+					: undefined;
+		if (altPat !== undefined) {{
+			args.pattern = altPat;
+			delete args.query;
+			delete args.regex;
+			changed = true;
+		}}
 	}}
 	return {{ changed, args }};
+}}
+
+/**
+ * Scrub leaked DeepSeek DSML / `<tool_call>` XML fragments from assistant text so unparsed markup
+ * never poisons downstream prompt context or triggers hallucination loops.
+ */
+export function scrubLeakedToolMarkup(text: string): string {{
+	if (!text || (!text.includes("DSML") && !text.includes("<tool_call>"))) return text;
+	return text
+		.replace(/<[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>/g, "")
+		.replace(/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke\b[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke>/g, "")
+		.replace(/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}[^>]*>/g, "")
+		.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+		.replace(/\n{{3,}}/g, "\n\n")
+		.trim();
 }}
 
 export interface DsmlRecoveredCall {{
@@ -6352,6 +6736,29 @@ function detectPiBuiltinSetTimeout(): boolean {{
 
 export default function (pi: ExtensionAPI) {{
 	const apProfileOverrides = loadApProfile();
+	let peerClaimedCompaction = false;
+	const evBusInit = (pi as {{ events?: {{ on?: (ch: string, fn: () => void) => void }} }}).events;
+	if (typeof evBusInit?.on === "function") {{
+		evBusInit.on("ap:claim_compaction", () => {{
+			peerClaimedCompaction = true;
+		}});
+	}}
+	let cachedCompactionTriggerKey = "";
+	let cachedCompactionTriggerTokens: number | undefined = undefined;
+	const getEffectiveMaskHighWaterTokens = (
+		model?: {{ provider?: string; id?: string; contextWindow?: number; cost?: {{ input?: number; cacheRead?: number }} }},
+	): number => {{
+		const mKey = model ? `${{model.provider ?? ""}}/${{model.id ?? ""}}` : "";
+		if (mKey !== cachedCompactionTriggerKey) {{
+			cachedCompactionTriggerKey = mKey;
+			cachedCompactionTriggerTokens = readModelCompactionTriggerTokens(model);
+		}}
+		return resolveEffectiveMaskHighWaterTokens({{
+			deepCacheDiscount: isDeepCacheDiscountModel(model),
+			profileMaskTokens: apProfileOverrides?.maskHighWaterTokens,
+			compactionTriggerTokens: cachedCompactionTriggerTokens,
+		}});
+	}};
 	const recentShellFps: string[] = [];
 	const unchangedReads = new Map<string, number>();
 	const outlinedPaths = new Set<string>();
@@ -6510,9 +6917,12 @@ export default function (pi: ExtensionAPI) {{
 		if (sievedCount > 0) parts.push(`${{sievedCount}} sieved`);
 		if (maskedCount > 0) parts.push(`${{maskedCount}} masked`);
 		if (guardsTriggered > 0) parts.push(`${{guardsTriggered}} guarded`);
+		const effMaskHighWater = getEffectiveMaskHighWaterTokens(
+			ctx.model as {{ provider?: string; id?: string; contextWindow?: number; cost?: {{ input?: number; cacheRead?: number }} }} | undefined,
+		);
 		const highWater =
 			(pct !== null && pct >= MASK_HIGH_WATER_PCT) ||
-			(tok !== null && tok >= MASK_HIGH_WATER_TOKENS);
+			(tok !== null && tok >= effMaskHighWater);
 		if (highWater) {{
 			parts.push(
 				tokLabel && pct !== null
@@ -6660,7 +7070,14 @@ export default function (pi: ExtensionAPI) {{
 				}}
 			}}
 		}}
-		if (process.env.AP_YIELD_COMPACT === "1") {{
+		if (
+			shouldYieldCompaction({{
+				compactionClaimed: Boolean((event as {{ compactionClaimed?: boolean }} | undefined)?.compactionClaimed),
+				envYieldCompact: process.env.AP_YIELD_COMPACT,
+				profileYieldCompact: apProfileOverrides?.yieldCompact,
+				peerClaimed: peerClaimedCompaction,
+			}})
+		) {{
 			return undefined;
 		}}
 
@@ -6774,13 +7191,17 @@ export default function (pi: ExtensionAPI) {{
 			maxTokens: 6144,
 			cacheRetention: "none" as const,
 			signal,
+			timeoutMs: 45000,
+			maxAttempts: 2,
 		}};
 		// Use `streamSimple().result()` (NOT `complete()`): in Pi v1.5+, `complete()` bypasses
 		// `streamSimple`, dropping `reasoning` effort mapping and rejecting virtual models like `flash-auto`.
-		const response =
-			typeof ctx.modelRegistry.streamSimple === "function"
-				? await ctx.modelRegistry.streamSimple(model, compCtx, compOpts).result()
-				: await ctx.modelRegistry.complete(model, compCtx, compOpts as never);
+		const response = await callSubLlmWithRetry(
+			ctx as Parameters<typeof callSubLlmWithRetry>[0],
+			model as Parameters<typeof callSubLlmWithRetry>[1],
+			compCtx,
+			compOpts,
+		);
 		if (
 			!response ||
 			response.stopReason === "error" ||
@@ -6789,7 +7210,8 @@ export default function (pi: ExtensionAPI) {{
 		) {{
 			return undefined;
 		}}
-		return (response.content ?? [])
+		const respContent = Array.isArray(response.content) ? response.content : [];
+		return respContent
 			.filter((c): c is {{ type: "text"; text: string }} => c?.type === "text" && typeof c.text === "string")
 			.map((c) => c.text)
 			.join("\n")
@@ -7012,13 +7434,18 @@ export default function (pi: ExtensionAPI) {{
 							reasoning: "low" as const,
 							maxTokens: 6144,
 							cacheRetention: "none" as const,
+							timeoutMs: 45000,
+							maxAttempts: 2,
 						}};
-						const response =
-							typeof ctx.modelRegistry.streamSimple === "function"
-								? await ctx.modelRegistry.streamSimple(ctx.model, handoffCtx, handoffOpts).result()
-								: await ctx.modelRegistry.complete(ctx.model, handoffCtx, handoffOpts as never);
-						const draft = response.content
-							.filter((c): c is {{ type: "text"; text: string }} => c.type === "text")
+						const response = await callSubLlmWithRetry(
+							ctx as Parameters<typeof callSubLlmWithRetry>[0],
+							ctx.model as Parameters<typeof callSubLlmWithRetry>[1],
+							handoffCtx,
+							handoffOpts,
+						);
+						const respBlocks = Array.isArray(response?.content) ? response.content : [];
+						const draft = respBlocks
+							.filter((c): c is {{ type: "text"; text: string }} => c?.type === "text" && typeof c.text === "string")
 							.map((c) => c.text)
 							.join("\n")
 							.trim();
@@ -7101,11 +7528,7 @@ export default function (pi: ExtensionAPI) {{
 					ctx.ui.notify("[ap review] Running isolated skeptical diff review (0 parent context bloat)...", "info");
 					try {{
 						const focusLine = rest ? `\n\n## Specific Review Focus\n${{rest}}` : "";
-						// Resolve physical deepseek-flash if active model is virtual `flash-auto` so `/ap review` always runs at true `high` effort
-						const reviewModel =
-							ctx.model.id === "flash-auto"
-								? ctx.modelRegistry.find?.("deepseek", "deepseek-flash") ?? ctx.model
-								: ctx.model;
+						// Unwrap virtual `flash-auto` -> physical `deepseek-flash` via callSubLlmWithRetry({{ unwrapVirtual: true }}) so `/ap review` always runs at true `high` effort
 						const reviewCtx = {{
 							systemPrompt:
 								"You are an independent, skeptical senior code reviewer seeing this Git diff with fresh eyes (zero bias from the author). Identify ONLY concrete, verified defects: logic bugs, edge cases, regressions, missing error handling, concurrency/resource leaks, or skipped/weak tests. Cite exact file:line. If the diff is solid, say LGTM concisely.",
@@ -7126,13 +7549,19 @@ export default function (pi: ExtensionAPI) {{
 							reasoning: "high" as const,
 							maxTokens: 8192,
 							cacheRetention: "none" as const,
+							timeoutMs: 60000,
+							maxAttempts: 2,
+							unwrapVirtual: true,
 						}};
-						const response =
-							typeof ctx.modelRegistry.streamSimple === "function"
-								? await ctx.modelRegistry.streamSimple(reviewModel, reviewCtx, reviewOpts).result()
-								: await ctx.modelRegistry.complete(reviewModel, reviewCtx, reviewOpts as never);
-						const report = response.content
-							.filter((c): c is {{ type: "text"; text: string }} => c.type === "text")
+						const response = await callSubLlmWithRetry(
+							ctx as Parameters<typeof callSubLlmWithRetry>[0],
+							ctx.model as Parameters<typeof callSubLlmWithRetry>[1],
+							reviewCtx,
+							reviewOpts,
+						);
+						const reviewBlocks = Array.isArray(response?.content) ? response.content : [];
+						const report = reviewBlocks
+							.filter((c): c is {{ type: "text"; text: string }} => c?.type === "text" && typeof c.text === "string")
 							.map((c) => c.text)
 							.join("\n")
 							.trim();
@@ -7171,8 +7600,11 @@ export default function (pi: ExtensionAPI) {{
 				const storeKeys = countCodemodeStoreKeys(branch as unknown as Array<Record<string, unknown>>);
 				const compactSuffix = extCompactionsCount > 0 ? ` extCompacts=${{extCompactionsCount}}` : "";
 				const warmSuffix = cacheWarmsCount > 0 ? ` cacheWarms=${{cacheWarmsCount}}` : "";
+				const effMaskTok = getEffectiveMaskHighWaterTokens(
+					ctx.model as {{ provider?: string; id?: string; contextWindow?: number; cost?: {{ input?: number; cacheRead?: number }} }} | undefined,
+				);
 				ctx.ui.notify(
-					`[ap telemetry] model=${{modelStr}} | ctx=${{ctxStr}} (mask@180k) | cache=${{hitPct}}% (saved ~$${{estUsdSaved}}) | sieved=${{sievedCount}} masked=${{maskedCount}} healedEdits=${{healedEditsCount}} guarded=${{guardsTriggered}}${{compactSuffix}}${{warmSuffix}} | serial1=${{serialPct}} storeKeys=${{storeKeys}}`,
+					`[ap telemetry] model=${{modelStr}} | ctx=${{ctxStr}} (mask@${{Math.round(effMaskTok / 1000)}}k) | cache=${{hitPct}}% (saved ~$${{estUsdSaved}}) | sieved=${{sievedCount}} masked=${{maskedCount}} healedEdits=${{healedEditsCount}} guarded=${{guardsTriggered}}${{compactSuffix}}${{warmSuffix}} | serial1=${{serialPct}} storeKeys=${{storeKeys}}`,
 					"info",
 				);
 			}},
@@ -7182,6 +7614,7 @@ export default function (pi: ExtensionAPI) {{
 	pi.on("message_end", (event) => {{
 		const msg = event.message as {{
 			role?: string;
+			stopReason?: string;
 			content?: Array<{{ type?: string; text?: string; name?: string; arguments?: unknown; [k: string]: unknown }}>;
 		}} | undefined;
 		if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return undefined;
@@ -7189,19 +7622,30 @@ export default function (pi: ExtensionAPI) {{
 		const active = new Set(pi.getActiveTools?.() ?? []);
 		if (active.size === 0) return undefined;
 
-		// 1. Repair hallucinated native toolCall names (e.g. `codemake` -> `codemode`, `read_file` -> `read`)
+		// 1. Repair hallucinated native toolCall names AND heal parameter aliases on already-active native tools
 		if (msg.content.some((b) => b?.type === "toolCall")) {{
 			let repairedAny = false;
 			const repairedContent = msg.content.map((blk) => {{
-				if (blk?.type === "toolCall" && typeof blk.name === "string" && !active.has(blk.name)) {{
-					const fixedName = repairHallucinatedToolName(blk.name, active);
-					if (fixedName) {{
-						repairedAny = true;
-						return {{
-							...blk,
-							name: fixedName,
-							arguments: normalizeRepairedToolArgs(fixedName, blk.arguments).args,
-						}};
+				if (blk?.type === "toolCall" && typeof blk.name === "string") {{
+					if (!active.has(blk.name)) {{
+						const fixedName = repairHallucinatedToolName(blk.name, active);
+						if (fixedName) {{
+							repairedAny = true;
+							return {{
+								...blk,
+								name: fixedName,
+								arguments: normalizeRepairedToolArgs(fixedName, blk.arguments).args,
+							}};
+						}}
+					}} else {{
+						const norm = normalizeRepairedToolArgs(blk.name, blk.arguments);
+						if (norm.changed) {{
+							repairedAny = true;
+							return {{
+								...blk,
+								arguments: norm.args,
+							}};
+						}}
 					}}
 				}}
 				return blk;
@@ -7243,9 +7687,37 @@ export default function (pi: ExtensionAPI) {{
 		return {{
 			message: {{
 				...(msg as Record<string, unknown>),
+				...(msg.stopReason !== "length" ? {{ stopReason: "toolUse" }} : {{}}),
 				content: nextContent,
 			}} as typeof event.message,
 		}};
+	}});
+
+	// Scrub leaked unparsed DSML / <tool_call> XML text on assistant messages without toolCall blocks before provider request
+	pi.on("context", (event) => {{
+		const msgs = (event as {{ messages?: Array<Record<string, unknown>> }} | undefined)?.messages;
+		if (!Array.isArray(msgs) || msgs.length === 0) return undefined;
+		let changed = false;
+		const nextMessages = msgs.map((m) => {{
+			if (!m || m.role !== "assistant" || !Array.isArray(m.content)) return m;
+			const content = m.content as Array<{{ type?: string; text?: string; [k: string]: unknown }}>;
+			if (content.some((b) => b?.type === "toolCall")) return m;
+			let msgChanged = false;
+			const nextBlocks = content.map((b) => {{
+				if (b?.type === "text" && typeof b.text === "string" && (b.text.includes("DSML") || b.text.includes("<tool_call>"))) {{
+					const scrubbed = scrubLeakedToolMarkup(b.text);
+					if (scrubbed !== b.text) {{
+						msgChanged = true;
+						return {{ ...b, text: scrubbed }};
+					}}
+				}}
+				return b;
+			}});
+			if (!msgChanged) return m;
+			changed = true;
+			return {{ ...m, content: nextBlocks }};
+		}});
+		return changed ? {{ messages: nextMessages }} : undefined;
 	}});
 
 	pi.on("turn_end", (event, ctx) => {{
@@ -7369,10 +7841,13 @@ export default function (pi: ExtensionAPI) {{
 			const basePlanOpts = deepCacheDiscount
 				? {{ highWaterTokens: 210000, staleCharsFallback: 360000 }}
 				: {{}};
-			const maskOpts =
-				typeof apProfileOverrides?.maskHighWaterTokens === "number"
-					? {{ ...basePlanOpts, highWaterTokens: apProfileOverrides.maskHighWaterTokens }}
-					: basePlanOpts;
+			const effMaskHighWater = getEffectiveMaskHighWaterTokens(
+				ctx?.model as {{ provider?: string; id?: string; contextWindow?: number; cost?: {{ input?: number; cacheRead?: number }} }} | undefined,
+			);
+			const maskOpts = {{
+				...basePlanOpts,
+				highWaterTokens: effMaskHighWater,
+			}};
 			const plan = planObservationMasking(contextEntries, {{
 				usagePercent: usage?.percent ?? null,
 				usageTokens: effTokens,
@@ -7400,6 +7875,12 @@ export default function (pi: ExtensionAPI) {{
 		if (Array.isArray(event.entries) && event.entries.some((e) => e?.type === "compaction")) {{
 			editedFilesThisRun.clear();
 			builtInCodeEditsThisRun.clear();
+			return undefined;
+		}}
+		if (
+			(event as {{ continue?: boolean }}).continue === true ||
+			(Array.isArray(event.entries) && event.entries.length > 0)
+		) {{
 			return undefined;
 		}}
 
@@ -8982,6 +9463,10 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("normalizeWindowsToolPath")
                 && s.contains("healMsysPathConv")
                 && s.contains("healCmdForLoop")
+                && s.contains("shouldYieldCompaction")
+                && s.contains("resolveEffectiveMaskHighWaterTokens")
+                && s.contains("scrubLeakedToolMarkup")
+                && s.contains("callSubLlmWithRetry")
         })
         .unwrap_or(false);
 
@@ -9049,7 +9534,10 @@ fn inspect_pi_runtime(home: &Path) -> Value {
         .and_then(Value::as_u64);
     let show_cache_miss_notices = settings_json
         .as_ref()
-        .and_then(|v| v.get("showCacheMissNotices"))
+        .and_then(|v| {
+            v.pointer("/notices/cacheMisses")
+                .or_else(|| v.get("showCacheMissNotices"))
+        })
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let flash_auto_enabled = settings_json
@@ -9184,7 +9672,7 @@ fn inspect_pi_runtime(home: &Path) -> Value {
     }
     if is_deepseek && !show_cache_miss_notices {
         recommendations.push(
-            "Set `\"showCacheMissNotices\": true` in ~/.pi/agent/settings.json to surface DeepSeek prefix cache misses immediately."
+            "Set `\"notices\": { \"cacheMisses\": true }` in ~/.pi/agent/settings.json (Pi v1.6.1+; legacy `showCacheMissNotices: true`) to surface DeepSeek prefix cache misses immediately."
                 .to_string(),
         );
     }
@@ -9792,5 +10280,255 @@ enabled = true
         assert!(standalone.is_file());
         assert!(remove_toml_mcp_server(&standalone));
         assert!(!standalone.exists());
+    }
+
+    #[test]
+    fn inspect_pi_runtime_recognizes_v161_notices_and_legacy_cache_miss_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let pi_agent = dir.path().join(".pi").join("agent");
+        fs::create_dir_all(&pi_agent).unwrap();
+
+        // Pi v1.6.1 nested notices.cacheMisses = true
+        fs::write(
+            pi_agent.join("settings.json"),
+            r#"{"defaultProvider":"deepseek","defaultModel":"deepseek-flash","notices":{"cacheMisses":true}}"#,
+        )
+        .unwrap();
+        let r1 = inspect_pi_runtime(dir.path());
+        assert_eq!(r1["show_cache_miss_notices"], true);
+        let recs1 = r1["recommendations"].as_array().unwrap();
+        assert!(
+            !recs1
+                .iter()
+                .any(|x| x.as_str().unwrap_or("").contains("cacheMisses")),
+            "notices.cacheMisses=true must silence cache-miss recommendation: {recs1:?}"
+        );
+
+        // Legacy showCacheMissNotices = true still recognized
+        fs::write(
+            pi_agent.join("settings.json"),
+            r#"{"defaultProvider":"deepseek","defaultModel":"deepseek-flash","showCacheMissNotices":true}"#,
+        )
+        .unwrap();
+        let r2 = inspect_pi_runtime(dir.path());
+        assert_eq!(r2["show_cache_miss_notices"], true);
+
+        // Missing notice triggers v1.6.1 notices.cacheMisses recommendation
+        fs::write(
+            pi_agent.join("settings.json"),
+            r#"{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}"#,
+        )
+        .unwrap();
+        let r3 = inspect_pi_runtime(dir.path());
+        assert_eq!(r3["show_cache_miss_notices"], false);
+        let recs3 = r3["recommendations"].as_array().unwrap();
+        assert!(recs3
+            .iter()
+            .any(|x| x.as_str().unwrap_or("").contains("notices")));
+    }
+
+    #[test]
+    fn pi_accelerator_ts_node_verifies_yield_masking_scrubbing_bash_and_sub_llm_retry() {
+        let node_ok = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !node_ok {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ts_path = dir.path().join("zz-ap-accelerator.ts");
+        let rendered = render_pi_accelerator_ts("ap");
+        // Guard existing integration invariants
+        assert!(rendered.contains("MASK_HIGH_WATER_TOKENS = 180000"));
+        assert!(rendered.contains("highWaterTokens: 210000"));
+        assert!(rendered.contains("staleCharsFallback: 360000"));
+        fs::write(&ts_path, &rendered).unwrap();
+
+        let prof_yield = dir.path().join("profile-yield.json");
+        fs::write(
+            &prof_yield,
+            r#"{"schema_version":1,"model_profile":"auto","yield_compact":true}"#,
+        )
+        .unwrap();
+        let prof_small = dir.path().join("profile-small.json");
+        fs::write(
+            &prof_small,
+            r#"{"schema_version":1,"model_profile":"small"}"#,
+        )
+        .unwrap();
+        let settings_p = dir.path().join("settings.json");
+        fs::write(
+            &settings_p,
+            r#"{"compaction":{"reserveTokens":16384,"modelOverrides":{"deepseek/deepseek-flash":{"reserveTokens":840000}}}}"#,
+        )
+        .unwrap();
+
+        let url = format!("file:///{}", ts_path.to_string_lossy().replace('\\', "/"));
+        let py_str = prof_yield.to_string_lossy().replace('\\', "/");
+        let ps_str = prof_small.to_string_lossy().replace('\\', "/");
+        let st_str = settings_p.to_string_lossy().replace('\\', "/");
+
+        let script = format!(
+            r#"
+import assert from "node:assert/strict";
+import mod from "{url}";
+import {{
+  loadApProfile,
+  shouldYieldCompaction,
+  readModelCompactionTriggerTokens,
+  resolveEffectiveMaskHighWaterTokens,
+  scrubLeakedToolMarkup,
+  repairHallucinatedToolName,
+  normalizeRepairedToolArgs,
+  healCommand,
+  classifyCodemodeFailureTip,
+  callSubLlmWithRetry,
+  isNonRetryableSubLlmError,
+}} from "{url}";
+
+// 1. Profile + yield_compact protocol
+const py = loadApProfile("{py_str}");
+assert.strictEqual(py?.yieldCompact, true);
+const ps = loadApProfile("{ps_str}");
+assert.strictEqual(ps?.sieveHardChars, 10000);
+assert.strictEqual(shouldYieldCompaction({{ compactionClaimed: true }}), true);
+assert.strictEqual(shouldYieldCompaction({{ envYieldCompact: "1" }}), true);
+assert.strictEqual(shouldYieldCompaction({{ profileYieldCompact: true }}), true);
+assert.strictEqual(shouldYieldCompaction({{ peerClaimed: true }}), true);
+assert.strictEqual(shouldYieldCompaction({{}}), false);
+
+// 2. Dynamic masking threshold below 160k DeepSeek Flash compaction trigger
+const trigger = readModelCompactionTriggerTokens({{ provider: "deepseek", id: "flash-auto", contextWindow: 1000000 }}, "{st_str}");
+assert.strictEqual(trigger, 160000);
+const effMask = resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: true, compactionTriggerTokens: trigger }});
+assert.strictEqual(effMask, 136000, "must clamp below 85% of 160k compaction trigger");
+
+// 3. Tool alias + arg healing + DSML/tool_call scrubbing
+const active = new Set(["bash", "read", "edit", "write", "codemode", "grep"]);
+assert.strictEqual(repairHallucinatedToolName("run_bash", active), "bash");
+assert.strictEqual(repairHallucinatedToolName("str_replace", active), "edit");
+assert.strictEqual(repairHallucinatedToolName("js_eval", active), "codemode");
+assert.deepStrictEqual(normalizeRepairedToolArgs("edit", {{ file: "a.ts", old_text: "x", new_text: "y" }}).args, {{ path: "a.ts", oldText: "x", newText: "y" }});
+assert.deepStrictEqual(normalizeRepairedToolArgs("bash", {{ shell_command: "ls" }}).args, {{ command: "ls" }});
+const scrubbed = scrubLeakedToolMarkup('before <|DSML|function_calls><|DSML|invoke name="bash"></|DSML|invoke></|DSML|function_calls> <tool_call>{{"name":"read"}}</tool_call> after');
+assert.strictEqual(scrubbed.replace(/\s+/g, " "), "before after");
+assert.ok(!scrubbed.includes("DSML") && !scrubbed.includes("tool_call"));
+
+// 4. RSI bash rewrites (2>&1, ls | head/tail/grep, cat | grep)
+assert.ok(healCommand("ls -la src 2>&1 | head -n 10", "bash")?.includes('ls "src" -a --depth 1 --limit 10'));
+assert.ok(healCommand("ls -lt --color=never src | tail -n 5", "bash")?.includes('ls "src" -t --depth 1 | tail -n 5'));
+assert.strictEqual(healCommand("ls -r | head -10", "bash"), undefined);
+assert.strictEqual(healCommand("ls --reverse | head -10", "bash"), undefined);
+assert.ok(healCommand("ls src 2>&1 | grep -i foo | head -n 15", "bash")?.includes('ls "src" --depth 1 | grep -i foo | head -n 15'));
+assert.ok(healCommand("cat app.log 2>&1 | grep -in 'error' | head -n 20", "bash")?.includes('search --max 20 -i'));
+assert.ok(healCommand("cat Makefile | grep -i build", "bash")?.includes('search -i'));
+assert.ok(healCommand("head -n 25 README.md 2>&1", "bash")?.includes('read "README.md" --lines 1-25'));
+
+// 5. Codemode failure tip retains all contract phrases
+const tip = classifyCodemodeFailureTip("TypeError: cannot read property 'slice' of undefined");
+assert.ok(tip.includes("VOID output printer"));
+assert.ok(tip.includes("res?.output"));
+
+// 6. Sub-LLM retry: retries transient stopReason=error, NEVER retries 402 insufficient balance
+assert.strictEqual(isNonRetryableSubLlmError("HTTP 402 Insufficient Balance"), true);
+assert.strictEqual(isNonRetryableSubLlmError("ECONNRESET socket hang up"), false);
+let callsTransient = 0;
+const okResp = await callSubLlmWithRetry(
+  {{
+    modelRegistry: {{
+      find: (_p, id) => ({{ provider: "deepseek", id }}),
+      streamSimple: () => ({{
+        async result() {{
+          callsTransient += 1;
+          if (callsTransient === 1) return {{ stopReason: "error", errorMessage: "ECONNRESET" }};
+          return {{ stopReason: "stop", content: [{{ type: "text", text: "recovered" }}] }};
+        }}
+      }})
+    }}
+  }},
+  {{ provider: "deepseek", id: "flash-auto" }},
+  {{}},
+  {{ unwrapVirtual: true, retryDelayMs: 5, timeoutMs: 2000 }}
+);
+assert.strictEqual(callsTransient, 2);
+assert.strictEqual(okResp?.stopReason, "stop");
+
+let calls402 = 0;
+const resp402 = await callSubLlmWithRetry(
+  {{
+    modelRegistry: {{
+      streamSimple: () => ({{
+        async result() {{
+          calls402 += 1;
+          return {{ stopReason: "error", errorMessage: "402 Insufficient Balance" }};
+        }}
+      }})
+    }}
+  }},
+  {{ provider: "deepseek", id: "deepseek-flash" }},
+  {{}},
+  {{ retryDelayMs: 5, timeoutMs: 2000 }}
+);
+assert.strictEqual(calls402, 1, "402 must NEVER be retried");
+assert.strictEqual(resp402?.stopReason, "error");
+
+// 7. Extension hook wiring: ap:claim_compaction, context scrub, message_end stopReason=toolUse, agent_before_settle yield
+const handlers = new Map();
+const eventSubs = new Map();
+const fakePi = {{
+  on(ev, fn) {{ handlers.set(ev, fn); }},
+  events: {{
+    on(ch, fn) {{ eventSubs.set(ch, fn); }},
+    emit(ch) {{ eventSubs.get(ch)?.(); }},
+  }},
+  getActiveTools: () => ["bash", "read", "edit", "write", "codemode"],
+}};
+mod(fakePi);
+
+// agent_before_settle must yield when continue===true or entries non-empty
+const settleFn = handlers.get("agent_before_settle");
+assert.strictEqual(settleFn({{ outcome: "completed", continue: true, entries: [] }}, {{}}), undefined);
+assert.strictEqual(settleFn({{ outcome: "completed", continue: false, entries: [{{ type: "custom_message" }}] }}, {{}}), undefined);
+
+// context hook scrubs leaked DSML on assistant without toolCall, leaves clean messages untouched
+const ctxFn = handlers.get("context");
+assert.strictEqual(ctxFn({{ messages: [{{ role: "assistant", content: [{{ type: "text", text: "clean" }}] }}] }}), undefined);
+const scrubbedCtx = ctxFn({{ messages: [{{ role: "assistant", content: [{{ type: "text", text: 'hi <tool_call>{{"name":"bash"}}</tool_call>' }}] }}] }});
+assert.strictEqual(scrubbedCtx?.messages?.[0]?.content?.[0]?.text, "hi");
+
+// message_end sets stopReason: "toolUse" on DSML recovery and heals native arg aliases
+const msgEndFn = handlers.get("message_end");
+const recMsg = msgEndFn({{ message: {{ role: "assistant", stopReason: "stop", content: [{{ type: "text", text: '<|DSML|invoke name="bash"><|DSML|parameter name="command">echo ok</|DSML|parameter></|DSML|invoke>' }}] }} }});
+assert.strictEqual(recMsg?.message?.stopReason, "toolUse");
+assert.strictEqual(recMsg?.message?.content?.[0]?.type, "toolCall");
+const argHealMsg = msgEndFn({{ message: {{ role: "assistant", stopReason: "toolUse", content: [{{ type: "toolCall", id: "1", name: "bash", arguments: {{ cmd: "pwd" }} }}] }} }});
+assert.strictEqual(argHealMsg?.message?.content?.[0]?.arguments?.command, "pwd");
+
+// session_before_compact yields after ap:claim_compaction event
+fakePi.events.emit("ap:claim_compaction");
+const compactFn = handlers.get("session_before_compact");
+const compactRes = await compactFn({{ preparation: {{ firstKeptEntryId: "x", tokensBefore: 100000, messagesToSummarize: [{{ role: "user", content: "hi" }}] }} }}, {{ model: {{ provider: "deepseek", id: "deepseek-flash" }}, modelRegistry: {{ streamSimple: () => {{ throw new Error("should not call LLM when yielded"); }} }} }});
+assert.strictEqual(compactRes, undefined);
+console.log("OK_PI_ACCELERATOR_NODE");
+"#
+        );
+        let run = std::process::Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--no-warnings",
+                "--input-type=module",
+                "-e",
+                &script,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Node accelerator verification failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 }

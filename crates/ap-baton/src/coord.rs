@@ -46,15 +46,26 @@ impl Drop for FileGuard {
 fn acquire_lock(dir: &Path) -> Result<FileGuard, String> {
     let _ = fs::create_dir_all(dir);
     let lock_p = dir.join("claims.lock");
-    let deadline = Instant::now() + Duration::from_millis(3000);
+    let deadline = Instant::now() + Duration::from_millis(4000);
+    let pid = std::process::id();
+    let mut attempt = 0u64;
     loop {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock_p)
         {
-            Ok(_) => return Ok(FileGuard(lock_p)),
-            Err(_) => {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = writeln!(f, "pid={pid}");
+                return Ok(FileGuard(lock_p));
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || (cfg!(windows)
+                        && (e.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(5) | Some(32)))) =>
+            {
                 // Reap stale lock older than 15s
                 if let Ok(md) = fs::metadata(&lock_p) {
                     if let Ok(mt) = md.modified() {
@@ -69,33 +80,38 @@ fn acquire_lock(dir: &Path) -> Result<FileGuard, String> {
                     }
                 }
                 if Instant::now() >= deadline {
-                    return Err("timed out acquiring baton claims lock".to_string());
+                    return Err(format!("timed out acquiring baton claims lock: {e}"));
                 }
-                thread::sleep(Duration::from_millis(20));
+                attempt += 1;
+                let jitter = ((pid as u64).wrapping_mul(37) + attempt * 11) % 19;
+                thread::sleep(Duration::from_millis(8 + jitter));
             }
+            Err(e) => return Err(format!("failed acquiring baton claims lock: {e}")),
         }
     }
 }
 
 fn load_claims(dir: &Path) -> BTreeMap<String, ResourceClaim> {
     let p = dir.join("claims.json");
-    let Ok(raw) = fs::read_to_string(&p) else {
-        return BTreeMap::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
+    for attempt in 0..5u64 {
+        if let Ok(raw) = fs::read_to_string(&p) {
+            if let Ok(parsed) = serde_json::from_str::<BTreeMap<String, ResourceClaim>>(&raw) {
+                return parsed;
+            }
+        }
+        if !p.exists() {
+            return BTreeMap::new();
+        }
+        if attempt < 4 {
+            thread::sleep(Duration::from_millis(6 + attempt * 4));
+        }
+    }
+    BTreeMap::new()
 }
 
 fn save_claims(dir: &Path, map: &BTreeMap<String, ResourceClaim>) -> Result<(), String> {
-    let _ = fs::create_dir_all(dir);
-    let tmp = dir.join(format!("claims.{}.tmp", std::process::id()));
-    let dst = dir.join("claims.json");
     let body = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-    fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    if fs::rename(&tmp, &dst).is_err() {
-        fs::copy(&tmp, &dst).map_err(|e| e.to_string())?;
-        let _ = fs::remove_file(&tmp);
-    }
-    Ok(())
+    crate::frontier::atomic_write_text(&dir.join("claims.json"), &body)
 }
 
 /// Atomically claim a shared multi-agent resource with TTL expiry (exit 2 if held by another owner).
