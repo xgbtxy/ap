@@ -309,6 +309,28 @@ fn format_clean_real(v: f64) -> String {
     v.to_string()
 }
 
+fn emit_query_err(as_json: bool, t0: Instant, msg: &str) {
+    record_event_ex(
+        "query",
+        0,
+        0,
+        0,
+        0,
+        "query-err",
+        false,
+        t0.elapsed().as_millis() as u64,
+        Some(msg),
+    );
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let cli = match QueryCli::try_parse_from(args) {
         Ok(c) => c,
@@ -320,7 +342,11 @@ pub fn run_cli(args: &[String]) -> i32 {
     };
     let t0 = Instant::now();
     let Ok(conn) = Connection::open_in_memory() else {
-        eprintln!("[ap query] failed to initialize in-memory SQLite engine");
+        emit_query_err(
+            cli.json,
+            t0,
+            "[ap query] failed to initialize in-memory SQLite engine",
+        );
         return 1;
     };
 
@@ -342,7 +368,11 @@ pub fn run_cli(args: &[String]) -> i32 {
         let alias = sanitize_ident(&alias_raw);
         let p = Path::new(&path_str);
         if !p.is_file() {
-            eprintln!("[ap query] file not found: {path_str}");
+            emit_query_err(
+                cli.json,
+                t0,
+                &format!("[ap query] file not found: {path_str}"),
+            );
             return 1;
         }
         let ext = p
@@ -354,14 +384,18 @@ pub fn run_cli(args: &[String]) -> i32 {
         if matches!(ext.as_str(), "sqlite" | "db" | "sqlite3") || is_sqlite_magic(p) {
             total_raw_bytes += fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             if let Err(e) = attach_sqlite_db(&conn, &alias, p, &path_str, &mut schema_info) {
-                eprintln!("[ap query] {path_str}: {e}");
+                emit_query_err(cli.json, t0, &format!("[ap query] {path_str}: {e}"));
                 return 1;
             }
             continue;
         }
 
         let Ok(bytes) = fs::read(p) else {
-            eprintln!("[ap query] failed to read: {path_str}");
+            emit_query_err(
+                cli.json,
+                t0,
+                &format!("[ap query] failed to read: {path_str}"),
+            );
             return 1;
         };
         total_raw_bytes += bytes.len() as u64;
@@ -370,7 +404,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             let sheets = match extract_xlsx_sheets_raw(&bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[ap query] {path_str}: {e}");
+                    emit_query_err(cli.json, t0, &format!("[ap query] {path_str}: {e}"));
                     return 1;
                 }
             };
@@ -392,7 +426,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                             primary_bound = true;
                         }
                         Err(e) => {
-                            eprintln!("[ap query] {e}");
+                            emit_query_err(cli.json, t0, &format!("[ap query] {e}"));
                             return 1;
                         }
                     }
@@ -440,7 +474,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     );
                 }
                 Err(e) => {
-                    eprintln!("[ap query] {path_str}: {e}");
+                    emit_query_err(cli.json, t0, &format!("[ap query] {path_str}: {e}"));
                     return 1;
                 }
             }
@@ -481,7 +515,11 @@ pub fn run_cli(args: &[String]) -> i32 {
     let mut stmt = match conn.prepare(sql_str) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[ap query] SQL syntax/schema error: {e}\nLoaded tables: {schema_info:?}");
+            emit_query_err(
+                cli.json,
+                t0,
+                &format!("[ap query] SQL syntax/schema error: {e}\nLoaded tables: {schema_info:?}"),
+            );
             return 1;
         }
     };
@@ -492,7 +530,11 @@ pub fn run_cli(args: &[String]) -> i32 {
     let mut rows_iter = match stmt.query([]) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[ap query] SQL execution error: {e}");
+            emit_query_err(
+                cli.json,
+                t0,
+                &format!("[ap query] SQL execution error: {e}"),
+            );
             return 1;
         }
     };

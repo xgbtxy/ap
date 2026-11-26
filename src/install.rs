@@ -3111,6 +3111,8 @@ import initAccelerator, {{
   healCodemodeSource,
   guardEphemeralServerCommand,
   scrubLeakedToolMarkup,
+  extractDsmlToolCalls,
+  extractXmlJsonToolCalls,
   isNonRetryableSubLlmError,
   callSubLlmWithRetry,
   classifyCodemodeFailureTip,
@@ -3199,6 +3201,8 @@ const positiveCases = [
   [`grep -in "error" ${{FILE}} 2>&1 | head -n 5`, `"ap" search`],
   [`grep -oE "token_[a-z]+" ${{FILE}} | sort -u | head -n 5`, `"ap" search`],
   [`grep -rn "ERROR" ${{DIR}}`, `"ap" search`],
+  [`grep -rlI "ERROR" ${{DIR}} | head -n 5`, `"ap" search`],
+  [`grep -rnI -C 1 "ERROR" ${{DIR}}`, `"ap" search`],
 ];
 
 function splitShellArgs(cmdStr) {{
@@ -3438,6 +3442,137 @@ assert.strictEqual(classifyCacheDropCause(hThink1, hThink2), "thinking_changed")
 const hSys1 = snapshotProviderRequestHashes({{ model: "claude", system: "A", tools: [], messages: [] }});
 const hSys2 = snapshotProviderRequestHashes({{ model: "claude", system: "B", tools: [], messages: [] }});
 assert.strictEqual(classifyCacheDropCause(hSys1, hSys2), "system_changed");
+
+// G) Cycle 4 regression checks:
+// 1. CommonMark fence/inline-code isolation for extractDsmlToolCalls & extractXmlJsonToolCalls + §4.5/indent3 nits
+const activeTools = new Set(["bash", "read"]);
+assert.strictEqual(
+  extractXmlJsonToolCalls(
+    'Here is an example:\n```xml\n<tool_call>{{"name":"bash","arguments":{{"command":"echo pwned"}}}}</tool_call>\n```\nDone.',
+    activeTools,
+  ),
+  undefined,
+  "fenced XML <tool_call> must never extract live tool calls",
+);
+assert.strictEqual(
+  extractDsmlToolCalls(
+    'Example DSML:\n```xml\n<｜DSML｜invoke name="bash"><｜DSML｜parameter name="command">echo pwned</｜DSML｜parameter></｜DSML｜invoke>\n```',
+    activeTools,
+  ),
+  undefined,
+  "fenced DSML must never extract live tool calls",
+);
+assert.strictEqual(
+  extractXmlJsonToolCalls(
+    'Use `<tool_call>{{"name":"bash","arguments":{{"command":"echo pwned"}}}}</tool_call>` syntax.',
+    activeTools,
+  ),
+  undefined,
+  "inline backtick <tool_call> must never extract live tool calls",
+);
+assert.strictEqual(
+  extractDsmlToolCalls(
+    'Use `<｜DSML｜invoke name="bash"><｜DSML｜parameter name="command">x</｜DSML｜parameter></｜DSML｜invoke>` inline.',
+    activeTools,
+  ),
+  undefined,
+  "inline backtick DSML must never extract live tool calls",
+);
+// Mixed fenced example + real prose call: extract ONLY prose call & preserve fenced example verbatim
+const mixedXml =
+  'Docs:\n```xml\n<tool_call>{{"name":"bash","arguments":{{"command":"echo doc"}}}}</tool_call>\n```\n<tool_call>{{"name":"read","arguments":{{"path":"a.txt"}}}}</tool_call>';
+const mixedXmlRec = extractXmlJsonToolCalls(mixedXml, activeTools);
+assert.strictEqual(mixedXmlRec?.calls.length, 1);
+assert.strictEqual(mixedXmlRec?.calls[0].name, "read");
+assert.ok(mixedXmlRec?.cleanedText.includes("echo doc"), "fenced example must stay verbatim in cleanedText");
+const mixedDsml =
+  '   ```xml\n<｜DSML｜invoke name="bash"><｜DSML｜parameter name="command">doc</｜DSML｜parameter></｜DSML｜invoke>\n   ```\n<｜DSML｜invoke name="read"><｜DSML｜parameter name="path">b.txt</｜DSML｜parameter></｜DSML｜invoke>';
+const mixedDsmlRec = extractDsmlToolCalls(mixedDsml, activeTools);
+assert.strictEqual(mixedDsmlRec?.calls.length, 1);
+assert.strictEqual(mixedDsmlRec?.calls[0].name, "read");
+assert.ok(mixedDsmlRec?.cleanedText.startsWith("   ```xml\n"), "3-space indented fence must keep leading indent");
+// CommonMark §4.5: backtick in backtick-fence info string is NOT a fence opener -> leak MUST be scrubbed; tilde fence allows backticks
+const btInfoLeak = "```js `x`\n<tool_call>{{\"name\":\"bash\"}}</tool_call>\n```";
+assert.ok(!scrubLeakedToolMarkup(btInfoLeak).includes("tool_call"), "backtick in backtick-fence info string must not shield leak");
+const tildeInfoKeep = "~~~js `x`\n<tool_call>{{\"name\":\"bash\"}}</tool_call>\n~~~";
+assert.strictEqual(scrubLeakedToolMarkup(tildeInfoKeep), tildeInfoKeep, "tilde fence allows backticks in info string");
+// Preserve 3-space leading indentation on preserved fence when scrubbing a later leak
+const indent3Leak = "   ```xml\n<tool_call>{{\"name\":\"bash\"}}</tool_call>\n   ```\n<tool_call>{{\"name\":\"leak\"}}</tool_call>";
+assert.strictEqual(
+  scrubLeakedToolMarkup(indent3Leak),
+  "   ```xml\n<tool_call>{{\"name\":\"bash\"}}</tool_call>\n   ```",
+);
+
+// 2. stripTsTypesInCodemode -> stripParamList must preserve ternary `? :` in default parameter values
+for (const validDefaultJs of [
+  "const f = (x = cond ? 1 : 2) => x;",
+  "function f(x = cond ? 1 : 2) {{ return x; }}",
+  "const f = (x = ok ? {{ a: 1 }} : {{ a: 2 }}) => x.a;",
+]) {{
+  assert.strictEqual(healCodemodeSource(validDefaultJs), undefined, `valid JS default ternary must stay untouched: ${{validDefaultJs}}`);
+}}
+const typedDefault = healCodemodeSource("function f(x = a < b ? 1 : 2, y: number = ok ? 3 : 4): number {{ return x + y; }}");
+assert.ok(typedDefault && typedDefault.includes("x = a < b ? 1 : 2") && typedDefault.includes("y = ok ? 3 : 4"));
+assert.strictEqual(new Function("a", "b", "ok", `${{typedDefault}}; return f();`)(1, 2, true), 4);
+const typedObjDefault = healCodemodeSource("const f = (cfg: Opts = ok ? {{ a: 1 }} : {{ a: 2 }}) => cfg.a;");
+assert.ok(typedObjDefault && typedObjDefault.includes("cfg = ok ? {{ a: 1 }} : {{ a: 2 }}"));
+assert.strictEqual(new Function("ok", `${{typedObjDefault}}; return f();`)(false), 2);
+
+// 3. healRedirNul boundary safety (never corrupt NUL.txt / nul.log / NUL-bak / nul/out / NUL"foo")
+for (const safeNulFile of [
+  "ls > NUL.txt",
+  "ls > nul.log",
+  "ls > NUL-bak",
+  "ls > nul/out",
+  'ls > NUL"foo"',
+]) {{
+  assert.strictEqual(healCommand(safeNulFile, "bash"), undefined, `must not corrupt NUL filename: ${{safeNulFile}}`);
+}}
+assert.strictEqual(healCommand("ls 2>NUL && echo ok", "bash"), "ls 2> /dev/null && echo ok");
+assert.strictEqual(healCommand("(ls 2>NUL)", "bash"), "(ls 2> /dev/null)");
+
+// 4. guardEphemeralServerCommand env-var prefix preservation
+assert.strictEqual(
+  guardEphemeralServerCommand("FOO=1 python -m http.server 8000 &"),
+  "FOO=1 timeout 900 python -m http.server 8000 &",
+);
+assert.strictEqual(
+  guardEphemeralServerCommand('FOO=1 BAR="a b" python -m http.server 8000 &'),
+  'FOO=1 BAR="a b" timeout 900 python -m http.server 8000 &',
+);
+assert.strictEqual(
+  guardEphemeralServerCommand("cd /tmp && FOO=1 python -m http.server 8000 &"),
+  "cd /tmp && FOO=1 timeout 900 python -m http.server 8000 &",
+);
+assert.strictEqual(
+  guardEphemeralServerCommand("FOO=1 nohup node proxy.js &"),
+  "FOO=1 nohup timeout 900 node proxy.js &",
+);
+assert.strictEqual(
+  guardEphemeralServerCommand("PYTHONUNBUFFERED=1 ap probe listen 9999 &"),
+  "PYTHONUNBUFFERED=1 timeout 900 ap probe listen 9999 &",
+);
+
+// 5. cd /d <path> healing across leading ws / newline / subshell / destructive cmds, without breaking bare `cd /d`
+assert.strictEqual(healCommand("cd /d C:\\temp && ls", "bash"), "cd C:/temp && ls");
+assert.strictEqual(healCommand("  cd /d C:\\temp && ls", "bash"), "  cd C:/temp && ls");
+assert.strictEqual(healCommand('echo hi\ncd /D "C:\\temp" && ls', "bash"), 'echo hi\ncd "C:/temp" && ls');
+assert.strictEqual(healCommand("(cd /d C:\\temp && ls)", "bash"), "(cd C:/temp && ls)");
+assert.strictEqual(healCommand('cd /d "C:\\temp" && rm foo.txt', "bash"), 'cd "C:\\temp" && rm foo.txt');
+assert.strictEqual(healCommand("cd /d && ls", "bash"), undefined);
+assert.strictEqual(healCommand("cd /d", "bash"), undefined);
+assert.strictEqual(healCommand('echo "cd /d C:\\temp"', "bash"), undefined);
+
+// 6. guardBareJsonStringifySlice spaced member access + non-string .slice codemode tip
+for (const spacedMember of [
+  "const s = foo . JSON.stringify(x).slice(0, 5);",
+  "const s = foo\n  . JSON.stringify(x).slice(0, 5);",
+  "const s = foo ?. JSON.stringify(x).slice(0, 5);",
+]) {{
+  assert.strictEqual(healCodemodeSource(spacedMember), undefined, `spaced member access must stay untouched: ${{spacedMember}}`);
+}}
+const nonStrSliceTip = classifyCodemodeFailureTip("TypeError: not a function");
+assert.ok(nonStrSliceTip.includes("JSON.stringify(undefined)") && nonStrSliceTip.includes('typeof v === "string"'));
 
 console.log(JSON.stringify(emittedApInvocations));
 "#

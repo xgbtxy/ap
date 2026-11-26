@@ -1631,6 +1631,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             json,
         }) => {
             let file_p = PathBuf::from(&file);
+            if !file_p.exists() {
+                emit_err(json, &format!("[atlas] file not found: {file}"));
+                return 1;
+            }
             let sym_opt = (!symbol.trim().is_empty()).then_some(symbol.as_str());
             let lines_opt = (!lines.trim().is_empty()).then_some(lines.as_str());
             let rep = history::analyze_file_history(&file_p, sym_opt, lines_opt, limit);
@@ -1639,7 +1643,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             } else {
                 println!("{}", history::render_history_md(&rep));
             }
-            return if file_p.exists() { 0 } else { 1 };
+            return 0;
         }
         Some(SubCmd::Deps {
             target,

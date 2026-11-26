@@ -606,6 +606,13 @@ pub fn render_ai_surface_md(rep: &AiSurfaceReport) -> String {
 }
 
 pub fn run_ai_surface_cli(root: &Path, max_files: usize, as_json: bool) -> i32 {
+    if !root.exists() {
+        crate::emit_err(
+            as_json,
+            &format!("[guard ai-surface] path not found: {}", root.display()),
+        );
+        return 1;
+    }
     let rep = scan_ai_surface(root, max_files);
     if as_json {
         println!(

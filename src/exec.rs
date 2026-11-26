@@ -2307,6 +2307,28 @@ fn build_shell_command(raw_cmd: &str) -> (Command, Vec<&'static str>) {
     }
 }
 
+fn emit_exec_err(as_json: bool, t0: Instant, win_heals: u32, tag: &str, msg: &str) {
+    record_event_ex(
+        "exec",
+        0,
+        0,
+        win_heals,
+        0,
+        tag,
+        false,
+        t0.elapsed().as_millis() as u64,
+        Some(msg),
+    );
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let cli = match ExecCli::try_parse_from(args) {
         Ok(c) => c,
@@ -2316,6 +2338,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
+    let cli_t0 = Instant::now();
 
     let mut win_heals = 0u32;
     let mut freed_pids = Vec::new();
@@ -2331,19 +2354,37 @@ pub fn run_cli(args: &[String]) -> i32 {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("[ap exec] invalid UTF-8 in --base64 payload: {e}");
+                    emit_exec_err(
+                        cli.json,
+                        cli_t0,
+                        win_heals,
+                        "exec-err",
+                        &format!("[ap exec] invalid UTF-8 in --base64 payload: {e}"),
+                    );
                     return 2;
                 }
             },
             Err(e) => {
-                eprintln!("[ap exec] invalid --base64 payload: {e}");
+                emit_exec_err(
+                    cli.json,
+                    cli_t0,
+                    win_heals,
+                    "exec-err",
+                    &format!("[ap exec] invalid --base64 payload: {e}"),
+                );
                 return 2;
             }
         }
     } else if cli.run_stdin {
         let mut buf = String::new();
         if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
-            eprintln!("[ap exec] failed reading --run-stdin: {e}");
+            emit_exec_err(
+                cli.json,
+                cli_t0,
+                win_heals,
+                "exec-err",
+                &format!("[ap exec] failed reading --run-stdin: {e}"),
+            );
             return 2;
         }
         Some(buf)
@@ -2359,7 +2400,17 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     if shell_str.is_none() && clean_argv.is_empty() {
         if let Some(port) = cli.free_port {
-            record_event_ex("exec", 0, 0, win_heals, 0, "free-port", true, 0, None);
+            record_event_ex(
+                "exec",
+                0,
+                0,
+                win_heals,
+                0,
+                "free-port",
+                true,
+                cli_t0.elapsed().as_millis() as u64,
+                None,
+            );
             if cli.json {
                 println!(
                     "{}",
@@ -2376,32 +2427,32 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 0;
         }
         let msg = "[ap exec] provide `-c \"<cmd>\"`, `--base64 <b64>`, `--free-port <p>`, or `-- <prog> <args...>`";
-        record_event_ex("exec", 0, 0, 0, 0, "exec-err", false, 0, Some(msg));
-        if cli.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
-                    .unwrap_or_default()
-            );
-        } else {
-            eprintln!("{msg}");
-        }
+        emit_exec_err(cli.json, cli_t0, win_heals, "exec-err", msg);
         return 2;
     }
 
     let label = shell_str.clone().unwrap_or_else(|| clean_argv.join(" "));
     let safety_issues = ap_guard::inspect_text_safety(&label);
     if !safety_issues.is_empty() {
-        for item in safety_issues {
-            eprintln!("[GUARD BLOCKED | exit 2] {item}");
-        }
+        let joined = safety_issues
+            .iter()
+            .map(|item| format!("[GUARD BLOCKED | exit 2] {item}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        emit_exec_err(cli.json, cli_t0, win_heals, "guard-blocked", &joined);
         return 2;
     }
 
     let mut stdin_bytes: Option<Vec<u8>> = None;
     let (mut child_cmd, heals) = if let Some(ref lang_raw) = cli.lang {
         let Some(ref code) = shell_str else {
-            eprintln!("[ap exec] `--lang` requires `--base64` or `--run-stdin`");
+            emit_exec_err(
+                cli.json,
+                cli_t0,
+                win_heals,
+                "exec-err",
+                "[ap exec] `--lang` requires `--base64` or `--run-stdin`",
+            );
             return 2;
         };
         let lang_low = lang_raw.trim().to_ascii_lowercase();
@@ -2434,8 +2485,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                 cmd
             }
             other => {
-                eprintln!(
-                    "[ap exec] unsupported `--lang {other}` (expected py|js|node|mjs|pwsh|bash)"
+                emit_exec_err(
+                    cli.json,
+                    cli_t0,
+                    win_heals,
+                    "exec-err",
+                    &format!(
+                        "[ap exec] unsupported `--lang {other}` (expected py|js|node|mjs|pwsh|bash)"
+                    ),
                 );
                 return 2;
             }
@@ -2489,12 +2546,24 @@ pub fn run_cli(args: &[String]) -> i32 {
     let err_file_p = std::env::temp_dir().join(format!("ap_exec_err_{pid_self}_{stamp}.log"));
 
     let Ok(out_f) = File::create(&out_file_p) else {
-        eprintln!("[ap exec] failed to allocate temp output file");
+        emit_exec_err(
+            cli.json,
+            cli_t0,
+            win_heals,
+            "exec-err",
+            "[ap exec] failed to allocate temp output file",
+        );
         return 1;
     };
     let Ok(err_f) = File::create(&err_file_p) else {
         let _ = fs::remove_file(&out_file_p);
-        eprintln!("[ap exec] failed to allocate temp error file");
+        emit_exec_err(
+            cli.json,
+            cli_t0,
+            win_heals,
+            "exec-err",
+            "[ap exec] failed to allocate temp error file",
+        );
         return 1;
     };
     child_cmd

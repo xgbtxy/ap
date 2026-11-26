@@ -1,9 +1,9 @@
 use crate::impact::{analyze_symbol_impact, ImpactSite};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -222,6 +222,32 @@ pub fn build_suggested_test_cmds(
     cmds
 }
 
+pub(crate) fn find_git_root_fast(start: &Path) -> Option<PathBuf> {
+    if std::env::var_os("GIT_DIR").is_some() {
+        return None;
+    }
+    let canon = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    for anc in canon.ancestors() {
+        let dot_git = anc.join(".git");
+        if dot_git.is_dir() {
+            return Some(anc.to_path_buf());
+        }
+        if dot_git.is_file() {
+            // Worktree or submodule `.git` file: fall back to `git rev-parse --show-toplevel`
+            return None;
+        }
+    }
+    None
+}
+
+fn has_git_ancestor(start: &Path) -> bool {
+    if std::env::var_os("GIT_DIR").is_some() {
+        return true;
+    }
+    let canon = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    canon.ancestors().any(|anc| anc.join(".git").exists())
+}
+
 pub fn analyze_git_changes(
     root: &Path,
     base_opt: Option<&str>,
@@ -234,13 +260,7 @@ pub fn analyze_git_changes(
         .unwrap_or("HEAD")
         .to_string();
 
-    let is_git = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(root)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !is_git {
+    if !has_git_ancestor(root) {
         return ChangesReport {
             is_git_repo: false,
             base_ref,
@@ -253,19 +273,53 @@ pub fn analyze_git_changes(
         };
     }
 
-    let diff_out = Command::new("git")
+    let first_diff = Command::new("git")
         .args(["diff", "-U0", &base_ref])
         .current_dir(root)
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .or_else(|| {
+        .ok();
+    let diff_out = match first_diff {
+        Some(o) if o.status.success() => Some(o),
+        Some(o) => {
+            let err_s = String::from_utf8_lossy(&o.stderr).to_ascii_lowercase();
+            if err_s.contains("not a git repository") {
+                return ChangesReport {
+                    is_git_repo: false,
+                    base_ref,
+                    elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                    files: Vec::new(),
+                    modified_symbols: Vec::new(),
+                    external_callers: Vec::new(),
+                    related_tests: Vec::new(),
+                    suggested_test_cmds: Vec::new(),
+                };
+            }
             Command::new("git")
                 .args(["diff", "-U0"])
                 .current_dir(root)
                 .output()
                 .ok()
-        });
+        }
+        None => None,
+    };
+    if let Some(ref o) = diff_out {
+        if !o.status.success()
+            && String::from_utf8_lossy(&o.stderr)
+                .to_ascii_lowercase()
+                .contains("not a git repository")
+        {
+            return ChangesReport {
+                is_git_repo: false,
+                base_ref,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                files: Vec::new(),
+                modified_symbols: Vec::new(),
+                external_callers: Vec::new(),
+                related_tests: Vec::new(),
+                suggested_test_cmds: Vec::new(),
+            };
+        }
+    }
     let diff_txt = diff_out
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
@@ -310,12 +364,12 @@ pub fn analyze_git_changes(
         }
     }
 
-    let mut file_stats: Vec<ChangedFileStat> = Vec::new();
-    let mut all_syms: BTreeSet<String> = BTreeSet::new();
-    let mut changed_path_set: HashSet<String> = HashSet::new();
-
-    for (rel, ranges) in &per_file_ranges {
-        changed_path_set.insert(rel.clone());
+    let entries: Vec<(&String, &Vec<(usize, usize)>)> = per_file_ranges.iter().collect();
+    let changed_path_set: HashSet<String> = per_file_ranges.keys().cloned().collect();
+    let parse_one = |rel: &String,
+                     ranges: &Vec<(usize, usize)>,
+                     parsers: &mut HashMap<String, Parser>|
+     -> (ChangedFileStat, Vec<String>) {
         let full_p = root.join(rel);
         let mut syms_here: Vec<String> = Vec::new();
         if full_p.is_file() {
@@ -323,34 +377,78 @@ pub fn analyze_git_changes(
             if let Some(lang) = lang_for_ext(ext) {
                 if let Ok(bytes) = fs::read(&full_p) {
                     let body = String::from_utf8_lossy(&bytes);
-                    let mut parser = Parser::new();
-                    if parser.set_language(&lang).is_ok() {
-                        if let Some(tree) = parser.parse(body.as_ref(), None) {
-                            let mut spans = Vec::new();
-                            collect_symbol_spans(tree.root_node(), body.as_bytes(), &mut spans);
-                            let mut seen_local = HashSet::new();
-                            for (nm, s, e) in spans {
-                                let overlaps = ranges.iter().any(|&(rs, re)| rs <= e && re >= s);
-                                if overlaps
-                                    && nm.len() >= 2
-                                    && !matches!(nm.as_str(), "main" | "new" | "default" | "run")
-                                    && seen_local.insert(nm.clone())
-                                {
-                                    all_syms.insert(nm.clone());
-                                    syms_here.push(nm);
-                                }
+                    let parser = parsers.entry(ext.to_ascii_lowercase()).or_insert_with(|| {
+                        let mut pr = Parser::new();
+                        let _ = pr.set_language(&lang);
+                        pr
+                    });
+                    if let Some(tree) = parser.parse(body.as_ref(), None) {
+                        let mut spans = Vec::new();
+                        collect_symbol_spans(tree.root_node(), body.as_bytes(), &mut spans);
+                        let mut seen_local = HashSet::new();
+                        for (nm, s, e) in spans {
+                            let overlaps = ranges.iter().any(|&(rs, re)| rs <= e && re >= s);
+                            if overlaps
+                                && nm.len() >= 2
+                                && !matches!(nm.as_str(), "main" | "new" | "default" | "run")
+                                && seen_local.insert(nm.clone())
+                            {
+                                syms_here.push(nm);
                             }
                         }
                     }
                 }
             }
         }
-        file_stats.push(ChangedFileStat {
+        let stat = ChangedFileStat {
             path: rel.clone(),
             added: *per_file_add.get(rel).unwrap_or(&0),
             deleted: *per_file_del.get(rel).unwrap_or(&0),
-            modified_symbols: syms_here,
+            modified_symbols: syms_here.clone(),
+        };
+        (stat, syms_here)
+    };
+
+    let mut file_stats: Vec<ChangedFileStat> = Vec::with_capacity(entries.len());
+    let mut all_syms: BTreeSet<String> = BTreeSet::new();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(entries.len().max(1));
+    if workers <= 1 || entries.len() <= 2 {
+        let mut parsers: HashMap<String, Parser> = HashMap::new();
+        for (rel, ranges) in &entries {
+            let (stat, syms) = parse_one(rel, ranges, &mut parsers);
+            all_syms.extend(syms);
+            file_stats.push(stat);
+        }
+    } else {
+        let chunk_sz = entries.len().div_ceil(workers);
+        let chunks: Vec<_> = entries.chunks(chunk_sz).collect();
+        let results: Vec<Vec<(ChangedFileStat, Vec<String>)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut parsers: HashMap<String, Parser> = HashMap::new();
+                        chunk
+                            .iter()
+                            .map(|(rel, ranges)| parse_one(rel, ranges, &mut parsers))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
         });
+        for part in results {
+            for (stat, syms) in part {
+                all_syms.extend(syms);
+                file_stats.push(stat);
+            }
+        }
     }
 
     let modified_symbols: Vec<String> = all_syms.into_iter().take(24).collect();
@@ -530,5 +628,51 @@ mod tests {
         fs::remove_file(td.0.join("package.json")).unwrap();
         let cmds_node = build_suggested_test_cmds(&td.0, &["web/auth.test.mjs".into()], &[]);
         assert_eq!(cmds_node, vec!["node --test web/auth.test.mjs"]);
+    }
+
+    #[test]
+    fn parallel_impact_changes_and_trace_are_deterministic() {
+        let td = mk_tmp("det");
+        fs::create_dir_all(td.0.join("src")).unwrap();
+        fs::create_dir_all(td.0.join("tests")).unwrap();
+        fs::write(
+            td.0.join("src/core.rs"),
+            "pub fn helper_calc(v: i32) -> i32 { v + 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("src/a.rs"),
+            "pub fn use_a() -> i32 { helper_calc(1) }\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("src/b.rs"),
+            "pub fn use_b() -> i32 { helper_calc(2) }\n",
+        )
+        .unwrap();
+        fs::write(
+            td.0.join("tests/t.rs"),
+            "fn test_calc() { assert_eq!(helper_calc(3), 4); }\n",
+        )
+        .unwrap();
+
+        let i1 = analyze_symbol_impact(&td.0, &["helper_calc".to_string()], &[]);
+        let i2 = analyze_symbol_impact(&td.0, &["helper_calc".to_string()], &[]);
+        assert_eq!(i1.definitions.len(), 1);
+        assert_eq!(i1.callers_and_refs.len(), 2);
+        assert_eq!(i1.test_refs.len(), 1);
+        assert_eq!(
+            serde_json::to_string(&i1.callers_and_refs).unwrap(),
+            serde_json::to_string(&i2.callers_and_refs).unwrap(),
+            "parallel impact callers must be deterministically ordered"
+        );
+
+        let tr1 = crate::trace::trace_symbol_chain(&td.0, "helper_calc", 3);
+        let tr2 = crate::trace::trace_symbol_chain(&td.0, "helper_calc", 3);
+        assert_eq!(
+            serde_json::to_string(&tr1.upstream_callers).unwrap(),
+            serde_json::to_string(&tr2.upstream_callers).unwrap(),
+            "parallel trace callers must be deterministically ordered"
+        );
     }
 }

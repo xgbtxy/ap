@@ -16,10 +16,127 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+static SPLICE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceEncoding {
+    Utf8,
+    Utf8Bom,
+    Utf16LeBom,
+    Utf16BeBom,
+}
+
+fn emit_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+#[cfg(windows)]
+fn replace_atomic_os(src: &Path, dst: &Path) -> std::io::Result<()> {
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(src: *const u16, dst: *const u16, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    let src_w: Vec<u16> = src
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let dst_w: Vec<u16> = dst
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    for attempt in 0..12u64 {
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = unsafe { GetLastError() };
+        if (err == 5 || err == 32) && attempt < 11 {
+            std::thread::sleep(std::time::Duration::from_millis(4 + attempt * 4));
+            continue;
+        }
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    Err(std::io::Error::other("MoveFileExW failed after retries"))
+}
+
+#[cfg(not(windows))]
+fn replace_atomic_os(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::rename(src, dst)
+}
+
+pub(crate) fn write_file_atomic(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let seq = SPLICE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let fname = dst.file_name().and_then(|s| s.to_str()).unwrap_or("splice");
+    let tmp = parent.join(format!(".{fname}.ap_tmp.{}.{seq}", std::process::id()));
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    drop(f);
+    if let Err(e) = replace_atomic_os(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_source_bytes(content_lf: &str, nl_sep: &str, enc: SourceEncoding) -> Vec<u8> {
+    let body = if nl_sep == "\n" {
+        std::borrow::Cow::Borrowed(content_lf)
+    } else {
+        std::borrow::Cow::Owned(content_lf.replace('\n', nl_sep))
+    };
+    match enc {
+        SourceEncoding::Utf8 => body.as_bytes().to_vec(),
+        SourceEncoding::Utf8Bom => {
+            let mut out = Vec::with_capacity(3 + body.len());
+            out.extend_from_slice(b"\xEF\xBB\xBF");
+            out.extend_from_slice(body.as_bytes());
+            out
+        }
+        SourceEncoding::Utf16LeBom => {
+            let mut out = Vec::with_capacity(2 + body.len() * 2);
+            out.extend_from_slice(b"\xFF\xFE");
+            for u in body.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out
+        }
+        SourceEncoding::Utf16BeBom => {
+            let mut out = Vec::with_capacity(2 + body.len() * 2);
+            out.extend_from_slice(b"\xFE\xFF");
+            for u in body.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+            out
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewBlock {
@@ -190,14 +307,17 @@ fn format_numbered(lines: &[&str], s_1idx: usize, e_1idx: usize) -> String {
         .join("\n")
 }
 
-pub(crate) fn decode_source_bytes_clean(
+pub(crate) fn decode_source_bytes_with_encoding(
     raw_b: &[u8],
     label: &str,
-) -> Result<(String, &'static str), String> {
-    let text = if let Some(rest) = raw_b.strip_prefix(b"\xEF\xBB\xBF") {
-        std::str::from_utf8(rest)
-            .map_err(|e| format!("`{label}` is not valid UTF-8: {e}"))?
-            .to_string()
+) -> Result<(String, &'static str, SourceEncoding), String> {
+    let (text, enc) = if let Some(rest) = raw_b.strip_prefix(b"\xEF\xBB\xBF") {
+        (
+            std::str::from_utf8(rest)
+                .map_err(|e| format!("`{label}` is not valid UTF-8: {e}"))?
+                .to_string(),
+            SourceEncoding::Utf8Bom,
+        )
     } else if let Some(rest) = raw_b.strip_prefix(b"\xFF\xFE") {
         if rest.len() % 2 != 0 {
             return Err(format!("`{label}` has truncated UTF-16LE byte length"));
@@ -206,9 +326,12 @@ pub(crate) fn decode_source_bytes_clean(
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|e| format!("`{label}` invalid UTF-16LE: {e}"))?
+        (
+            char::decode_utf16(units)
+                .collect::<Result<String, _>>()
+                .map_err(|e| format!("`{label}` invalid UTF-16LE: {e}"))?,
+            SourceEncoding::Utf16LeBom,
+        )
     } else if let Some(rest) = raw_b.strip_prefix(b"\xFE\xFF") {
         if rest.len() % 2 != 0 {
             return Err(format!("`{label}` has truncated UTF-16BE byte length"));
@@ -217,19 +340,33 @@ pub(crate) fn decode_source_bytes_clean(
             .chunks_exact(2)
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|e| format!("`{label}` invalid UTF-16BE: {e}"))?
+        (
+            char::decode_utf16(units)
+                .collect::<Result<String, _>>()
+                .map_err(|e| format!("`{label}` invalid UTF-16BE: {e}"))?,
+            SourceEncoding::Utf16BeBom,
+        )
     } else {
-        std::str::from_utf8(raw_b)
-            .map_err(|e| format!("`{label}` is not valid UTF-8: {e}"))?
-            .to_string()
+        (
+            std::str::from_utf8(raw_b)
+                .map_err(|e| format!("`{label}` is not valid UTF-8: {e}"))?
+                .to_string(),
+            SourceEncoding::Utf8,
+        )
     };
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
     Ok((
         text.trim_start_matches('\u{FEFF}').replace("\r\n", "\n"),
         nl,
+        enc,
     ))
+}
+
+pub(crate) fn decode_source_bytes_clean(
+    raw_b: &[u8],
+    label: &str,
+) -> Result<(String, &'static str), String> {
+    decode_source_bytes_with_encoding(raw_b, label).map(|(s, nl, _)| (s, nl))
 }
 
 pub fn view_single_file(
@@ -367,7 +504,7 @@ fn restore_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) {
                 let _ = fs::remove_file(p);
             }
             Some(bytes) => {
-                let _ = fs::write(p, bytes);
+                let _ = write_file_atomic(p, bytes).or_else(|_| fs::write(p, bytes));
                 if p.extension().and_then(|e| e.to_str()) == Some("py") {
                     purge_stale_pyc(p);
                 }
@@ -514,7 +651,19 @@ fn apply_spec_inner(
     let ops = match parse_edit_spec(raw_spec) {
         Ok(o) if !o.is_empty() => o,
         Ok(_) => {
-            eprintln!("[splice apply] expected a non-empty edit transaction.");
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "rolled_back": false,
+                        "error": "[splice apply] expected a non-empty edit transaction."
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("[splice apply] expected a non-empty edit transaction.");
+            }
             return 1;
         }
         Err(e) => {
@@ -534,6 +683,7 @@ fn apply_spec_inner(
     let mut key_to_path: HashMap<String, PathBuf> = HashMap::new();
     let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
     let mut working_text: HashMap<PathBuf, (String, &'static str)> = HashMap::new();
+    let mut file_encodings: HashMap<PathBuf, SourceEncoding> = HashMap::new();
     let mut staged_bytes: HashMap<PathBuf, Vec<u8>> = HashMap::new();
     let mut applied_summary: Vec<serde_json::Value> = Vec::new();
 
@@ -545,11 +695,14 @@ fn apply_spec_inner(
             if !backups.contains_key(&p) {
                 if p.exists() {
                     let raw_b = fs::read(&p).map_err(|e| e.to_string())?;
-                    let (clean_lf, nl) = decode_source_bytes_clean(&raw_b, &item.path)?;
+                    let (clean_lf, nl, enc) =
+                        decode_source_bytes_with_encoding(&raw_b, &item.path)?;
                     working_text.insert(p.clone(), (clean_lf, nl));
+                    file_encodings.insert(p.clone(), enc);
                     backups.insert(p.clone(), Some(raw_b));
                 } else {
                     working_text.insert(p.clone(), (String::new(), "\n"));
+                    file_encodings.insert(p.clone(), SourceEncoding::Utf8);
                     backups.insert(p.clone(), None);
                 }
                 touched_paths.push(p.clone());
@@ -775,19 +928,23 @@ fn apply_spec_inner(
 
         for p in &touched_paths {
             let (final_lf, nl_sep) = working_text.get(p).unwrap();
+            let enc = file_encodings
+                .get(p)
+                .copied()
+                .unwrap_or(SourceEncoding::Utf8);
             let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
             if !fname.ends_with(".d.ts") {
                 verify_syntax(final_lf, ext).map_err(|e| format!("in `{fname}`: {e}"))?;
             }
-            staged_bytes.insert(p.clone(), final_lf.replace('\n', nl_sep).into_bytes());
+            staged_bytes.insert(p.clone(), encode_source_bytes(final_lf, nl_sep, enc));
         }
 
         for p in &touched_paths {
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            fs::write(p, staged_bytes.get(p).unwrap()).map_err(|e| e.to_string())?;
+            write_file_atomic(p, staged_bytes.get(p).unwrap()).map_err(|e| e.to_string())?;
             if p.extension().and_then(|e| e.to_str()) == Some("py") {
                 purge_stale_pyc(p);
             }
@@ -1045,10 +1202,11 @@ fn run_post_edit_hook(explicit_root: &Path) -> i32 {
         let Ok(raw) = fs::read(&path) else {
             continue;
         };
-        let Ok(text) = std::str::from_utf8(&raw) else {
+        let Ok(raw_text) = std::str::from_utf8(&raw) else {
             issues.push(format!("{}: non-UTF-8 bytes after edit", path.display()));
             continue;
         };
+        let text = raw_text.strip_prefix('\u{FEFF}').unwrap_or(raw_text);
         if text.lines().any(|l| {
             l.starts_with("<<<<<<< ") || l.trim_end() == "=======" || l.starts_with(">>>>>>> ")
         }) {
@@ -1125,7 +1283,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 match view_single_file(p, &symbols, &heading, &lines) {
                     Ok(r) => results.push(r),
                     Err(e) => {
-                        eprintln!("{e}");
+                        emit_err(as_json, &e);
                         return 1;
                     }
                 }
@@ -1183,7 +1341,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                 match base64::engine::general_purpose::STANDARD.decode(b.trim()) {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                     Err(e) => {
-                        eprintln!("[splice apply] invalid --b64 payload: {e}");
+                        emit_err(
+                            as_json,
+                            &format!("[splice apply] invalid --b64 payload: {e}"),
+                        );
                         return 1;
                     }
                 }
@@ -1196,7 +1357,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                     sp
                 };
                 let Ok(s) = fs::read_to_string(&resolved) else {
-                    eprintln!("[splice apply] spec file not found: {}", resolved.display());
+                    emit_err(
+                        as_json,
+                        &format!("[splice apply] spec file not found: {}", resolved.display()),
+                    );
                     return 1;
                 };
                 if unlink_spec {
@@ -1204,7 +1368,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                 }
                 s
             } else {
-                eprintln!("[splice apply] must pass one of --stdin, --b64, or --spec");
+                emit_err(
+                    as_json,
+                    "[splice apply] must pass one of --stdin, --b64, or --spec",
+                );
                 return 2;
             };
 
@@ -1232,6 +1399,13 @@ pub fn run_cli(args: &[String]) -> i32 {
         } => {
             if hook {
                 return run_post_edit_hook(&root);
+            }
+            if !root.exists() {
+                emit_err(
+                    as_json,
+                    &format!("[splice check] path not found: {}", root.display()),
+                );
+                return 1;
             }
             let payload = collect_check_payload(&root, test, &test_cmd);
             if as_json {
@@ -1348,5 +1522,102 @@ mod tests {
         assert!(after.contains("10"), "first edit lost: {after}");
         assert!(after.contains("20"), "second edit lost: {after}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preserves_utf8_bom_utf16_bom_and_crlf_across_apply_rename_rewrite_and_bom_json_check() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("ap_splice_bom_{}_{}", std::process::id(), nanos));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let p_utf8_bom = dir.join("bom.py");
+        let p_u16le = dir.join("u16le.py");
+        let p_u16be = dir.join("u16be.py");
+        let p_json_bom = dir.join("cfg.json");
+
+        let mut u16le_bytes = vec![0xFFu8, 0xFEu8];
+        for u in "def old_sym():\r\n    return old_call(1)\r\n".encode_utf16() {
+            u16le_bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let mut u16be_bytes = vec![0xFEu8, 0xFFu8];
+        for u in "def keep_be():\r\n    return 1\r\n".encode_utf16() {
+            u16be_bytes.extend_from_slice(&u.to_be_bytes());
+        }
+        fs::write(
+            &p_utf8_bom,
+            b"\xEF\xBB\xBFdef old_sym():\r\n    return old_call(1)\r\n",
+        )
+        .unwrap();
+        fs::write(&p_u16le, &u16le_bytes).unwrap();
+        fs::write(&p_u16be, &u16be_bytes).unwrap();
+        fs::write(&p_json_bom, b"\xEF\xBB\xBF{\"ok\": true}\r\n").unwrap();
+
+        // 1. `apply` preserves UTF-8 BOM, UTF-16LE BOM, UTF-16BE BOM, and CRLF
+        let spec = "@@ FILE: bom.py\n<<<\n    return old_call(1)\n===\n    return old_call(2)\n>>>\n\
+                    @@ FILE: u16le.py\n<<<\n    return old_call(1)\n===\n    return old_call(2)\n>>>\n\
+                    @@ FILE: u16be.py\n<<<\n    return 1\n===\n    return 2\n>>>\n";
+        assert_eq!(apply_spec_silent(&dir, spec), 0);
+        let b_u8 = fs::read(&p_utf8_bom).unwrap();
+        assert!(
+            b_u8.starts_with(b"\xEF\xBB\xBF"),
+            "UTF-8 BOM lost: {b_u8:?}"
+        );
+        assert!(b_u8.windows(2).any(|w| w == b"\r\n"), "CRLF lost");
+        let b_le = fs::read(&p_u16le).unwrap();
+        assert!(b_le.starts_with(b"\xFF\xFE"), "UTF-16LE BOM lost: {b_le:?}");
+        let (dec_le, nl_le, enc_le) = decode_source_bytes_with_encoding(&b_le, "u16le.py").unwrap();
+        assert_eq!(enc_le, SourceEncoding::Utf16LeBom);
+        assert_eq!(nl_le, "\r\n");
+        assert!(dec_le.contains("old_call(2)"), "{dec_le}");
+        let b_be = fs::read(&p_u16be).unwrap();
+        assert!(b_be.starts_with(b"\xFE\xFF"), "UTF-16BE BOM lost: {b_be:?}");
+        let (dec_be, nl_be, enc_be) = decode_source_bytes_with_encoding(&b_be, "u16be.py").unwrap();
+        assert_eq!(enc_be, SourceEncoding::Utf16BeBom);
+        assert_eq!(nl_be, "\r\n");
+        assert!(dec_be.contains("return 2"), "{dec_be}");
+
+        // 2. `rename` preserves UTF-8 BOM & UTF-16LE BOM
+        let r_rep =
+            rename::rename_symbol_workspace(&dir, "old_sym", "new_sym", false, false, "", false);
+        assert!(r_rep.ok && r_rep.files_changed == 2, "{r_rep:?}");
+        assert!(fs::read(&p_utf8_bom).unwrap().starts_with(b"\xEF\xBB\xBF"));
+        assert!(fs::read(&p_u16le).unwrap().starts_with(b"\xFF\xFE"));
+
+        // 3. `rewrite` preserves UTF-8 BOM & UTF-16LE BOM
+        let rw_rep = rewrite::rewrite_pattern_workspace(
+            &dir,
+            "old_call($X)",
+            "new_call($X)",
+            "py",
+            false,
+            false,
+            false,
+            "",
+            false,
+        );
+        assert!(rw_rep.ok && rw_rep.files_changed == 2, "{rw_rep:?}");
+        let rw_u8 = fs::read(&p_utf8_bom).unwrap();
+        assert!(rw_u8.starts_with(b"\xEF\xBB\xBF"));
+        assert!(String::from_utf8_lossy(&rw_u8).contains("new_call(2)"));
+        let rw_le = fs::read(&p_u16le).unwrap();
+        assert!(rw_le.starts_with(b"\xFF\xFE"));
+        let (rw_le_txt, _, _) = decode_source_bytes_with_encoding(&rw_le, "u16le.py").unwrap();
+        assert!(rw_le_txt.contains("new_call(2)"), "{rw_le_txt}");
+
+        // 4. `splice check` passes cleanly on UTF-8 BOM JSON file
+        let _ = fs::remove_file(&p_u16le);
+        let _ = fs::remove_file(&p_u16be);
+        let chk = collect_check_payload(&dir, false, "");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            chk.ok,
+            "UTF-8 BOM json/py must pass check: {:?}",
+            chk.issues
+        );
     }
 }

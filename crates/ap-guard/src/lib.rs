@@ -20,6 +20,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const EXIT_BLOCK: i32 = 2;
 
+pub(crate) fn emit_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub sig: String,
@@ -1373,6 +1384,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         SubCmd::Sec { cwd, json } => {
+            if !cwd.exists() {
+                emit_err(
+                    json,
+                    &format!("[guard sec] path not found: {}", cwd.display()),
+                );
+                return 1;
+            }
             let findings = sec::scan_security_issues(&cwd);
             if json {
                 println!(
@@ -1410,6 +1428,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             json,
         } => ai_surface::run_ai_surface_cli(&cwd, max_files, json),
         SubCmd::Diff { cwd, json } => {
+            if !cwd.exists() {
+                emit_err(
+                    json,
+                    &format!("[guard diff] path not found: {}", cwd.display()),
+                );
+                return 1;
+            }
             let rep = diff_audit::audit_git_diff(&cwd);
             if json {
                 println!(
@@ -1530,14 +1555,17 @@ pub fn run_cli(args: &[String]) -> i32 {
                 match fs::read_to_string(p) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[ap guard scrub] failed to read {}: {e}", p.display());
+                        emit_err(
+                            json,
+                            &format!("[ap guard scrub] failed to read {}: {e}", p.display()),
+                        );
                         return 1;
                     }
                 }
             } else {
                 let mut buf = String::new();
                 if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-                    eprintln!("[ap guard scrub] failed to read stdin: {e}");
+                    emit_err(json, &format!("[ap guard scrub] failed to read stdin: {e}"));
                     return 1;
                 }
                 let _ = stdin;

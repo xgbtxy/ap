@@ -405,7 +405,27 @@ fn run_metrics_mode(cli: &LsCli) -> i32 {
     }
 
     if valid_count == 0 {
-        eprintln!("[ap ls] path not found: {}", normalize_cli_path(&cli.path));
+        let msg = format!("[ap ls] path not found: {}", normalize_cli_path(&cli.path));
+        record_event_ex(
+            "ls",
+            0,
+            0,
+            0,
+            0,
+            "ls-err",
+            false,
+            t0.elapsed().as_millis() as u64,
+            Some(&msg),
+        );
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                    .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
         return 1;
     }
 

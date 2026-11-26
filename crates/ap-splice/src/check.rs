@@ -494,13 +494,14 @@ pub fn collect_check_payload(
             .to_string_lossy()
             .replace('\\', "/");
         let Ok(raw_b) = fs::read(&p) else { continue };
-        let txt = match std::str::from_utf8(&raw_b) {
+        let raw_txt = match std::str::from_utf8(&raw_b) {
             Ok(s) => s,
             Err(uerr) => {
                 issues.push(format!("{rel_s}: Invalid UTF-8 encoding ({uerr})"));
                 continue;
             }
         };
+        let txt = raw_txt.strip_prefix('\u{FEFF}').unwrap_or(raw_txt);
         if conflict_re.is_match(txt) {
             issues.push(format!("{rel_s}: Unresolved git merge conflict marker"));
         }

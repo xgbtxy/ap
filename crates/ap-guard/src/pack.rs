@@ -86,7 +86,10 @@ pub fn run_pack_audit(
     as_json: bool,
 ) -> i32 {
     if !dir.is_dir() {
-        eprintln!("[guard pack] directory not found: {}", dir.display());
+        crate::emit_err(
+            as_json,
+            &format!("[guard pack] directory not found: {}", dir.display()),
+        );
         return 2;
     }
     let t0 = Instant::now();

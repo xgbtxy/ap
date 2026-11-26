@@ -1126,19 +1126,24 @@ fn test_windows_exec_shield_bom_utf16_splice_and_stats_ledger() {
     );
     let after_ts = fs::read(&bom_utf8_file).unwrap();
     assert!(
-        !after_ts.starts_with(b"\xEF\xBB\xBF"),
-        "UTF-8 BOM must be stripped cleanly"
+        after_ts.starts_with(b"\xEF\xBB\xBF"),
+        "UTF-8 BOM must be preserved on existing BOM file"
     );
-    assert!(std::str::from_utf8(&after_ts).unwrap().contains("新标题"));
+    assert!(std::str::from_utf8(&after_ts[3..])
+        .unwrap()
+        .contains("新标题"));
 
     let after_js = fs::read(&utf16_file).unwrap();
     assert!(
-        !after_js.starts_with(&[0xFF, 0xFE]),
-        "UTF-16LE BOM must be converted to clean UTF-8"
+        after_js.starts_with(&[0xFF, 0xFE]),
+        "UTF-16LE BOM must be preserved on existing UTF-16LE file"
     );
-    assert!(std::str::from_utf8(&after_js)
-        .unwrap()
-        .contains("utf8-clean"));
+    let after_js_units: Vec<u16> = after_js[2..]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let after_js_str = String::from_utf16(&after_js_units).unwrap();
+    assert!(after_js_str.contains("utf8-clean"), "{after_js_str}");
 
     // 2. Transparent Windows PreToolUse hook Base64 auto-heal (`AP_FORCE_WIN_SHIELD=1`)
     let win_hook_in = serde_json::json!({
@@ -14617,4 +14622,310 @@ fn test_cycle3_stats_atomicity_cli_telemetry_search_fastpath_recall_prune_and_pr
         fs::read_to_string(&corrupt_fp).unwrap(),
         "{ broken frontier json"
     );
+}
+
+#[test]
+fn test_cycle4_sieve_concurrency_isolation_splice_bom_atlas_and_fail_closed_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // 1a. `ap sieve` explicit SIEVE_HOME isolation: must NEVER leak HOME/.ap/sieve archives
+    let fake_home = root.join("fake_home");
+    let fake_global_sieve = fake_home.join(".ap").join("sieve");
+    let iso_sieve = root.join("iso_sieve");
+    fs::create_dir_all(&fake_global_sieve).unwrap();
+    fs::create_dir_all(&iso_sieve).unwrap();
+
+    // Seed an archive in fake HOME/.ap/sieve
+    let seed_global = run_ap(
+        root,
+        &["sieve", "pipe", "--label", "host-secret", "--json"],
+        Some(&format!("FAKE_HOST_SECRET_9999\n{}", "x".repeat(1600))),
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("SIEVE_HOME", fake_global_sieve.as_path()),
+        ],
+    );
+    assert!(seed_global.status.success());
+    let seed_v: Value = serde_json::from_slice(&seed_global.stdout).unwrap();
+    let host_id = seed_v["id"].as_str().unwrap().to_string();
+
+    // Seed a different archive in explicit SIEVE_HOME
+    let seed_iso = run_ap(
+        root,
+        &["sieve", "pipe", "--label", "iso-only", "--json"],
+        Some(&format!("ISO_ARCHIVE_TOKEN_777\n{}", "y".repeat(1600))),
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("SIEVE_HOME", iso_sieve.as_path()),
+        ],
+    );
+    assert!(seed_iso.status.success());
+
+    // Search for host token with explicit SIEVE_HOME -> MUST return 0 hits!
+    let leak_search = run_ap(
+        root,
+        &["sieve", "search", "FAKE_HOST_SECRET_9999", "--json"],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("SIEVE_HOME", iso_sieve.as_path()),
+        ],
+    );
+    assert!(leak_search.status.success());
+    let leak_v: Value = serde_json::from_slice(&leak_search.stdout).unwrap();
+    assert_eq!(
+        leak_v["hits"].as_array().unwrap().len(),
+        0,
+        "explicit SIEVE_HOME leaked HOME/.ap/sieve archive: {leak_v}"
+    );
+    // Peek for host archive id with explicit SIEVE_HOME -> MUST fail (rc=1)!
+    let leak_peek = run_ap(
+        root,
+        &["sieve", "peek", &host_id],
+        None,
+        &[
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("SIEVE_HOME", iso_sieve.as_path()),
+        ],
+    );
+    assert!(
+        !leak_peek.status.success(),
+        "explicit SIEVE_HOME peek must not read HOME/.ap/sieve"
+    );
+
+    // 1b. `ap sieve` 12-process concurrent `pipe` + `search` + `prune --vacuum`: 0 lost, 0 dup FTS5 rows
+    let conc_sieve = root.join("conc_sieve");
+    fs::create_dir_all(&conc_sieve).unwrap();
+    std::thread::scope(|s| {
+        for i in 0..8usize {
+            let cs_c = conc_sieve.clone();
+            let root_c = root.to_path_buf();
+            s.spawn(move || {
+                let body = format!("C4_MULTI_PROC_{i}\n{}", "alpha beta line\n".repeat(120));
+                let o = run_ap(
+                    &root_c,
+                    &["sieve", "pipe", "--label", &format!("p{i}"), "--json"],
+                    Some(&body),
+                    &[("SIEVE_HOME", cs_c.as_path())],
+                );
+                assert!(
+                    o.status.success(),
+                    "pipe {i} failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            });
+        }
+        for i in 0..2usize {
+            let cs_c = conc_sieve.clone();
+            let root_c = root.to_path_buf();
+            s.spawn(move || {
+                let o = run_ap(
+                    &root_c,
+                    &["sieve", "search", "C4_MULTI_PROC", "--json"],
+                    None,
+                    &[("SIEVE_HOME", cs_c.as_path())],
+                );
+                assert!(o.status.success(), "search {i} failed");
+            });
+        }
+        for i in 0..2usize {
+            let cs_c = conc_sieve.clone();
+            let root_c = root.to_path_buf();
+            s.spawn(move || {
+                let o = run_ap(
+                    &root_c,
+                    &["sieve", "prune", "--max-mb", "4", "--vacuum", "--json"],
+                    None,
+                    &[("SIEVE_HOME", cs_c.as_path())],
+                );
+                assert!(o.status.success(), "prune {i} failed");
+            });
+        }
+    });
+    let raw_cnt = fs::read_dir(&conc_sieve)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("raw"))
+        .count();
+    assert_eq!(raw_cnt, 8);
+    let final_s = run_ap(
+        root,
+        &[
+            "sieve",
+            "search",
+            "C4_MULTI_PROC",
+            "--limit",
+            "20",
+            "--json",
+        ],
+        None,
+        &[("SIEVE_HOME", conc_sieve.as_path())],
+    );
+    assert!(final_s.status.success());
+    let final_v: Value = serde_json::from_slice(&final_s.stdout).unwrap();
+    assert_eq!(
+        final_v["hits"].as_array().unwrap().len(),
+        8,
+        "all 8 concurrent archives must be searchable with 0 loss & 0 dups: {final_v}"
+    );
+
+    // 2. `ap splice` BOM preservation (UTF-8 BOM + UTF-16LE BOM + CRLF) & BOM JSON `splice check`
+    let sp_ws = root.join("splice_bom_ws");
+    fs::create_dir_all(&sp_ws).unwrap();
+    let f_u8 = sp_ws.join("bom.py");
+    let f_u16 = sp_ws.join("u16.py");
+    let f_json = sp_ws.join("bom.json");
+    fs::write(&f_u8, b"\xEF\xBB\xBFdef a_fn():\r\n    return 1\r\n").unwrap();
+    let mut u16_b = vec![0xFFu8, 0xFEu8];
+    for u in "def b_fn():\r\n    return 1\r\n".encode_utf16() {
+        u16_b.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(&f_u16, &u16_b).unwrap();
+    fs::write(&f_json, b"\xEF\xBB\xBF{\"hello\": 1}\r\n").unwrap();
+
+    let sp_spec = "@@ FILE: bom.py\n<<<\n    return 1\n===\n    return 42\n>>>\n\
+                   @@ FILE: u16.py\n<<<\n    return 1\n===\n    return 42\n>>>\n";
+    let sp_out = run_ap(
+        &sp_ws,
+        &["splice", "apply", "--stdin", "--json"],
+        Some(sp_spec),
+        &[],
+    );
+    assert!(
+        sp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sp_out.stdout)
+    );
+    let u8_after = fs::read(&f_u8).unwrap();
+    assert!(u8_after.starts_with(b"\xEF\xBB\xBF"), "UTF-8 BOM stripped");
+    assert!(u8_after.windows(2).any(|w| w == b"\r\n"), "CRLF stripped");
+    let u16_after = fs::read(&f_u16).unwrap();
+    assert!(u16_after.starts_with(b"\xFF\xFE"), "UTF-16LE BOM stripped");
+
+    // `splice check` & `splice check --hook` pass cleanly on UTF-8 BOM JSON
+    let hook_o = run_ap(
+        &sp_ws,
+        &["splice", "check", "--hook"],
+        Some(f_json.to_str().unwrap()),
+        &[],
+    );
+    assert!(
+        hook_o.status.success(),
+        "splice check --hook must accept UTF-8 BOM JSON: {}",
+        String::from_utf8_lossy(&hook_o.stderr)
+    );
+    let _ = fs::remove_file(&f_u16);
+    let chk_o = run_ap(&sp_ws, &["splice", "check", ".", "--json"], None, &[]);
+    assert!(
+        chk_o.status.success(),
+        "splice check must accept UTF-8 BOM JSON: {}",
+        String::from_utf8_lossy(&chk_o.stdout)
+    );
+
+    // 3. Fail-closed missing paths, `--json` error envelopes & `stats.jsonl` `ok: false` coverage
+    let ap_home = root.join("c4_stats_home");
+    fs::create_dir_all(&ap_home).unwrap();
+    let missing_s = root
+        .join("definitely_missing_xyz")
+        .to_string_lossy()
+        .to_string();
+    let err_cases: Vec<(Vec<&str>, Option<&str>)> = vec![
+        (vec!["guard", "sec", &missing_s, "--json"], None),
+        (vec!["guard", "ai-surface", &missing_s, "--json"], None),
+        (vec!["guard", "diff", &missing_s, "--json"], None),
+        (vec!["guard", "pack", &missing_s, "--json"], None),
+        (vec!["guard", "scrub", &missing_s, "--json"], None),
+        (vec!["splice", "check", &missing_s, "--json"], None),
+        (vec!["splice", "view", &missing_s, "--json"], None),
+        (vec!["splice", "apply", "--stdin", "--json"], Some("[]")),
+        (vec!["atlas", "history", &missing_s, "--json"], None),
+        (vec!["sieve", "run", "--json"], None),
+        (vec!["query", "-f", &missing_s, "--json"], None),
+        (
+            vec!["exec", "--lang", "cobol", "--base64", "aGk=", "--json"],
+            None,
+        ),
+        (vec!["ls", "--lines", &missing_s, "--json"], None),
+    ];
+    for (args, stdin_opt) in &err_cases {
+        let out = run_ap(root, args, *stdin_opt, &[("AP_HOME", ap_home.as_path())]);
+        assert!(
+            !out.status.success(),
+            "expected non-zero exit for {args:?}; stdout={}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let jv: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "expected valid JSON error for {args:?}: {e}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(jv["ok"], false, "args={args:?} jv={jv}");
+        assert!(
+            jv["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "args={args:?} jv={jv}"
+        );
+    }
+
+    let stats_raw = fs::read_to_string(ap_home.join("stats.jsonl")).unwrap();
+    let stat_evs: Vec<Value> = stats_raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for expected_kind in ["query", "exec", "ls", "guard", "splice", "atlas", "sieve"] {
+        assert!(
+            stat_evs.iter().any(|e| {
+                e["kind"] == expected_kind
+                    && e["ok"] == false
+                    && e["ms"].is_u64()
+                    && e["err"].as_str().is_some_and(|s| !s.is_empty())
+            }),
+            "missing ok:false stats.jsonl record for kind={expected_kind}: {stat_evs:?}"
+        );
+    }
+
+    // 4. MCP `ap_changes` logs ONCE (no double-log) & keeps exact 37 tools
+    let mcp_home = root.join("c4_mcp_stats");
+    fs::create_dir_all(&mcp_home).unwrap();
+    let mcp_req = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ap_changes","arguments":{"path": sp_ws.to_string_lossy()}}}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_o = run_ap(
+        &sp_ws,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", mcp_home.as_path())],
+    );
+    assert!(mcp_o.status.success());
+    let mcp_lines: Vec<Value> = String::from_utf8_lossy(&mcp_o.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        mcp_lines[0]["result"]["tools"].as_array().unwrap().len(),
+        37
+    );
+    let mcp_stats: Vec<Value> = fs::read_to_string(mcp_home.join("stats.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        mcp_stats.len(),
+        1,
+        "MCP ap_changes must log exactly once (no double-log): {mcp_stats:?}"
+    );
+    assert_eq!(mcp_stats[0]["kind"], "mcp");
 }

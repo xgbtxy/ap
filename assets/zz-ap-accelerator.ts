@@ -32,17 +32,22 @@ const PY_INVOKE = /(?:^|[;&|(\s=])(?:python3?(?:\.exe)?|py(?:\.exe)?|pytest)(?=\
 const HAS_UTF8_ENV = /PYTHONUTF8|PYTHONIOENCODING/i;
 const PY_WIN_BS =
 	/\b(?:python3?(?:\.exe)?|py(?:\.exe)?)\b[\s\S]*(?:-c\b|<<)[\s\S]*(?<![rR])(['"])([A-Za-z]:\\(?!\\)[^'"\r\n]+)\1/;
-const REDIR_NUL = /(\s(?:[12]?>>?|&>))\s*NUL\b/gi;
+const REDIR_NUL = /(\s(?:[12]?>>?|&>))\s*NUL(?=$|[\s;&|)])/gi;
 function healRedirNul(cmd: string): string {
-	if (!/\bNUL\b/i.test(cmd)) return cmd;
+	if (!/\bNUL(?=$|[\s;&|)])/i.test(cmd)) return cmd;
 	const hdIdx = cmd.indexOf("<<");
 	const head = hdIdx >= 0 ? cmd.slice(0, hdIdx) : cmd;
 	const tail = hdIdx >= 0 ? cmd.slice(hdIdx) : "";
 	let out = "";
 	let quote: string | null = null;
 	let segStart = 0;
-	const rewriteUnquoted = (seg: string): string =>
-		seg.replace(/((?:^|[\s"'`)}]|[A-Za-z0-9_./\\-])(?:(?<![A-Za-z0-9_])[12]?>>?|>>?|&>))\s*NUL\b/gi, "$1 /dev/null");
+	const rewriteUnquoted = (seg: string, followedByQuote: boolean): string =>
+		seg.replace(
+			followedByQuote
+				? /((?:^|[\s"'`)}]|[A-Za-z0-9_./\\-])(?:(?<![A-Za-z0-9_])[12]?>>?|>>?|&>))\s*NUL(?=[\s;&|)])/gi
+				: /((?:^|[\s"'`)}]|[A-Za-z0-9_./\\-])(?:(?<![A-Za-z0-9_])[12]?>>?|>>?|&>))\s*NUL(?=$|[\s;&|)])/gi,
+			"$1 /dev/null",
+		);
 	for (let i = 0; i < head.length; i++) {
 		const ch = head[i];
 		if (quote) {
@@ -58,13 +63,53 @@ function healRedirNul(cmd: string): string {
 			continue;
 		}
 		if (ch === "'" || ch === '"') {
-			if (i > segStart) out += rewriteUnquoted(head.slice(segStart, i));
+			if (i > segStart) out += rewriteUnquoted(head.slice(segStart, i), true);
 			segStart = i;
 			quote = ch;
 		}
 	}
 	if (segStart < head.length) {
-		out += quote ? head.slice(segStart) : rewriteUnquoted(head.slice(segStart));
+		out += quote ? head.slice(segStart) : rewriteUnquoted(head.slice(segStart), false);
+	}
+	return out + tail;
+}
+function healCmdCdSlashD(cmd: string): string {
+	if (!/\bcd\s+\/d\b/i.test(cmd)) return cmd;
+	const hdIdx = cmd.indexOf("<<");
+	const head = hdIdx >= 0 ? cmd.slice(0, hdIdx) : cmd;
+	const tail = hdIdx >= 0 ? cmd.slice(hdIdx) : "";
+	let out = "";
+	let quote: string | null = null;
+	let segStart = 0;
+	const rewriteUnquoted = (seg: string, followedByQuote: boolean): string =>
+		seg.replace(
+			followedByQuote
+				? /(^|[;&|(\n])([ \t]*)cd\s+\/[dD]\s+(?=[^\s;&|)\n]|$)/gi
+				: /(^|[;&|(\n])([ \t]*)cd\s+\/[dD]\s+(?=[^\s;&|)\n])/gi,
+			"$1$2cd ",
+		);
+	for (let i = 0; i < head.length; i++) {
+		const ch = head[i];
+		if (quote) {
+			if (ch === "\\" && quote === '"' && i + 1 < head.length) {
+				i++;
+				continue;
+			}
+			if (ch === quote) {
+				out += head.slice(segStart, i + 1);
+				segStart = i + 1;
+				quote = null;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			if (i > segStart) out += rewriteUnquoted(head.slice(segStart, i), true);
+			segStart = i;
+			quote = ch;
+		}
+	}
+	if (segStart < head.length) {
+		out += quote ? head.slice(segStart) : rewriteUnquoted(head.slice(segStart), false);
 	}
 	return out + tail;
 }
@@ -1139,13 +1184,14 @@ function stripTsTypesInCodemode(code: string): string {
 		let dp = 0;
 		let db = 0;
 		let da = 0;
+		let inDefault = false;
 		while (idx < params.length) {
 			const ch = params[idx];
 			if (ch === "(") dp++;
 			else if (ch === ")" && dp > 0) dp--;
 			else if (ch === "[") db++;
 			else if (ch === "]" && db > 0) db--;
-			else if (ch === "<") da++;
+			else if (ch === "<" && !inDefault) da++;
 			else if (ch === ">" && da > 0) da--;
 			else if (ch === "{") {
 				let bDepth = 1;
@@ -1157,7 +1203,7 @@ function stripTsTypesInCodemode(code: string): string {
 				}
 				outP += params.slice(idx, j);
 				idx = j;
-				if (dp === 0 && db === 0 && da === 0) {
+				if (dp === 0 && db === 0 && da === 0 && !inDefault) {
 					const rest = params.slice(idx).match(/^[ \t]*\??[ \t]*:/);
 					if (rest) {
 						const tEnd = consumeBalancedType(params, idx + rest[0].length, true);
@@ -1166,13 +1212,24 @@ function stripTsTypesInCodemode(code: string): string {
 				}
 				continue;
 			}
-			if (dp === 0 && db === 0 && da === 0 && (ch === "?" || ch === ":")) {
-				const colonM = params.slice(idx).match(/^\??[ \t]*:/);
-				if (colonM) {
-					const tEnd = consumeBalancedType(params, idx + colonM[0].length, true);
-					if (tEnd > 0) {
-						idx = tEnd;
-						continue;
+			if (dp === 0 && db === 0 && da === 0) {
+				if (ch === ",") {
+					inDefault = false;
+				} else if (
+					ch === "=" &&
+					params[idx + 1] !== ">" &&
+					params[idx + 1] !== "=" &&
+					(idx === 0 || !"!=<>".includes(params[idx - 1]))
+				) {
+					inDefault = true;
+				} else if (!inDefault && (ch === "?" || ch === ":")) {
+					const colonM = params.slice(idx).match(/^\??[ \t]*:/);
+					if (colonM) {
+						const tEnd = consumeBalancedType(params, idx + colonM[0].length, true);
+						if (tEnd > 0) {
+							idx = tEnd;
+							continue;
+						}
 					}
 				}
 			}
@@ -1447,6 +1504,14 @@ function guardBareJsonStringifySlice(s: string): string {
 		if (idx < 0) break;
 		const beforeCh = idx > 0 ? s[idx - 1] : "";
 		if (beforeCh && /[A-Za-z0-9_$.]/.test(beforeCh)) {
+			i = idx + 14;
+			continue;
+		}
+		let prevSig = idx - 1;
+		while (prevSig >= 0 && (s[prevSig] === " " || s[prevSig] === "\t" || s[prevSig] === "\r" || s[prevSig] === "\n")) {
+			prevSig--;
+		}
+		if (prevSig >= 0 && s[prevSig] === ".") {
 			i = idx + 14;
 			continue;
 		}
@@ -1816,11 +1881,11 @@ export function classifyCodemodeFailureTip(outText: string): string {
 		return `[ap codemode-tip] QuickJS sandbox has NO Node APIs (fs/path/require/process/fetch/Buffer); use await sleep(ms) for delays and tools.<name>(args) (e.g. tools.read, tools.bash, tools.mcp__agent_primitives__ap_search) or inspect ALL_TOOLS.`;
 	}
 	if (
-		/\bTypeError\b|(?:split|trim|match|replace|includes|slice|indexOf|toLowerCase|toUpperCase|startsWith|endsWith)\s+is not a function|cannot read propert|not iterable|unexpected token.*\[object Object\]/i.test(
+		/\bTypeError\b|(?:split|trim|match|replace|includes|slice|indexOf|toLowerCase|toUpperCase|startsWith|endsWith)\s+is not a function|\bnot a function\b|cannot read propert|not iterable|unexpected token.*\[object Object\]/i.test(
 			outText,
 		)
 	) {
-		return `[ap codemode-tip] TypeError: JSON.stringify(undefined) returns undefined (ALWAYS guard with (JSON.stringify(val) ?? "").slice(...)) and text(val) is a VOID output printer in older bundles (don't chain .slice() on it); guard undefined strings with String(res?.output ?? res?.text ?? "").slice(...) before slicing/splitting. tools.bash(...) resolves to an OBJECT { output, exit_code, truncated, full_output_path }, tools.read(...) resolves to a string, and tools.mcp__* resolves to { content, structuredContent, isError } (already parsed; check Object.keys(res) instead of slicing undefined). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
+		return `[ap codemode-tip] TypeError: JSON.stringify(undefined) returns undefined (ALWAYS guard with (JSON.stringify(val) ?? "").slice(...)) and text(val) is a VOID output printer in older bundles (don't chain .slice() on it); if a tool result field (e.g. r.result?.value) is an auto-parsed JSON object/number rather than a string, convert via (typeof v === "string" ? v : JSON.stringify(v) ?? "").slice(...) instead of calling .slice() directly on a non-string; guard undefined strings with String(res?.output ?? res?.text ?? "").slice(...) before slicing/splitting. tools.bash(...) resolves to an OBJECT { output, exit_code, truncated, full_output_path }, tools.read(...) resolves to a string, and tools.mcp__* resolves to { content, structuredContent, isError } (already parsed; check Object.keys(res) instead of slicing undefined). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
 	}
 	if (/Unexpected end of JSON input|unexpected token:\s*'object'|JSON\.parse/i.test(outText)) {
 		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on an already-parsed object or non-JSON wrapper.`;
@@ -3170,7 +3235,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 					else if (ch === "c") countOnly = true;
 					else if (ch === "o") onlyMatch = true;
 					else if (ch === "h") noFilename = true;
-					else if (ch === "H" || ch === "s" || ch === "a") continue;
+					else if (ch === "H" || ch === "s" || ch === "a" || ch === "I") continue;
 					else { ok = false; break; }
 				}
 				if (!ok) break;
@@ -3299,19 +3364,25 @@ export function guardEphemeralServerCommand(cmd: string): string | undefined {
 	const leadWs = rawTail.match(/^\s*/)?.[0] ?? "";
 	const tail = rawTail.slice(leadWs.length);
 	if (!tail || /\btimeout\s+\d+/.test(tail)) return undefined;
+	// Preserve leading inline env assignments (e.g. `FOO=1 python -m http.server 8000 &`)
+	// so external `timeout` never tries to exec `FOO=1` as a command name.
+	const envLeadM = tail.match(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"\\]*(?:\\.[^"\\]*)*"|[^\s;&|]*)\s+)+/);
+	const envLead = envLeadM ? envLeadM[0] : "";
+	const execTail = tail.slice(envLead.length);
+	if (!execTail) return undefined;
 	// Never place external `timeout` before shell builtins, subshells, or compound blocks
-	if (/^(?:cd|export|unset|echo|printf|set|eval|exec|if|for|while|until|case|\(|\{)\b|^[\(\{]/i.test(tail)) {
+	if (/^(?:cd|export|unset|echo|printf|set|eval|exec|if|for|while|until|case|\(|\{)\b|^[\(\{]/i.test(execTail)) {
 		return undefined;
 	}
 	const isHttpOrProbeServer =
-		/(?:python3?(?:\.exe)?\s+-m\s+http\.server\b|\bhttp\.server\b|\bap(?:\.exe)?\s+probe\s+listen\b)/.test(tail);
+		/(?:python3?(?:\.exe)?\s+-m\s+http\.server\b|\bhttp\.server\b|\bap(?:\.exe)?\s+probe\s+listen\b)/.test(execTail);
 	const isNohupScriptServer =
-		/^nohup\s+(?:env\s+(?:\w+=\S+\s+)*)?(?:python3?|py|node)(?:\.exe)?\b/i.test(tail);
+		/^nohup\s+(?:env\s+(?:\w+=\S+\s+)*)?(?:python3?|py|node)(?:\.exe)?\b/i.test(execTail);
 	if (!isHttpOrProbeServer && !isNohupScriptServer) return undefined;
-	if (/^nohup\s+/i.test(tail)) {
-		return `${prefix}${leadWs}${tail.replace(/^nohup\s+/i, "nohup timeout 900 ")}`;
+	if (/^nohup\s+/i.test(execTail)) {
+		return `${prefix}${leadWs}${envLead}${execTail.replace(/^nohup\s+/i, "nohup timeout 900 ")}`;
 	}
-	return `${prefix}${leadWs}timeout 900 ${tail}`;
+	return `${prefix}${leadWs}${envLead}timeout 900 ${execTail}`;
 }
 
 /**
@@ -3628,7 +3699,7 @@ export function healCmdForLoop(raw: string, toolName = "bash"): string | undefin
 	}
 	body = body.replace(new RegExp(`%%?(?:~[fdpnxsatz]*)?${v}(?!\\w)`, "gi"), () => "${" + v + "}");
 	body = normWinTmpEnv(body);
-	body = body.replace(/\s+2>\s*nul\b/gi, " 2>/dev/null");
+	body = body.replace(/\s+2>\s*nul(?=$|[\s;&|)])/gi, " 2>/dev/null");
 	body = body.replace(/\bdir\s+\/b\s+\/s\s+("[^"]+"|'[^']+'|\S+)/gi, `"${AP_BIN}" ls $1 --depth 3`);
 	body = body.replace(/\bdir\s+\/s\s+\/b\s+("[^"]+"|'[^']+'|\S+)/gi, `"${AP_BIN}" ls $1 --depth 3`);
 	body = body.replace(/\bdir\s+\/b\s+("[^"]+"|'[^']+'|\S+)/gi, `"${AP_BIN}" ls $1`);
@@ -3939,6 +4010,7 @@ function accelerateGrepPipeline(
 				else if (ch === "H" || ch === "s" || ch === "a") continue;
 				else if (isRg && ch === "N") continue;
 				else if (isRg && ch === "I") noFilename = true;
+				else if (!isRg && ch === "I") continue;
 				else if (!isRg && (ch === "r" || ch === "R")) recursive = true;
 				else if (!isRg && ch === "E") extendedRe = true;
 				else if (ch === "h") noFilename = true;
@@ -4693,6 +4765,11 @@ export function healCommand(
 	const isDestructive = DESTRUCTIVE_OR_WRITE.test(cmd);
 	if (isDestructive) {
 		if (toolName === "bash") {
+			const fixedDestrCd = healCmdCdSlashD(cmd);
+			if (fixedDestrCd !== cmd) {
+				cmd = fixedDestrCd;
+				changed = true;
+			}
 			const psDestr = healBashPowerShellCommand(cmd);
 			if (psDestr) {
 				cmd = psDestr;
@@ -4709,15 +4786,16 @@ export function healCommand(
 
 	// 0. Pre-normalize safe Git Bash Windowsisms BEFORE accelerators so `cd /d`, `2>NUL`, `&`, unquoted/quoted backslashes, `| more` & `| Select-Object` accelerate too
 	if (toolName === "bash") {
-		if (/\bNUL\b/i.test(cmd)) {
+		if (/\bNUL(?=$|[\s;&|)])/i.test(cmd)) {
 			const fixedNul = healRedirNul(cmd);
 			if (fixedNul !== cmd) {
 				cmd = fixedNul;
 				changed = true;
 			}
 		}
-		if (/(?:^|[;&|]\s*)cd\s+\/d\s+/i.test(cmd)) {
-			cmd = cmd.replace(/(^|[;&|]\s*)cd\s+\/d\s+/gi, "$1cd ");
+		const fixedCdD = healCmdCdSlashD(cmd);
+		if (fixedCdD !== cmd) {
+			cmd = fixedCdD;
 			changed = true;
 		}
 		const cdAmp = cmd.match(/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)(?:\s+2>\s*\/dev\/null)?)\s*&\s*(?![&>])([\s\S]+)$/);
@@ -5298,75 +5376,99 @@ export function normalizeRepairedToolArgs(
 	return { changed, args };
 }
 
-/**
- * Scrub leaked DeepSeek DSML / `<tool_call>` XML fragments from assistant prose so unparsed markup
- * never poisons downstream prompt context, while strictly preserving CommonMark fenced code blocks
- * (N-backtick / N-tilde, incl. nested 4-backtick and unclosed-to-EOF fences) and N-backtick inline
- * code spans (respecting escaped `\` `). Returns the exact original string on no-op so clean history
- * never mutates or busts prompt KV-cache.
- */
-export function scrubLeakedToolMarkup(text: string): string {
-	if (!text || (!text.includes("DSML") && !text.includes("<tool_call>"))) return text;
-	const stripRaw = (seg: string): string =>
-		seg
-			.replace(/<[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>/g, "")
-			.replace(/<\/?[|｜]{1,2}DSML[|｜]{1,2}\s*invoke\b[\s\S]*?<\/[|｜]{1,2}DSML[|｜]{1,2}\s*invoke>/g, "")
-			.replace(/<\/?[|｜]{1,2}DSML[|｜]{1,2}[^>]*>/g, "")
-			.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "");
+interface MarkdownSegment {
+	text: string;
+	isCode: boolean;
+}
 
+function matchCommonMarkFenceOpener(
+	text: string,
+	lineStart: number,
+): { fenceChar: string; fenceLen: number; infoEnd: number } | undefined {
 	const n = text.length;
-	const parts: Array<{ text: string; isCode: boolean }> = [];
+	let p = lineStart;
+	while (p < n && p - lineStart < 3 && text[p] === " ") p++;
+	const fc = p < n ? text[p] : "";
+	if (fc !== "`" && fc !== "~") return undefined;
+	let fl = 0;
+	while (p + fl < n && text[p + fl] === fc) fl++;
+	if (fl < 3) return undefined;
+	const eol = text.indexOf("\n", p + fl);
+	const infoEnd = eol < 0 ? n : eol;
+	const info = text.slice(p + fl, infoEnd);
+	// CommonMark §4.5: backtick code fence info strings cannot contain backticks (tilde fences may)
+	if (fc === "`" && info.includes("`")) return undefined;
+	return { fenceChar: fc, fenceLen: fl, infoEnd };
+}
+
+/**
+ * Segment Markdown text into non-overlapping prose (`isCode: false`) and code (`isCode: true`)
+ * spans per CommonMark §3/§4.5/§6.1:
+ * - Fenced code blocks (`0-3` leading spaces, `3+` backticks or tildes, nested longer fences, unclosed-to-EOF,
+ *   rejecting backticks in backtick-fence info strings while allowing them in tilde-fence info strings).
+ * - N-backtick inline code spans (respecting escaped `\` `, stopping at blank lines and at paragraph-interrupting
+ *   CommonMark fenced code block openers).
+ */
+function segmentMarkdownCodeSpans(text: string): MarkdownSegment[] {
+	const n = text.length;
+	const parts: MarkdownSegment[] = [];
 	let proseStart = 0;
-	let changed = false;
 	let i = 0;
 	let atLineStart = true;
 
 	const flushProse = (end: number) => {
 		if (end <= proseStart) return;
-		const raw = text.slice(proseStart, end);
-		const stripped = stripRaw(raw);
-		if (stripped !== raw) changed = true;
-		parts.push({ text: stripped, isCode: false });
+		parts.push({ text: text.slice(proseStart, end), isCode: false });
 	};
 
 	while (i < n) {
+		let rejectedBacktickFence = false;
 		if (atLineStart) {
+			const opener = matchCommonMarkFenceOpener(text, i);
+			if (opener) {
+				let q = opener.infoEnd < n ? opener.infoEnd + 1 : n;
+				let closeEnd = n;
+				while (q < n) {
+					const lineEnd = text.indexOf("\n", q);
+					const nextLine = lineEnd < 0 ? n : lineEnd + 1;
+					let cp = q;
+					while (cp < n && cp - q < 3 && text[cp] === " ") cp++;
+					let cl = 0;
+					while (cp + cl < n && text[cp + cl] === opener.fenceChar) cl++;
+					if (cl >= opener.fenceLen) {
+						let rest = cp + cl;
+						const stop = lineEnd < 0 ? n : lineEnd;
+						while (rest < stop && (text[rest] === " " || text[rest] === "\t" || text[rest] === "\r")) rest++;
+						if (rest === stop) {
+							closeEnd = stop;
+							break;
+						}
+					}
+					q = nextLine;
+				}
+				flushProse(i);
+				parts.push({ text: text.slice(i, closeEnd), isCode: true });
+				i = closeEnd;
+				proseStart = i;
+				atLineStart = false;
+				continue;
+			}
+			// Detect a CommonMark §4.5 rejected backtick fence opener (info string contains `` ` ``)
+			// so its opening backticks can still close on the same line (e.g. ```` ``` a ``` ````)
+			// without swallowing subsequent lines as a pseudo-fenced block.
 			let p = i;
 			while (p < n && p - i < 3 && text[p] === " ") p++;
-			const fc = p < n ? text[p] : "";
-			if (fc === "`" || fc === "~") {
+			if (p < n && text[p] === "`") {
 				let fl = 0;
-				while (p + fl < n && text[p + fl] === fc) fl++;
+				while (p + fl < n && text[p + fl] === "`") fl++;
 				if (fl >= 3) {
 					const eol = text.indexOf("\n", p + fl);
-					const info = eol < 0 ? text.slice(p + fl) : text.slice(p + fl, eol);
-					if (fc === "~" || !info.includes("`")) {
-						let q = eol < 0 ? n : eol + 1;
-						let closeEnd = n;
-						while (q < n) {
-							const lineEnd = text.indexOf("\n", q);
-							const nextLine = lineEnd < 0 ? n : lineEnd + 1;
-							let cp = q;
-							while (cp < n && cp - q < 3 && text[cp] === " ") cp++;
-							let cl = 0;
-							while (cp + cl < n && text[cp + cl] === fc) cl++;
-							if (cl >= fl) {
-								let rest = cp + cl;
-								const stop = lineEnd < 0 ? n : lineEnd;
-								while (rest < stop && (text[rest] === " " || text[rest] === "\t" || text[rest] === "\r")) rest++;
-								if (rest === stop) {
-									closeEnd = stop;
-									break;
-								}
-							}
-							q = nextLine;
+					const info = text.slice(p + fl, eol < 0 ? n : eol);
+					if (info.includes("`")) {
+						rejectedBacktickFence = true;
+						if (p > i) {
+							i = p;
 						}
-						flushProse(i);
-						parts.push({ text: text.slice(i, closeEnd), isCode: true });
-						i = closeEnd;
-						proseStart = i;
-						atLineStart = false;
-						continue;
 					}
 				}
 			}
@@ -5385,6 +5487,7 @@ export function scrubLeakedToolMarkup(text: string): string {
 			let matchEnd = -1;
 			while (j < n) {
 				if (text[j] === "\n") {
+					if (rejectedBacktickFence) break;
 					let k = j + 1;
 					while (k < n && (text[k] === " " || text[k] === "\t" || text[k] === "\r")) k++;
 					if (k < n && text[k] === "\n") break;
@@ -5419,11 +5522,74 @@ export function scrubLeakedToolMarkup(text: string): string {
 		i++;
 	}
 	flushProse(n);
+	return parts;
+}
+
+function finalizeStrippedMarkdownSegments(
+	segments: Array<{ raw: string; text: string; isCode: boolean; changed: boolean }>,
+): string {
+	const out = segments.map((seg) => ({
+		...seg,
+		text: seg.isCode || !seg.changed ? seg.text : seg.text.replace(/\n{3,}/g, "\n\n"),
+	}));
+	while (out.length > 0 && !out[0].isCode && out[0].changed) {
+		const leadTrimmed =
+			out[0].text.trim().length === 0 || out[0].raw.trimStart() !== out[0].text.trimStart()
+				? out[0].text.replace(/^[ \t\r\n]+/, "")
+				: out[0].text;
+		out[0].text = leadTrimmed;
+		if (out[0].text.length === 0) {
+			out.shift();
+		} else {
+			break;
+		}
+	}
+	while (out.length > 0) {
+		const last = out[out.length - 1];
+		if (last.isCode || !last.changed) break;
+		const trailTrimmed =
+			last.text.trim().length === 0 || last.raw.trimEnd() !== last.text.trimEnd()
+				? last.text.replace(/[ \t\r\n]+$/, "")
+				: last.text;
+		last.text = trailTrimmed;
+		if (last.text.length === 0) {
+			out.pop();
+		} else {
+			break;
+		}
+	}
+	return out.map((seg) => seg.text).join("");
+}
+
+/**
+ * Scrub leaked DeepSeek DSML / `<tool_call>` XML fragments from assistant prose so unparsed markup
+ * never poisons downstream prompt context, while strictly preserving CommonMark fenced code blocks
+ * (N-backtick / N-tilde, incl. nested 4-backtick and unclosed-to-EOF fences) and N-backtick inline
+ * code spans (respecting escaped `\` `). Returns the exact original string on no-op so clean history
+ * never mutates or busts prompt KV-cache.
+ */
+export function scrubLeakedToolMarkup(text: string): string {
+	if (!text || (!text.includes("DSML") && !text.includes("<tool_call>"))) return text;
+	const stripRaw = (seg: string): string =>
+		seg
+			.replace(/<[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>/g, "")
+			.replace(/<\/?[|｜]{1,2}DSML[|｜]{1,2}\s*invoke\b[\s\S]*?<\/[|｜]{1,2}DSML[|｜]{1,2}\s*invoke>/g, "")
+			.replace(/<\/?[|｜]{1,2}DSML[|｜]{1,2}[^>]*>/g, "")
+			.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "");
+
+	const segments = segmentMarkdownCodeSpans(text);
+	let changed = false;
+	const processed = segments.map((seg) => {
+		if (seg.isCode) {
+			return { raw: seg.text, text: seg.text, isCode: true, changed: false };
+		}
+		const stripped = stripRaw(seg.text);
+		const segChanged = stripped !== seg.text;
+		if (segChanged) changed = true;
+		return { raw: seg.text, text: stripped, isCode: false, changed: segChanged };
+	});
 	if (!changed) return text;
-	return parts
-		.map((seg) => (seg.isCode ? seg.text : seg.text.replace(/\n{3,}/g, "\n\n")))
-		.join("")
-		.trim();
+	return finalizeStrippedMarkdownSegments(processed);
 }
 
 export interface DsmlRecoveredCall {
@@ -5434,8 +5600,8 @@ export interface DsmlRecoveredCall {
 }
 
 /**
- * Recover leaked DeepSeek DSML XML tool invocations into native Pi `toolCall` blocks.
- * Strictly gated to currently active tools (`allowedTools`) so unknown names never run.
+ * Recover leaked DeepSeek DSML XML tool invocations from assistant prose into native Pi `toolCall` blocks.
+ * Strictly ignores Markdown fenced code blocks and inline code spans, and gates names to `allowedTools`.
  */
 export function extractDsmlToolCalls(
 	text: string,
@@ -5447,53 +5613,63 @@ export function extractDsmlToolCalls(
 	const paramRe =
 		/<[|｜]{1,2}DSML[|｜]{1,2}\s*parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?[^>]*>([\s\S]*?)<\/[|｜]{1,2}DSML[|｜]{1,2}\s*parameter>/g;
 
+	const segments = segmentMarkdownCodeSpans(text);
 	const calls: DsmlRecoveredCall[] = [];
-	let match: RegExpExecArray | null;
 	let seq = 0;
-	while ((match = invokeRe.exec(text)) !== null) {
-		const rawToolName = (match[1] || "").trim();
-		const toolName = allowedTools.has(rawToolName)
-			? rawToolName
-			: repairHallucinatedToolName(rawToolName, allowedTools) ?? "";
-		if (!toolName) continue;
-		const body = match[2] || "";
-		const args: Record<string, unknown> = {};
-		let pm: RegExpExecArray | null;
-		paramRe.lastIndex = 0;
-		while ((pm = paramRe.exec(body)) !== null) {
-			const key = (pm[1] || "").trim();
-			const isStr = pm[2] !== "false";
-			const rawVal = pm[3] ?? "";
-			if (!key) continue;
-			if (!isStr) {
-				try {
-					args[key] = JSON.parse(rawVal.trim());
-					continue;
-				} catch {
-					// fall through to raw string
+	for (const seg of segments) {
+		if (seg.isCode || !seg.text.includes("DSML") || !seg.text.includes("invoke")) continue;
+		invokeRe.lastIndex = 0;
+		let match: RegExpExecArray | null;
+		while ((match = invokeRe.exec(seg.text)) !== null) {
+			const rawToolName = (match[1] || "").trim();
+			const toolName = allowedTools.has(rawToolName)
+				? rawToolName
+				: repairHallucinatedToolName(rawToolName, allowedTools) ?? "";
+			if (!toolName) continue;
+			const body = match[2] || "";
+			const args: Record<string, unknown> = {};
+			let pm: RegExpExecArray | null;
+			paramRe.lastIndex = 0;
+			while ((pm = paramRe.exec(body)) !== null) {
+				const key = (pm[1] || "").trim();
+				const isStr = pm[2] !== "false";
+				const rawVal = pm[3] ?? "";
+				if (!key) continue;
+				if (!isStr) {
+					try {
+						args[key] = JSON.parse(rawVal.trim());
+						continue;
+					} catch {
+						// fall through to raw string
+					}
 				}
+				args[key] = rawVal;
 			}
-			args[key] = rawVal;
+			seq += 1;
+			calls.push({
+				type: "toolCall",
+				id: `ap_dsml_${Date.now()}_${seq}`,
+				name: toolName,
+				arguments: toolName !== rawToolName ? normalizeRepairedToolArgs(toolName, args).args : args,
+			});
 		}
-		seq += 1;
-		calls.push({
-			type: "toolCall",
-			id: `ap_dsml_${Date.now()}_${seq}`,
-			name: toolName,
-			arguments: toolName !== rawToolName ? normalizeRepairedToolArgs(toolName, args).args : args,
-		});
 	}
 	if (calls.length === 0) return undefined;
-	const cleanedText = text
-		.replace(/<[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>/g, "")
-		.replace(invokeRe, "")
-		.trim();
+	const processed = segments.map((seg) => {
+		if (seg.isCode) return { raw: seg.text, text: seg.text, isCode: true, changed: false };
+		const stripped = seg.text
+			.replace(/<[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{1,2}DSML[|｜]{1,2}\s*(?:function_)?calls>/g, "")
+			.replace(invokeRe, "");
+		return { raw: seg.text, text: stripped, isCode: false, changed: stripped !== seg.text };
+	});
+	const cleanedText = finalizeStrippedMarkdownSegments(processed);
 	return { cleanedText, calls };
 }
 
 /**
  * Recover leaked `<tool_call>{"name":"...","arguments":{...}}</tool_call>` blocks
- * emitted as plain text under high context pressure (strictly gated to `allowedTools`).
+ * emitted in plain assistant prose under high context pressure (strictly ignores Markdown
+ * fenced code blocks and inline code spans, and gates names to `allowedTools`).
  */
 export function extractXmlJsonToolCalls(
 	text: string,
@@ -5501,40 +5677,50 @@ export function extractXmlJsonToolCalls(
 ): { cleanedText: string; calls: DsmlRecoveredCall[] } | undefined {
 	if (!text || !text.includes("<tool_call>")) return undefined;
 	const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+	const segments = segmentMarkdownCodeSpans(text);
 	const calls: DsmlRecoveredCall[] = [];
-	let match: RegExpExecArray | null;
 	let seq = 0;
-	while ((match = re.exec(text)) !== null) {
-		try {
-			const obj = JSON.parse(match[1]) as {
-				name?: unknown;
-				arguments?: unknown;
-				parameters?: unknown;
-			};
-			const rawName = typeof obj?.name === "string" ? obj.name.trim() : "";
-			const name = allowedTools.has(rawName)
-				? rawName
-				: repairHallucinatedToolName(rawName, allowedTools) ?? "";
-			if (!name) continue;
-			const rawArgs = obj.arguments ?? obj.parameters ?? {};
-			const baseArgs =
-				rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
-					? (rawArgs as Record<string, unknown>)
-					: {};
-			const args = name !== rawName ? normalizeRepairedToolArgs(name, baseArgs).args : baseArgs;
-			seq += 1;
-			calls.push({
-				type: "toolCall",
-				id: `ap_xmltc_${Date.now()}_${seq}`,
-				name,
-				arguments: args,
-			});
-		} catch {
-			// ignore non-JSON blocks
+	for (const seg of segments) {
+		if (seg.isCode || !seg.text.includes("<tool_call>")) continue;
+		re.lastIndex = 0;
+		let match: RegExpExecArray | null;
+		while ((match = re.exec(seg.text)) !== null) {
+			try {
+				const obj = JSON.parse(match[1]) as {
+					name?: unknown;
+					arguments?: unknown;
+					parameters?: unknown;
+				};
+				const rawName = typeof obj?.name === "string" ? obj.name.trim() : "";
+				const name = allowedTools.has(rawName)
+					? rawName
+					: repairHallucinatedToolName(rawName, allowedTools) ?? "";
+				if (!name) continue;
+				const rawArgs = obj.arguments ?? obj.parameters ?? {};
+				const baseArgs =
+					rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+						? (rawArgs as Record<string, unknown>)
+						: {};
+				const args = name !== rawName ? normalizeRepairedToolArgs(name, baseArgs).args : baseArgs;
+				seq += 1;
+				calls.push({
+					type: "toolCall",
+					id: `ap_xmltc_${Date.now()}_${seq}`,
+					name,
+					arguments: args,
+				});
+			} catch {
+				// ignore non-JSON blocks
+			}
 		}
 	}
 	if (calls.length === 0) return undefined;
-	const cleanedText = text.replace(re, "").trim();
+	const processed = segments.map((seg) => {
+		if (seg.isCode) return { raw: seg.text, text: seg.text, isCode: true, changed: false };
+		const stripped = seg.text.replace(re, "");
+		return { raw: seg.text, text: stripped, isCode: false, changed: stripped !== seg.text };
+	});
+	const cleanedText = finalizeStrippedMarkdownSegments(processed);
 	return { cleanedText, calls };
 }
 
@@ -6898,11 +7084,9 @@ export default function (pi: ExtensionAPI) {
 		const nextContent: Array<Record<string, unknown>> = [];
 		for (const blk of msg.content) {
 			if (blk?.type === "text" && typeof blk.text === "string") {
-				const rec = blk.text.includes("DSML")
-					? extractDsmlToolCalls(blk.text, active)
-					: blk.text.includes("<tool_call>")
-						? extractXmlJsonToolCalls(blk.text, active)
-						: undefined;
+				const rec =
+					(blk.text.includes("DSML") ? extractDsmlToolCalls(blk.text, active) : undefined) ??
+					(blk.text.includes("<tool_call>") ? extractXmlJsonToolCalls(blk.text, active) : undefined);
 				if (rec) {
 					recoveredAny = true;
 					if (rec.cleanedText) {

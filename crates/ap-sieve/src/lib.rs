@@ -6,12 +6,33 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static SIEVE_LOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+static SIEVE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn emit_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+fn has_explicit_sieve_home() -> bool {
+    std::env::var("SIEVE_HOME")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
 
 pub const DEFAULT_MAX_STORE_BYTES: u64 = 18 * 1024 * 1024;
 pub const PASSTHROUGH_BYTES: usize = 1200;
@@ -171,10 +192,199 @@ pub fn store_dir(cwd: &Path) -> PathBuf {
     base
 }
 
+struct SieveLockGuard {
+    lock_path: PathBuf,
+    token: String,
+}
+
+impl Drop for SieveLockGuard {
+    fn drop(&mut self) {
+        let owns_lock = fs::read_to_string(&self.lock_path)
+            .map(|cur| cur.trim() == self.token)
+            .unwrap_or(false);
+        if !owns_lock {
+            return;
+        }
+        for attempt in 0..12u64 {
+            match fs::remove_file(&self.lock_path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < 11 => {
+                    std::thread::sleep(Duration::from_millis(2 + attempt * 2));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+fn parse_lock_pid(content: &str) -> Option<u32> {
+    content
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("pid=")?.parse::<u32>().ok())
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        // ERROR_INVALID_PARAMETER (87) proves the PID does not exist; treat ERROR_ACCESS_DENIED (5)
+        // or any other transient failure conservatively as alive so active locks are never stolen.
+        return std::io::Error::last_os_error().raw_os_error() != Some(87);
+    }
+    let mut exit_code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(h, &mut exit_code) };
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    ok != 0 && exit_code == STILL_ACTIVE
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn is_pid_alive(_pid: u32) -> bool {
+    true
+}
+
+fn acquire_sieve_lock(store: &Path) -> Result<SieveLockGuard, String> {
+    let _ = fs::create_dir_all(store);
+    let lock_path = store.join("index.sqlite.lock");
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let pid = std::process::id();
+    let seq = SIEVE_LOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("pid={pid} seq={seq} ns={nanos}");
+    let mut attempt = 0u64;
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{token}");
+                let _ = f.flush();
+                return Ok(SieveLockGuard { lock_path, token });
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || (cfg!(windows)
+                        && (e.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(5) | Some(32)))) =>
+            {
+                if let Ok(meta) = fs::metadata(&lock_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(age) = SystemTime::now().duration_since(mtime) {
+                            let dead_holder = age >= Duration::from_millis(500)
+                                && fs::read_to_string(&lock_path)
+                                    .ok()
+                                    .and_then(|s| parse_lock_pid(&s))
+                                    .map(|holder| !is_pid_alive(holder))
+                                    .unwrap_or(false);
+                            if dead_holder || age >= Duration::from_secs(8) {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out acquiring sieve lock {}",
+                        lock_path.display()
+                    ));
+                }
+                attempt = attempt.saturating_add(1);
+                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 17) % 19;
+                std::thread::sleep(Duration::from_millis(6 + jitter));
+            }
+            Err(e) => return Err(format!("open sieve lock {}: {e}", lock_path.display())),
+        }
+    }
+}
+
+fn write_file_atomic(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let seq = SIEVE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        dst.file_name().and_then(|s| s.to_str()).unwrap_or("sieve"),
+        std::process::id(),
+        seq
+    ));
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    drop(f);
+    #[cfg(windows)]
+    {
+        for attempt in 0..8u64 {
+            if fs::rename(&tmp, dst).is_ok() {
+                return Ok(());
+            }
+            if dst.exists() {
+                let _ = fs::remove_file(dst);
+                if fs::rename(&tmp, dst).is_ok() {
+                    return Ok(());
+                }
+            }
+            if attempt < 7 {
+                std::thread::sleep(Duration::from_millis(4 + attempt * 3));
+            }
+        }
+        let res = fs::write(dst, bytes);
+        let _ = fs::remove_file(&tmp);
+        res
+    }
+    #[cfg(not(windows))]
+    {
+        let res = fs::rename(&tmp, dst);
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        res
+    }
+}
+
 fn open_sieve_db(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
-    let _ = conn.busy_timeout(Duration::from_millis(2000));
+    let _ = conn.busy_timeout(Duration::from_millis(8000));
     Ok(conn)
+}
+
+fn ensure_chunks_table(conn: &Connection) -> rusqlite::Result<()> {
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(id UNINDEXED, label, content);",
+    )
 }
 
 fn backfilled_cache() -> &'static Mutex<HashMap<PathBuf, u128>> {
@@ -190,27 +400,34 @@ fn store_dir_mtime_nanos(store: &Path) -> Option<u128> {
         .map(|d| d.as_nanos())
 }
 
-fn index_archive(store: &Path, item_id: &str, label: &str, raw_text: &str) {
+fn upsert_chunk_tx(
+    conn: &Connection,
+    item_id: &str,
+    label: &str,
+    raw_text: &str,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM chunks WHERE id = ?1", params![item_id])?;
+    tx.execute(
+        "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
+        params![item_id, label, raw_text],
+    )?;
+    tx.commit()
+}
+
+fn index_archive(store: &Path, item_id: &str, label: &str, raw_text: &str) -> Result<(), String> {
+    let _lock = acquire_sieve_lock(store)?;
     let db_path = store.join("index.sqlite");
-    if let Ok(conn) = open_sieve_db(&db_path) {
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(id UNINDEXED, label, content);",
-        );
-        if conn
-            .execute(
-                "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
-                params![item_id, label, raw_text],
-            )
-            .is_ok()
-        {
-            if let Some(mt) = store_dir_mtime_nanos(store) {
-                if let Ok(mut guard) = backfilled_cache().lock() {
-                    guard.insert(store.to_path_buf(), mt);
-                }
-            }
+    let conn = open_sieve_db(&db_path).map_err(|e| format!("open index.sqlite: {e}"))?;
+    ensure_chunks_table(&conn).map_err(|e| format!("init chunks fts5: {e}"))?;
+    upsert_chunk_tx(&conn, item_id, label, raw_text)
+        .map_err(|e| format!("upsert chunk {item_id}: {e}"))?;
+    if let Some(mt) = store_dir_mtime_nanos(store) {
+        if let Ok(mut guard) = backfilled_cache().lock() {
+            guard.insert(store.to_path_buf(), mt);
         }
     }
+    Ok(())
 }
 
 fn delete_chunk_ids(conn: &Connection, ids: &[String]) {
@@ -277,6 +494,9 @@ fn collect_orphan_chunk_ids(
 }
 
 fn prune_ring_buffer(store: &Path, max_bytes: u64) {
+    let Ok(_lock) = acquire_sieve_lock(store) else {
+        return;
+    };
     let Ok(rd) = fs::read_dir(store) else { return };
     let mut raw_files: Vec<(u64, u64, String, PathBuf)> = Vec::new();
     let mut total = 0u64;
@@ -332,6 +552,30 @@ pub fn prune_store(
     max_age_hours: Option<u64>,
     vacuum: bool,
 ) -> Value {
+    if !store.is_dir() {
+        return json!({
+            "store": store.display().to_string(),
+            "exists": false,
+            "removed_entries": 0,
+            "freed_bytes": 0,
+            "remaining_bytes": 0,
+            "vacuumed": false,
+        });
+    }
+    let _lock = match acquire_sieve_lock(store) {
+        Ok(g) => g,
+        Err(e) => {
+            return json!({
+                "store": store.display().to_string(),
+                "exists": true,
+                "error": e,
+                "removed_entries": 0,
+                "freed_bytes": 0,
+                "remaining_bytes": 0,
+                "vacuumed": false,
+            });
+        }
+    };
     let Ok(rd) = fs::read_dir(store) else {
         return json!({
             "store": store.display().to_string(),
@@ -426,13 +670,15 @@ pub fn prune_store(
     let mut vacuumed = false;
     if db_path.is_file() {
         if let Ok(conn) = open_sieve_db(&db_path) {
+            let _ = ensure_chunks_table(&conn);
             let orphans = collect_orphan_chunk_ids(&conn, &surviving_ids);
             let total_del = removed_ids.len() + orphans.len();
             if total_del >= 100 {
                 // Dropping & rebuilding FTS5 is >50x faster than un-indexing hundreds of docs via UNINDEXED scans.
                 rebuild_fts_from_surviving(&conn, store, &surviving_ids);
-                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
-                vacuumed = true;
+                vacuumed = conn
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+                    .is_ok();
             } else {
                 if !removed_ids.is_empty() {
                     delete_chunk_ids(&conn, &removed_ids);
@@ -445,8 +691,9 @@ pub fn prune_store(
                     || !removed_ids.is_empty()
                     || db_bytes_before > max_bytes.max(1)
                 {
-                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
-                    vacuumed = true;
+                    vacuumed = conn
+                        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+                        .is_ok();
                 }
             }
             if max_bytes > 0 {
@@ -471,8 +718,12 @@ pub fn prune_store(
                     } else {
                         delete_chunk_ids(&conn, &extra_ids);
                     }
-                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
-                    vacuumed = true;
+                    if conn
+                        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+                        .is_ok()
+                    {
+                        vacuumed = true;
+                    }
                 }
             }
         }
@@ -504,8 +755,7 @@ fn archive_stream(
     let id = format!("{:x}", hasher.finalize())[..10].to_string();
     let raw_path = store.join(format!("{id}.raw"));
     let meta_path = store.join(format!("{id}.meta.json"));
-    let already_indexed = raw_path.is_file();
-    let _ = fs::write(&raw_path, raw_text);
+    let _ = write_file_atomic(&raw_path, raw_text.as_bytes());
     let raw_lines = raw_text.lines().count();
     let meta = json!({
         "id": id,
@@ -517,10 +767,10 @@ fn archive_stream(
         "created_epoch": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     });
     if let Ok(ms) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(&meta_path, ms);
+        let _ = write_file_atomic(&meta_path, ms.as_bytes());
     }
-    if !already_indexed {
-        index_archive(store, &id, label, raw_text);
+    if let Err(e) = index_archive(store, &id, label, raw_text) {
+        eprintln!("[sieve] warning: failed to index archive {id}: {e}");
     }
     if raw_text.len() >= 16_384 || id.as_bytes().first().copied().unwrap_or(0) % 8 == 0 {
         prune_ring_buffer(store, DEFAULT_MAX_STORE_BYTES);
@@ -1891,6 +2141,9 @@ fn resolve_json_path<'a>(mut cur: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 fn ensure_backfilled(store: &Path) {
+    if !store.is_dir() {
+        return;
+    }
     let db_path = store.join("index.sqlite");
     let dir_mt = store_dir_mtime_nanos(store);
     if db_path.exists() {
@@ -1902,24 +2155,41 @@ fn ensure_backfilled(store: &Path) {
             }
         }
     }
-    let mut existing: HashSet<String> = HashSet::new();
-    if db_path.exists() {
-        if let Ok(conn) = open_sieve_db(&db_path) {
-            if let Ok(mut st) = conn.prepare("SELECT id FROM chunks") {
-                if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
-                    existing.extend(rows.flatten());
-                }
-            }
-        }
-    }
+    let Ok(_lock) = acquire_sieve_lock(store) else {
+        return;
+    };
     let Ok(rd) = fs::read_dir(store) else { return };
+    let mut raw_entries: Vec<(String, PathBuf)> = Vec::new();
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) == Some("raw") {
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !existing.contains(stem) {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                raw_entries.push((stem.to_string(), p));
+            }
+        }
+    }
+    if raw_entries.is_empty() && !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = open_sieve_db(&db_path) else {
+        return;
+    };
+    if ensure_chunks_table(&conn).is_err() {
+        return;
+    }
+    let mut existing: HashSet<String> = HashSet::new();
+    if let Ok(mut st) = conn.prepare("SELECT id FROM chunks") {
+        if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
+            existing.extend(rows.flatten());
+        }
+    }
+    let missing: Vec<(String, PathBuf)> = raw_entries
+        .into_iter()
+        .filter(|(stem, _)| !existing.contains(stem))
+        .collect();
+    if !missing.is_empty() {
+        if let Ok(tx) = conn.unchecked_transaction() {
+            for (stem, p) in missing {
                 let meta_p = p.with_extension("meta.json");
                 let lbl = fs::read_to_string(&meta_p)
                     .ok()
@@ -1927,9 +2197,15 @@ fn ensure_backfilled(store: &Path) {
                     .and_then(|v| v.get("label").and_then(Value::as_str).map(String::from))
                     .unwrap_or_else(|| "stream".to_string());
                 if let Ok(bytes) = fs::read(&p) {
-                    index_archive(store, stem, &lbl, &String::from_utf8_lossy(&bytes));
+                    let raw_text = String::from_utf8_lossy(&bytes);
+                    let _ = tx.execute("DELETE FROM chunks WHERE id = ?1", params![&stem]);
+                    let _ = tx.execute(
+                        "INSERT INTO chunks(id, label, content) VALUES (?1, ?2, ?3)",
+                        params![&stem, &lbl, raw_text.as_ref()],
+                    );
                 }
             }
+            let _ = tx.commit();
         }
     }
     if db_path.exists() {
@@ -1941,6 +2217,32 @@ fn ensure_backfilled(store: &Path) {
     }
 }
 
+fn query_fts_once(db_path: &Path, fts_q: &str, limit: usize) -> rusqlite::Result<Vec<SearchHit>> {
+    let conn = open_sieve_db(db_path)?;
+    let mut st = conn.prepare(
+        "SELECT id, label, snippet(chunks, 2, '[', ']', ' ... ', 20) FROM chunks WHERE chunks MATCH ?1 LIMIT ?2",
+    )?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut hits = Vec::new();
+    let rows = st.query_map(params![fts_q, limit as i64], |r| {
+        Ok(SearchHit {
+            id: r.get(0)?,
+            label: r.get(1)?,
+            snippet: r
+                .get::<_, String>(2)?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+    })?;
+    for h in rows.flatten() {
+        if seen.insert(h.id.clone()) {
+            hits.push(h);
+        }
+    }
+    Ok(hits)
+}
+
 pub fn search_archives(store: &Path, query: &str, limit: usize) -> (Vec<SearchHit>, f64) {
     let t0 = Instant::now();
     ensure_backfilled(store);
@@ -1948,28 +2250,20 @@ pub fn search_archives(store: &Path, query: &str, limit: usize) -> (Vec<SearchHi
     let mut hits = Vec::new();
     let q = query.trim();
     if db_path.exists() && !q.is_empty() {
-        if let Ok(conn) = open_sieve_db(&db_path) {
-            let fts_q = q
-                .split_whitespace()
-                .filter(|t| !t.is_empty())
-                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Ok(mut st) = conn.prepare(
-                "SELECT id, label, snippet(chunks, 2, '[', ']', ' ... ', 20) FROM chunks WHERE chunks MATCH ?1 LIMIT ?2",
-            ) {
-                if let Ok(rows) = st.query_map(params![fts_q, limit as i64], |r| {
-                    Ok(SearchHit {
-                        id: r.get(0)?,
-                        label: r.get(1)?,
-                        snippet: r
-                            .get::<_, String>(2)?
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    })
-                }) {
-                    hits.extend(rows.flatten());
+        let fts_q = q
+            .split_whitespace()
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        match query_fts_once(&db_path, &fts_q, limit) {
+            Ok(h) => hits = h,
+            Err(_) => {
+                // Retry once serialized behind lock if a concurrent prune rebuild/VACUUM was in flight
+                if let Ok(_lock) = acquire_sieve_lock(store) {
+                    if let Ok(h) = query_fts_once(&db_path, &fts_q, limit) {
+                        hits = h;
+                    }
                 }
             }
         }
@@ -1998,7 +2292,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 cmd
             };
             if clean_cmd.is_empty() {
-                eprintln!("[sieve] usage: ap sieve run -- <command...>");
+                emit_err(as_json, "[sieve] usage: ap sieve run -- <command...>");
                 return 2;
             }
             let t0 = Instant::now();
@@ -2018,13 +2312,22 @@ pub fn run_cli(args: &[String]) -> i32 {
                     {
                         Ok(o) => o,
                         Err(e2) => {
-                            eprintln!("[sieve] failed to execute `{}`: {e2}", clean_cmd.join(" "));
+                            emit_err(
+                                as_json,
+                                &format!(
+                                    "[sieve] failed to execute `{}`: {e2}",
+                                    clean_cmd.join(" ")
+                                ),
+                            );
                             return 127;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[sieve] failed to execute `{}`: {e}", clean_cmd.join(" "));
+                    emit_err(
+                        as_json,
+                        &format!("[sieve] failed to execute `{}`: {e}", clean_cmd.join(" ")),
+                    );
                     return 127;
                 }
             };
@@ -2081,9 +2384,11 @@ pub fn run_cli(args: &[String]) -> i32 {
         } => {
             let primary = store_dir_readonly(&cwd);
             let mut candidate_dirs = vec![primary.clone()];
-            if let Some(g) = global_sieve_dir() {
-                if g != primary {
-                    candidate_dirs.push(g);
+            if !has_explicit_sieve_home() {
+                if let Some(g) = global_sieve_dir() {
+                    if g != primary {
+                        candidate_dirs.push(g);
+                    }
                 }
             }
             let mut match_file: Option<PathBuf> = None;
@@ -2296,7 +2601,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             let primary = store_dir_readonly(&cwd);
             let (mut hits, mut elapsed_ms) = search_archives(&primary, &query, limit);
             let mut searched = primary.clone();
-            if hits.is_empty() {
+            if hits.is_empty() && !has_explicit_sieve_home() {
                 if let Some(g) = global_sieve_dir() {
                     if g != primary && g.join("index.sqlite").is_file() {
                         let (ghits, gms) = search_archives(&g, &query, limit);
@@ -2522,5 +2827,89 @@ mod tests {
             "{rep}"
         );
         assert_eq!(rep["vacuumed"], Value::Bool(true), "{rep}");
+    }
+
+    #[test]
+    fn concurrent_pipe_search_prune_and_dead_pid_lock_have_zero_dups_or_loss() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let td = std::env::temp_dir().join(format!("ap_sieve_c4_{}_{}", std::process::id(), nanos));
+        let _ = fs::remove_dir_all(&td);
+        fs::create_dir_all(&td).unwrap();
+
+        // 1. Dead-PID stale lock fast reclaim (<4s)
+        let dead_child = if cfg!(windows) {
+            Command::new("cmd").args(["/C", "exit", "0"]).spawn()
+        } else {
+            Command::new("sh").args(["-c", "exit 0"]).spawn()
+        };
+        if let Ok(mut ch) = dead_child {
+            let dead_pid = ch.id();
+            let _ = ch.wait();
+            let lock_p = td.join("index.sqlite.lock");
+            fs::write(&lock_p, format!("pid={dead_pid} seq=1 ns=1\n")).unwrap();
+            let t0 = Instant::now();
+            let _g = acquire_sieve_lock(&td).expect("must reclaim dead-PID sieve lock");
+            assert!(
+                t0.elapsed() < Duration::from_secs(4),
+                "dead-PID lock reclaim too slow: {:?}",
+                t0.elapsed()
+            );
+        }
+
+        // 2. Concurrent archive + search + prune_store under shared lock
+        std::thread::scope(|s| {
+            for i in 0..8usize {
+                let d = td.clone();
+                s.spawn(move || {
+                    let body = format!("C4_CONC_TOKEN_{i} {}", "payload line\n".repeat(120));
+                    let _ = compress_stream_in(&d, &body, &format!("w{i}"), 0, 1.0);
+                });
+            }
+            for _ in 0..4usize {
+                let d = td.clone();
+                s.spawn(move || {
+                    let _ = search_archives(&d, "C4_CONC_TOKEN", 20);
+                });
+            }
+            for _ in 0..2usize {
+                let d = td.clone();
+                s.spawn(move || {
+                    let _ = prune_store(&d, 4 * 1024 * 1024, None, true);
+                });
+            }
+        });
+
+        // Verify 100% parity between surviving .raw files and FTS5 rows (0 duplicates, 0 lost)
+        let mut raw_ids: Vec<String> = fs::read_dir(&td)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("raw"))
+                    .then(|| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+                    .flatten()
+            })
+            .collect();
+        raw_ids.sort();
+        assert_eq!(raw_ids.len(), 8, "expected all 8 raw files: {raw_ids:?}");
+
+        let conn = open_sieve_db(&td.join("index.sqlite")).unwrap();
+        let mut st = conn.prepare("SELECT id FROM chunks").unwrap();
+        let mut fts_ids: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        fts_ids.sort();
+        drop(st);
+        drop(conn);
+        let _ = fs::remove_dir_all(&td);
+        assert_eq!(
+            fts_ids, raw_ids,
+            "FTS5 chunks must match .raw files 1:1 with zero duplicates and zero loss"
+        );
     }
 }

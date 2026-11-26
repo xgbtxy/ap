@@ -1,10 +1,10 @@
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tree_sitter::{Node, Parser};
 
@@ -1478,7 +1478,8 @@ pub fn trace_symbol_chain(root: &Path, target: &str, max_depth: usize) -> TraceR
 }
 
 pub(crate) fn collect_project_fns(root: &Path) -> Vec<FnDef> {
-    let mut all_fns: Vec<FnDef> = Vec::new();
+    let all_fns_mx: Arc<Mutex<Vec<FnDef>>> = Arc::new(Mutex::new(Vec::new()));
+    let root_arc = Arc::new(root.to_path_buf());
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .filter_entry(|e| {
@@ -1491,34 +1492,73 @@ pub(crate) fn collect_project_fns(root: &Path) -> Vec<FnDef> {
             }
             true
         })
-        .build();
+        .build_parallel();
 
-    for entry in walker.flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let p = entry.path();
-        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let Some(mut parser) = parser_for_ext(ext) else {
-            continue;
-        };
-        let rel = p
-            .strip_prefix(root)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let Ok(src) = fs::read_to_string(p) else {
-            continue;
-        };
-        let Some(tree) = parser.parse(&src, None) else {
-            continue;
-        };
-        let src_lines: Vec<&str> = src.lines().collect();
-        extract_fns(tree.root_node(), &src, &src_lines, &rel, &mut all_fns);
-        if is_cpp_ext(ext) {
-            extract_cpp_fallback_fns(&src, &src_lines, &rel, &mut all_fns);
-        }
-    }
+    walker.run(|| {
+        let out_c = Arc::clone(&all_fns_mx);
+        let root_c = Arc::clone(&root_arc);
+        let mut parsers: HashMap<String, Option<Parser>> = HashMap::new();
+
+        Box::new(move |res| {
+            let Ok(entry) = res else {
+                return WalkState::Continue;
+            };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                return WalkState::Continue;
+            }
+            let p = entry.path();
+            let ext_raw = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext_raw.is_empty() {
+                return WalkState::Continue;
+            }
+            let ext_key = ext_raw.to_ascii_lowercase();
+            let parser_opt = parsers
+                .entry(ext_key.clone())
+                .or_insert_with(|| parser_for_ext(&ext_key));
+            let Some(parser) = parser_opt.as_mut() else {
+                return WalkState::Continue;
+            };
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() > 2 * 1024 * 1024 {
+                    return WalkState::Continue;
+                }
+            }
+            let rel = p
+                .strip_prefix(root_c.as_path())
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(src) = fs::read_to_string(p) else {
+                return WalkState::Continue;
+            };
+            let Some(tree) = parser.parse(&src, None) else {
+                return WalkState::Continue;
+            };
+            let src_lines: Vec<&str> = src.lines().collect();
+            let mut local_fns: Vec<FnDef> = Vec::new();
+            extract_fns(tree.root_node(), &src, &src_lines, &rel, &mut local_fns);
+            if is_cpp_ext(&ext_key) {
+                extract_cpp_fallback_fns(&src, &src_lines, &rel, &mut local_fns);
+            }
+            if !local_fns.is_empty() {
+                if let Ok(mut g) = out_c.lock() {
+                    g.extend(local_fns);
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    let mut all_fns = Arc::try_unwrap(all_fns_mx)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_else(|a| a.lock().map(|g| g.clone()).unwrap_or_default());
+    all_fns.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.end_line.cmp(&b.end_line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     all_fns
 }
 

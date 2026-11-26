@@ -279,9 +279,12 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
                 let mut diff_argv = Vec::with_capacity(tail_args.len());
                 diff_argv.push("archive-diff".to_string());
                 diff_argv.extend_from_slice(&tail_args[1..]);
-                return Some(diff_bin::run_cli(&diff_argv));
+                stats_kind = "probe";
+                stats_sub = Some("archive-diff");
+                Some(diff_bin::run_cli(&diff_argv))
+            } else {
+                Some(ap_probe::run_cli(&sub_argv))
             }
-            Some(ap_probe::run_cli(&sub_argv))
         }
         "splice" => Some(ap_splice::run_cli(&sub_argv)),
         "audit" => return Some(audit::run_cli(&sub_argv)),

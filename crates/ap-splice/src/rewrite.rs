@@ -1,7 +1,9 @@
 use crate::ast::{language_for_ext, verify_syntax};
 use crate::ast_search::{search_ast_source, AstQuery};
 use crate::check::{collect_check_payload, TestRunResult};
-use crate::{decode_source_bytes_clean, purge_stale_pyc};
+use crate::{
+    decode_source_bytes_with_encoding, encode_source_bytes, purge_stale_pyc, write_file_atomic,
+};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -322,10 +324,11 @@ pub fn rewrite_pattern_workspace(
         let Ok(raw_b) = fs::read(&p) else {
             continue;
         };
-        if raw_b.contains(&0) {
+        if raw_b.contains(&0) && !raw_b.starts_with(b"\xFF\xFE") && !raw_b.starts_with(b"\xFE\xFF")
+        {
             continue;
         }
-        let Ok((clean_lf, nl_sep)) = decode_source_bytes_clean(&raw_b, &rel) else {
+        let Ok((clean_lf, nl_sep, enc)) = decode_source_bytes_with_encoding(&raw_b, &rel) else {
             continue;
         };
 
@@ -343,15 +346,11 @@ pub fn rewrite_pattern_workspace(
             continue;
         }
 
-        let out_str = if nl_sep == "\r\n" {
-            updated_lf.replace('\n', "\r\n")
-        } else {
-            updated_lf
-        };
+        let out_bytes = encode_source_bytes(&updated_lf, nl_sep, enc);
         staged.push((
             p,
             raw_b,
-            out_str.into_bytes(),
+            out_bytes,
             RewriteFileChange {
                 path: rel,
                 replacements: count,
@@ -405,9 +404,9 @@ pub fn rewrite_pattern_workspace(
     let mut backups: HashMap<PathBuf, Vec<u8>> = HashMap::new();
     for (p, orig_b, new_b, _) in &staged {
         backups.insert(p.clone(), orig_b.clone());
-        if let Err(e) = fs::write(p, new_b) {
+        if let Err(e) = write_file_atomic(p, new_b) {
             for (bp, ob) in &backups {
-                let _ = fs::write(bp, ob);
+                let _ = write_file_atomic(bp, ob).or_else(|_| fs::write(bp, ob));
             }
             return RewriteReport {
                 ok: false,
@@ -456,7 +455,7 @@ pub fn rewrite_pattern_workspace(
         test_result = chk.test_result;
         if !ok && rollback_on_test_fail {
             for (bp, ob) in &backups {
-                let _ = fs::write(bp, ob);
+                let _ = write_file_atomic(bp, ob).or_else(|_| fs::write(bp, ob));
                 if bp.extension().and_then(|e| e.to_str()) == Some("py") {
                     purge_stale_pyc(bp);
                 }

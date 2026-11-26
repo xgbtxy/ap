@@ -3656,7 +3656,6 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     .clamp(1, 25) as usize;
                 let rep = ap_atlas::history::analyze_file_history(&hf_p, symbol, lines, limit);
                 let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
-                record_sub("history", 0, js.len() as u64, 0, 1, "mcp-history");
                 return (true, js);
             }
             let root_p = std::path::Path::new(root);
@@ -3666,7 +3665,6 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             let base = args.get("base").and_then(Value::as_str);
             let rep = ap_atlas::changes::analyze_git_changes(root_p, base, ap_atlas::SKIP_DIRS);
             let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
-            record_sub("changes", 0, js.len() as u64, 0, 1, "mcp-changes");
             (true, js)
         }
         "ap_surface" => {

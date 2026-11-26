@@ -1,4 +1,4 @@
-use crate::changes::{collect_symbol_spans, lang_for_ext};
+use crate::changes::{collect_symbol_spans, find_git_root_fast, lang_for_ext};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -72,14 +72,15 @@ fn parse_lines_arg(raw: &str) -> Option<(usize, usize)> {
     Some((s, e))
 }
 
-fn resolve_symbol_range(abs_file: &Path, symbol: &str) -> Option<(String, usize, usize)> {
-    let ext = abs_file.extension().and_then(|e| e.to_str()).unwrap_or("");
+fn resolve_symbol_range_in_str(
+    body: &str,
+    ext: &str,
+    symbol: &str,
+) -> Option<(String, usize, usize)> {
     let lang = lang_for_ext(ext)?;
-    let bytes = fs::read(abs_file).ok()?;
-    let body = String::from_utf8_lossy(&bytes);
     let mut parser = Parser::new();
     parser.set_language(&lang).ok()?;
-    let tree = parser.parse(body.as_ref(), None)?;
+    let tree = parser.parse(body, None)?;
     let mut spans = Vec::new();
     collect_symbol_spans(tree.root_node(), body.as_bytes(), &mut spans);
     if spans.is_empty() {
@@ -192,55 +193,60 @@ pub fn analyze_file_history(
     let abs_file = fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
     let work_dir = abs_file.parent().unwrap_or_else(|| Path::new("."));
 
-    let top_out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(work_dir)
-        .output();
-    let Ok(top) = top_out else {
-        return HistoryReport {
-            is_git_repo: false,
-            repo_root: String::new(),
-            file: norm_posix_str(&abs_file),
-            resolved_symbol: None,
-            line_range: None,
-            elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-            total_commits_sampled: 0,
-            commits: Vec::new(),
-            owners: Vec::new(),
-            co_changed_files: Vec::new(),
-            note: Some("Unable to execute `git rev-parse --show-toplevel`.".to_string()),
+    let repo_root = if let Some(fast_root) = find_git_root_fast(work_dir) {
+        fast_root
+    } else {
+        let top_out = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(work_dir)
+            .output();
+        let Ok(top) = top_out else {
+            return HistoryReport {
+                is_git_repo: false,
+                repo_root: String::new(),
+                file: norm_posix_str(&abs_file),
+                resolved_symbol: None,
+                line_range: None,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                total_commits_sampled: 0,
+                commits: Vec::new(),
+                owners: Vec::new(),
+                co_changed_files: Vec::new(),
+                note: Some("Unable to execute `git rev-parse --show-toplevel`.".to_string()),
+            };
         };
+        if !top.status.success() {
+            return HistoryReport {
+                is_git_repo: false,
+                repo_root: String::new(),
+                file: norm_posix_str(&abs_file),
+                resolved_symbol: None,
+                line_range: None,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                total_commits_sampled: 0,
+                commits: Vec::new(),
+                owners: Vec::new(),
+                co_changed_files: Vec::new(),
+                note: Some("Not inside a git working tree.".to_string()),
+            };
+        }
+        let raw_root = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+        fs::canonicalize(&raw_root).unwrap_or(raw_root)
     };
-    if !top.status.success() {
-        return HistoryReport {
-            is_git_repo: false,
-            repo_root: String::new(),
-            file: norm_posix_str(&abs_file),
-            resolved_symbol: None,
-            line_range: None,
-            elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-            total_commits_sampled: 0,
-            commits: Vec::new(),
-            owners: Vec::new(),
-            co_changed_files: Vec::new(),
-            note: Some("Not inside a git working tree.".to_string()),
-        };
-    }
-
-    let raw_root = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
-    let repo_root = fs::canonicalize(&raw_root).unwrap_or(raw_root);
     let rel_path = resolve_rel_path(&abs_file, &repo_root, file_path);
 
-    let file_lines = fs::read(&abs_file)
-        .map(|b| String::from_utf8_lossy(&b).lines().count().max(1))
-        .unwrap_or(1);
+    let file_body = fs::read(&abs_file)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let file_lines = file_body.lines().count().max(1);
 
     let mut note: Option<String> = None;
     let mut resolved_symbol: Option<String> = None;
     let mut line_range: Option<(usize, usize)> = None;
 
     if let Some(sym) = symbol_opt.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some((nm, s, e)) = resolve_symbol_range(&abs_file, sym) {
+        let ext = abs_file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if let Some((nm, s, e)) = resolve_symbol_range_in_str(&file_body, ext, sym) {
             resolved_symbol = Some(nm);
             line_range = Some((s.min(file_lines), e.min(file_lines).max(s.min(file_lines))));
         } else {
@@ -261,196 +267,214 @@ pub fn analyze_file_history(
     }
 
     let fmt_str = "%H\x1f%h\x1f%ad\x1f%an\x1f%s";
-    let mut commits = Vec::new();
-    if let Some((s, e)) = line_range {
-        let range_spec = format!("{s},{e}:{rel_path}");
-        if let Ok(out) = Command::new("git")
-            .args([
-                "log",
-                "-s",
-                "--no-patch",
-                "-n",
-                &limit.to_string(),
-                "-L",
-                &range_spec,
-                &format!("--format={fmt_str}"),
-                "--date=short",
-            ])
-            .current_dir(&repo_root)
-            .output()
-        {
-            if out.status.success() {
-                commits = parse_git_commits(&String::from_utf8_lossy(&out.stdout));
-            }
-        }
-    }
-    if commits.is_empty() {
-        if let Ok(out) = Command::new("git")
-            .args([
-                "log",
-                "-n",
-                &limit.to_string(),
-                "--follow",
-                &format!("--format={fmt_str}"),
-                "--date=short",
-                "--",
-                &rel_path,
-            ])
-            .current_dir(&repo_root)
-            .output()
-        {
-            if out.status.success() {
-                commits = parse_git_commits(&String::from_utf8_lossy(&out.stdout));
-            }
-        }
-    }
-
-    // Blame authorship summary over resolved span or up to 400 lines
     let (bs, be) = line_range.unwrap_or((1, file_lines.min(400)));
-    let mut author_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut blamed_total = 0usize;
-    if let Ok(out) = Command::new("git")
-        .args([
-            "blame",
-            "--line-porcelain",
-            "-L",
-            &format!("{bs},{be}"),
-            "--",
-            &rel_path,
-        ])
-        .current_dir(&repo_root)
-        .output()
-    {
-        if out.status.success() {
-            for ln in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some(author) = ln.strip_prefix("author ") {
-                    let a = author.trim();
-                    if !a.is_empty() {
-                        *author_counts.entry(a.to_string()).or_insert(0) += 1;
-                        blamed_total += 1;
+    let repo_root_ref = repo_root.as_path();
+    let rel_ref = rel_path.as_str();
+
+    // Run the 3 independent git queries (commit log, blame, co-change coupling) in parallel!
+    let (commits, owners, (total_commits_sampled, co_changed_files)) = std::thread::scope(|s| {
+        let h_commits = s.spawn(move || {
+            let mut commits = Vec::new();
+            if let Some((st, en)) = line_range {
+                let range_spec = format!("{st},{en}:{rel_ref}");
+                if let Ok(out) = Command::new("git")
+                    .args([
+                        "log",
+                        "-s",
+                        "--no-patch",
+                        "-n",
+                        &limit.to_string(),
+                        "-L",
+                        &range_spec,
+                        &format!("--format={fmt_str}"),
+                        "--date=short",
+                    ])
+                    .current_dir(repo_root_ref)
+                    .output()
+                {
+                    if out.status.success() {
+                        commits = parse_git_commits(&String::from_utf8_lossy(&out.stdout));
                     }
                 }
             }
-        }
-    }
-    let mut owner_pairs: Vec<(String, usize)> = author_counts.into_iter().collect();
-    owner_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let owners: Vec<AuthorShare> = owner_pairs
-        .into_iter()
-        .take(5)
-        .map(|(author, lines)| AuthorShare {
-            author,
-            lines,
-            share_pct: if blamed_total > 0 {
-                ((lines as f64 / blamed_total as f64) * 1000.0).round() / 10.0
-            } else {
-                0.0
-            },
-        })
-        .collect();
+            if commits.is_empty() {
+                if let Ok(out) = Command::new("git")
+                    .args([
+                        "log",
+                        "-n",
+                        &limit.to_string(),
+                        "--follow",
+                        &format!("--format={fmt_str}"),
+                        "--date=short",
+                        "--",
+                        rel_ref,
+                    ])
+                    .current_dir(repo_root_ref)
+                    .output()
+                {
+                    if out.status.success() {
+                        commits = parse_git_commits(&String::from_utf8_lossy(&out.stdout));
+                    }
+                }
+            }
+            commits
+        });
 
-    // Temporal co-change coupling across up to 40 recent commits touching rel_path
-    let mut total_commits_sampled = 0usize;
-    let mut co_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let hashes: Vec<String> = Command::new("git")
-        .args([
-            "log",
-            "-n",
-            "40",
-            "--follow",
-            "--format=format:%H",
-            "--",
-            &rel_path,
-        ])
-        .current_dir(&repo_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|s| s.len() >= 7)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !hashes.is_empty() {
-        let mut cmd = Command::new("git");
-        cmd.args([
-            "log",
-            "--no-walk",
-            "--name-only",
-            "--format=format:---AP-COMMIT---",
-        ])
-        .args(&hashes)
-        .current_dir(&repo_root);
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                let mut in_commit = false;
-                let mut bucket: HashSet<String> = HashSet::new();
-                let flush = |bucket: &mut HashSet<String>,
-                             total: &mut usize,
-                             co: &mut BTreeMap<String, usize>,
-                             self_rel: &str| {
-                    *total += 1;
-                    for p in bucket.drain() {
-                        if p != self_rel {
-                            *co.entry(p).or_insert(0) += 1;
+        let h_blame = s.spawn(move || {
+            let mut author_counts: BTreeMap<String, usize> = BTreeMap::new();
+            let mut blamed_total = 0usize;
+            if let Ok(out) = Command::new("git")
+                .args([
+                    "blame",
+                    "--line-porcelain",
+                    "-L",
+                    &format!("{bs},{be}"),
+                    "--",
+                    rel_ref,
+                ])
+                .current_dir(repo_root_ref)
+                .output()
+            {
+                if out.status.success() {
+                    for ln in String::from_utf8_lossy(&out.stdout).lines() {
+                        if let Some(author) = ln.strip_prefix("author ") {
+                            let a = author.trim();
+                            if !a.is_empty() {
+                                *author_counts.entry(a.to_string()).or_insert(0) += 1;
+                                blamed_total += 1;
+                            }
                         }
                     }
-                };
-                for raw_ln in String::from_utf8_lossy(&out.stdout).lines() {
-                    let ln = raw_ln.trim();
-                    if ln == "---AP-COMMIT---" {
+                }
+            }
+            let mut owner_pairs: Vec<(String, usize)> = author_counts.into_iter().collect();
+            owner_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            owner_pairs
+                .into_iter()
+                .take(5)
+                .map(|(author, lines)| AuthorShare {
+                    author,
+                    lines,
+                    share_pct: if blamed_total > 0 {
+                        ((lines as f64 / blamed_total as f64) * 1000.0).round() / 10.0
+                    } else {
+                        0.0
+                    },
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let h_cochange = s.spawn(move || {
+            let mut total_commits_sampled = 0usize;
+            let mut co_counts: BTreeMap<String, usize> = BTreeMap::new();
+            let hashes: Vec<String> = Command::new("git")
+                .args([
+                    "log",
+                    "-n",
+                    "40",
+                    "--follow",
+                    "--format=format:%H",
+                    "--",
+                    rel_ref,
+                ])
+                .current_dir(repo_root_ref)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::trim)
+                        .filter(|s| s.len() >= 7)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !hashes.is_empty() {
+                let mut cmd = Command::new("git");
+                cmd.args([
+                    "log",
+                    "--no-walk",
+                    "--name-only",
+                    "--format=format:---AP-COMMIT---",
+                ])
+                .args(&hashes)
+                .current_dir(repo_root_ref);
+                if let Ok(out) = cmd.output() {
+                    if out.status.success() {
+                        let mut in_commit = false;
+                        let mut bucket: HashSet<String> = HashSet::new();
+                        let flush = |bucket: &mut HashSet<String>,
+                                     total: &mut usize,
+                                     co: &mut BTreeMap<String, usize>,
+                                     self_rel: &str| {
+                            *total += 1;
+                            for p in bucket.drain() {
+                                if p != self_rel {
+                                    *co.entry(p).or_insert(0) += 1;
+                                }
+                            }
+                        };
+                        for raw_ln in String::from_utf8_lossy(&out.stdout).lines() {
+                            let ln = raw_ln.trim();
+                            if ln == "---AP-COMMIT---" {
+                                if in_commit {
+                                    flush(
+                                        &mut bucket,
+                                        &mut total_commits_sampled,
+                                        &mut co_counts,
+                                        rel_ref,
+                                    );
+                                }
+                                in_commit = true;
+                                continue;
+                            }
+                            if in_commit && !ln.is_empty() {
+                                bucket.insert(ln.replace('\\', "/"));
+                            }
+                        }
                         if in_commit {
                             flush(
                                 &mut bucket,
                                 &mut total_commits_sampled,
                                 &mut co_counts,
-                                &rel_path,
+                                rel_ref,
                             );
                         }
-                        in_commit = true;
-                        continue;
                     }
-                    if in_commit && !ln.is_empty() {
-                        bucket.insert(ln.replace('\\', "/"));
-                    }
-                }
-                if in_commit {
-                    flush(
-                        &mut bucket,
-                        &mut total_commits_sampled,
-                        &mut co_counts,
-                        &rel_path,
-                    );
                 }
             }
-        }
-    }
 
-    let mut co_pairs: Vec<(String, usize)> = co_counts.into_iter().collect();
-    co_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let co_changed_files: Vec<CoChangedFile> = co_pairs
-        .into_iter()
-        .take(8)
-        .map(|(path, co_changes)| {
-            let ratio_pct = if total_commits_sampled > 0 {
-                ((co_changes as f64 / total_commits_sampled as f64) * 1000.0).round() / 10.0
-            } else {
-                0.0
-            };
-            let exists = repo_root.join(&path).exists();
-            CoChangedFile {
-                path,
-                co_changes,
-                ratio_pct,
-                exists,
-            }
-        })
-        .collect();
+            let mut co_pairs: Vec<(String, usize)> = co_counts.into_iter().collect();
+            co_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let co_changed_files: Vec<CoChangedFile> = co_pairs
+                .into_iter()
+                .take(8)
+                .map(|(path, co_changes)| {
+                    let ratio_pct = if total_commits_sampled > 0 {
+                        ((co_changes as f64 / total_commits_sampled as f64) * 1000.0).round() / 10.0
+                    } else {
+                        0.0
+                    };
+                    let exists = repo_root_ref.join(&path).exists();
+                    CoChangedFile {
+                        path,
+                        co_changes,
+                        ratio_pct,
+                        exists,
+                    }
+                })
+                .collect();
+            (total_commits_sampled, co_changed_files)
+        });
+
+        (
+            h_commits.join().unwrap_or_default(),
+            h_blame.join().unwrap_or_default(),
+            h_cochange.join().unwrap_or_default(),
+        )
+    });
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
     HistoryReport {
