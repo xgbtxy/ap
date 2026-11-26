@@ -2638,7 +2638,7 @@ mod imp {
         filter: Option<&str>,
         max: usize,
     ) -> Value {
-        query_weak_acl_opts(target_or_empty, filter, max, false)
+        query_weak_acl_with_cache(target_or_empty, filter, max, false, None, None)
     }
 
     pub fn query_weak_acl_opts(
@@ -2646,6 +2646,17 @@ mod imp {
         filter: Option<&str>,
         max: usize,
         non_ms: bool,
+    ) -> Value {
+        query_weak_acl_with_cache(target_or_empty, filter, max, non_ms, None, None)
+    }
+
+    pub fn query_weak_acl_with_cache(
+        target_or_empty: Option<&str>,
+        filter: Option<&str>,
+        max: usize,
+        non_ms: bool,
+        cached_proc_map: Option<&std::collections::HashMap<u32, &ProcessIlInfo>>,
+        cached_all_pipes: Option<&[Value]>,
     ) -> Value {
         let cap = max.clamp(1, 200);
         let raw_tgt = target_or_empty.map(str::trim).filter(|s| !s.is_empty());
@@ -2698,27 +2709,52 @@ mod imp {
         }
 
         // OS-wide non-admin write attack-surface sweep (pipes + services/bins/regkeys + unquoted)
-        // Inspect ALL matching pipes cleanly before applying output cap (attributing only weak pipes).
         let eff_filter = filter.or(raw_tgt);
         let f_low = eff_filter.map(|s| s.to_ascii_lowercase());
-        let proc_vec = collect_processes_il().unwrap_or_default();
-        let proc_map: std::collections::HashMap<u32, &ProcessIlInfo> =
-            proc_vec.iter().map(|p| (p.pid, p)).collect();
-        let pipe_res = query_pipes_with_cache(
-            eff_filter,
-            usize::MAX,
-            non_ms,
-            false,
-            Some(&proc_map),
-            false,
-        );
         let mut weak_pipes = Vec::new();
-        if let Some(arr) = pipe_res.get("pipes").and_then(Value::as_array) {
-            for p in arr {
-                if p.get("non_admin_write").and_then(Value::as_bool) == Some(true) {
-                    weak_pipes.push(p.clone());
-                    if weak_pipes.len() >= cap {
-                        break;
+        if let Some(all_pipes) = cached_all_pipes {
+            for p in all_pipes {
+                if p.get("non_admin_write").and_then(Value::as_bool) != Some(true) {
+                    continue;
+                }
+                let nm_low = p
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if let Some(ref fl) = f_low {
+                    if !nm_low.contains(fl) {
+                        continue;
+                    }
+                }
+                if non_ms && super::is_ms_os_pipe(&nm_low) {
+                    continue;
+                }
+                weak_pipes.push(p.clone());
+                if weak_pipes.len() >= cap {
+                    break;
+                }
+            }
+        } else {
+            let owned_procs;
+            let owned_map;
+            let pm_ref: &std::collections::HashMap<u32, &ProcessIlInfo> = match cached_proc_map {
+                Some(m) => m,
+                None => {
+                    owned_procs = collect_processes_il().unwrap_or_default();
+                    owned_map = owned_procs.iter().map(|p| (p.pid, p)).collect();
+                    &owned_map
+                }
+            };
+            let pipe_res =
+                query_pipes_with_cache(eff_filter, usize::MAX, non_ms, false, Some(pm_ref), false);
+            if let Some(arr) = pipe_res.get("pipes").and_then(Value::as_array) {
+                for p in arr {
+                    if p.get("non_admin_write").and_then(Value::as_bool) == Some(true) {
+                        weak_pipes.push(p.clone());
+                        if weak_pipes.len() >= cap {
+                            break;
+                        }
                     }
                 }
             }
@@ -2942,10 +2978,19 @@ mod imp {
 
     #[cfg(test)]
     pub fn query_rpc_endpoints(filter: Option<&str>, max: usize) -> Value {
-        query_rpc_endpoints_opts(filter, max, false)
+        query_rpc_endpoints_with_cache(filter, max, false, None)
     }
 
     pub fn query_rpc_endpoints_opts(filter: Option<&str>, max: usize, non_ms: bool) -> Value {
+        query_rpc_endpoints_with_cache(filter, max, non_ms, None)
+    }
+
+    pub fn query_rpc_endpoints_with_cache(
+        filter: Option<&str>,
+        max: usize,
+        non_ms: bool,
+        cached_all_pipes: Option<&[Value]>,
+    ) -> Value {
         let mut inq: Handle = ptr::null_mut();
         let rc = unsafe {
             RpcMgmtEpEltInqBegin(
@@ -2965,12 +3010,21 @@ mod imp {
             });
         }
 
-        // Cross-link all named pipes for `ncacn_np` weak-ACL visibility (skip pipe handle open for speed)
+        // Cross-link all named pipes for `ncacn_np` weak-ACL visibility (reusing cached pipe sweep when available)
         let mut weak_pipe_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(arr) = query_pipes_with_cache(None, usize::MAX, false, false, None, false)
-            .get("pipes")
-            .and_then(Value::as_array)
-        {
+        let owned_pipe_res;
+        let pipe_slice: Option<&[Value]> = match cached_all_pipes {
+            Some(s) => Some(s),
+            None => {
+                owned_pipe_res =
+                    query_pipes_with_cache(None, usize::MAX, false, false, None, false);
+                owned_pipe_res
+                    .get("pipes")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+            }
+        };
+        if let Some(arr) = pipe_slice {
             for p in arr {
                 if p.get("non_admin_write").and_then(Value::as_bool) == Some(true) {
                     if let Some(nm) = p.get("name").and_then(Value::as_str) {
@@ -3234,6 +3288,7 @@ pub fn run_win_cli_ex(
             let run_rpc = all || rpc;
             let run_procs = all || procs;
 
+            // Collect process IL table ONCE and share across procs/weak_acl/pipes
             let cached_procs = if run_procs || run_weak_acl || pipes {
                 imp::collect_processes_il().ok()
             } else {
@@ -3244,18 +3299,56 @@ pub fn run_win_cli_ex(
                     .as_ref()
                     .map(|v| v.iter().map(|p| (p.pid, p)).collect());
 
+            // Deduplicate named-pipe enumeration when >=2 pipe-consuming sections run together
+            let weak_acl_needs_pipes = run_weak_acl
+                && weak_acl
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| !std::path::Path::new(&normalize_win_input_path(s)).exists())
+                    .unwrap_or(true);
+            let pipe_consumers =
+                usize::from(weak_acl_needs_pipes) + usize::from(run_rpc) + usize::from(pipes);
+            let cached_all_pipes: Option<Vec<Value>> = if pipe_consumers >= 2 {
+                imp::query_pipes_with_cache(
+                    None,
+                    usize::MAX,
+                    false,
+                    false,
+                    proc_map.as_ref(),
+                    pipes,
+                )
+                .get("pipes")
+                .and_then(Value::as_array)
+                .cloned()
+            } else {
+                None
+            };
+
             let mut modes_run: Vec<&str> = Vec::new();
+            let mut failed_sections: Vec<&str> = Vec::new();
             let mut sections = serde_json::Map::new();
             let mut combined = serde_json::Map::new();
-            let mut any_ok = false;
+            let mut all_ok = true;
+
+            let mut record_section = |name: &'static str, v: &Value| {
+                if v.get("ok").and_then(Value::as_bool) != Some(true) {
+                    all_ok = false;
+                    failed_sections.push(name);
+                }
+            };
 
             if run_weak_acl {
                 modes_run.push("weak_acl");
                 let wa_arg = weak_acl.unwrap_or("");
-                let wa = imp::query_weak_acl_opts(Some(wa_arg), filter, max, non_ms);
-                if wa.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                let wa = imp::query_weak_acl_with_cache(
+                    Some(wa_arg),
+                    filter,
+                    max,
+                    non_ms,
+                    proc_map.as_ref(),
+                    cached_all_pipes.as_deref(),
+                );
+                record_section("weak_acl", &wa);
                 for key in [
                     "weak_pipes_count",
                     "weak_services_count",
@@ -3268,8 +3361,9 @@ pub fn run_win_cli_ex(
                         combined.insert(key.to_string(), v.clone());
                     }
                 }
-                if !run_com {
-                    if let Some(f) = wa.get("findings") {
+                if let Some(f) = wa.get("findings") {
+                    combined.insert("weak_acl_findings".to_string(), f.clone());
+                    if !run_com {
                         combined.insert("findings".to_string(), f.clone());
                     }
                 }
@@ -3278,9 +3372,7 @@ pub fn run_win_cli_ex(
             if run_com {
                 modes_run.push("com");
                 let c = imp::query_com_audit_opts(filter, max, non_ms);
-                if c.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("com", &c);
                 if let Some(f) = c.get("findings") {
                     combined.insert("findings".to_string(), f.clone());
                 }
@@ -3291,10 +3383,13 @@ pub fn run_win_cli_ex(
             }
             if run_rpc {
                 modes_run.push("rpc");
-                let r = imp::query_rpc_endpoints_opts(filter, max, non_ms);
-                if r.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                let r = imp::query_rpc_endpoints_with_cache(
+                    filter,
+                    max,
+                    non_ms,
+                    cached_all_pipes.as_deref(),
+                );
+                record_section("rpc", &r);
                 if let Some(ep) = r.get("endpoints") {
                     combined.insert("endpoints".to_string(), ep.clone());
                 }
@@ -3303,9 +3398,7 @@ pub fn run_win_cli_ex(
             if run_procs {
                 modes_run.push("procs");
                 let pr = imp::query_procs_opts(filter, max, non_ms, cached_procs.as_deref());
-                if pr.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("procs", &pr);
                 if let Some(arr) = pr.get("processes") {
                     combined.insert("processes".to_string(), arr.clone());
                 }
@@ -3313,11 +3406,41 @@ pub fn run_win_cli_ex(
             }
             if pipes {
                 modes_run.push("pipes");
-                let pp =
-                    imp::query_pipes_with_cache(filter, max, non_ms, true, proc_map.as_ref(), true);
-                if pp.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                let pp = if let Some(ref all_p) = cached_all_pipes {
+                    let f_low = filter.map(|s| s.to_ascii_lowercase());
+                    let cap = max.clamp(1, 200);
+                    let mut total_matched = 0usize;
+                    let mut filtered_p = Vec::new();
+                    for p in all_p {
+                        let nm_low = p
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if let Some(ref fl) = f_low {
+                            if !nm_low.contains(fl) {
+                                continue;
+                            }
+                        }
+                        if non_ms && is_ms_os_pipe(&nm_low) {
+                            continue;
+                        }
+                        total_matched += 1;
+                        if filtered_p.len() < cap {
+                            filtered_p.push(p.clone());
+                        }
+                    }
+                    json!({
+                        "ok": true,
+                        "mode": "pipes",
+                        "total_matched": total_matched,
+                        "returned": filtered_p.len(),
+                        "pipes": filtered_p,
+                    })
+                } else {
+                    imp::query_pipes_with_cache(filter, max, non_ms, true, proc_map.as_ref(), true)
+                };
+                record_section("pipes", &pp);
                 if let Some(arr) = pp.get("pipes") {
                     combined.insert("pipes".to_string(), arr.clone());
                 }
@@ -3326,9 +3449,7 @@ pub fn run_win_cli_ex(
             if services {
                 modes_run.push("services");
                 let sv = imp::query_services_opts(filter, max, non_ms);
-                if sv.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("services", &sv);
                 if let Some(arr) = sv.get("services") {
                     combined.insert("services".to_string(), arr.clone());
                 }
@@ -3337,9 +3458,7 @@ pub fn run_win_cli_ex(
             if unquoted {
                 modes_run.push("unquoted");
                 let uq = imp::query_unquoted_services_opts(filter, max, non_ms);
-                if uq.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("unquoted", &uq);
                 if let Some(arr) = uq.get("findings") {
                     combined.insert("unquoted_findings".to_string(), arr.clone());
                     if !combined.contains_key("findings") {
@@ -3351,43 +3470,41 @@ pub fn run_win_cli_ex(
             if whoami {
                 modes_run.push("whoami");
                 let wh = imp::query_whoami();
-                if wh.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("whoami", &wh);
                 combined.insert("whoami".to_string(), wh.clone());
                 sections.insert("whoami".to_string(), wh);
             }
             if let Some(rk) = reg {
                 modes_run.push("reg");
                 let rg = imp::query_registry(rk, filter, max);
-                if rg.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("reg", &rg);
                 combined.insert("reg".to_string(), rg.clone());
                 sections.insert("reg".to_string(), rg);
             }
             if let Some(ap) = acl {
                 modes_run.push("acl");
                 let ac = imp::query_acl(ap);
-                if ac.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("acl", &ac);
                 combined.insert("acl".to_string(), ac.clone());
                 sections.insert("acl".to_string(), ac);
             }
             if let Some(sp) = sig {
                 modes_run.push("sig");
                 let sg = imp::query_signature(&sp.to_string_lossy());
-                if sg.get("ok").and_then(Value::as_bool) == Some(true) {
-                    any_ok = true;
-                }
+                record_section("sig", &sg);
                 combined.insert("sig".to_string(), sg.clone());
                 sections.insert("sig".to_string(), sg);
             }
 
-            combined.insert("ok".to_string(), Value::Bool(any_ok));
+            combined.insert(
+                "ok".to_string(),
+                Value::Bool(all_ok && !modes_run.is_empty()),
+            );
             combined.insert("mode".to_string(), json!("combined"));
             combined.insert("modes_run".to_string(), json!(modes_run));
+            if !failed_sections.is_empty() {
+                combined.insert("failed_sections".to_string(), json!(failed_sections));
+            }
             combined.insert("non_ms".to_string(), Value::Bool(non_ms));
             if let Some(fl) = filter {
                 combined.insert("filter".to_string(), json!(fl));

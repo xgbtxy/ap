@@ -395,7 +395,7 @@ fn mcp_tools_schema() -> Value {
                 "acl": { "type": "string", "description": "File or directory path whose owner, SDDL DACL & non-admin writability to inspect" },
                 "services": { "type": "boolean", "description": "Enumerate Windows services (state, PID, start_type, bin_path, account)" },
                 "procs": { "type": "boolean", "description": "Enumerate running processes with PID, PPID, exe, session_id & Win32 Integrity Level" },
-                "all": { "type": "boolean", "description": "Run combined pipes+services+procs+weak_acl+unquoted+com+rpc sweep in 1 call" },
+                "all": { "type": "boolean", "description": "Run combined weak_acl+com+rpc+procs sweep in 1 call (includes weak pipes, services & unquoted paths)" },
                 "whoami": { "type": "boolean", "description": "Inspect current process token user, SID, elevation, integrity level & privileges" },
                 "sig": { "type": "string", "description": "Inspect PE Authenticode signature & Windows catalog trust (signed, valid, subject, issuer, sha256)" },
                 "weak_acl": { "type": "string", "description": "Audit non-admin writable pipes/services/dirs (pass '' for OS sweep or a path)" },
@@ -3714,14 +3714,17 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     }
                 }
             }
-            let map = ap_atlas::surface::build_surface_map_with_excludes(
+            let map = match ap_atlas::surface::try_build_surface_map_with_excludes(
                 root_p,
                 max_files,
                 max_per_axis,
                 include_vendor,
                 include_binaries,
                 &excludes,
-            );
+            ) {
+                Ok(m) => m,
+                Err(e) => return (false, format!("[atlas] {e}")),
+            };
             let js = serde_json::to_string_pretty(&map).unwrap_or_default();
             crate::stats::record_event("surface", 0, js.len() as u64, 0, 1, "mcp-surface");
             (true, js)
@@ -3766,6 +3769,9 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     }
                 }
             }
+            if let Err(e) = ap_baton::frontier::validate_excludes(&item_excludes) {
+                return (false, format!("[frontier] {e}"));
+            }
             match action {
                 "seed" => {
                     let seed_raw = if let Some(sp) = args
@@ -3777,14 +3783,17 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         if !p.exists() {
                             return (false, format!("[frontier] scan_path not found: {sp}"));
                         }
-                        let map = ap_atlas::surface::build_surface_map_with_excludes(
+                        let map = match ap_atlas::surface::try_build_surface_map_with_excludes(
                             p,
                             1500,
                             12,
                             false,
                             false,
                             &item_excludes,
-                        );
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => return (false, format!("[frontier] {e}")),
+                        };
                         serde_json::to_string(&map).unwrap_or_default()
                     } else if let Some(tgt) = args
                         .get("target")
@@ -3809,7 +3818,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         Ok(g) => g,
                         Err(e) => return (false, format!("[frontier] lock failed: {e}")),
                     };
-                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    let mut state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     match ap_baton::frontier::seed_from_json_str_with_excludes(
                         &mut state,
                         &seed_raw,
@@ -3849,7 +3861,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         Ok(g) => g,
                         Err(e) => return (false, format!("[frontier] lock failed: {e}")),
                     };
-                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    let mut state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     let q_low = q.trim().to_ascii_lowercase();
                     let now = ap_baton::now_iso_utc();
                     let mut ids = Vec::new();
@@ -3946,14 +3961,21 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         Ok(g) => g,
                         Err(e) => return (false, format!("[frontier] lock failed: {e}")),
                     };
-                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    let mut state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     let mut marked = 0usize;
                     for (label, txt) in &loaded {
                         marked +=
                             ap_baton::frontier::sync_stopped_from_text(&mut state, label, txt);
                     }
                     if marked > 0 {
-                        let _ = ap_baton::frontier::save_frontier_unlocked(&store_path, &mut state);
+                        if let Err(e) =
+                            ap_baton::frontier::save_frontier_unlocked(&store_path, &mut state)
+                        {
+                            return (false, format!("[frontier] save failed: {e}"));
+                        }
                     }
                     (
                         true,
@@ -4023,7 +4045,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                         Ok(g) => g,
                         Err(e) => return (false, format!("[frontier] lock failed: {e}")),
                     };
-                    let mut state = ap_baton::frontier::load_frontier(&store_path);
+                    let mut state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     match ap_baton::frontier::ingest_tool_json_str_with_excludes(
                         &mut state,
                         &raw,
@@ -4537,7 +4562,25 @@ fn handle_rpc_request(req: &Value, profile: McpProfile) -> Option<Value> {
             if let Value::Object(ref mut map) = targs {
                 map.retain(|_, v| !v.is_null());
             }
+            let t0 = std::time::Instant::now();
             let (ok, text) = dispatch_tool_call(tname, &targs);
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let err_note = if ok {
+                None
+            } else {
+                Some(text.lines().next().unwrap_or("tool error"))
+            };
+            crate::stats::record_event_ex(
+                "mcp",
+                0,
+                text.len() as u64,
+                0,
+                0,
+                tname,
+                ok,
+                elapsed_ms,
+                err_note,
+            );
             let mut result = json!({
                 "content": [{ "type": "text", "text": text }],
                 "isError": !ok
@@ -4564,6 +4607,12 @@ fn handle_rpc_request(req: &Value, profile: McpProfile) -> Option<Value> {
                 if !populated {
                     result["structuredContent"] = json!({ "ok": true, "text": text });
                 }
+            } else {
+                result["structuredContent"] = json!({
+                    "ok": false,
+                    "error": text,
+                    "text": text,
+                });
             }
             Some(json!({
                 "jsonrpc": "2.0",

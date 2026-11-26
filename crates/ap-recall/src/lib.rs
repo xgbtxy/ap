@@ -8,7 +8,22 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static RECALL_LOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+const MAX_SYNC_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn emit_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
 
 fn default_weight() -> f64 {
     1.0
@@ -44,6 +59,10 @@ pub struct SyncReport {
     pub scanned_files: usize,
     pub indexed_files: usize,
     pub skipped_unchanged: usize,
+    #[serde(default)]
+    pub skipped_files: usize,
+    #[serde(default)]
+    pub error_files: usize,
     pub pruned_files: usize,
     pub indexed_entries: usize,
     pub elapsed_ms: f64,
@@ -326,11 +345,27 @@ pub fn resolve_vault_path(cwd: &Path, store: Option<&Path>) -> PathBuf {
 
 struct VaultLockGuard {
     lock_path: PathBuf,
+    token: String,
 }
 
 impl Drop for VaultLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        let owns_lock = fs::read_to_string(&self.lock_path)
+            .map(|cur| cur.trim() == self.token)
+            .unwrap_or(false);
+        if !owns_lock {
+            return;
+        }
+        for attempt in 0..12u64 {
+            match fs::remove_file(&self.lock_path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < 11 => {
+                    std::thread::sleep(Duration::from_millis(2 + attempt * 2));
+                }
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -341,8 +376,14 @@ fn acquire_vault_lock(db_path: &Path) -> Result<VaultLockGuard, String> {
     let mut os = db_path.as_os_str().to_os_string();
     os.push(".lock");
     let lock_path = PathBuf::from(os);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let pid = std::process::id();
+    let seq = RECALL_LOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("pid={pid} seq={seq} ns={nanos}");
     let mut attempt = 0u64;
     loop {
         match OpenOptions::new()
@@ -351,8 +392,9 @@ fn acquire_vault_lock(db_path: &Path) -> Result<VaultLockGuard, String> {
             .open(&lock_path)
         {
             Ok(mut f) => {
-                let _ = writeln!(f, "pid={pid}");
-                return Ok(VaultLockGuard { lock_path });
+                let _ = writeln!(f, "{token}");
+                let _ = f.flush();
+                return Ok(VaultLockGuard { lock_path, token });
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -377,43 +419,62 @@ fn acquire_vault_lock(db_path: &Path) -> Result<VaultLockGuard, String> {
                     ));
                 }
                 attempt += 1;
-                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 7) % 13;
-                std::thread::sleep(Duration::from_millis(8 + jitter));
+                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 7) % 7;
+                std::thread::sleep(Duration::from_millis(2 + jitter));
             }
             Err(e) => return Err(e.to_string()),
         }
     }
 }
 
-pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
-    if let Some(parent) = db_path.parent() {
-        let _ = fs::create_dir_all(parent);
+fn read_table_cols(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(rows.flatten().collect())
+}
+
+fn vault_needs_migration(conn: &Connection) -> rusqlite::Result<bool> {
+    let rules_cols: HashSet<String> = read_table_cols(conn, "rules")?.into_iter().collect();
+    let required_cols = [
+        "search_tokens",
+        "source_file",
+        "source_hash",
+        "git_commit",
+        "scope",
+        "weight",
+        "section",
+        "origin",
+    ];
+    if rules_cols.is_empty() || required_cols.iter().any(|c| !rules_cols.contains(*c)) {
+        return Ok(true);
     }
-    let conn = Connection::open(db_path)?;
-    let _ = conn.busy_timeout(Duration::from_millis(5000));
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
-    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
-    conn.execute_batch(
+    let fts_cols = read_table_cols(conn, "rules_fts")?;
+    if fts_cols.len() != 2 || !fts_cols.iter().any(|c| c == "search_tokens") {
+        return Ok(true);
+    }
+    let sync_cols = read_table_cols(conn, "sync_files")?;
+    Ok(sync_cols.is_empty())
+}
+
+fn migrate_vault_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS rules (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL,
             triggers TEXT NOT NULL,
             rule TEXT NOT NULL,
-            search_tokens TEXT NOT NULL,
+            search_tokens TEXT NOT NULL DEFAULT '',
             hits INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT 0,
             last_hit_at INTEGER NOT NULL DEFAULT 0,
             source_file TEXT NOT NULL DEFAULT '',
             source_hash TEXT NOT NULL DEFAULT '',
             git_commit TEXT NOT NULL DEFAULT '',
             scope TEXT NOT NULL DEFAULT '',
             weight REAL NOT NULL DEFAULT 1.0,
-            section TEXT NOT NULL DEFAULT ''
-        );
-        CREATE VIRTUAL TABLE IF NOT EXISTS rules_fts USING fts5(
-            id UNINDEXED,
-            search_tokens,
-            tokenize='unicode61'
+            section TEXT NOT NULL DEFAULT '',
+            origin TEXT NOT NULL DEFAULT 'manual'
         );
         CREATE TABLE IF NOT EXISTS sync_files (
             file_path TEXT PRIMARY KEY,
@@ -425,15 +486,13 @@ pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
             synced_at INTEGER NOT NULL DEFAULT 0
         );",
     )?;
-    let mut existing_cols: HashSet<String> = HashSet::new();
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(rules)")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        for col in rows.flatten() {
-            existing_cols.insert(col);
-        }
-    }
+    let existing_cols: HashSet<String> = read_table_cols(&tx, "rules")?.into_iter().collect();
+    let mut added_search_tokens = false;
     for (col, ddl) in [
+        (
+            "search_tokens",
+            "ALTER TABLE rules ADD COLUMN search_tokens TEXT NOT NULL DEFAULT ''",
+        ),
         (
             "source_file",
             "ALTER TABLE rules ADD COLUMN source_file TEXT NOT NULL DEFAULT ''",
@@ -458,12 +517,101 @@ pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
             "section",
             "ALTER TABLE rules ADD COLUMN section TEXT NOT NULL DEFAULT ''",
         ),
+        (
+            "origin",
+            "ALTER TABLE rules ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'",
+        ),
     ] {
         if !existing_cols.contains(col) {
-            conn.execute(ddl, [])?;
+            tx.execute(ddl, [])?;
+            if col == "search_tokens" {
+                added_search_tokens = true;
+            }
+        }
+    }
+
+    let fts_cols = read_table_cols(&tx, "rules_fts")?;
+    let need_fts_rebuild = fts_cols.len() != 2 || !fts_cols.iter().any(|c| c == "search_tokens");
+
+    // Backfill empty search_tokens for legacy rows before rebuilding FTS
+    if added_search_tokens || need_fts_rebuild {
+        let legacy_rows: Vec<(String, String, String, String, String, String)> = {
+            let mut st = tx.prepare(
+                "SELECT id, kind, triggers, rule, scope, section FROM rules WHERE search_tokens = ''",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+        for (id, kind, triggers, rule, scope, section) in legacy_rows {
+            let toks = tokenize_cjk_hybrid(&format!(
+                "{} {section} {rule} {kind} {}",
+                triggers.replace(',', " "),
+                scope.replace(',', " ")
+            ));
+            tx.execute(
+                "UPDATE rules SET search_tokens = ?1 WHERE id = ?2",
+                params![toks, id],
+            )?;
+        }
+    }
+
+    if need_fts_rebuild {
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS rules_fts;
+             CREATE VIRTUAL TABLE rules_fts USING fts5(
+                 id UNINDEXED,
+                 search_tokens,
+                 tokenize='unicode61'
+             );",
+        )?;
+        let all_rows: Vec<(String, String)> = {
+            let mut st = tx.prepare("SELECT id, search_tokens FROM rules")?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.flatten().collect()
+        };
+        for (id, toks) in all_rows {
+            tx.execute(
+                "INSERT INTO rules_fts (id, search_tokens) VALUES (?1, ?2)",
+                params![id, toks],
+            )?;
+        }
+    }
+    tx.commit()
+}
+
+fn open_vault_inner(db_path: &Path, already_locked: bool) -> rusqlite::Result<Connection> {
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut conn = Connection::open(db_path)?;
+    let _ = conn.busy_timeout(Duration::from_millis(5000));
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    if vault_needs_migration(&conn)? {
+        let _mig_lock = if already_locked {
+            None
+        } else {
+            acquire_vault_lock(db_path).ok()
+        };
+        if vault_needs_migration(&conn)? {
+            migrate_vault_schema(&mut conn)?;
         }
     }
     Ok(conn)
+}
+
+pub fn open_vault(db_path: &Path) -> rusqlite::Result<Connection> {
+    open_vault_inner(db_path, false)
 }
 
 fn now_epoch() -> i64 {
@@ -592,9 +740,26 @@ pub fn add_rule_full(
         norm_scope.replace(',', " ")
     ));
 
+    struct ImmediateTxGuard<'a> {
+        conn: &'a Connection,
+        committed: bool,
+    }
+    impl<'a> Drop for ImmediateTxGuard<'a> {
+        fn drop(&mut self) {
+            if !self.committed {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let mut tx_guard = ImmediateTxGuard {
+        conn,
+        committed: false,
+    };
+
     conn.execute(
-        "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit, scope, weight, section)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit, scope, weight, section, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, 'manual')
          ON CONFLICT(id) DO UPDATE SET
              kind=excluded.kind,
              triggers=excluded.triggers,
@@ -605,7 +770,8 @@ pub fn add_rule_full(
              git_commit=excluded.git_commit,
              scope=excluded.scope,
              weight=excluded.weight,
-             section=excluded.section",
+             section=excluded.section,
+             origin='manual'",
         params![
             rule_id,
             kind,
@@ -626,6 +792,8 @@ pub fn add_rule_full(
         "INSERT INTO rules_fts (id, search_tokens) VALUES (?1, ?2)",
         params![rule_id, tokens],
     )?;
+    conn.execute_batch("COMMIT")?;
+    tx_guard.committed = true;
     Ok(rule_id)
 }
 
@@ -857,24 +1025,31 @@ pub fn match_rules_scoped(
         }
     }
 
-    if !q_tokens.is_empty() {
+    if !q_tokens.is_empty() && !rows_by_id.is_empty() {
         let fts_expr = q_tokens
             .iter()
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
+        // Stream BM25 hits in rank order and collect up to 64 in-scope/in-kind matches
+        // so scoped queries on large multi-scope vaults are never starved by global LIMIT 64.
         if let Ok(mut fts_stmt) = conn.prepare(
-            "SELECT id, bm25(rules_fts) AS rank FROM rules_fts WHERE rules_fts MATCH ?1 ORDER BY rank LIMIT 64",
+            "SELECT f.id, bm25(rules_fts) AS rank FROM rules_fts f WHERE rules_fts MATCH ?1 ORDER BY rank",
         ) {
             if let Ok(rows) = fts_stmt.query_map(params![fts_expr], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
             }) {
+                let mut matched_in_scope = 0usize;
                 for pair in rows.flatten() {
                     if !rows_by_id.contains_key(&pair.0) {
                         continue;
                     }
                     let boost = (-pair.1).max(0.5);
                     *scores.entry(pair.0).or_insert(0.0) += boost;
+                    matched_in_scope += 1;
+                    if matched_in_scope >= 64 {
+                        break;
+                    }
                 }
             }
         }
@@ -1064,6 +1239,32 @@ fn compact_text_clip(raw: &str, max_chars: usize) -> String {
     }
 }
 
+fn decode_text_smart(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    // UTF-16LE / UTF-16BE BOM detection
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let (cow, _, _) = encoding_rs::UTF_16LE.decode(&bytes[2..]);
+        return Some(cow.into_owned());
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let (cow, _, _) = encoding_rs::UTF_16BE.decode(&bytes[2..]);
+        return Some(cow.into_owned());
+    }
+    // Reject binary files (NUL byte in prefix)
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.contains(&0) {
+        return None;
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Ok(s) = std::str::from_utf8(body) {
+        return Some(s.to_string());
+    }
+    let (cow, _, _) = encoding_rs::GBK.decode(body);
+    Some(cow.into_owned())
+}
+
 fn parse_markdown_entries(
     file_path: &Path,
     text: &str,
@@ -1078,10 +1279,29 @@ fn parse_markdown_entries(
     let mut sections: Vec<(String, Vec<String>)> = Vec::new();
     let mut cur_heading = stem.to_string();
     let mut cur_lines: Vec<String> = Vec::new();
+    let mut in_fence: Option<char> = None;
 
     for line in text.lines() {
         let t = line.trim();
-        if t.starts_with('#') {
+        if t.starts_with("```") {
+            match in_fence {
+                Some('`') => in_fence = None,
+                None => in_fence = Some('`'),
+                _ => {}
+            }
+            cur_lines.push(t.to_string());
+            continue;
+        }
+        if t.starts_with("~~~") {
+            match in_fence {
+                Some('~') => in_fence = None,
+                None => in_fence = Some('~'),
+                _ => {}
+            }
+            cur_lines.push(t.to_string());
+            continue;
+        }
+        if in_fence.is_none() && t.starts_with('#') {
             let trimmed_h = t.trim_start_matches('#').trim();
             if !trimmed_h.is_empty()
                 && t.as_bytes().get(t.len() - trimmed_h.len() - 1) == Some(&b' ')
@@ -1206,7 +1426,7 @@ fn parse_json_entries(
     default_scope: &str,
     default_kind: &str,
     default_weight: f64,
-) -> Vec<SyncEntryDraft> {
+) -> Result<Vec<SyncEntryDraft>, String> {
     let stem = file_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1218,46 +1438,59 @@ fn parse_json_entries(
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "jsonl" {
+        let mut saw_nonempty = false;
+        let mut parse_errors = 0usize;
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() {
                 continue;
             }
-            if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(t) {
+            saw_nonempty = true;
+            match serde_json::from_str::<Value>(t) {
+                Ok(Value::Object(obj)) => {
+                    if let Some(d) = parse_json_obj_entry(
+                        &obj,
+                        stem,
+                        default_scope,
+                        default_kind,
+                        default_weight,
+                    ) {
+                        out.push(d);
+                    }
+                }
+                Ok(_) => parse_errors += 1,
+                Err(_) => parse_errors += 1,
+            }
+        }
+        if saw_nonempty && out.is_empty() && parse_errors > 0 {
+            return Err("invalid JSONL entries".to_string());
+        }
+        return Ok(out);
+    }
+    let val = serde_json::from_str::<Value>(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    let items_opt = val.as_array().or_else(|| {
+        ["items", "rules", "entries", "cards", "records"]
+            .iter()
+            .find_map(|k| val.get(*k).and_then(Value::as_array))
+    });
+    if let Some(arr) = items_opt {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
                 if let Some(d) =
-                    parse_json_obj_entry(&obj, stem, default_scope, default_kind, default_weight)
+                    parse_json_obj_entry(obj, stem, default_scope, default_kind, default_weight)
                 {
                     out.push(d);
                 }
             }
         }
-        return out;
-    }
-    if let Ok(val) = serde_json::from_str::<Value>(text) {
-        let items_opt = val.as_array().or_else(|| {
-            ["items", "rules", "entries", "cards", "records"]
-                .iter()
-                .find_map(|k| val.get(*k).and_then(Value::as_array))
-        });
-        if let Some(arr) = items_opt {
-            for item in arr {
-                if let Some(obj) = item.as_object() {
-                    if let Some(d) =
-                        parse_json_obj_entry(obj, stem, default_scope, default_kind, default_weight)
-                    {
-                        out.push(d);
-                    }
-                }
-            }
-        } else if let Some(obj) = val.as_object() {
-            if let Some(d) =
-                parse_json_obj_entry(obj, stem, default_scope, default_kind, default_weight)
-            {
-                out.push(d);
-            }
+    } else if let Some(obj) = val.as_object() {
+        if let Some(d) =
+            parse_json_obj_entry(obj, stem, default_scope, default_kind, default_weight)
+        {
+            out.push(d);
         }
     }
-    out
+    Ok(out)
 }
 
 fn file_mtime_ns_and_size(path: &Path) -> (i64, i64) {
@@ -1274,15 +1507,27 @@ fn file_mtime_ns_and_size(path: &Path) -> (i64, i64) {
     (mtime_ns, sz)
 }
 
+fn normalize_drive_letter_case(p: String) -> String {
+    let bytes = p.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let mut out = String::with_capacity(p.len());
+        out.push((bytes[0] as char).to_ascii_lowercase());
+        out.push_str(&p[1..]);
+        out
+    } else {
+        p
+    }
+}
+
 fn normalize_sync_key(cwd: &Path, file_path: &Path) -> String {
     let cwd_c = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let file_c = fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
     if let Ok(rel) = file_c.strip_prefix(&cwd_c) {
-        return normalize_source_file(&rel.to_string_lossy());
+        return normalize_drive_letter_case(normalize_source_file(&rel.to_string_lossy()));
     }
     let s = file_c.to_string_lossy().to_string();
     let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    normalize_source_file(stripped)
+    normalize_drive_letter_case(normalize_source_file(stripped))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1306,7 +1551,7 @@ pub fn sync_path(
         return Err(format!("sync path not found: {}", resolved_root.display()));
     }
     let _lock = acquire_vault_lock(db_path)?;
-    let mut conn = open_vault(db_path).map_err(|e| e.to_string())?;
+    let mut conn = open_vault_inner(db_path, true).map_err(|e| e.to_string())?;
     let eff_globs = expand_globs(globs);
     let norm_scope = normalize_scopes(scope);
     let eff_weight = if weight.is_finite() {
@@ -1346,6 +1591,8 @@ pub fn sync_path(
     let mut seen_keys: HashSet<String> = HashSet::new();
     let mut indexed_files = 0usize;
     let mut skipped_unchanged = 0usize;
+    let mut skipped_files = 0usize;
+    let mut error_files = 0usize;
     let mut indexed_entries = 0usize;
 
     let tx = conn
@@ -1356,6 +1603,10 @@ pub fn sync_path(
         let key = normalize_sync_key(cwd, fp);
         seen_keys.insert(key.clone());
         let (mtime_ns, size_bytes) = file_mtime_ns_and_size(fp);
+        if size_bytes < 0 || (size_bytes as u64) > MAX_SYNC_FILE_BYTES {
+            skipped_files += 1;
+            continue;
+        }
         if let Some((prev_m, prev_sz, _prev_sha, prev_scope, _cnt)) = existing_sync.get(&key) {
             if *prev_m == mtime_ns && *prev_sz == size_bytes && prev_scope == &norm_scope {
                 skipped_unchanged += 1;
@@ -1363,6 +1614,11 @@ pub fn sync_path(
             }
         }
         let Ok(bytes) = fs::read(fp) else {
+            error_files += 1;
+            continue;
+        };
+        let Some(text) = decode_text_smart(&bytes) else {
+            skipped_files += 1;
             continue;
         };
         let mut hasher = Sha256::new();
@@ -1381,22 +1637,28 @@ pub fn sync_path(
             }
         }
 
-        let text = String::from_utf8_lossy(&bytes);
         let ext = fp
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
         let drafts = if ext == "json" || ext == "jsonl" {
-            parse_json_entries(fp, &text, &norm_scope, kind, eff_weight)
+            match parse_json_entries(fp, &text, &norm_scope, kind, eff_weight) {
+                Ok(d) => d,
+                Err(_) => {
+                    error_files += 1;
+                    continue;
+                }
+            }
         } else {
             parse_markdown_entries(fp, &text, &norm_scope, kind, eff_weight)
         };
 
-        // Atomically replace all rules previously indexed from this source_file
+        // Atomically replace ONLY sync-origin rules previously indexed from this source_file
+        // (preserving any manually added `ap recall add --file` rules).
         let old_ids: Vec<String> = {
             let mut st = tx
-                .prepare("SELECT id FROM rules WHERE source_file = ?1")
+                .prepare("SELECT id FROM rules WHERE source_file = ?1 AND origin = 'sync'")
                 .map_err(|e| e.to_string())?;
             let rows = st
                 .query_map(params![key], |r| r.get::<_, String>(0))
@@ -1438,8 +1700,8 @@ pub fn sync_path(
                 d_scope.replace(',', " ")
             ));
             tx.execute(
-                "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit, scope, weight, section)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)
+                "INSERT INTO rules (id, kind, triggers, rule, search_tokens, hits, created_at, last_hit_at, source_file, source_hash, git_commit, scope, weight, section, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, 'sync')
                  ON CONFLICT(id) DO UPDATE SET
                      kind=excluded.kind,
                      triggers=excluded.triggers,
@@ -1450,7 +1712,8 @@ pub fn sync_path(
                      git_commit=excluded.git_commit,
                      scope=excluded.scope,
                      weight=excluded.weight,
-                     section=excluded.section",
+                     section=excluded.section,
+                     origin='sync'",
                 params![
                     rid,
                     d.kind,
@@ -1513,34 +1776,46 @@ pub fn sync_path(
             if seen_keys.contains(tracked_fp) {
                 continue;
             }
-            let in_scope_tree = if resolved_root.is_file() {
-                tracked_fp == &root_key
+            // Strictly scope pruning to tracked files inside the synced root matching current --glob,
+            // so syncing one directory/glob/CWD never wipes entries from other roots, globs, or manual rules.
+            let rel_within_root: Option<&str> = if resolved_root.is_file() {
+                (tracked_fp == &root_key).then_some(tracked_fp.as_str())
             } else if root_prefix.is_empty() {
-                true
+                let is_abs_other = tracked_fp.starts_with('/')
+                    || (tracked_fp.len() >= 2 && tracked_fp.as_bytes()[1] == b':');
+                (!is_abs_other).then_some(tracked_fp.as_str())
+            } else if let Some(rest) = tracked_fp.strip_prefix(&root_prefix) {
+                Some(rest)
+            } else if tracked_fp == &root_key {
+                Some(tracked_fp.as_str())
             } else {
-                tracked_fp.starts_with(&root_prefix) || tracked_fp == &root_key
+                None
             };
-            let missing_on_disk = !resolve_provenance_path(cwd, tracked_fp).exists();
-            if in_scope_tree || missing_on_disk {
-                let old_ids: Vec<String> = {
-                    let mut st = tx
-                        .prepare("SELECT id FROM rules WHERE source_file = ?1")
-                        .map_err(|e| e.to_string())?;
-                    let rows = st
-                        .query_map(params![tracked_fp], |r| r.get::<_, String>(0))
-                        .map_err(|e| e.to_string())?;
-                    rows.flatten().collect()
-                };
-                for oid in &old_ids {
-                    let _ = tx.execute("DELETE FROM rules WHERE id = ?1", params![oid]);
-                    let _ = tx.execute("DELETE FROM rules_fts WHERE id = ?1", params![oid]);
-                }
-                let _ = tx.execute(
-                    "DELETE FROM sync_files WHERE file_path = ?1",
-                    params![tracked_fp],
-                );
-                pruned_files += 1;
+            let Some(rel_sub) = rel_within_root else {
+                continue;
+            };
+            let fname = rel_sub.rsplit('/').next().unwrap_or(rel_sub);
+            if !matches_any_glob(rel_sub, fname, &eff_globs) {
+                continue;
             }
+            let old_ids: Vec<String> = {
+                let mut st = tx
+                    .prepare("SELECT id FROM rules WHERE source_file = ?1 AND origin = 'sync'")
+                    .map_err(|e| e.to_string())?;
+                let rows = st
+                    .query_map(params![tracked_fp], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                rows.flatten().collect()
+            };
+            for oid in &old_ids {
+                let _ = tx.execute("DELETE FROM rules WHERE id = ?1", params![oid]);
+                let _ = tx.execute("DELETE FROM rules_fts WHERE id = ?1", params![oid]);
+            }
+            let _ = tx.execute(
+                "DELETE FROM sync_files WHERE file_path = ?1",
+                params![tracked_fp],
+            );
+            pruned_files += 1;
         }
     }
 
@@ -1553,6 +1828,8 @@ pub fn sync_path(
         scanned_files,
         indexed_files,
         skipped_unchanged,
+        skipped_files,
+        error_files,
         pruned_files,
         indexed_entries,
         elapsed_ms,
@@ -1698,10 +1975,20 @@ pub fn run_cli(args: &[String]) -> i32 {
         };
     }
 
+    let want_json = matches!(
+        cli.subcmd,
+        SubCmd::Match { json: true, .. }
+            | SubCmd::Verify { json: true, .. }
+            | SubCmd::Stats { json: true }
+            | SubCmd::Sync { json: true, .. }
+    );
     let conn = match open_vault(&db_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[recall] failed to open SQLite vault: {e}");
+            emit_err(
+                want_json,
+                &format!("[recall] failed to open SQLite vault: {e}"),
+            );
             return 1;
         }
     };
@@ -1830,7 +2117,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     0
                 }
                 Err(e) => {
-                    eprintln!("[recall] match failed: {e}");
+                    emit_err(as_json, &format!("[recall] match failed: {e}"));
                     1
                 }
             }
@@ -1862,7 +2149,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("[recall] verify failed: {e}");
+                emit_err(as_json, &format!("[recall] verify failed: {e}"));
                 1
             }
         },
@@ -1882,7 +2169,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("[recall] stats failed: {e}");
+                emit_err(as_json, &format!("[recall] stats failed: {e}"));
                 1
             }
         },
@@ -2157,6 +2444,227 @@ mod tests {
         .unwrap();
         assert!(after_prune.is_empty());
         drop(conn3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_legacy_migration_concurrent_open_scope_starvation_and_sync_hygiene() {
+        let dir = std::env::temp_dir().join(format!(
+            "ap_recall_c2_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("repo_a")).unwrap();
+        fs::create_dir_all(dir.join("repo_b")).unwrap();
+        let db = dir.join("legacy.db");
+
+        // 1. Create pre-Wave-1 legacy SQLite schema (NO search_tokens column, 3-col rules_fts)
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE rules (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    triggers TEXT NOT NULL,
+                    rule TEXT NOT NULL,
+                    hits INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    last_hit_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE VIRTUAL TABLE rules_fts USING fts5(id UNINDEXED, triggers, rule);
+                INSERT INTO rules (id, kind, triggers, rule, hits, created_at, last_hit_at)
+                    VALUES ('legacy0001', 'gotcha', 'legacy,sqlite', 'Preserve legacy rules across schema upgrades', 2, 1000, 1000);
+                INSERT INTO rules_fts (id, triggers, rule)
+                    VALUES ('legacy0001', 'legacy,sqlite', 'Preserve legacy rules across schema upgrades');",
+            )
+            .unwrap();
+        }
+
+        // Concurrent open_vault calls on legacy DB must migrate cleanly with zero duplicate-column errors
+        let bar = std::sync::Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let db_p = &db;
+                let bar_c = std::sync::Arc::clone(&bar);
+                s.spawn(move || {
+                    bar_c.wait();
+                    let conn = open_vault(db_p).expect("concurrent legacy migration must succeed");
+                    let (hits, _) = match_rules_in(&conn, Path::new("."), "legacy sqlite", &[], 5)
+                        .expect("legacy rule must remain searchable");
+                    assert!(
+                        hits.iter().any(|h| h.id == "legacy0001"),
+                        "migrated legacy rule missing: {hits:?}"
+                    );
+                });
+            }
+        });
+
+        // 2. Multi-scope >64-row FTS5 starvation test + nasty FTS5 metacharacters
+        let conn = open_vault(&db).unwrap();
+        for i in 0..80 {
+            add_rule_full(
+                &conn,
+                &dir,
+                &format!("auth,token,noisy{i}"),
+                &format!("High frequency noisy alpha auth rule number {i} auth auth"),
+                "note",
+                "",
+                "alpha",
+                2.0,
+                "",
+            )
+            .unwrap();
+        }
+        add_rule_full(
+            &conn,
+            &dir,
+            "auth,rare",
+            "Rare beta scope authentication policy rule",
+            "gotcha",
+            "",
+            "beta",
+            1.0,
+            "",
+        )
+        .unwrap();
+        let (beta_hits, _) = match_rules_scoped(
+            &conn,
+            &dir,
+            "auth-policy:rare* (OR) NOT",
+            &[],
+            5,
+            None,
+            Some("beta"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            beta_hits.len(),
+            1,
+            "beta scope must not be starved by 80 alpha hits"
+        );
+
+        // Manual rule bound to a file inside repo_a must NOT be wiped by sync/prune!
+        let manual_f = dir.join("repo_a/guide.md");
+        fs::write(
+            &manual_f,
+            "# Real Heading\n```bash\n# comment inside code fence\necho hello\n```\nBody line stays in Real Heading.\n",
+        )
+        .unwrap();
+        add_rule_full(
+            &conn,
+            &dir,
+            "manualkeep",
+            "Manual note attached to guide.md must survive sync",
+            "gotcha",
+            "repo_a/guide.md",
+            "manual",
+            1.0,
+            "",
+        )
+        .unwrap();
+        drop(conn);
+
+        // 3. Binary, oversized, GBK, and invalid JSON hygiene + fenced code check
+        fs::write(
+            dir.join("repo_a/bin_fake.md"),
+            b"\x00\x01\x02BINARY\x00DATA",
+        )
+        .unwrap();
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("# 中文配置\n必须使用GBK兼容解码读取。\n");
+        fs::write(dir.join("repo_a/gbk.md"), gbk_bytes.as_ref()).unwrap();
+        fs::write(dir.join("repo_a/bad.json"), "{ not valid json").unwrap();
+        fs::write(
+            dir.join("repo_a/good.json"),
+            r#"{"items":[{"title":"GoodCard","triggers":["goodcard"],"rule":"Valid json card survives md-only prune"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("repo_b/other.md"),
+            "# Repo B Doc\nEntries in repo B must survive repo A prune.\n",
+        )
+        .unwrap();
+
+        let rep_a = sync_path(&db, &dir, &dir.join("repo_a"), &[], "a", "doc", 1.0, false).unwrap();
+        assert_eq!(
+            rep_a.skipped_files, 1,
+            "binary file must be skipped: {rep_a:?}"
+        );
+        assert_eq!(
+            rep_a.error_files, 1,
+            "invalid json must count as error: {rep_a:?}"
+        );
+        assert_eq!(
+            rep_a.indexed_files, 3,
+            "guide.md + gbk.md + good.json: {rep_a:?}"
+        );
+
+        let rep_b = sync_path(
+            &db,
+            &dir.join("repo_b"),
+            &dir.join("repo_b"),
+            &["*.md".to_string()],
+            "b",
+            "doc",
+            1.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rep_b.indexed_files, 1);
+
+        // Syncing repo_a with ONLY `--glob "*.md" --prune` must NOT prune good.json OR repo_b/other.md OR manual rule!
+        let rep_prune = sync_path(
+            &db,
+            &dir,
+            &dir.join("repo_a"),
+            &["*.md".to_string()],
+            "a",
+            "doc",
+            1.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(rep_prune.pruned_files, 0, "{rep_prune:?}");
+
+        let conn2 = open_vault(&db).unwrap();
+        // GBK decoded cleanly without mojibake
+        let (gbk_hits, _) =
+            match_rules_scoped(&conn2, &dir, "兼容解码", &[], 5, None, Some("a"), 0).unwrap();
+        assert!(!gbk_hits.is_empty(), "GBK markdown must match cleanly");
+        assert!(
+            !gbk_hits[0].rule.contains('\u{FFFD}'),
+            "no mojibake allowed"
+        );
+        // Fenced code `# comment inside code fence` did NOT create a fake section
+        let (fence_hits, _) = match_rules_scoped(
+            &conn2,
+            &dir,
+            "comment inside code fence",
+            &[],
+            5,
+            None,
+            Some("a"),
+            0,
+        )
+        .unwrap();
+        assert!(!fence_hits.is_empty());
+        assert_eq!(fence_hits[0].section, "Real Heading");
+        // good.json, repo_b, and manual rule all survived
+        let (json_hits, _) =
+            match_rules_scoped(&conn2, &dir, "goodcard", &[], 5, None, Some("a"), 0).unwrap();
+        assert_eq!(json_hits.len(), 1);
+        let (b_hits, _) =
+            match_rules_scoped(&conn2, &dir, "Repo B Doc", &[], 5, None, Some("b"), 0).unwrap();
+        assert_eq!(b_hits.len(), 1);
+        let (man_hits, _) =
+            match_rules_scoped(&conn2, &dir, "manualkeep", &[], 5, None, Some("manual"), 0)
+                .unwrap();
+        assert_eq!(man_hits.len(), 1);
+        drop(conn2);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1133,7 +1133,7 @@ const SIEVE_HOME = process.env.SIEVE_HOME || join(homedir(), ".ap", "sieve");
 const DESTRUCTIVE_OR_WRITE =
 	/(?:^|[;&|]\s*)(?:Remove-Item|rm|del|erase|rmdir|rd|Move-Item|Rename-Item|mv|ren|Set-Content|Add-Content|Clear-Content|Out-File|Copy-Item|cpi|copy)\b|shutil\.rmtree|os\.remove|os\.unlink|\.unlink\(|\.rmdir\(|\bgit(?:\.exe)?\b[\s\S]{{0,80}}?\bclean\b/i;
 const BARE_SLOW_GREP =
-	/^\s*grep\s+-([rRnwiEHlco]+)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$/;
+	/^\s*grep\s+-([rRniEHlco]+)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?\s*$/;
 const PY_INVOKE = /(?:^|[;&|(\s=])(?:python3?(?:\.exe)?|py(?:\.exe)?|pytest)(?=\s|$)/i;
 const HAS_UTF8_ENV = /PYTHONUTF8|PYTHONIOENCODING/i;
 const PY_WIN_BS =
@@ -1493,12 +1493,30 @@ export function resolveEffectiveMaskHighWaterTokens(input: {{
 }}
 
 /**
- * Return true for non-retryable billing/auth/request errors (402 insufficient balance, 401/403, 400/422)
- * that sub-LLM helpers must never retry.
+ * Return true for DeepSeek models (including virtual `deepseek/flash-auto`).
+ */
+export function isDeepSeekModel(model?: {{ provider?: string; id?: string; modelId?: string }}): boolean {{
+	if (!model) return false;
+	const prov = String(model.provider ?? "").toLowerCase();
+	const id = String(model.id ?? model.modelId ?? "").toLowerCase();
+	return prov.includes("deepseek") || id.includes("deepseek") || id.includes("flash-auto");
+}}
+
+/**
+ * Strip benign trailing stderr redirections (`2>/dev/null`, `2>NUL`, `2>&1`) from a shell command stage.
+ */
+function stripBenignStderrRedir(s: string): string {{
+	return s.replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+}}
+
+/**
+ * Return true for non-retryable billing/auth/request errors (HTTP 400/401/402/403/404/422, insufficient balance,
+ * quota/auth/context-length) that sub-LLM helpers must never retry. Anchors numeric codes to HTTP/status context
+ * so bare numbers in transport errors (e.g. "reset after 404 ms", "reading 422 bytes") are still retried.
  */
 export function isNonRetryableSubLlmError(errMsg: string): boolean {{
 	if (!errMsg) return false;
-	return /\b(?:400|401|402|403|404|422)\b|insufficient[\s_-]*balance|quota|billing|payment|invalid[\s_-]*api[\s_-]*key|unauthorized|forbidden|authentication|context[\s_-]*length/i.test(
+	return /(?:HTTP(?:\/\d(?:\.\d)?)?\s+|status(?:\s+code)?[\s:=]+|\berror(?:\s+code)?[\s:=]+)(?:400|401|402|403|404|422)\b|^\s*(?:400|401|402|403|404|422)\s+[A-Za-z]|insufficient[\s_-]*balance|quota|billing|payment|invalid[\s_-]*api[\s_-]*key|unauthorized|forbidden|authentication|context[\s_-]*length/i.test(
 		errMsg,
 	);
 }}
@@ -2756,10 +2774,10 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 			outText,
 		)
 	) {{
-		return `[ap codemode-tip] TypeError: text(val) is a VOID output printer in older bundles (don't chain .slice() on it); guard undefined strings with String(res?.output ?? res?.text ?? "").slice(...) before slicing/splitting. tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }}, tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined, or use (JSON.stringify(val) ?? "").slice(...)). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
+		return `[ap codemode-tip] TypeError: JSON.stringify(undefined) returns undefined (ALWAYS guard with (JSON.stringify(val) ?? "").slice(...)) and text(val) is a VOID output printer in older bundles (don't chain .slice() on it); guard undefined strings with String(res?.output ?? res?.text ?? "").slice(...) before slicing/splitting. tools.bash(...) resolves to an OBJECT {{ output, exit_code, truncated, full_output_path }}, tools.read(...) resolves to a string, and tools.mcp__* resolves to {{ content, structuredContent, isError }} (already parsed; check Object.keys(res) instead of slicing undefined). With Promise.allSettled([...]), check r.status === "fulfilled" (read r.value?.output ?? r.value; rejected items have r.value === undefined and r.reason as an Error, so use String(r.reason)). Run await describeTool("<name>") to verify exact fields.`;
 	}}
-	if (/Unexpected end of JSON input/i.test(outText)) {{
-		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on non-JSON wrappers.`;
+	if (/Unexpected end of JSON input|unexpected token:\s*'object'|JSON\.parse/i.test(outText)) {{
+		return `[ap codemode-tip] SyntaxError (JSON.parse): tools.* ALREADY return structured JS objects/strings — inspect res.structuredContent or (res.output ?? "") directly without calling JSON.parse() on an already-parsed object or non-JSON wrapper.`;
 	}}
 	if (/Unexpected identifier|unterminated string/i.test(outText)) {{
 		return `[ap codemode-tip] SyntaxError: unescaped quote or multiline literal inside JS source. Write complex payloads cleanly via tools.write instead of inline escaping.`;
@@ -2818,10 +2836,7 @@ export function decideDeepSeekCacheWarming(input: {{
 	action?: string;
 	isIdle?: boolean;
 }}): {{ action: "warm" }} | undefined {{
-	const prov = String(input.provider ?? "").toLowerCase();
-	const mid = String(input.modelId ?? "").toLowerCase();
-	const isDs = prov.includes("deepseek") || mid.includes("deepseek") || mid.includes("flash-auto");
-	if (!isDs) return undefined;
+	if (!isDeepSeekModel(input)) return undefined;
 	const warm = typeof input.warmCost === "number" ? input.warmCost : 0;
 	const miss = typeof input.missCost === "number" ? input.missCost : 0;
 	if (warm > 0 && ((miss >= 0.015 && miss / warm >= 20) || (input.isIdle && miss >= 0.005 && miss / warm >= 15))) {{
@@ -3904,14 +3919,15 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	}}
 
 	// Fast-path A3: `cat <files> | grep -o[E] <pat> [| sort/head...]` -> `rg -a --no-ignore -o --no-filename`
+	// Strictly require `-o` and refuse `-n`/`-A` so non-`-o` commands (e.g. `cat f | grep -E "a|b"`) never silently lose full lines.
 	const catGrep = cleaned.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:echo\s+[^;]+;\s*)?cat\s+([^|;&]+)\|\s*grep\s+-[aAoEhHn]+\s+('[^']+'|"[^"]+")(\s*\|[\s\S]*)?$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?(?:echo\s+[^;]+;\s*)?cat\s+([^|;&]+)\|\s*grep\s+-([aAoEhHn]+)\s+('[^']+'|"[^"]+")(\s*\|[\s\S]*)?$/,
 	);
-	if (catGrep) {{
+	if (catGrep && catGrep[3].includes("o") && !catGrep[3].includes("n") && !catGrep[3].includes("A")) {{
 		const cdPrefix = catGrep[1] || "";
 		const files = catGrep[2].trim();
-		const patTok = catGrep[3];
-		const pipeSuffix = catGrep[4] || "";
+		const patTok = catGrep[4];
+		const pipeSuffix = catGrep[5] || "";
 		return `${{cdPrefix}}rg -a --no-ignore -o --no-filename ${{patTok}} ${{files}}${{pipeSuffix}}`;
 	}}
 
@@ -3943,7 +3959,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 
 	// Trailing `-l` / `-c`, multi-target, AppData, arbitrary-pipe, or backtick-safe recursive grep -> fast bounded `rg`
 	const complexRec = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRnwiEHhlcIFso]+\s+)+)(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|[^;&<>]+)+)?$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRniEHhlcIFso]+\s+)+)(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|[^;&<>]+)+)?$/,
 	);
 	if (complexRec && /[rR]/.test(complexRec[2])) {{
 		const cdPrefix = complexRec[1] || "";
@@ -3989,7 +4005,7 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 	}}
 
 	const m = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aArRnwiEHhlcIFso]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aArRniEHhlcIFso]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))(?:\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+)))?((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+)?\s*$/,
 	);
 	if (m) {{
 		const flags = m[2].replace(/[\s-]+/g, "");
@@ -4039,7 +4055,6 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		let countOnly = false;
 		let onlyMatch = false;
 		let noFilename = false;
-		let wordRe = false;
 		let ctxA = 0;
 		let ctxB = 0;
 		let ctxC = 0;
@@ -4081,7 +4096,6 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 					else if (ch === "c") countOnly = true;
 					else if (ch === "o") onlyMatch = true;
 					else if (ch === "h") noFilename = true;
-					else if (ch === "w") wordRe = true;
 					else if (ch === "H" || ch === "s" || ch === "a") continue;
 					else {{ ok = false; break; }}
 				}}
@@ -4104,7 +4118,6 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 					onlyMatch ? " -o" : "",
 					ignoreCase ? " -i" : "",
 					fixed ? " -F" : "",
-					wordRe ? " -w" : "",
 					noFilename ? " --no-filename" : "",
 					ctxC > 0 ? ` -C ${{ctxC}}` : "",
 					ctxB > 0 ? ` -B ${{ctxB}}` : "",
@@ -4640,6 +4653,7 @@ function splitUnquotedPipes(s: string): string[] | undefined {{
 		}} else if (ch === "&") {{
 			if (
 				i >= 2 &&
+				(i === 2 || /\s/.test(s[i - 3])) &&
 				s[i - 1] === ">" &&
 				s[i - 2] === "2" &&
 				s[i + 1] === "1" &&
@@ -4665,11 +4679,11 @@ function splitUnquotedPipes(s: string): string[] | undefined {{
 function accelerateGrepPipeline(
 	cmdTailBody: string,
 	cdLeadPfx: string,
-	allowSingleStage = false,
+	fromCat = false,
 ): string | undefined {{
 	const stages = splitUnquotedPipes(cmdTailBody.trim());
-	if (!stages || stages.length < (allowSingleStage ? 1 : 2)) return undefined;
-	const grepRaw = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+	if (!stages || stages.length < 2) return undefined;
+	const grepRaw = stripBenignStderrRedir(stages[0]);
 	const stripQuotes = (s: string) => s.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
 	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(grepRaw))) return undefined;
 	if (!/^(?:grep|egrep|fgrep|rg)(?:\s|$)/.test(grepRaw)) return undefined;
@@ -4688,7 +4702,7 @@ function accelerateGrepPipeline(
 	let extendedRe = isEgrep;
 	let filesOnly = false;
 	let countOnly = false;
-	let wordRe = false;
+	let lineNum = false;
 	let onlyMatch = false;
 	let invertMatch = false;
 	let noFilename = false;
@@ -4742,8 +4756,10 @@ function accelerateGrepPipeline(
 				if (gi >= gToks.length || !addGlob(gToks[gi])) return undefined;
 			}} else if (gt === "--no-filename") {{
 				noFilename = true;
-			}} else if (gt === "--no-messages" || gt === "--no-line-number" || gt === "--line-number") {{
+			}} else if (gt === "--no-messages" || gt === "--no-line-number") {{
 				// compatible defaults
+			}} else if (gt === "--line-number") {{
+				lineNum = true;
 			}} else if (gt === "--ignore-case") {{
 				ignoreCase = true;
 			}} else if (gt === "--fixed-strings") {{
@@ -4754,8 +4770,6 @@ function accelerateGrepPipeline(
 				filesOnly = true;
 			}} else if (gt === "--count") {{
 				countOnly = true;
-			}} else if (gt === "--word-regexp") {{
-				wordRe = true;
 			}} else {{
 				return undefined;
 			}}
@@ -4800,7 +4814,8 @@ function accelerateGrepPipeline(
 				continue;
 			}}
 			for (const ch of sh) {{
-				if (ch === "n" || ch === "H" || ch === "s" || ch === "a") continue;
+				if (ch === "n") lineNum = true;
+				else if (ch === "H" || ch === "s" || ch === "a") continue;
 				else if (isRg && ch === "N") continue;
 				else if (isRg && ch === "I") noFilename = true;
 				else if (!isRg && (ch === "r" || ch === "R" || ch === "E")) continue;
@@ -4809,7 +4824,6 @@ function accelerateGrepPipeline(
 				else if (ch === "F") fixed = true;
 				else if (ch === "l") filesOnly = true;
 				else if (ch === "c") countOnly = true;
-				else if (ch === "w") wordRe = true;
 				else if (ch === "o") onlyMatch = true;
 				else if (ch === "v") invertMatch = true;
 				else return undefined;
@@ -4819,13 +4833,14 @@ function accelerateGrepPipeline(
 		gPos.push(gt);
 	}}
 	if (invertMatch && onlyMatch) return undefined;
+	if (fromCat && (filesOnly || countOnly)) return undefined;
 	const patPos = gPos[0];
 	const tgtPos = isRg && gPos.length === 1 ? "." : gPos.length === 2 ? gPos[1] : "";
 	if (!patPos || !tgtPos || tgtPos === "-" || /[*?,]/.test(tgtPos) || (gPos.length !== 2 && !(isRg && gPos.length === 1))) {{
 		return undefined;
 	}}
 	const isSingleConcreteFile = !isRg && !gToks.some((t) => /^-[a-zA-Z]*[rR]/.test(t));
-	if (isSingleConcreteFile && !allowSingleStage && (tgtPos === "." || !/[./\\]/.test(tgtPos))) {{
+	if (isSingleConcreteFile && !fromCat && (tgtPos === "." || !/[./\\]/.test(tgtPos))) {{
 		return undefined;
 	}}
 	let cutWidth = 0;
@@ -4837,12 +4852,12 @@ function accelerateGrepPipeline(
 		const norm = stages[si].replace(/\s+/g, " ").trim();
 		if (/[;&><{{}}`]|\$\(/.test(norm)) return undefined;
 		if (norm === "sort") {{
-			if (sawBareSort) return undefined;
+			if (fromCat || lineNum || sawBareSort) return undefined;
 			sawBareSort = true;
 			continue;
 		}}
 		if (norm === "uniq -c" || norm === "uniq") {{
-			if (!sawBareSort) return undefined;
+			if (fromCat || lineNum || !sawBareSort) return undefined;
 			sawBareSort = false;
 			sawUniqC = true;
 			unique = true;
@@ -4850,6 +4865,7 @@ function accelerateGrepPipeline(
 		}}
 		if (sawBareSort) return undefined;
 		if (norm === "sort -u") {{
+			if (fromCat || lineNum) return undefined;
 			unique = true;
 		}} else if ((norm === "sort -rn" || norm === "sort -nr" || norm === "sort -r") && sawUniqC) {{
 			// `ap search --unique` already ranks descending by frequency
@@ -4869,7 +4885,7 @@ function accelerateGrepPipeline(
 			}}
 		}}
 	}}
-	if (sawBareSort || (!allowSingleStage && cutWidth === 0 && maxHits === 0 && !unique)) return undefined;
+	if (sawBareSort || (cutWidth === 0 && maxHits === 0 && !unique)) return undefined;
 	const rustPat = isRg ? patPos : translateGrepBreToRustRegex(patPos, `${{fixed ? "F" : ""}}${{extendedRe || gToks.some((t) => /^-[a-zA-Z]*E/.test(t)) ? "E" : ""}}`);
 	const flags = [
 		cutWidth > 0 ? ` --width ${{cutWidth}}` : "",
@@ -4881,7 +4897,6 @@ function accelerateGrepPipeline(
 		noFilename ? " --no-filename" : "",
 		ignoreCase ? " -i" : "",
 		fixed ? " --fixed-strings" : "",
-		wordRe ? " -w" : "",
 		ctxC > 0 ? ` -C ${{ctxC}}` : "",
 		ctxB > 0 ? ` -B ${{ctxB}}` : "",
 		ctxA > 0 ? ` -A ${{ctxA}}` : "",
@@ -4893,13 +4908,15 @@ function accelerateGrepPipeline(
 
 function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | undefined {{
 	const stages = splitUnquotedPipes(cmdTailBody.trim());
-	if (!stages || stages.length < 2 || stages.length > 3) return undefined;
-	const lhs = stages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+	if (!stages || stages.length !== 2) return undefined;
+	const lhs = stripBenignStderrRedir(stages[0]);
+	const rhs = stages[1].trim();
 	const stripQuotes = (s: string) => s.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "");
-	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(lhs))) return undefined;
-	for (let si = 1; si < stages.length; si += 1) {{
-		if (/[;&><{{}}`]|\$\(/.test(stripQuotes(stages[si].trim()))) return undefined;
-	}}
+	if (/[;&><{{}}`]|\$\(/.test(stripQuotes(lhs)) || /[;&><{{}}`]|\$\(/.test(stripQuotes(rhs))) return undefined;
+	const headM = rhs.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
+	if (!headM) return undefined;
+	const limit = Number(headM[1] || headM[2]);
+	if (!Number.isInteger(limit) || limit < 1) return undefined;
 	const toks = (lhs.match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || []).map((t) =>
 		(t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")) ? t.slice(1, -1) : t,
 	);
@@ -4941,31 +4958,7 @@ function accelerateLsPipeline(cmdTailBody: string, cdLeadPfx: string): string | 
 	}}
 	const esc = (tgt || ".").replace(/"/g, '\\"');
 	const flags = `${{showAll ? " -a" : ""}}${{sortMtime ? " -t" : sortSize ? " -S" : ""}}`;
-	const rhs1 = stages[1].trim();
-	if (stages.length === 2) {{
-		const headM = rhs1.match(/^head\s+(?:-n\s*(\d+)|-(\d+))$/);
-		if (headM) {{
-			const limit = Number(headM[1] || headM[2]);
-			if (!Number.isInteger(limit) || limit < 1) return undefined;
-			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 --limit ${{limit}}`;
-		}}
-		const tailM = rhs1.match(/^tail\s+(?:-n\s*(\d+)|-(\d+))$/);
-		if (tailM) {{
-			const n = Number(tailM[1] || tailM[2]);
-			if (!Number.isInteger(n) || n < 1) return undefined;
-			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 | tail -n ${{n}}`;
-		}}
-		if (/^(?:grep|egrep|fgrep)\s+/.test(rhs1)) {{
-			return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 | ${{rhs1}}`;
-		}}
-		return undefined;
-	}}
-	// 3-stage: `ls ... | grep ... | head -n N`
-	const rhs2 = stages[2].trim();
-	if (/^(?:grep|egrep|fgrep)\s+/.test(rhs1) && /^head\s+(?:-n\s*\d+|-\d+)$/.test(rhs2)) {{
-		return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 | ${{rhs1}} | ${{rhs2}}`;
-	}}
-	return undefined;
+	return `${{cdLeadPfx}}"${{AP_BIN}}" ls "${{esc}}"${{flags}} --depth 1 --limit ${{limit}}`;
 }}
 
 function parseSedLineRanges(expr: string): string | undefined {{
@@ -5025,7 +5018,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 	if (toolName === "bash" && /\bdir\b/i.test(cmdTailBody)) {{
 		const dStages = splitUnquotedPipes(cmdTailBody.trim());
 		if (dStages && dStages.length >= 1) {{
-			const dirTail = dStages[0].replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+			const dirTail = stripBenignStderrRedir(dStages[0]);
 			const pipeTail = dStages.length > 1 ? ` | ${{dStages.slice(1).join(" | ")}}` : "";
 			if (!/[;&><]/.test(dirTail)) {{
 				const toks = dirTail.match(/"[^"]*"|'[^']*'|\S+/g) || [];
@@ -5085,7 +5078,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 	if (toolName === "bash") {{
 		const trimmedTail = cmdTailBody.trim();
 		const qPathOk = (f: string) => Boolean(f) && f !== "-" && !/[*?,]/.test(f);
-		const stripErr = (s: string) => s.replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)\s*$/i, "").trim();
+		const stripErr = stripBenignStderrRedir;
 		const cutOnlyM = trimmedTail.match(/^([\s\S]+?)\s*\|\s*cut\s+-c\s*1-(\d+)\s*$/);
 		const sliceCore = stripErr(cutOnlyM ? cutOnlyM[1].trim() : trimmedTail);
 		const sliceWidth = cutOnlyM && Number(cutOnlyM[2]) >= 1 ? Number(cutOnlyM[2]) : 0;
@@ -5191,7 +5184,7 @@ function accelerateSingleBashSegment(seg: string, toolName: string): string | un
 						return `${{cdLeadPfx}}"${{AP_BIN}}" read "${{esc}}" --lines ${{rSedRanges}}${{sliceWidthFlag}}`;
 					}}
 				}}
-				if (/^(?:grep|egrep|fgrep)(?:\s|$)/.test(rhs1) && !hasUnsafeOutsideQuotes(rhs1)) {{
+				if ((catStages.length >= 3 || sliceWidth > 0) && /^(?:grep|egrep|fgrep)(?:\s|$)/.test(rhs1) && !hasUnsafeOutsideQuotes(rhs1)) {{
 					const tailParts = [
 						`${{rhs1}} "${{esc}}"`,
 						...catStages.slice(2).map((s) => s.trim()),
@@ -5530,9 +5523,10 @@ function accelerateCompoundSegments(cmd: string, toolName: string): string | und
 		const core = part.text.trim();
 		let nextCore = core;
 		if (core) {{
-			const isAndConditionGrep =
-				part.sep === "&&" && /^(?:grep|egrep|fgrep|rg|findstr)\b/i.test(core);
-			const accel = isAndConditionGrep ? undefined : accelerateSingleBashSegment(core, toolName);
+			const isConditionalGrep =
+				(part.sep === "&&" || part.sep === "||") &&
+				/^(?:(?:grep|egrep|fgrep|rg|findstr)\b|cat\s+[^|;&]+\|\s*(?:grep|egrep|fgrep|rg)\b)/i.test(core);
+			const accel = isConditionalGrep ? undefined : accelerateSingleBashSegment(core, toolName);
 			if (accel) {{
 				nextCore = accel;
 				anyChanged = true;
@@ -6162,18 +6156,29 @@ export function normalizeRepairedToolArgs(
 }}
 
 /**
- * Scrub leaked DeepSeek DSML / `<tool_call>` XML fragments from assistant text so unparsed markup
- * never poisons downstream prompt context or triggers hallucination loops.
+ * Scrub leaked DeepSeek DSML / `<tool_call>` XML fragments from assistant prose so unparsed markup
+ * never poisons downstream prompt context, while strictly preserving fenced code blocks (``` / ~~~)
+ * and inline backtick code spans.
  */
 export function scrubLeakedToolMarkup(text: string): string {{
 	if (!text || (!text.includes("DSML") && !text.includes("<tool_call>"))) return text;
-	return text
-		.replace(/<[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>/g, "")
-		.replace(/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke\b[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke>/g, "")
-		.replace(/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}[^>]*>/g, "")
-		.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-		.replace(/\n{{3,}}/g, "\n\n")
-		.trim();
+	const stripRaw = (seg: string): string =>
+		seg
+			.replace(/<[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*(?:function_)?calls>/g, "")
+			.replace(/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke\b[\s\S]*?<\/[|｜]{{1,2}}DSML[|｜]{{1,2}}\s*invoke>/g, "")
+			.replace(/<\/?[|｜]{{1,2}}DSML[|｜]{{1,2}}[^>]*>/g, "")
+			.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "");
+	const protectedRe = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\r\n]+`)/g;
+	let out = "";
+	let lastIdx = 0;
+	let m: RegExpExecArray | null;
+	while ((m = protectedRe.exec(text)) !== null) {{
+		out += stripRaw(text.slice(lastIdx, m.index));
+		out += m[0];
+		lastIdx = m.index + m[0].length;
+	}}
+	out += stripRaw(text.slice(lastIdx));
+	return out.replace(/\n{{3,}}/g, "\n\n").trim();
 }}
 
 export interface DsmlRecoveredCall {{
@@ -6579,9 +6584,7 @@ export function isDeepCacheDiscountModel(model?: {{
 	const inp = Number(model.cost?.input ?? 0);
 	const cr = Number(model.cost?.cacheRead ?? 0);
 	if (inp > 0 && cr > 0 && inp / cr >= 20) return true;
-	const prov = String(model.provider ?? "").toLowerCase();
-	const id = String(model.id ?? "").toLowerCase();
-	return prov.includes("deepseek") || id.includes("deepseek") || id.includes("flash-auto");
+	return isDeepSeekModel(model);
 }}
 
 function clampDeepSeekEffort(raw?: string): DeepSeekEffort {{
@@ -6961,12 +6964,7 @@ export default function (pi: ExtensionAPI) {{
 
 	pi.on("before_agent_start", (event, ctx) => {{
 		const m = ctx?.model;
-		const isDs = Boolean(
-			m &&
-				(String(m.provider ?? "").toLowerCase().includes("deepseek") ||
-					String(m.id ?? "").toLowerCase().includes("deepseek") ||
-					String(m.id ?? "").toLowerCase().includes("flash-auto")),
-		);
+		const isDs = isDeepSeekModel(m);
 		if (isDs && Array.isArray(event?.systemPromptOptions?.promptGuidelines)) {{
 			const branch = ctx?.sessionManager?.getBranch?.() ?? [];
 			const hasPriorAssistant =
@@ -7092,12 +7090,7 @@ export default function (pi: ExtensionAPI) {{
 			previousSummary?: string;
 			fileOps?: {{ read?: Iterable<string>; written?: Iterable<string>; edited?: Iterable<string> }};
 		}} | undefined;
-		const isDeepSeek = Boolean(
-			model &&
-				(String(model.provider ?? "").toLowerCase().includes("deepseek") ||
-					String(model.id ?? "").toLowerCase().includes("deepseek") ||
-					String(model.id ?? "").toLowerCase().includes("flash-auto")),
-		);
+		const isDeepSeek = isDeepSeekModel(model);
 		const hasSimpleComplete =
 			typeof ctx?.modelRegistry?.streamSimple === "function" ||
 			typeof ctx?.modelRegistry?.complete === "function";
@@ -7234,12 +7227,7 @@ export default function (pi: ExtensionAPI) {{
 		const prep = (event as {{ preparation?: {{ entriesToSummarize?: Array<Record<string, unknown>>; customInstructions?: string; userWantsSummary?: boolean }}; signal?: AbortSignal }} | undefined)?.preparation;
 		const signal = (event as {{ signal?: AbortSignal }} | undefined)?.signal;
 		const model = ctx?.model;
-		const isDeepSeek = Boolean(
-			model &&
-				(String(model.provider ?? "").toLowerCase().includes("deepseek") ||
-					String(model.id ?? "").toLowerCase().includes("deepseek") ||
-					String(model.id ?? "").toLowerCase().includes("flash-auto")),
-		);
+		const isDeepSeek = isDeepSeekModel(model);
 		const hasSimpleComplete =
 			typeof ctx?.modelRegistry?.streamSimple === "function" ||
 			typeof ctx?.modelRegistry?.complete === "function";
@@ -10416,24 +10404,29 @@ const scrubbed = scrubLeakedToolMarkup('before <|DSML|function_calls><|DSML|invo
 assert.strictEqual(scrubbed.replace(/\s+/g, " "), "before after");
 assert.ok(!scrubbed.includes("DSML") && !scrubbed.includes("tool_call"));
 
-// 4. RSI bash rewrites (2>&1, ls | head/tail/grep, cat | grep)
+// 4. RSI bash rewrites (2>&1, ls | head, cat | grep | head, strict pass-through on semantic-changing pipes)
 assert.ok(healCommand("ls -la src 2>&1 | head -n 10", "bash")?.includes('ls "src" -a --depth 1 --limit 10'));
-assert.ok(healCommand("ls -lt --color=never src | tail -n 5", "bash")?.includes('ls "src" -t --depth 1 | tail -n 5'));
+assert.strictEqual(healCommand("ls -lt --color=never src | tail -n 5", "bash"), undefined);
 assert.strictEqual(healCommand("ls -r | head -10", "bash"), undefined);
 assert.strictEqual(healCommand("ls --reverse | head -10", "bash"), undefined);
-assert.ok(healCommand("ls src 2>&1 | grep -i foo | head -n 15", "bash")?.includes('ls "src" --depth 1 | grep -i foo | head -n 15'));
+assert.strictEqual(healCommand("ls src 2>&1 | grep -i foo | head -n 15", "bash"), undefined);
 assert.ok(healCommand("cat app.log 2>&1 | grep -in 'error' | head -n 20", "bash")?.includes('search --max 20 -i'));
-assert.ok(healCommand("cat Makefile | grep -i build", "bash")?.includes('search -i'));
+assert.ok(!healCommand("cat Makefile | grep -i build", "bash")?.includes('"ap" search'));
 assert.ok(healCommand("head -n 25 README.md 2>&1", "bash")?.includes('read "README.md" --lines 1-25'));
 
-// 5. Codemode failure tip retains all contract phrases
+// 5. Codemode failure tip retains all contract phrases + live JSON.stringify/JSON.parse hints
 const tip = classifyCodemodeFailureTip("TypeError: cannot read property 'slice' of undefined");
 assert.ok(tip.includes("VOID output printer"));
+assert.ok(tip.includes("JSON.stringify(undefined)"));
 assert.ok(tip.includes("res?.output"));
+const parseObjTip = classifyCodemodeFailureTip("SyntaxError: unexpected token: 'object'");
+assert.ok(parseObjTip.includes("ALREADY return structured JS objects"));
 
-// 6. Sub-LLM retry: retries transient stopReason=error, NEVER retries 402 insufficient balance
+// 6. Sub-LLM retry: retries transient stopReason=error, NEVER retries 402 insufficient balance, never false-positives bare numbers
 assert.strictEqual(isNonRetryableSubLlmError("HTTP 402 Insufficient Balance"), true);
 assert.strictEqual(isNonRetryableSubLlmError("ECONNRESET socket hang up"), false);
+assert.strictEqual(isNonRetryableSubLlmError("Connection reset after 404 ms"), false);
+assert.strictEqual(isNonRetryableSubLlmError("ECONNRESET while reading 422 bytes"), false);
 let callsTransient = 0;
 const okResp = await callSubLlmWithRetry(
   {{
@@ -10530,5 +10523,239 @@ console.log("OK_PI_ACCELERATOR_NODE");
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
+    }
+
+    #[test]
+    fn pi_accelerator_adversarial_metamorphic_and_live_ap_cli_suite() {
+        let node_ok = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !node_ok {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fixture_dir = dir.path().join("src");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        let sample_file = fixture_dir.join("sample.log");
+        fs::write(
+            &sample_file,
+            "alpha line 1\nERROR token_abc=42\nwarn foo bar\nERROR token_xyz=99\nbeta line 5\n",
+        )
+        .unwrap();
+        let ts_path = dir.path().join("zz-ap-accelerator.ts");
+        fs::write(&ts_path, render_pi_accelerator_ts("ap")).unwrap();
+
+        let url = format!("file:///{}", ts_path.to_string_lossy().replace('\\', "/"));
+        let fix_dir_s = fixture_dir.to_string_lossy().replace('\\', "/");
+        let sample_s = sample_file.to_string_lossy().replace('\\', "/");
+
+        // 65+ adversarial / metamorphic assertions + export every rewritten `"ap" ...` command for live in-process ap CLI verification
+        let script = format!(
+            r#"
+import assert from "node:assert/strict";
+import {{
+  healCommand,
+  scrubLeakedToolMarkup,
+  isNonRetryableSubLlmError,
+  classifyCodemodeFailureTip,
+  isDeepSeekModel,
+}} from "{url}";
+
+const DIR = "{fix_dir_s}";
+const FILE = "{sample_s}";
+
+// A) MUST PASS THROUGH (undefined) or NOT emit ap search/ls/read — semantic preservation invariants (34 cases)
+const mustNotRewriteToAp = [
+  // ls semantic traps (reverse sort, multi-dir, glob, tail/grep format & >120 truncation)
+  `ls -r | head -10`,
+  `ls -lr ${{DIR}} | head -n 5`,
+  `ls --reverse ${{DIR}} | head -n 5`,
+  `ls -la ${{DIR}} ${{DIR}} | head -n 10`,
+  `ls ${{DIR}}/*.log | head -n 5`,
+  `ls -la ${{DIR}} | tail -n 5`,
+  `ls -1 ${{DIR}} | tail -n 3`,
+  `ls -la ${{DIR}} | grep "^d"`,
+  `ls -la ${{DIR}} | grep "Nov"`,
+  `ls ${{DIR}} 2>&1 | grep -v foo | head -n 10`,
+  `ls -R ${{DIR}} | head -n 10`,
+  `(ls ${{DIR}}) | head -n 5`,
+  `ls ${{DIR}} & head -n 5`,
+  // cat + grep semantic traps (-w unsupported, -c format, -l format, bare cat|grep, sort -u order, multi-file, && / || exit-code)
+  `cat ${{FILE}} ${{FILE}} | head -n 5`,
+  `cat ${{FILE}} | grep ERROR`,
+  `cat ${{FILE}} | grep -n ERROR`,
+  `cat ${{FILE}} | grep -w ERROR`,
+  `cat ${{FILE}} | grep -w ERROR | head -n 5`,
+  `grep -rnw ERROR ${{DIR}}`,
+  `grep -w ERROR ${{FILE}} | head -n 5`,
+  `rg --word-regexp ERROR ${{DIR}} | head -n 5`,
+  `cat ${{FILE}} | grep -c ERROR`,
+  `cat ${{FILE}} | grep -c ERROR | head -n 5`,
+  `cat ${{FILE}} | grep -l ERROR | head -n 5`,
+  `cat ${{FILE}} | grep -n ERROR | sort -u | head -n 10`,
+  `grep -n ERROR ${{FILE}} | sort -u | head -n 10`,
+  `cat ${{FILE}} | grep ERROR | wc -l`,
+  `cat ${{FILE}} | grep ERROR && echo found`,
+  `cat ${{FILE}} | grep ERROR | head -n 5 && echo found`,
+  `grep ERROR ${{FILE}} || echo missing`,
+  // 2>&1 boundary / quoting / subshell traps
+  `echo foo2>&1 | head -n 1`,
+  `echo "a | b" 2>&1 | head -n 1`,
+  `head -n 5 ${{FILE}} ${{FILE}}`,
+  `ls ${{DIR}} 2>&12 | head -n 5`,
+];
+for (const cmd of mustNotRewriteToAp) {{
+  const out = healCommand(cmd, "bash");
+  const badAp = typeof out === "string" && /"ap"\s+(?:search|ls|read)\b/.test(out);
+  assert.strictEqual(badAp, false, `Semantic trap must NOT rewrite to ap: ${{cmd}} => ${{out}}`);
+}}
+
+// Fast-path A3 regression: `cat f | grep -E "a|b"` MUST NEVER inject `-o`
+const catE = healCommand(`cat ${{FILE}} | grep -E "ERROR|warn" | head -n 10`, "bash");
+assert.ok(catE && catE.includes(`"ap" search --max 10`), `expected safe ap search, got: ${{catE}}`);
+assert.ok(!catE.includes(" -o"), `cat | grep -E must never inject -o: ${{catE}}`);
+
+// Fast-path A3 positive: explicit `cat f | grep -oE` still accelerates safely (and without -n/-A)
+const catOE = healCommand(`cat ${{FILE}} | grep -oE 'token_[a-z]+'`, "bash");
+assert.ok(catOE && catOE.includes("rg -a --no-ignore -o"), `expected rg -o fast-path: ${{catOE}}`);
+const catNoDropN = healCommand(`cat ${{FILE}} | grep -on 'token_[a-z]+'`, "bash");
+assert.ok(!catNoDropN?.includes("rg -a --no-ignore -o"), `must not drop -n in Fast-path A3: ${{catNoDropN}}`);
+
+// B) Safe positive rewrites -> verify output AND collect all `"ap" ...` invocations for live Rust CLI execution (18 cases)
+const positiveCases = [
+  [`ls -la ${{DIR}} | head -n 5`, `"ap" ls`],
+  [`ls -la ${{DIR}} 2>&1 | head -n 5`, `"ap" ls`],
+  [`ls -t --color=never ${{DIR}} | head -n 5`, `"ap" ls`],
+  [`ls -S --group-directories-first ${{DIR}} 2>/dev/null | head -5`, `"ap" ls`],
+  [`ls -A --human-readable ${{DIR}} 2>&1|head -n 4`, `"ap" ls`],
+  [`cat ${{FILE}} | head -n 3`, `"ap" read`],
+  [`cat ${{FILE}} 2>&1 | tail -n 2`, `"ap" read`],
+  [`cat ${{FILE}} | sed -n '1,3p'`, `"ap" read`],
+  [`head -n 3 ${{FILE}} 2>&1`, `"ap" read`],
+  [`tail -n 2 ${{FILE}} 2>&1`, `"ap" read`],
+  [`sed -n '2,4p' ${{FILE}} 2>&1`, `"ap" read`],
+  [`cat ${{FILE}} 2>&1 | grep -i error | head -n 5`, `"ap" search`],
+  [`cat ${{FILE}} | grep -E "ERROR|warn" | head -n 5`, `"ap" search`],
+  [`cat ${{FILE}} | egrep -i "error|warn" | cut -c 1-80`, `"ap" search`],
+  [`cat ${{FILE}} | fgrep "token_abc" | head -n 3`, `"ap" search`],
+  [`grep -in "error" ${{FILE}} 2>&1 | head -n 5`, `"ap" search`],
+  [`grep -oE "token_[a-z]+" ${{FILE}} | sort -u | head -n 5`, `"ap" search`],
+  [`grep -rn "ERROR" ${{DIR}}`, `"ap" search`],
+];
+
+function splitShellArgs(cmdStr) {{
+  const out = [];
+  let cur = "";
+  let q = null;
+  for (let i = 0; i < cmdStr.length; i++) {{
+    const c = cmdStr[i];
+    if (q) {{
+      if (c === q) {{ q = null; continue; }}
+      if (q === '"' && c === "\\" && i + 1 < cmdStr.length) {{ cur += cmdStr[++i]; continue; }}
+      cur += c;
+    }} else if (c === "'" || c === '"') {{
+      q = c;
+    }} else if (/\s/.test(c)) {{
+      if (cur.length > 0) {{ out.push(cur); cur = ""; }}
+    }} else {{
+      cur += c;
+    }}
+  }}
+  if (cur.length > 0) out.push(cur);
+  return out;
+}}
+
+const emittedApInvocations = [];
+for (const [cmd, expectedPrefix] of positiveCases) {{
+  const rewritten = healCommand(cmd, "bash");
+  assert.ok(rewritten && rewritten.startsWith(expectedPrefix), `Expected ${{expectedPrefix}} for ${{cmd}}, got ${{rewritten}}`);
+  emittedApInvocations.push(splitShellArgs(rewritten));
+}}
+
+// C) isNonRetryableSubLlmError positive & negative matrix (14 cases)
+for (const e of [
+  "HTTP 402 Insufficient Balance",
+  "HTTP/1.1 401 Unauthorized",
+  "HTTP/2 403 Forbidden",
+  "status: 400 Bad Request",
+  "status code=422 Unprocessable",
+  "402 Insufficient Balance",
+  "invalid_api_key provided",
+  "context_length_exceeded",
+]) {{
+  assert.strictEqual(isNonRetryableSubLlmError(e), true, `Expected non-retryable: ${{e}}`);
+}}
+for (const e of [
+  "Error at line 400 of stream",
+  "Connection reset after 404 ms",
+  "ECONNRESET while reading 422 bytes",
+  "terminated: read ECONNRESET",
+  "getaddrinfo ENOTFOUND api.deepseek.com",
+  "HTTP 502 Bad Gateway",
+]) {{
+  assert.strictEqual(isNonRetryableSubLlmError(e), false, `Expected retryable: ${{e}}`);
+}}
+
+// D) scrubLeakedToolMarkup preserves inline & fenced code blocks while scrubbing raw prose leaks (6 cases)
+assert.strictEqual(scrubLeakedToolMarkup("Use `<|DSML|invoke>` syntax in tests"), "Use `<|DSML|invoke>` syntax in tests");
+const fencedXml = "Here is ```xml\n<tool_call>{{\"name\":\"bash\"}}</tool_call>\n``` example";
+assert.strictEqual(scrubLeakedToolMarkup(fencedXml), fencedXml);
+const tildeFence = "~~~xml\n<|DSML|invoke name=\"bash\"></|DSML|invoke>\n~~~";
+assert.strictEqual(scrubLeakedToolMarkup(tildeFence), tildeFence);
+const mixedLeak = "Keep `<code>` and <tool_call>{{\"name\":\"bash\"}}</tool_call> done";
+assert.strictEqual(scrubLeakedToolMarkup(mixedLeak).replace(/\s+/g, " "), "Keep `<code>` and done");
+assert.ok(!scrubLeakedToolMarkup("raw <|DSML|function_calls><|DSML|invoke name=\"x\"></|DSML|invoke></|DSML|function_calls> end").includes("DSML"));
+assert.strictEqual(isDeepSeekModel({{ provider: "deepseek", id: "flash-auto" }}), true);
+assert.strictEqual(isDeepSeekModel({{ provider: "anthropic", id: "claude-sonnet" }}), false);
+
+// E) Codemode tips for #50 top live crashes
+assert.ok(classifyCodemodeFailureTip("TypeError: cannot read property 'slice' of undefined").includes("JSON.stringify(undefined)"));
+assert.ok(classifyCodemodeFailureTip("SyntaxError: unexpected token: 'object'").includes("ALREADY return structured JS objects"));
+
+console.log(JSON.stringify(emittedApInvocations));
+"#
+        );
+
+        let run = std::process::Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--no-warnings",
+                "--input-type=module",
+                "-e",
+                &script,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "Adversarial/metamorphic Node suite failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        // Execute EVERY rewritten `ap search` / `ap ls` / `ap read` command directly through ap's real clap CLI handlers
+        let invocations: Vec<Vec<String>> =
+            serde_json::from_slice(&run.stdout).expect("expected JSON invocations from Node");
+        assert!(invocations.len() >= 18);
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&dir.path().join("ap_home"));
+        for inv in invocations {
+            assert!(inv.len() >= 2, "invalid invocation: {inv:?}");
+            let sub = inv[1].as_str();
+            let sub_args: Vec<String> = inv[1..].to_vec();
+            let rc = match sub {
+                "search" => crate::search::run_cli(&sub_args),
+                "ls" => crate::ls::run_cli(&sub_args),
+                "read" => crate::read::run_cli(&sub_args),
+                other => {
+                    panic!("unexpected ap subcommand emitted by healCommand: {other} ({inv:?})")
+                }
+            };
+            assert_eq!(
+                rc, 0,
+                "Rewritten command failed live ap CLI execution (rc={rc}): {inv:?}"
+            );
+        }
     }
 }

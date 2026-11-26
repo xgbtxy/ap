@@ -727,11 +727,35 @@ pub fn run_cli(args: &[String]) -> i32 {
                     .filter_map(|s| s.trim().parse::<u16>().ok())
                     .collect();
                 if parts.len() != 2 {
-                    eprintln!("[probe cdp] --diff-ports requires two comma-separated ports, e.g. `9222,9223`");
+                    let msg = "[probe cdp] --diff-ports requires two comma-separated ports, e.g. `9222,9223`";
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": msg
+                            }))
+                            .unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("{msg}");
+                    }
                     return 2;
                 }
                 let Some(expr) = eval_owned.as_deref().filter(|s| !s.trim().is_empty()) else {
-                    eprintln!("[probe cdp] --diff-ports requires `--eval <JS>` or `--eval-stdin`");
+                    let msg = "[probe cdp] --diff-ports requires `--eval <JS>` or `--eval-stdin`";
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": msg
+                            }))
+                            .unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("{msg}");
+                    }
                     return 2;
                 };
                 let (ta, tb) = if let Some(tids) = target_ids.as_deref() {
@@ -816,6 +840,65 @@ pub fn run_cli(args: &[String]) -> i32 {
                 fuzz_schema,
                 json,
             } = *boxed;
+            let has_from_har = from_har.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let vary_fields_vec: Vec<String> = vary_json_field
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_roles_matrix = roles_matrix.is_some()
+                || !role_vars.is_empty()
+                || methods.is_some()
+                || cross_id
+                || !vary_fields_vec.is_empty();
+            let has_flow = flow.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let has_vary_field = vary_field.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let mut active_http_modes: Vec<&str> = Vec::new();
+            if has_from_har {
+                active_http_modes.push("--from-har");
+            }
+            if has_roles_matrix {
+                active_http_modes.push("--roles-matrix");
+            }
+            if has_flow {
+                active_http_modes.push("--flow");
+            }
+            if mutate_matrix {
+                active_http_modes.push("--mutate-matrix");
+            }
+            if race >= 2 {
+                active_http_modes.push("--race");
+            }
+            if batch_stdin {
+                active_http_modes.push("--batch-stdin");
+            }
+            if has_vary_field {
+                active_http_modes.push("--vary-field");
+            }
+            if active_http_modes.len() > 1 {
+                let msg = format!(
+                    "[probe http] conflicting mutually-exclusive mode flags: {} (run one mode per invocation)",
+                    active_http_modes.join(", ")
+                );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "error": msg
+                        }))
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{msg}");
+                }
+                return 2;
+            }
             if let Some(har) = from_har.as_deref().filter(|s| !s.trim().is_empty()) {
                 let mut principal_hdrs = Vec::new();
                 for p in &principals {
@@ -843,22 +926,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     as_json: json,
                 });
             }
-            let vary_fields_vec: Vec<String> = vary_json_field
-                .as_deref()
-                .map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|x| !x.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if roles_matrix.is_some()
-                || !role_vars.is_empty()
-                || methods.is_some()
-                || cross_id
-                || !vary_fields_vec.is_empty()
-            {
+            if has_roles_matrix {
                 return http_probe::run_http_roles_matrix(
                     roles_matrix.as_deref(),
                     vary_request.as_deref(),

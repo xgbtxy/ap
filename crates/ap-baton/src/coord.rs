@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,77 +36,40 @@ fn claims_store_dir() -> PathBuf {
     std::env::temp_dir().join("ap_baton_claims")
 }
 
-struct FileGuard(PathBuf);
-impl Drop for FileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-fn acquire_lock(dir: &Path) -> Result<FileGuard, String> {
+fn acquire_lock(dir: &Path) -> Result<crate::frontier::FrontierLockGuard, String> {
     let _ = fs::create_dir_all(dir);
-    let lock_p = dir.join("claims.lock");
-    let deadline = Instant::now() + Duration::from_millis(4000);
-    let pid = std::process::id();
-    let mut attempt = 0u64;
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_p)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = writeln!(f, "pid={pid}");
-                return Ok(FileGuard(lock_p));
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AlreadyExists
-                    || (cfg!(windows)
-                        && (e.kind() == std::io::ErrorKind::PermissionDenied
-                            || matches!(e.raw_os_error(), Some(5) | Some(32)))) =>
-            {
-                // Reap stale lock older than 15s
-                if let Ok(md) = fs::metadata(&lock_p) {
-                    if let Ok(mt) = md.modified() {
-                        if SystemTime::now()
-                            .duration_since(mt)
-                            .map(|d| d.as_secs() > 15)
-                            .unwrap_or(false)
-                        {
-                            let _ = fs::remove_file(&lock_p);
-                            continue;
-                        }
-                    }
-                }
-                if Instant::now() >= deadline {
-                    return Err(format!("timed out acquiring baton claims lock: {e}"));
-                }
-                attempt += 1;
-                let jitter = ((pid as u64).wrapping_mul(37) + attempt * 11) % 19;
-                thread::sleep(Duration::from_millis(8 + jitter));
-            }
-            Err(e) => return Err(format!("failed acquiring baton claims lock: {e}")),
-        }
-    }
+    crate::frontier::acquire_file_lock(&dir.join("claims"))
 }
 
-fn load_claims(dir: &Path) -> BTreeMap<String, ResourceClaim> {
+pub fn load_claims_strict(dir: &Path) -> Result<BTreeMap<String, ResourceClaim>, String> {
     let p = dir.join("claims.json");
-    for attempt in 0..5u64 {
-        if let Ok(raw) = fs::read_to_string(&p) {
-            if let Ok(parsed) = serde_json::from_str::<BTreeMap<String, ResourceClaim>>(&raw) {
-                return parsed;
+    if !p.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut last_err = String::new();
+    for attempt in 0..8u64 {
+        match fs::read_to_string(&p) {
+            Ok(raw) => match serde_json::from_str::<BTreeMap<String, ResourceClaim>>(&raw) {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => {
+                    last_err = format!("corrupt claims store {}: {e}", p.display());
+                    if attempt < 2 {
+                        thread::sleep(Duration::from_millis(6 + attempt * 5));
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => {
+                last_err = format!("cannot read claims store {}: {e}", p.display());
+                if attempt < 7 {
+                    thread::sleep(Duration::from_millis(8 + attempt * 5));
+                }
             }
         }
-        if !p.exists() {
-            return BTreeMap::new();
-        }
-        if attempt < 4 {
-            thread::sleep(Duration::from_millis(6 + attempt * 4));
-        }
     }
-    BTreeMap::new()
+    Err(last_err)
 }
 
 fn save_claims(dir: &Path, map: &BTreeMap<String, ResourceClaim>) -> Result<(), String> {
@@ -117,13 +80,22 @@ fn save_claims(dir: &Path, map: &BTreeMap<String, ResourceClaim>) -> Result<(), 
 /// Atomically claim a shared multi-agent resource with TTL expiry (exit 2 if held by another owner).
 pub fn run_claim(resource: &str, owner: &str, ttl_secs: u64, note: &str, as_json: bool) -> i32 {
     let dir = claims_store_dir();
-    let Ok(_guard) = acquire_lock(&dir) else {
-        eprintln!("[baton claim] Could not acquire atomic claims lock");
-        return 1;
+    let _guard = match acquire_lock(&dir) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::frontier::emit_err(as_json, &format!("[baton claim] {e}"));
+            return 1;
+        }
     };
     let now = now_unix_secs();
     let ttl = ttl_secs.clamp(5, 86_400);
-    let mut map = load_claims(&dir);
+    let mut map = match load_claims_strict(&dir) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::frontier::emit_err(as_json, &format!("[baton claim] {e}"));
+            return 1;
+        }
+    };
     if let Some(existing) = map.get(resource) {
         if existing.expires_at > now && !existing.owner.eq_ignore_ascii_case(owner) {
             let rem = existing.expires_at.saturating_sub(now);
@@ -158,7 +130,7 @@ pub fn run_claim(resource: &str, owner: &str, ttl_secs: u64, note: &str, as_json
     };
     map.insert(resource.to_string(), claim.clone());
     if let Err(e) = save_claims(&dir, &map) {
-        eprintln!("[baton claim] save failed: {e}");
+        crate::frontier::emit_err(as_json, &format!("[baton claim] save failed: {e}"));
         return 1;
     }
     if as_json {
@@ -179,12 +151,21 @@ pub fn run_claim(resource: &str, owner: &str, ttl_secs: u64, note: &str, as_json
 
 pub fn run_release(resource: &str, owner: Option<&str>, force: bool, as_json: bool) -> i32 {
     let dir = claims_store_dir();
-    let Ok(_guard) = acquire_lock(&dir) else {
-        eprintln!("[baton release] Could not acquire atomic claims lock");
-        return 1;
+    let _guard = match acquire_lock(&dir) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::frontier::emit_err(as_json, &format!("[baton release] {e}"));
+            return 1;
+        }
     };
     let now = now_unix_secs();
-    let mut map = load_claims(&dir);
+    let mut map = match load_claims_strict(&dir) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::frontier::emit_err(as_json, &format!("[baton release] {e}"));
+            return 1;
+        }
+    };
     if let Some(existing) = map.get(resource) {
         if !force
             && existing.expires_at > now
@@ -192,15 +173,32 @@ pub fn run_release(resource: &str, owner: Option<&str>, force: bool, as_json: bo
                 .map(|o| !o.eq_ignore_ascii_case(&existing.owner))
                 .unwrap_or(false)
         {
-            eprintln!(
-                "[CLAIM OWNED BY OTHER | exit 2] `{resource}` is held by `{}` (pass `--force` to override)",
-                existing.owner
-            );
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "status": "owned_by_other",
+                        "resource": resource,
+                        "held_by": existing.owner,
+                        "error": format!("`{resource}` is held by `{}` (pass `--force` to override)", existing.owner),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!(
+                    "[CLAIM OWNED BY OTHER | exit 2] `{resource}` is held by `{}` (pass `--force` to override)",
+                    existing.owner
+                );
+            }
             return 2;
         }
     }
     let existed = map.remove(resource).is_some();
-    let _ = save_claims(&dir, &map);
+    if let Err(e) = save_claims(&dir, &map) {
+        crate::frontier::emit_err(as_json, &format!("[baton release] save failed: {e}"));
+        return 1;
+    }
     if as_json {
         println!(
             "{}",
@@ -222,7 +220,13 @@ pub fn run_release(resource: &str, owner: Option<&str>, force: bool, as_json: bo
 pub fn run_claims_list(as_json: bool) -> i32 {
     let dir = claims_store_dir();
     let now = now_unix_secs();
-    let map = load_claims(&dir);
+    let map = match load_claims_strict(&dir) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::frontier::emit_err(as_json, &format!("[baton claims] {e}"));
+            return 1;
+        }
+    };
     let rows: Vec<serde_json::Value> = map
         .values()
         .map(|c| {
@@ -401,7 +405,7 @@ pub fn run_dedup(query: &str, files: &[PathBuf], top_k: usize, as_json: bool) ->
     let t0 = Instant::now();
     let q_toks: HashSet<String> = tokenize_hybrid(query).into_iter().collect();
     if q_toks.is_empty() {
-        eprintln!("[baton dedup] Empty query");
+        crate::frontier::emit_err(as_json, "[baton dedup] Empty query");
         return 2;
     }
     let mut docs = Vec::new();

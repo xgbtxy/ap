@@ -3218,6 +3218,17 @@ pub fn run_http_race(
     0
 }
 
+fn emit_http_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FlowStepSpec {
     #[serde(default)]
@@ -3228,7 +3239,7 @@ struct FlowStepSpec {
     #[serde(default)]
     headers: Vec<String>,
     #[serde(default)]
-    body: Option<String>,
+    body: Option<Value>,
     #[serde(default)]
     cdp_cookies: Option<u16>,
     #[serde(default)]
@@ -3292,7 +3303,7 @@ pub fn run_http_flow(
     let raw_txt = if flow_spec.trim() == "-" {
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
-            eprintln!("[probe http flow] failed reading stdin");
+            emit_http_err(as_json, "[probe http flow] failed reading stdin");
             return 2;
         }
         buf
@@ -3300,7 +3311,10 @@ pub fn run_http_flow(
         match std::fs::read_to_string(flow_spec) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[probe http flow] failed reading `{flow_spec}`: {e}");
+                emit_http_err(
+                    as_json,
+                    &format!("[probe http flow] failed reading `{flow_spec}`: {e}"),
+                );
                 return 2;
             }
         }
@@ -3308,7 +3322,10 @@ pub fn run_http_flow(
     let parsed: Value = match serde_json::from_str(raw_txt.trim()) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[probe http flow] invalid JSON flow spec: {e}");
+            emit_http_err(
+                as_json,
+                &format!("[probe http flow] invalid JSON flow spec: {e}"),
+            );
             return 2;
         }
     };
@@ -3337,12 +3354,15 @@ pub fn run_http_flow(
     let steps: Vec<FlowStepSpec> = match serde_json::from_value(steps_val) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[probe http flow] invalid steps schema: {e}");
+            emit_http_err(
+                as_json,
+                &format!("[probe http flow] invalid steps schema: {e}"),
+            );
             return 2;
         }
     };
     if steps.is_empty() {
-        eprintln!("[probe http flow] flow contains 0 steps");
+        emit_http_err(as_json, "[probe http flow] flow contains 0 steps");
         return 2;
     }
 
@@ -3364,7 +3384,18 @@ pub fn run_http_flow(
             .map(|h| substitute_flow_vars(h, &vars))
             .collect();
         hdrs.extend(step.headers.iter().map(|h| substitute_flow_vars(h, &vars)));
-        let body_sub = step.body.as_deref().map(|b| substitute_flow_vars(b, &vars));
+        let is_structured_json_body = matches!(
+            step.body.as_ref(),
+            Some(Value::Object(_)) | Some(Value::Array(_))
+        );
+        let body_sub = step.body.as_ref().and_then(|b| match b {
+            Value::Null => None,
+            Value::String(s) => Some(substitute_flow_vars(s, &vars)),
+            other => Some(substitute_flow_vars(&other.to_string(), &vars)),
+        });
+        if is_structured_json_body && !has_header_name(&hdrs, "content-type") {
+            hdrs.push("Content-Type: application/json".to_string());
+        }
 
         if let Some(port) = step.cdp_cookies {
             if !has_header_name(&hdrs, "cookie") {

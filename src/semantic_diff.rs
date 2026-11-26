@@ -652,38 +652,36 @@ fn diff_js_pair(
     (diffs, unchanged_norm_count)
 }
 
-fn format_js_semantic_report(
+fn format_js_semantic_both(
     kind_label: &str,
     old_label: &str,
     new_label: &str,
     diffs: &[JsSemanticDiffEntry],
     unchanged_fns: usize,
     matched_files: usize,
-    as_json: bool,
-) -> String {
-    if as_json {
-        return serde_json::to_string_pretty(&json!({
-            "kind": kind_label,
-            "old": old_label,
-            "new": new_label,
-            "matched_files": matched_files,
-            "unchanged_normalized_functions": unchanged_fns,
-            "changed_entries": diffs.iter().map(|d| json!({
-                "file": d.file,
-                "function": d.fn_name,
-                "status": d.status,
-                "severity": d.severity,
-                "old_line": d.old_line,
-                "new_line": d.new_line,
-                "added_guards": d.added_guards,
-                "removed_guards": d.removed_guards,
-                "added_sinks": d.added_sinks,
-                "removed_sinks": d.removed_sinks,
-                "branch_delta": d.branch_delta,
-            })).collect::<Vec<_>>(),
-        }))
-        .unwrap_or_else(|_| "{}".to_string());
-    }
+) -> (String, Value) {
+    let jv = json!({
+        "ok": true,
+        "format": "semantic-diff",
+        "kind": kind_label,
+        "old": old_label,
+        "new": new_label,
+        "matched_files": matched_files,
+        "unchanged_normalized_functions": unchanged_fns,
+        "changed_entries": diffs.iter().map(|d| json!({
+            "file": d.file,
+            "function": d.fn_name,
+            "status": d.status,
+            "severity": d.severity,
+            "old_line": d.old_line,
+            "new_line": d.new_line,
+            "added_guards": d.added_guards,
+            "removed_guards": d.removed_guards,
+            "added_sinks": d.added_sinks,
+            "removed_sinks": d.removed_sinks,
+            "branch_delta": d.branch_delta,
+        })).collect::<Vec<_>>(),
+    });
 
     let mut md = vec![
         format!("# Semantic Patch-Diff (`{kind_label}`)"),
@@ -696,7 +694,7 @@ fn format_js_semantic_report(
 
     if diffs.is_empty() {
         md.push("_No semantic security or control-flow deltas detected (all differences normalized out as chunk hashes or mangled identifiers)._".to_string());
-        return md.join("\n");
+        return (md.join("\n"), jv);
     }
 
     md.push("| Severity | Status | File | Function | Guard / Sink / Branch Delta |".to_string());
@@ -742,7 +740,7 @@ fn format_js_semantic_report(
             diffs.len() - 120
         ));
     }
-    md.join("\n")
+    (md.join("\n"), jv)
 }
 
 fn load_asar_js_map(path: &Path) -> Result<BTreeMap<String, (String, Vec<u8>)>> {
@@ -806,14 +804,13 @@ fn collect_dir_js_map(root: &Path) -> Result<BTreeMap<String, (String, Vec<u8>)>
     Ok(map)
 }
 
-fn diff_js_collections(
+fn diff_js_collections_both(
     kind_label: &str,
     old_label: &str,
     new_label: &str,
     old_map: BTreeMap<String, (String, Vec<u8>)>,
     new_map: BTreeMap<String, (String, Vec<u8>)>,
-    as_json: bool,
-) -> String {
+) -> (String, Value) {
     let mut all_diffs = Vec::new();
     let mut unchanged_fns = 0usize;
     let mut matched_files = 0usize;
@@ -844,14 +841,13 @@ fn diff_js_collections(
             (None, None) => {}
         }
     }
-    format_js_semantic_report(
+    format_js_semantic_both(
         kind_label,
         old_label,
         new_label,
         &all_diffs,
         unchanged_fns,
         matched_files,
-        as_json,
     )
 }
 
@@ -1051,13 +1047,12 @@ fn build_pe64_fn_signatures(bytes: &[u8]) -> Result<(Vec<NativeFnSig>, BTreeSet<
     Ok((sigs, exports))
 }
 
-fn diff_native_semantic_files(
+fn diff_native_semantic_files_both(
     old_path: &Path,
     new_path: &Path,
     old_bytes: &[u8],
     new_bytes: &[u8],
-    as_json: bool,
-) -> Result<String> {
+) -> Result<(String, Value)> {
     let old_label = old_path.display().to_string();
     let new_label = new_path.display().to_string();
 
@@ -1155,18 +1150,17 @@ fn diff_native_semantic_files(
             }
         }
 
-        if as_json {
-            return serde_json::to_string_pretty(&json!({
-                "kind": "pe64-semantic",
-                "old": old_label,
-                "new": new_label,
-                "added_exports": added_exports,
-                "removed_exports": removed_exports,
-                "unchanged_normalized_functions": unchanged,
-                "function_deltas": deltas,
-            }))
-            .map_err(|e| e.to_string());
-        }
+        let jv = json!({
+            "ok": true,
+            "format": "semantic-diff",
+            "kind": "pe64-semantic",
+            "old": old_label,
+            "new": new_label,
+            "added_exports": added_exports,
+            "removed_exports": removed_exports,
+            "unchanged_normalized_functions": unchanged,
+            "function_deltas": deltas,
+        });
 
         let mut md = vec![
             "# Semantic Patch-Diff (`PE64`)".to_string(),
@@ -1235,7 +1229,7 @@ fn diff_native_semantic_files(
                 ));
             }
         }
-        return Ok(md.join("\n"));
+        return Ok((md.join("\n"), jv));
     }
 
     if old_bytes.starts_with(b"\x7FELF") && new_bytes.starts_with(b"\x7FELF") {
@@ -1243,25 +1237,25 @@ fn diff_native_semantic_files(
         let new_syms = crate::binary::extract_elf_dynsyms_set(new_bytes);
         let added: Vec<String> = new_syms.difference(&old_syms).cloned().collect();
         let removed: Vec<String> = old_syms.difference(&new_syms).cloned().collect();
-        if as_json {
-            return serde_json::to_string_pretty(&json!({
-                "kind": "elf-semantic",
-                "old": old_label,
-                "new": new_label,
-                "added_dynsyms": added,
-                "removed_dynsyms": removed,
-                "unchanged_dynsyms": old_syms.intersection(&new_syms).count(),
-            }))
-            .map_err(|e| e.to_string());
-        }
-        return Ok(format!(
+        let jv = json!({
+            "ok": true,
+            "format": "semantic-diff",
+            "kind": "elf-semantic",
+            "old": old_label,
+            "new": new_label,
+            "added_dynsyms": added,
+            "removed_dynsyms": removed,
+            "unchanged_dynsyms": old_syms.intersection(&new_syms).count(),
+        });
+        let md = format!(
             "# Semantic Patch-Diff (`ELF`)\n\n- Old: `{old_label}`\n- New: `{new_label}`\n- Unchanged `.dynsym`: `{}`\n- Added `.dynsym` ({}): {}\n- Removed `.dynsym` ({}): {}",
             old_syms.intersection(&new_syms).count(),
             added.len(),
             added.iter().take(30).cloned().collect::<Vec<_>>().join(", "),
             removed.len(),
             removed.iter().take(30).cloned().collect::<Vec<_>>().join(", "),
-        ));
+        );
+        return Ok((md, jv));
     }
 
     Err(
@@ -1270,17 +1264,16 @@ fn diff_native_semantic_files(
     )
 }
 
-pub fn diff_semantic_paths(old_path: &Path, new_path: &Path, as_json: bool) -> Result<String> {
+pub fn diff_semantic_paths_both(old_path: &Path, new_path: &Path) -> Result<(String, Value)> {
     if old_path.is_dir() && new_path.is_dir() {
         let om = collect_dir_js_map(old_path)?;
         let nm = collect_dir_js_map(new_path)?;
-        return Ok(diff_js_collections(
+        return Ok(diff_js_collections_both(
             "dir-js-semantic",
             &old_path.display().to_string(),
             &new_path.display().to_string(),
             om,
             nm,
-            as_json,
         ));
     }
 
@@ -1298,13 +1291,12 @@ pub fn diff_semantic_paths(old_path: &Path, new_path: &Path, as_json: bool) -> R
     if ext_old == "asar" && ext_new == "asar" {
         let om = load_asar_js_map(old_path)?;
         let nm = load_asar_js_map(new_path)?;
-        return Ok(diff_js_collections(
+        return Ok(diff_js_collections_both(
             "asar-js-semantic",
             &old_path.display().to_string(),
             &new_path.display().to_string(),
             om,
             nm,
-            as_json,
         ));
     }
 
@@ -1323,20 +1315,29 @@ pub fn diff_semantic_paths(old_path: &Path, new_path: &Path, as_json: bool) -> R
             &nb,
             &hint,
         );
-        return Ok(format_js_semantic_report(
+        return Ok(format_js_semantic_both(
             "js-ast-semantic",
             &old_path.display().to_string(),
             &new_path.display().to_string(),
             &diffs,
             unc,
             1,
-            as_json,
         ));
     }
 
     let ob = fs::read(old_path).map_err(|e| e.to_string())?;
     let nb = fs::read(new_path).map_err(|e| e.to_string())?;
-    diff_native_semantic_files(old_path, new_path, &ob, &nb, as_json)
+    diff_native_semantic_files_both(old_path, new_path, &ob, &nb)
+}
+
+#[cfg(test)]
+pub fn diff_semantic_paths(old_path: &Path, new_path: &Path, as_json: bool) -> Result<String> {
+    let (md, jv) = diff_semantic_paths_both(old_path, new_path)?;
+    if as_json {
+        serde_json::to_string_pretty(&jv).map_err(|e| e.to_string())
+    } else {
+        Ok(md)
+    }
 }
 
 #[cfg(test)]

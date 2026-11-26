@@ -175,7 +175,16 @@ pub fn run_fs_cli(
     as_json: bool,
 ) -> i32 {
     if !dir.is_dir() {
-        eprintln!("[probe fs] directory not found: {}", dir.display());
+        let msg = format!("[probe fs] directory not found: {}", dir.display());
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                    .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
         return 2;
     }
     let t0 = Instant::now();

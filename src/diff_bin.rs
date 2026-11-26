@@ -87,11 +87,12 @@ pub fn run_diff_paths_opts(
     let old_p = Path::new(&old_norm);
     let new_p = Path::new(&new_norm);
     if semantic {
-        let md = crate::semantic_diff::diff_semantic_paths(old_p, new_p, false)
+        let (md, mut jv) = crate::semantic_diff::diff_semantic_paths_both(old_p, new_p)
             .map_err(|e| format!("[ap diff --semantic] {e}"))?;
-        let jv_str = crate::semantic_diff::diff_semantic_paths(old_p, new_p, true)
-            .unwrap_or_else(|_| "{}".to_string());
-        let jv = serde_json::from_str::<Value>(&jv_str).unwrap_or_else(|_| json!({ "raw": md }));
+        if let Some(m) = jv.as_object_mut() {
+            m.insert("ok".to_string(), json!(true));
+            m.insert("format".to_string(), json!("semantic-diff"));
+        }
         return Ok((md, jv));
     }
     let new_ext = new_p

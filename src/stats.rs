@@ -50,6 +50,12 @@ pub struct StatEvent {
     pub guards: u32,
     #[serde(default)]
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -96,6 +102,52 @@ pub fn record_event(
     guards: u32,
     note: &str,
 ) {
+    record_event_inner(
+        kind, raw_bytes, out_bytes, win_heals, guards, note, None, None, None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_event_ex(
+    kind: &str,
+    raw_bytes: u64,
+    out_bytes: u64,
+    win_heals: u32,
+    guards: u32,
+    note: &str,
+    ok: bool,
+    ms: u64,
+    err: Option<&str>,
+) {
+    let clipped_err = err
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(180).collect::<String>());
+    record_event_inner(
+        kind,
+        raw_bytes,
+        out_bytes,
+        win_heals,
+        guards,
+        note,
+        Some(ok),
+        Some(ms),
+        clipped_err,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_event_inner(
+    kind: &str,
+    raw_bytes: u64,
+    out_bytes: u64,
+    win_heals: u32,
+    guards: u32,
+    note: &str,
+    ok: Option<bool>,
+    ms: Option<u64>,
+    err: Option<String>,
+) {
     let path = stats_file_path(None);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -112,6 +164,9 @@ pub fn record_event(
         win_heals,
         guards,
         note: note.to_string(),
+        ok,
+        ms,
+        err,
     };
     if let Ok(line) = serde_json::to_string(&ev) {
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
@@ -165,9 +220,24 @@ pub fn run_cli(args: &[String]) -> i32 {
     let total_win_heals: u64 = events.iter().map(|e| e.win_heals as u64).sum();
     let total_guards: u64 = events.iter().map(|e| e.guards as u64).sum();
     let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
+    let mut error_count: u64 = 0;
+    let mut latencies_ms: Vec<u64> = Vec::new();
     for ev in &events {
         *by_kind.entry(ev.kind.clone()).or_insert(0) += 1;
+        if ev.ok == Some(false) {
+            error_count += 1;
+        }
+        if let Some(m) = ev.ms {
+            latencies_ms.push(m);
+        }
     }
+    latencies_ms.sort_unstable();
+    let p95_ms = if latencies_ms.is_empty() {
+        None
+    } else {
+        let idx = ((latencies_ms.len() as f64) * 0.95).ceil() as usize;
+        latencies_ms.get(idx.saturating_sub(1)).copied()
+    };
     let saved_bytes = total_raw.saturating_sub(total_out);
     let direct_tokens_saved = saved_bytes / 4;
     let retry_tokens_avoided = total_win_heals * 3_500;
@@ -179,22 +249,23 @@ pub fn run_cli(args: &[String]) -> i32 {
     };
 
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "total_calls": total_calls,
-                "raw_bytes": total_raw,
-                "emitted_bytes": total_out,
-                "compression_pct": compression_pct,
-                "windows_heals": total_win_heals,
-                "quality_gates": total_guards,
-                "direct_tokens_saved": direct_tokens_saved,
-                "retry_tokens_avoided": retry_tokens_avoided,
-                "estimated_total_tokens_saved": net_tokens_saved,
-                "by_kind": by_kind,
-            }))
-            .unwrap_or_default()
-        );
+        let mut out = json!({
+            "total_calls": total_calls,
+            "raw_bytes": total_raw,
+            "emitted_bytes": total_out,
+            "compression_pct": compression_pct,
+            "windows_heals": total_win_heals,
+            "quality_gates": total_guards,
+            "direct_tokens_saved": direct_tokens_saved,
+            "retry_tokens_avoided": retry_tokens_avoided,
+            "estimated_total_tokens_saved": net_tokens_saved,
+            "by_kind": by_kind,
+            "error_count": error_count,
+        });
+        if let Some(p95) = p95_ms {
+            out["p95_ms"] = json!(p95);
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
 

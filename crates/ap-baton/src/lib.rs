@@ -357,15 +357,39 @@ pub fn baton_dir(cwd: &Path) -> PathBuf {
     base
 }
 
-pub fn load_state(base: &Path) -> BatonState {
+pub fn load_state_strict(base: &Path) -> Result<BatonState, String> {
     let p = base.join("state.json");
     if !p.exists() {
-        return BatonState::default();
+        return Ok(BatonState::default());
     }
-    fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str::<BatonState>(&s).ok())
-        .unwrap_or_default()
+    let mut last_err = String::new();
+    for attempt in 0..8u64 {
+        match fs::read_to_string(&p) {
+            Ok(s) => match serde_json::from_str::<BatonState>(&s) {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => {
+                    last_err = format!("corrupt baton state {}: {e}", p.display());
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(6 + attempt * 5));
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BatonState::default()),
+            Err(e) => {
+                last_err = format!("cannot read baton state {}: {e}", p.display());
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(8 + attempt * 5));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+pub fn load_state(base: &Path) -> BatonState {
+    load_state_strict(base).unwrap_or_default()
 }
 
 fn fnv1a64_file(path: &Path) -> Option<String> {
@@ -692,7 +716,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             let mut state = if reset {
                 BatonState::default()
             } else {
-                load_state(&base)
+                match load_state_strict(&base) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[baton] {e} (use --reset to overwrite)");
+                        return 1;
+                    }
+                }
             };
             if let Some(g) = goal {
                 state.goal = truncate_chars(&g, 240);
@@ -712,7 +742,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         SubCmd::Fact { text, reference } => {
-            let mut state = load_state(&base);
+            let mut state = match load_state_strict(&base) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[baton] {e}");
+                    return 1;
+                }
+            };
             let clean_text = truncate_chars(&text, 220);
             let clean_ref = truncate_chars(&reference, 120);
             let ref_hash = extract_ref_path(&clean_ref)
@@ -745,7 +781,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         SubCmd::Deadend { text, reason } => {
-            let mut state = load_state(&base);
+            let mut state = match load_state_strict(&base) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[baton] {e}");
+                    return 1;
+                }
+            };
             let clean_text = truncate_chars(&text, 220);
             if !state.deadends.iter().any(|d| d.text == clean_text) {
                 state.deadends.push(DeadEndEntry {
@@ -767,7 +809,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         SubCmd::Checkpoint { note } => {
-            let mut state = load_state(&base);
+            let mut state = match load_state_strict(&base) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[baton] {e}");
+                    return 1;
+                }
+            };
             if !note.trim().is_empty() {
                 state.next_step = truncate_chars(&note, 240);
             }
@@ -777,7 +825,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         SubCmd::Resume { json } => {
-            let mut state = load_state(&base);
+            let mut state = match load_state_strict(&base) {
+                Ok(s) => s,
+                Err(e) => {
+                    frontier::emit_err(json, &format!("[baton] {e}"));
+                    return 1;
+                }
+            };
             let live_ws = probe_workspace(&cwd);
             let drift = verify_state_drift(&state, &cwd, &live_ws);
             state.workspace = live_ws;
@@ -837,7 +891,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                     match frontier::load_exclude_file(Path::new(ef)) {
                         Ok(pats) => merged_excl.extend(pats),
                         Err(e) => {
-                            eprintln!("[baton frontier] cannot read --exclude-file `{ef}`: {e}");
+                            frontier::emit_err(
+                                json,
+                                &format!("[baton frontier] cannot read --exclude-file `{ef}`: {e}"),
+                            );
                             return 2;
                         }
                     }
@@ -913,7 +970,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                     match frontier::load_exclude_file(Path::new(ef)) {
                         Ok(pats) => merged_excl.extend(pats),
                         Err(e) => {
-                            eprintln!("[baton frontier] cannot read --exclude-file `{ef}`: {e}");
+                            frontier::emit_err(
+                                json,
+                                &format!("[baton frontier] cannot read --exclude-file `{ef}`: {e}"),
+                            );
                             return 2;
                         }
                     }

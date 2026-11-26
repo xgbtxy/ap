@@ -1469,6 +1469,18 @@ pub fn render_atlas_md(data: &AtlasData) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+fn emit_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "ok": false, "error": msg }))
+                .unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
@@ -1482,7 +1494,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         Some(SubCmd::Product { root, write, json }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let pm = product::build_product_map(&root_p, SKIP_DIRS);
@@ -1494,7 +1506,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                     root_p.join(&write)
                 };
                 if let Err(e) = fs::write(&out_p, &md) {
-                    eprintln!("[atlas] failed to write {}: {e}", out_p.display());
+                    emit_err(
+                        json,
+                        &format!("[atlas] failed to write {}: {e}", out_p.display()),
+                    );
                     return 1;
                 }
             }
@@ -1508,7 +1523,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         Some(SubCmd::Impact { symbol, root, json }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let rep = impact::analyze_symbol_impact(&root_p, &[symbol], SKIP_DIRS);
@@ -1527,7 +1542,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let rep = locate::locate_faults(&root_p, &query, top_k);
@@ -1549,7 +1564,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let rep = trace::trace_symbol_chain_to_opts(
@@ -1577,7 +1592,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let rep = variants::analyze_variants_with_opts(
@@ -1597,7 +1612,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         Some(SubCmd::Changes { root, base, json }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let rep = changes::analyze_git_changes(&root_p, Some(&base), SKIP_DIRS);
@@ -1635,7 +1650,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let rep = deps::analyze_module_deps_with_opts(&root_p, &target, depth, dead, SKIP_DIRS);
@@ -1658,7 +1673,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }) => {
             let root_p = PathBuf::from(&root);
             if !root_p.exists() {
-                eprintln!("[atlas] path not found: {root}");
+                emit_err(json, &format!("[atlas] path not found: {root}"));
                 return 1;
             }
             let mut merged_excludes = exclude;
@@ -1666,19 +1681,28 @@ pub fn run_cli(args: &[String]) -> i32 {
                 match surface::load_exclude_file(Path::new(ef)) {
                     Ok(pats) => merged_excludes.extend(pats),
                     Err(e) => {
-                        eprintln!("[atlas] cannot read --exclude-file `{ef}`: {e}");
+                        emit_err(
+                            json,
+                            &format!("[atlas] cannot read --exclude-file `{ef}`: {e}"),
+                        );
                         return 2;
                     }
                 }
             }
-            let map = surface::build_surface_map_with_excludes(
+            let map = match surface::try_build_surface_map_with_excludes(
                 &root_p,
                 max_files,
                 max_per_axis,
                 include_vendor,
                 include_binaries,
                 &merged_excludes,
-            );
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    emit_err(json, &format!("[atlas] {e}"));
+                    return 2;
+                }
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&map).unwrap_or_default());
             } else {
@@ -1697,7 +1721,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     };
     let root_p = PathBuf::from(&root);
     if !root_p.exists() {
-        eprintln!("[atlas] path not found: {root}");
+        emit_err(as_json, &format!("[atlas] path not found: {root}"));
         return 1;
     }
     let data = scan_workspace(&root_p, &focus, max_files, stale_days);

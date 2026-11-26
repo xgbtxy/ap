@@ -14029,3 +14029,330 @@ fn test_wave1_recall_sync_win_combined_excludes_and_har_json_contract() {
         .is_some());
     assert_eq!(mlines[2]["result"]["isError"], false, "{}", mlines[2]);
 }
+
+#[test]
+fn test_cycle2_hardening_migration_failclosed_json_contracts_and_mcp_errors() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // 1. Corrupt frontier.json fail-closed (must NEVER wipe existing corrupt file) + JSON error envelope
+    let corrupt_frontier = root.join("corrupt_frontier.json");
+    fs::write(&corrupt_frontier, "{ broken frontier json").unwrap();
+    let f_corrupt = run_ap(
+        root,
+        &[
+            "baton",
+            "frontier",
+            "seed",
+            "--store",
+            corrupt_frontier.to_str().unwrap(),
+            "--axis",
+            "exec_spawn",
+            "--target",
+            "src/a.ts",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(!f_corrupt.status.success());
+    let fcv: Value = serde_json::from_slice(&f_corrupt.stdout)
+        .expect("corrupt frontier --json MUST emit valid JSON error");
+    assert_eq!(fcv["ok"], false, "{fcv}");
+    assert_eq!(
+        fs::read_to_string(&corrupt_frontier).unwrap(),
+        "{ broken frontier json"
+    );
+
+    // 2. Cross-subcommand `--json` error-envelope sweep (every error emits parseable JSON with ok=false)
+    let missing_file = root.join("no_such_file.txt");
+    let missing_str = missing_file.to_str().unwrap();
+    let json_err_cases: Vec<Vec<&str>> = vec![
+        vec![
+            "atlas",
+            "surface",
+            root.to_str().unwrap(),
+            "-x",
+            "re:[bad",
+            "--json",
+        ],
+        vec![
+            "atlas",
+            "surface",
+            root.to_str().unwrap(),
+            "--exclude-file",
+            missing_str,
+            "--json",
+        ],
+        vec!["atlas", "surface", missing_str, "--json"],
+        vec![
+            "baton", "frontier", "seed", "--target", "a.ts", "-x", "re:[bad", "--json",
+        ],
+        vec![
+            "baton",
+            "frontier",
+            "seed",
+            "--target",
+            "a.ts",
+            "--exclude-file",
+            missing_str,
+            "--json",
+        ],
+        vec!["recall", "sync", missing_str, "--json"],
+        vec!["probe", "fs", missing_str, "--json"],
+        vec!["probe", "http", "--flow", missing_str, "--json"],
+        vec![
+            "probe",
+            "http",
+            "--flow",
+            missing_str,
+            "--mutate-matrix",
+            "--json",
+        ],
+        vec!["probe", "cdp", "--port", "1", "--list", "--json"],
+        vec![
+            "probe",
+            "cdp",
+            "--diff-ports",
+            "badport",
+            "--eval",
+            "1",
+            "--json",
+        ],
+    ];
+    for args in json_err_cases {
+        let out = run_ap(root, &args, None, &[]);
+        assert!(
+            !out.status.success(),
+            "expected non-zero exit for {args:?}, got success: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let jv: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "CLI `{args:?}` under --json MUST emit valid JSON error on stdout, got parse error {e}; stdout=`{}`, stderr=`{}`",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(jv["ok"], false, "expected ok:false for {args:?}: {jv}");
+        assert!(
+            jv["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "expected non-empty error string for {args:?}: {jv}"
+        );
+    }
+
+    // 3. `ap probe http --flow --json` accepts JSON object `body` and auto-sets Content-Type
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        use std::io::Read;
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req_txt = String::from_utf8_lossy(&buf[..n]).to_string();
+            let ok_ct = req_txt
+                .to_ascii_lowercase()
+                .contains("content-type: application/json");
+            let ok_body = req_txt.contains(r#""item":"widget""#);
+            let resp_body =
+                serde_json::json!({ "ok": ok_ct && ok_body, "received_ct": ok_ct }).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    let flow_path = root.join("obj_body_flow.json");
+    fs::write(
+        &flow_path,
+        serde_json::json!({
+            "steps": [
+                {
+                    "name": "post_obj",
+                    "method": "POST",
+                    "url": format!("http://127.0.0.1:{http_port}/items"),
+                    "body": { "item": "widget", "qty": 3 },
+                    "expect_status": 200
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let flow_out = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            "--flow",
+            flow_path.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    let _ = srv.join();
+    assert!(
+        flow_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&flow_out.stderr)
+    );
+    let fv: Value = serde_json::from_slice(&flow_out.stdout).unwrap();
+    assert_eq!(fv["ok"], true, "{fv}");
+    assert!(
+        fv["steps"][0]["body_preview"]
+            .as_str()
+            .unwrap_or("")
+            .contains(r#""ok":true"#),
+        "{fv}"
+    );
+
+    // 4. `ap diff --semantic --json` includes `ok: true` and `format: "semantic-diff"`
+    let old_js = root.join("old.js");
+    let new_js = root.join("new.js");
+    fs::write(
+        &old_js,
+        "function run(x) { if (!verify(x)) return; eval(x); }\n",
+    )
+    .unwrap();
+    fs::write(&new_js, "function run(x) { eval(x); }\n").unwrap();
+    let diff_out = run_ap(
+        root,
+        &[
+            "diff",
+            old_js.to_str().unwrap(),
+            new_js.to_str().unwrap(),
+            "--semantic",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        diff_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff_out.stderr)
+    );
+    let dv: Value = serde_json::from_slice(&diff_out.stdout).unwrap();
+    assert_eq!(dv["ok"], true, "{dv}");
+    assert_eq!(dv["format"], "semantic-diff", "{dv}");
+
+    // 5. `ap read --ioctl --json` auto-collects `device_pipes`, and `--ioctl --surface` combines both modes
+    let fake_pe = root.join("driver.sys");
+    let mut pe_bytes = vec![0u8; 256];
+    pe_bytes[0] = b'M';
+    pe_bytes[1] = b'Z';
+    pe_bytes.extend_from_slice(b"\\\\.\\pipe\\test_ctl_pipe\0\\Device\\TestCtlDrv\0");
+    fs::write(&fake_pe, &pe_bytes).unwrap();
+    let ioctl_out = run_ap(
+        root,
+        &["read", fake_pe.to_str().unwrap(), "--ioctl", "--json"],
+        None,
+        &[],
+    );
+    assert!(ioctl_out.status.success());
+    let iv: Value = serde_json::from_slice(&ioctl_out.stdout).unwrap();
+    let pipes_found = iv["device_pipes"].as_array().unwrap();
+    assert!(
+        !pipes_found.is_empty(),
+        "ap read --ioctl --json must auto-populate device_pipes: {iv}"
+    );
+    let combo_bin = run_ap(
+        root,
+        &[
+            "read",
+            fake_pe.to_str().unwrap(),
+            "--ioctl",
+            "--surface",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(combo_bin.status.success());
+    let cbv: Value = serde_json::from_slice(&combo_bin.stdout).unwrap();
+    assert_eq!(cbv["format_tag"], "binary-combined", "{cbv}");
+    assert!(cbv["device_pipes"].is_array(), "{cbv}");
+    assert!(cbv["artifacts"].is_object(), "{cbv}");
+
+    // 6. Windows combined mode partial failure must NOT return ok=true
+    #[cfg(windows)]
+    {
+        let w_fail = run_ap(
+            root,
+            &[
+                "probe",
+                "win",
+                "--reg",
+                r"HKLM\SOFTWARE\__AP_NONEXISTENT_KEY_C2__",
+                "--whoami",
+                "--json",
+            ],
+            None,
+            &[],
+        );
+        assert!(
+            !w_fail.status.success(),
+            "partial failure must exit non-zero"
+        );
+        let wfv: Value = serde_json::from_slice(&w_fail.stdout).unwrap();
+        assert_eq!(wfv["ok"], false, "{wfv}");
+        assert_eq!(wfv["failed_sections"], serde_json::json!(["reg"]), "{wfv}");
+    }
+
+    // 7. MCP `isError: true` populates `structuredContent: { ok: false, error, text }`, tools === 37, stats captures ok/ms/err
+    let ap_home = root.join("c2_ap_home");
+    let mcp_in = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ap_surface", "arguments": {"path": missing_str}}}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_in),
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(mcp_out.status.success());
+    let mlines: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(mlines[1]["result"]["tools"].as_array().unwrap().len(), 37);
+    let err_res = &mlines[2]["result"];
+    assert_eq!(err_res["isError"], true, "{err_res}");
+    assert_eq!(err_res["structuredContent"]["ok"], false, "{err_res}");
+    assert!(
+        err_res["structuredContent"]["text"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "isError:true must populate structuredContent.text for safe .slice(): {err_res}"
+    );
+    assert!(
+        err_res["structuredContent"]["error"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{err_res}"
+    );
+
+    // Verify stats.jsonl recorded ok=false, ms, err and `ap stats --json` exposes error_count + p95_ms
+    let stats_raw = fs::read_to_string(ap_home.join("stats.jsonl")).unwrap();
+    assert!(stats_raw.contains("\"ok\":false"), "{stats_raw}");
+    assert!(stats_raw.contains("\"ms\":"), "{stats_raw}");
+    let stats_out = run_ap(
+        root,
+        &["stats", "--json"],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(stats_out.status.success());
+    let stv: Value = serde_json::from_slice(&stats_out.stdout).unwrap();
+    assert!(stv["error_count"].as_u64().unwrap_or(0) >= 1, "{stv}");
+    assert!(stv["p95_ms"].is_u64(), "{stv}");
+}

@@ -1,4 +1,5 @@
 use crate::now_iso_utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -6,9 +7,20 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static FRONTIER_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub fn emit_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
 
 #[cfg(windows)]
 mod win_replace {
@@ -76,11 +88,27 @@ mod win_replace {
 
 pub struct FrontierLockGuard {
     lock_path: PathBuf,
+    token: String,
 }
 
 impl Drop for FrontierLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        let owns_lock = fs::read_to_string(&self.lock_path)
+            .map(|cur| cur.trim() == self.token)
+            .unwrap_or(false);
+        if !owns_lock {
+            return;
+        }
+        for attempt in 0..12u64 {
+            match fs::remove_file(&self.lock_path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < 11 => {
+                    std::thread::sleep(Duration::from_millis(2 + attempt * 2));
+                }
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -91,8 +119,14 @@ pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
     let mut os = store_path.as_os_str().to_os_string();
     os.push(".lock");
     let lock_path = PathBuf::from(os);
-    let deadline = SystemTime::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let pid = std::process::id();
+    let seq = FRONTIER_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("pid={pid} seq={seq} ns={nanos}");
     let mut attempt = 0u64;
     loop {
         match OpenOptions::new()
@@ -101,8 +135,9 @@ pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
             .open(&lock_path)
         {
             Ok(mut f) => {
-                let _ = writeln!(f, "pid={pid}");
-                return Ok(FrontierLockGuard { lock_path });
+                let _ = writeln!(f, "{token}");
+                let _ = f.flush();
+                return Ok(FrontierLockGuard { lock_path, token });
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -120,15 +155,15 @@ pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
                         }
                     }
                 }
-                if SystemTime::now() >= deadline {
+                if Instant::now() >= deadline {
                     return Err(format!(
                         "Timed out waiting for lock {}: {e}",
                         lock_path.display()
                     ));
                 }
                 attempt += 1;
-                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 7) % 17;
-                std::thread::sleep(Duration::from_millis(6 + jitter));
+                let jitter = ((pid as u64).wrapping_mul(31) + attempt * 7) % 7;
+                std::thread::sleep(Duration::from_millis(2 + jitter));
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -196,37 +231,81 @@ fn glob_match_ci(pat: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-pub fn item_matches_exclude(item: &FrontierItem, excludes: &[String]) -> bool {
-    if excludes.is_empty() {
-        return false;
-    }
-    let target_low = item.target.replace('\\', "/").to_ascii_lowercase();
-    let fname_low = target_low.rsplit('/').next().unwrap_or(&target_low);
-    let module_low = item.module.replace('\\', "/").to_ascii_lowercase();
-    let symbol_low = item.symbol.to_ascii_lowercase();
-    let axis_low = item.axis.to_ascii_lowercase();
-    for raw in excludes {
-        let pat = raw.trim().replace('\\', "/").to_ascii_lowercase();
-        if pat.is_empty() || pat.starts_with('#') {
-            continue;
+pub struct FrontierExcludeMatcher {
+    globs: Vec<String>,
+    regexes: Vec<Regex>,
+}
+
+impl FrontierExcludeMatcher {
+    pub fn compile(excludes: &[String]) -> Result<Self, String> {
+        let mut globs = Vec::new();
+        let mut regexes = Vec::new();
+        for raw in excludes {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(re_src) = trimmed.strip_prefix("re:") {
+                let re_pat = re_src.trim();
+                let re = Regex::new(re_pat)
+                    .map_err(|e| format!("invalid --exclude regex `{trimmed}`: {e}"))?;
+                regexes.push(re);
+            } else {
+                globs.push(trimmed.replace('\\', "/").to_ascii_lowercase());
+            }
         }
-        if pat.contains('*') || pat.contains('?') {
-            if glob_match_ci(&pat, &target_low)
-                || glob_match_ci(&pat, fname_low)
-                || glob_match_ci(&pat, &module_low)
-                || glob_match_ci(&pat, &symbol_low)
+        Ok(Self { globs, regexes })
+    }
+
+    pub fn matches(&self, item: &FrontierItem) -> bool {
+        if self.globs.is_empty() && self.regexes.is_empty() {
+            return false;
+        }
+        let target_norm = item.target.replace('\\', "/");
+        let target_low = target_norm.to_ascii_lowercase();
+        let fname_low = target_low.rsplit('/').next().unwrap_or(&target_low);
+        let module_norm = item.module.replace('\\', "/");
+        let module_low = module_norm.to_ascii_lowercase();
+        let symbol_low = item.symbol.to_ascii_lowercase();
+        let axis_low = item.axis.to_ascii_lowercase();
+        for pat in &self.globs {
+            if pat.contains('*') || pat.contains('?') {
+                if glob_match_ci(pat, &target_low)
+                    || glob_match_ci(pat, fname_low)
+                    || glob_match_ci(pat, &module_low)
+                    || glob_match_ci(pat, &symbol_low)
+                {
+                    return true;
+                }
+            } else if target_low.contains(pat.as_str())
+                || module_low.contains(pat.as_str())
+                || symbol_low.contains(pat.as_str())
+                || axis_low == pat.as_str()
             {
                 return true;
             }
-        } else if target_low.contains(&pat)
-            || module_low.contains(&pat)
-            || symbol_low.contains(&pat)
-            || axis_low == pat
-        {
-            return true;
         }
+        for re in &self.regexes {
+            if re.is_match(&target_norm)
+                || re.is_match(&module_norm)
+                || re.is_match(&item.symbol)
+                || re.is_match(&item.axis)
+            {
+                return true;
+            }
+        }
+        false
     }
-    false
+}
+
+pub fn validate_excludes(excludes: &[String]) -> Result<(), String> {
+    FrontierExcludeMatcher::compile(excludes).map(|_| ())
+}
+
+pub fn item_matches_exclude(item: &FrontierItem, excludes: &[String]) -> bool {
+    FrontierExcludeMatcher::compile(excludes)
+        .map(|m| m.matches(item))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -323,21 +402,40 @@ pub fn resolve_store_path(cwd: &Path, store: Option<&str>) -> PathBuf {
     crate::baton_dir(cwd).join("frontier.json")
 }
 
-pub fn load_frontier(store_path: &Path) -> FrontierState {
+pub fn load_frontier_strict(store_path: &Path) -> Result<FrontierState, String> {
     if !store_path.exists() {
-        return FrontierState::default();
+        return Ok(FrontierState::default());
     }
-    for attempt in 0..4u64 {
-        if let Ok(s) = fs::read_to_string(store_path) {
-            if let Ok(parsed) = serde_json::from_str::<FrontierState>(&s) {
-                return parsed;
+    let mut last_err = String::new();
+    for attempt in 0..8u64 {
+        match fs::read_to_string(store_path) {
+            Ok(s) => match serde_json::from_str::<FrontierState>(&s) {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => {
+                    last_err = format!("corrupt frontier store {}: {e}", store_path.display());
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(6 + attempt * 5));
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FrontierState::default());
+            }
+            Err(e) => {
+                last_err = format!("cannot read frontier store {}: {e}", store_path.display());
+                if attempt < 7 {
+                    std::thread::sleep(Duration::from_millis(8 + attempt * 5));
+                }
             }
         }
-        if attempt < 3 {
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
-    FrontierState::default()
+    Err(last_err)
+}
+
+pub fn load_frontier(store_path: &Path) -> FrontierState {
+    load_frontier_strict(store_path).unwrap_or_default()
 }
 
 pub fn save_frontier_unlocked(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
@@ -405,6 +503,7 @@ pub fn seed_from_json_str_with_excludes(
     raw: &str,
     excludes: &[String],
 ) -> Result<(usize, usize, usize), String> {
+    let matcher = FrontierExcludeMatcher::compile(excludes)?;
     let val: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     if let Some(root) = val
         .get("root")
@@ -501,7 +600,7 @@ pub fn seed_from_json_str_with_excludes(
             evidence_ref: String::new(),
             updated_at: now.clone(),
         };
-        if item_matches_exclude(&item, excludes) {
+        if matcher.matches(&item) {
             filtered += 1;
             continue;
         }
@@ -1814,6 +1913,7 @@ pub fn ingest_tool_json_str_with_excludes(
     kind_hint: Option<&str>,
     excludes: &[String],
 ) -> Result<(String, usize, usize, usize), String> {
+    let matcher = FrontierExcludeMatcher::compile(excludes)?;
     let val: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     let hint = kind_hint
         .map(|s| s.trim().to_ascii_lowercase())
@@ -1858,7 +1958,7 @@ pub fn ingest_tool_json_str_with_excludes(
     let mut filtered = 0usize;
     let mut push_item = |d: ItemDraft<'_>| {
         let item = make_frontier_item(d);
-        if item_matches_exclude(&item, excludes) {
+        if matcher.matches(&item) {
             filtered += 1;
             return;
         }
@@ -2204,11 +2304,18 @@ pub struct FrontierSeedOpts<'a> {
 }
 
 pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
+    let matcher = match FrontierExcludeMatcher::compile(opts.excludes) {
+        Ok(m) => m,
+        Err(e) => {
+            emit_err(opts.as_json, &format!("[baton frontier] {e}"));
+            return 2;
+        }
+    };
     let store_path = resolve_store_path(cwd, opts.store);
     let raw_input: Option<String> = if opts.from_stdin {
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
-            eprintln!("[baton frontier] failed to read stdin");
+            emit_err(opts.as_json, "[baton frontier] failed to read stdin");
             return 1;
         }
         Some(buf)
@@ -2216,7 +2323,10 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
         match fs::read_to_string(path_str) {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("[baton frontier] cannot read {path_str}: {e}");
+                emit_err(
+                    opts.as_json,
+                    &format!("[baton frontier] cannot read {path_str}: {e}"),
+                );
                 return 1;
             }
         }
@@ -2227,16 +2337,22 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
     let _lock = match acquire_file_lock(&store_path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[baton frontier] lock failed: {e}");
+            emit_err(opts.as_json, &format!("[baton frontier] lock failed: {e}"));
             return 1;
         }
     };
-    let mut state = load_frontier(&store_path);
+    let mut state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(opts.as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let (added, skipped, filtered) = if let Some(raw) = raw_input {
         match seed_from_json_str_with_excludes(&mut state, &raw, opts.excludes) {
             Ok(triple) => triple,
             Err(e) => {
-                eprintln!("[baton frontier] {e}");
+                emit_err(opts.as_json, &format!("[baton frontier] {e}"));
                 return 1;
             }
         }
@@ -2262,7 +2378,7 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
             evidence_ref: String::new(),
             updated_at: now_iso_utc(),
         };
-        if item_matches_exclude(&item, opts.excludes) {
+        if matcher.matches(&item) {
             (0, 0, 1)
         } else if upsert_item(&mut state, item) {
             (1, 0, 0)
@@ -2270,12 +2386,15 @@ pub fn run_frontier_seed(cwd: &Path, opts: &FrontierSeedOpts<'_>) -> i32 {
             (0, 1, 0)
         }
     } else {
-        eprintln!("[baton frontier] seed requires --from-json, --stdin, or --target");
+        emit_err(
+            opts.as_json,
+            "[baton frontier] seed requires --from-json, --stdin, or --target",
+        );
         return 2;
     };
 
     if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
-        eprintln!("[baton frontier] save failed: {e}");
+        emit_err(opts.as_json, &format!("[baton frontier] save failed: {e}"));
         return 1;
     }
     if opts.as_json {
@@ -2310,18 +2429,27 @@ pub fn run_frontier_mark(
     as_json: bool,
 ) -> i32 {
     let Some(status) = FrontierStatus::parse(status_str) else {
-        eprintln!("[baton frontier] invalid status '{status_str}' (use unvisited|probed|stopped|confirmed|deferred)");
+        emit_err(
+            as_json,
+            &format!("[baton frontier] invalid status '{status_str}' (use unvisited|probed|stopped|confirmed|deferred)"),
+        );
         return 2;
     };
     let store_path = resolve_store_path(cwd, store);
     let _lock = match acquire_file_lock(&store_path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[baton frontier] lock failed: {e}");
+            emit_err(as_json, &format!("[baton frontier] lock failed: {e}"));
             return 1;
         }
     };
-    let mut state = load_frontier(&store_path);
+    let mut state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let q_low = query.trim().to_ascii_lowercase();
     let now = now_iso_utc();
     let mut updated_ids = Vec::new();
@@ -2352,7 +2480,7 @@ pub fn run_frontier_mark(
         return 1;
     }
     if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
-        eprintln!("[baton frontier] save failed: {e}");
+        emit_err(as_json, &format!("[baton frontier] save failed: {e}"));
         return 1;
     }
     if as_json {
@@ -2385,13 +2513,20 @@ pub fn run_frontier_next(
     as_json: bool,
 ) -> i32 {
     let store_path = resolve_store_path(cwd, store);
-    let state = load_frontier(&store_path);
+    let state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let picked = pick_next_diverse(&state, top_k, exclude_axes);
     let summary = status_summary_json(&state, top_k);
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
                 "total": state.items.len(),
                 "unvisited": summary["unvisited"],
                 "unexplored_axes": summary["unexplored_axes"],
@@ -2428,7 +2563,13 @@ pub fn run_frontier_next(
 
 pub fn run_frontier_status(cwd: &Path, store: Option<&str>, top_k: usize, as_json: bool) -> i32 {
     let store_path = resolve_store_path(cwd, store);
-    let state = load_frontier(&store_path);
+    let state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     if as_json {
         println!(
             "{}",
@@ -2461,17 +2602,26 @@ pub fn run_frontier_sync_stopped(
     let _lock = match acquire_file_lock(&store_path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[baton frontier] lock failed: {e}");
+            emit_err(as_json, &format!("[baton frontier] lock failed: {e}"));
             return 1;
         }
     };
-    let mut state = load_frontier(&store_path);
+    let mut state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let mut total_marked = 0usize;
     for (label, txt) in &loaded_texts {
         total_marked += sync_stopped_from_text(&mut state, label, txt);
     }
     if total_marked > 0 {
-        let _ = save_frontier_unlocked(&store_path, &mut state);
+        if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
+            emit_err(as_json, &format!("[baton frontier] save failed: {e}"));
+            return 1;
+        }
     }
     if as_json {
         println!(
@@ -2491,7 +2641,13 @@ pub fn run_frontier_sync_stopped(
 
 pub fn run_frontier_coverage(cwd: &Path, store: Option<&str>, top_k: usize, as_json: bool) -> i32 {
     let store_path = resolve_store_path(cwd, store);
-    let state = load_frontier(&store_path);
+    let state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let rep = compute_coverage_report(&state, top_k, &[]);
     if as_json {
         println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
@@ -2509,7 +2665,13 @@ pub fn run_frontier_challenge(
     as_json: bool,
 ) -> i32 {
     let store_path = resolve_store_path(cwd, store);
-    let state = load_frontier(&store_path);
+    let state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let rep = compute_coverage_report(&state, top_k, exclude_axes);
     if as_json {
         println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
@@ -2540,11 +2702,15 @@ pub fn run_frontier_ingest_with_excludes(
     excludes: &[String],
     as_json: bool,
 ) -> i32 {
+    if let Err(e) = validate_excludes(excludes) {
+        emit_err(as_json, &format!("[baton frontier] {e}"));
+        return 2;
+    }
     let store_path = resolve_store_path(cwd, store);
     let raw = if from_stdin {
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
-            eprintln!("[baton frontier] failed to read stdin");
+            emit_err(as_json, "[baton frontier] failed to read stdin");
             return 1;
         }
         buf
@@ -2552,33 +2718,45 @@ pub fn run_frontier_ingest_with_excludes(
         match fs::read_to_string(path_str) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[baton frontier] cannot read {path_str}: {e}");
+                emit_err(
+                    as_json,
+                    &format!("[baton frontier] cannot read {path_str}: {e}"),
+                );
                 return 1;
             }
         }
     } else {
-        eprintln!("[baton frontier] ingest requires --from-file or --stdin");
+        emit_err(
+            as_json,
+            "[baton frontier] ingest requires --from-file or --stdin",
+        );
         return 2;
     };
 
     let _lock = match acquire_file_lock(&store_path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[baton frontier] lock failed: {e}");
+            emit_err(as_json, &format!("[baton frontier] lock failed: {e}"));
             return 1;
         }
     };
-    let mut state = load_frontier(&store_path);
+    let mut state = match load_frontier_strict(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_err(as_json, &format!("[baton frontier] {e}"));
+            return 1;
+        }
+    };
     let (detected_kind, added, skipped, filtered) =
         match ingest_tool_json_str_with_excludes(&mut state, &raw, kind_hint, excludes) {
             Ok(res) => res,
             Err(e) => {
-                eprintln!("[baton frontier] {e}");
+                emit_err(as_json, &format!("[baton frontier] {e}"));
                 return 1;
             }
         };
     if let Err(e) = save_frontier_unlocked(&store_path, &mut state) {
-        eprintln!("[baton frontier] save failed: {e}");
+        emit_err(as_json, &format!("[baton frontier] save failed: {e}"));
         return 1;
     }
     let cov = compute_coverage_report(&state, 5, &[]);
@@ -3102,6 +3280,61 @@ mod tests {
             final_st.items.len(),
             30,
             "full RMW locking must preserve all 6x5 concurrent seeds without lost updates"
+        );
+
+        // Regex (`re:`) exclude support + invalid regex rejection
+        let re_excludes = vec!["re:^noise/.*\\.tmp$".to_string()];
+        let mut st_re = FrontierState::default();
+        let re_json = json!({
+            "items": [
+                {"axis": "fs_path_io", "module": "noise", "target": "noise/cache.tmp", "symbol": "open"},
+                {"axis": "fs_path_io", "module": "src", "target": "src/store.rs", "symbol": "open"}
+            ]
+        });
+        let (ra, rs, rf) =
+            seed_from_json_str_with_excludes(&mut st_re, &re_json.to_string(), &re_excludes)
+                .unwrap();
+        assert_eq!((ra, rs, rf), (1, 0, 1));
+        assert!(validate_excludes(&["re:[unclosed".to_string()]).is_err());
+
+        // Fail-closed strict loader on corrupt frontier.json (must NEVER wipe corrupt file!)
+        let corrupt_fp = td.join("corrupt_frontier.json");
+        fs::write(&corrupt_fp, "{ invalid json !!!").unwrap();
+        assert!(load_frontier_strict(&corrupt_fp).is_err());
+        let rc_corrupt = run_frontier_seed(
+            &td,
+            &FrontierSeedOpts {
+                store: Some(corrupt_fp.to_str().unwrap()),
+                from_json: None,
+                from_stdin: false,
+                axis: Some("exec_spawn"),
+                target: Some("src/new.rs"),
+                module: None,
+                note: None,
+                score: 80,
+                excludes: &[],
+                as_json: true,
+            },
+        );
+        assert_ne!(rc_corrupt, 0);
+        assert_eq!(
+            fs::read_to_string(&corrupt_fp).unwrap(),
+            "{ invalid json !!!",
+            "corrupt frontier store must never be silently overwritten"
+        );
+
+        // Lock-owner token prevents a stale holder's Drop from deleting a newer holder's lock
+        let tok_target = td.join("tok_test.json");
+        let lock_file = td.join("tok_test.json.lock");
+        {
+            let _g1 = acquire_file_lock(&tok_target).unwrap();
+            assert!(lock_file.is_file());
+            // Simulate another process replacing the lockfile with a different token
+            fs::write(&lock_file, "pid=999999 seq=999 ns=1\n").unwrap();
+        }
+        assert!(
+            lock_file.is_file(),
+            "Drop must NOT delete a lockfile whose owner token changed"
         );
         let _ = fs::remove_dir_all(&td);
     }

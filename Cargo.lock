@@ -121,6 +121,7 @@ name = "ap-baton"
 version = "2.70.0"
 dependencies = [
  "clap",
+ "regex",
  "serde",
  "serde_json",
 ]
@@ -161,6 +162,7 @@ name = "ap-recall"
 version = "2.70.0"
 dependencies = [
  "clap",
+ "encoding_rs",
  "rusqlite",
  "serde",
  "serde_json",

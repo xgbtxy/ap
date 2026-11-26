@@ -564,38 +564,46 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 id: "bundle_session_before_compact_first_wins",
                 rel_hint: None,
                 old: r#"if(this.isSessionBeforeEvent(event)&&handlerResult&&(result=handlerResult,result.cancel))return result"#,
-                alt_olds: &[],
-                new: r#"if(this.isSessionBeforeEvent(event)&&handlerResult){if(handlerResult.cancel)return handlerResult;if(event.type==="session_before_compact"&&handlerResult.compaction){if(!result?.compaction){result=handlerResult;try{event.compactionClaimed=!0}catch{}}}else result=handlerResult}"#,
+                alt_olds: &[
+                    r#"if(this.isSessionBeforeEvent(event)&&handlerResult){if(handlerResult.cancel)return handlerResult;if(event.type==="session_before_compact"&&handlerResult.compaction){if(!result?.compaction){result=handlerResult;try{event.compactionClaimed=!0}catch{}}}else result=handlerResult}"#,
+                ],
+                new: r#"if(this.isSessionBeforeEvent(event)&&handlerResult){if(handlerResult.cancel)return handlerResult;if(event.type==="session_before_compact"){if(handlerResult.compaction&&!result?.compaction){result=handlerResult;try{event.compactionClaimed=!0}catch{}}else if(!result?.compaction)result=handlerResult}else result=handlerResult}"#,
                 already_present_markers: &[],
             },
             PatchHunk {
                 id: "core_runner_session_before_compact_first_wins",
                 rel_hint: Some("dist/core/extensions/runner.js"),
                 old: "                    if (this.isSessionBeforeEvent(event) && handlerResult) {\n                        result = handlerResult;\n                        if (result.cancel) {\n                            return result;\n                        }\n                    }",
-                alt_olds: &[],
-                new: "                    if (this.isSessionBeforeEvent(event) && handlerResult) {\n                        if (handlerResult.cancel) {\n                            return handlerResult;\n                        }\n                        if (event.type === \"session_before_compact\" && handlerResult.compaction) {\n                            if (!result?.compaction) {\n                                result = handlerResult;\n                                try { event.compactionClaimed = true; } catch { }\n                            }\n                        }\n                        else {\n                            result = handlerResult;\n                        }\n                    }",
+                alt_olds: &[
+                    "                    if (this.isSessionBeforeEvent(event) && handlerResult) {\n                        if (handlerResult.cancel) {\n                            return handlerResult;\n                        }\n                        if (event.type === \"session_before_compact\" && handlerResult.compaction) {\n                            if (!result?.compaction) {\n                                result = handlerResult;\n                                try { event.compactionClaimed = true; } catch { }\n                            }\n                        }\n                        else {\n                            result = handlerResult;\n                        }\n                    }",
+                ],
+                new: "                    if (this.isSessionBeforeEvent(event) && handlerResult) {\n                        if (handlerResult.cancel) {\n                            return handlerResult;\n                        }\n                        if (event.type === \"session_before_compact\") {\n                            if (handlerResult.compaction && !result?.compaction) {\n                                result = handlerResult;\n                                try { event.compactionClaimed = true; } catch { }\n                            }\n                            else if (!result?.compaction) {\n                                result = handlerResult;\n                            }\n                        }\n                        else {\n                            result = handlerResult;\n                        }\n                    }",
                 already_present_markers: &[],
             },
         ],
     },
     PatchSpec {
         id: "http_dns_stale_cache",
-        summary: "Inject a 45s fresh-TTL + 10m stale-IP DNS lookup cache onto EnvHttpProxyAgent's plain connect options (preserves keepAlive/timeouts and HTTP-CONNECT proxy tunnels; leaves createUndiciClient untouched)",
+        summary: "Inject an LRU 45s fresh-TTL + 10m stale-IP coalescing DNS lookup cache onto EnvHttpProxyAgent's plain connect options (preserves keepAlive/timeouts and HTTP-CONNECT proxy tunnels; leaves createUndiciClient untouched)",
         hunks: &[
             PatchHunk {
                 id: "bundle_http_dns_stale_cache",
                 rel_hint: None,
                 old: r#"withUndiciErrorListener(new undici.EnvHttpProxyAgent("#,
-                alt_olds: &[],
-                new: r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let fam=typeof opts=="number"?opts:opts?.family??0,all=Boolean(typeof opts=="object"&&opts?.all),key=`${host}|${fam}|${all?1:0}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}_dp.then(m=>{m.lookup(host,opts,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(v.length>0){if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}all?cb(null,a):cb(null,a,b);return}if(hit&&Date.now()-hit.t<6e5&&(err?.code==="ENOTFOUND"||err?.code==="EAI_AGAIN"||err?.code==="ETIMEOUT"||err?.code==="ESERVFAIL")){all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]);return}cb(err)})},e=>cb(e))}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
+                alt_olds: &[
+                    r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let fam=typeof opts=="number"?opts:opts?.family??0,all=Boolean(typeof opts=="object"&&opts?.all),key=`${host}|${fam}|${all?1:0}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}_dp.then(m=>{m.lookup(host,opts,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(v.length>0){if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}all?cb(null,a):cb(null,a,b);return}if(hit&&Date.now()-hit.t<6e5&&(err?.code==="ENOTFOUND"||err?.code==="EAI_AGAIN"||err?.code==="ETIMEOUT"||err?.code==="ESERVFAIL")){all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]);return}cb(err)})},e=>cb(e))}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
+                ],
+                new: r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_inf=globalThis.__piDnsInFlight??(globalThis.__piDnsInFlight=new Map),_se=new Set(["ENOTFOUND","EAI_AGAIN","ETIMEOUT","ETIMEDOUT","ESERVFAIL","EAI_FAIL","EAI_NODATA","EAI_NONAME"]);_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let h=String(host||"").toLowerCase(),fam=typeof opts=="number"?opts:opts?.family??0,all=Boolean(typeof opts=="object"&&opts?.all),hints=typeof opts=="object"&&opts?.hints?opts.hints:0,ord=typeof opts=="object"?opts?.order??(opts?.verbatim?"verbatim":""):"",key=`${h}|${fam}|${all?1:0}|${hints}|${ord}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){_c.delete(key);_c.set(key,hit);queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}let q=_inf.get(key);if(q){q.push(cb);return}q=[cb];_inf.set(key,q);let _fin=(err,a,b)=>{let list=_inf.get(key)||q;_inf.delete(key);for(let fn of list)try{err?fn(err):all?fn(null,Array.isArray(a)?a.map(x=>({...x})):[]):fn(null,a,b)}catch{}},_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_dp.then(m=>{try{m.lookup(host,opts,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(v.length>0){_c.delete(key);if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}return _fin(null,a,b)}if(hit&&Date.now()-hit.t<6e5&&_se.has(err?.code))return _fin(null,all?hit.v:hit.v[0],all?void 0:hit.v[1]);_fin(err)})}catch(e){_fin(e)}},e=>{globalThis.__piDnsModP===_dp&&(globalThis.__piDnsModP=void 0);_fin(e)})}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
                 already_present_markers: &[],
             },
             PatchHunk {
                 id: "core_http_dns_stale_cache",
                 rel_hint: Some("dist/core/http-dispatcher.js"),
                 old: "withUndiciErrorListener(new undici.EnvHttpProxyAgent(",
-                alt_olds: &[],
-                new: "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const fam = typeof opts === \"number\" ? opts : (opts?.family ?? 0);\n                        const all = Boolean(typeof opts === \"object\" && opts?.all);\n                        const key = `${host}|${fam}|${all ? 1 : 0}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        _dp.then((m) => {\n                            m.lookup(host, opts, (err, a, b) => {\n                                if (!err) {\n                                    const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                    if (v.length > 0) {\n                                        if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                        _c.set(key, { v, t: Date.now() });\n                                    }\n                                    if (all) cb(null, a); else cb(null, a, b);\n                                    return;\n                                }\n                                if (hit && Date.now() - hit.t < 600000 && (err?.code === \"ENOTFOUND\" || err?.code === \"EAI_AGAIN\" || err?.code === \"ETIMEOUT\" || err?.code === \"ESERVFAIL\")) {\n                                    if (all) cb(null, hit.v.map((x) => ({ ...x }))); else cb(null, hit.v[0], hit.v[1]);\n                                    return;\n                                }\n                                cb(err);\n                            });\n                        }, (e) => cb(e));\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
+                alt_olds: &[
+                    "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const fam = typeof opts === \"number\" ? opts : (opts?.family ?? 0);\n                        const all = Boolean(typeof opts === \"object\" && opts?.all);\n                        const key = `${host}|${fam}|${all ? 1 : 0}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        _dp.then((m) => {\n                            m.lookup(host, opts, (err, a, b) => {\n                                if (!err) {\n                                    const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                    if (v.length > 0) {\n                                        if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                        _c.set(key, { v, t: Date.now() });\n                                    }\n                                    if (all) cb(null, a); else cb(null, a, b);\n                                    return;\n                                }\n                                if (hit && Date.now() - hit.t < 600000 && (err?.code === \"ENOTFOUND\" || err?.code === \"EAI_AGAIN\" || err?.code === \"ETIMEOUT\" || err?.code === \"ESERVFAIL\")) {\n                                    if (all) cb(null, hit.v.map((x) => ({ ...x }))); else cb(null, hit.v[0], hit.v[1]);\n                                    return;\n                                }\n                                cb(err);\n                            });\n                        }, (e) => cb(e));\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
+                ],
+                new: "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _inf = globalThis.__piDnsInFlight ?? (globalThis.__piDnsInFlight = new Map());\n            const _se = new Set([\"ENOTFOUND\", \"EAI_AGAIN\", \"ETIMEOUT\", \"ETIMEDOUT\", \"ESERVFAIL\", \"EAI_FAIL\", \"EAI_NODATA\", \"EAI_NONAME\"]);\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const h = String(host || \"\").toLowerCase();\n                        const fam = typeof opts === \"number\" ? opts : (opts?.family ?? 0);\n                        const all = Boolean(typeof opts === \"object\" && opts?.all);\n                        const hints = typeof opts === \"object\" && opts?.hints ? opts.hints : 0;\n                        const ord = typeof opts === \"object\" ? (opts?.order ?? (opts?.verbatim ? \"verbatim\" : \"\")) : \"\";\n                        const key = `${h}|${fam}|${all ? 1 : 0}|${hints}|${ord}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            _c.delete(key);\n                            _c.set(key, hit);\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        let q = _inf.get(key);\n                        if (q) { q.push(cb); return; }\n                        q = [cb];\n                        _inf.set(key, q);\n                        const _fin = (err, a, b) => {\n                            const list = _inf.get(key) || q;\n                            _inf.delete(key);\n                            for (const fn of list) {\n                                try {\n                                    if (err) fn(err);\n                                    else if (all) fn(null, Array.isArray(a) ? a.map((x) => ({ ...x })) : []);\n                                    else fn(null, a, b);\n                                } catch { }\n                            }\n                        };\n                        const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n                        _dp.then((m) => {\n                            try {\n                                m.lookup(host, opts, (err, a, b) => {\n                                    if (!err) {\n                                        const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                        if (v.length > 0) {\n                                            _c.delete(key);\n                                            if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                            _c.set(key, { v, t: Date.now() });\n                                        }\n                                        _fin(null, a, b);\n                                        return;\n                                    }\n                                    if (hit && Date.now() - hit.t < 600000 && _se.has(err?.code)) {\n                                        _fin(null, all ? hit.v : hit.v[0], all ? undefined : hit.v[1]);\n                                        return;\n                                    }\n                                    _fin(err);\n                                });\n                            } catch (e) {\n                                _fin(e);\n                            }\n                        }, (e) => {\n                            if (globalThis.__piDnsModP === _dp) globalThis.__piDnsModP = undefined;\n                            _fin(e);\n                        });\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
                 already_present_markers: &[],
             },
         ],
@@ -1872,14 +1880,16 @@ assert.ok(true);
             r#"
 import assert from "node:assert/strict";
 
-// 1) Verify session_before_compact_first_wins semantics
+// 1) Verify session_before_compact_first_wins semantics (incl. H2 returning {{cancel:false}} / {{}} / H1 throwing)
 const runner = {{
   isSessionBeforeEvent(e) {{ return e.type === "session_before_compact" || e.type === "session_before_tree"; }},
   async emit(event, handlers) {{
     let result;
     for (const handler of handlers) {{
-      const handlerResult = await handler(event);
-      {compact_branch}
+      try {{
+        const handlerResult = await handler(event);
+        {compact_branch}
+      }} catch (_err) {{}}
     }}
     return result;
   }}
@@ -1894,6 +1904,30 @@ const res1 = await runner.emit(ev1, [
 assert.strictEqual(seenClaimed, true, "second handler must see event.compactionClaimed === true");
 assert.strictEqual(res1.compaction.summary, "first-wins", "first compaction must not be overwritten");
 
+// H2 returning {{ cancel: false }} or {{}} MUST NOT wipe out H1's compaction!
+const res1b = await runner.emit({{ type: "session_before_compact" }}, [
+  async () => ({{ compaction: {{ summary: "A" }} }}),
+  async () => ({{ cancel: false }}),
+  async () => ({{}}),
+]);
+assert.strictEqual(res1b?.compaction?.summary, "A", "truthy non-compaction H2 must never wipe H1 compaction");
+
+// H1 throwing leaves compactionClaimed unset and allows H2 to win
+const evThrow = {{ type: "session_before_compact" }};
+const resThrow = await runner.emit(evThrow, [
+  async () => {{ throw new Error("boom"); }},
+  async (e) => {{ assert.strictEqual(Boolean(e.compactionClaimed), false); return {{ compaction: {{ summary: "B-after-throw" }} }}; }},
+]);
+assert.strictEqual(resThrow?.compaction?.summary, "B-after-throw");
+assert.strictEqual(evThrow.compactionClaimed, true);
+
+// H1 returning undefined allows H2 to win
+const resUndef = await runner.emit({{ type: "session_before_compact" }}, [
+  async () => undefined,
+  async () => ({{ compaction: {{ summary: "B-after-undef" }} }}),
+]);
+assert.strictEqual(resUndef?.compaction?.summary, "B-after-undef");
+
 const ev2 = {{ type: "session_before_compact" }};
 const res2 = await runner.emit(ev2, [
   async () => ({{ compaction: {{ summary: "first" }} }}),
@@ -1904,20 +1938,26 @@ assert.strictEqual(res2.cancel, true, "cancel must still preempt");
 // 2) Verify http_dns_stale_cache in configureHttpDispatcher:
 //    - preserves connect keepAlive/timeout/autoSelectFamilyAttemptTimeout options
 //    - never overwrites a function-valued connect (proxy tunnel / pre-built connector)
-//    - fresh 45s TTL hit + all:true/all:false + 10m stale fallback on ENOTFOUND + >10m error propagation
+//    - coalesces 5-way concurrent lookups (1 live call), case-insensitive host, hints/order key isolation
+//    - fresh 45s TTL hit + LRU refresh + all:true/all:false
+//    - 10m stale fallback on ENOTFOUND, ETIMEDOUT, EAI_FAIL, EAI_NODATA, EAI_NONAME + >10m error propagation
+//    - rejected __piDnsModP clears itself and recovers on next call
 let liveCalls = 0;
-let failMode = false;
+let failCode = null;
 globalThis.__piDnsStaleCache = new Map();
+globalThis.__piDnsInFlight = new Map();
 globalThis.__piDnsModP = Promise.resolve({{
   lookup(host, opts, cb) {{
     liveCalls += 1;
-    if (failMode) {{
-      const err = new Error("getaddrinfo ENOTFOUND " + host);
-      err.code = "ENOTFOUND";
-      return cb(err);
-    }}
-    if (opts && opts.all) return cb(null, [{{ address: "1.2.3.4", family: 4 }}]);
-    return cb(null, "1.2.3.4", 4);
+    setTimeout(() => {{
+      if (failCode) {{
+        const err = new Error("getaddrinfo " + failCode + " " + host);
+        err.code = failCode;
+        return cb(err);
+      }}
+      if (opts && opts.all) return cb(null, [{{ address: "1.2.3.4", family: 4 }}]);
+      return cb(null, "1.2.3.4", 4);
+    }}, 10);
   }}
 }});
 let capturedOpts = null;
@@ -1955,39 +1995,56 @@ const lookupP = (host, opts) => new Promise((res, rej) => {{
   lookupFn(host, opts, (err, a, b) => err ? rej(err) : res([a, b]));
 }});
 
-// Fresh lookup populates cache
-const [addr1, fam1] = await lookupP("api.example.test", {{ family: 4 }});
-assert.strictEqual(addr1, "1.2.3.4");
-assert.strictEqual(fam1, 4);
-assert.strictEqual(liveCalls, 1);
+// 5-way concurrent cold lookup (mixed case) must coalesce into 1 live DNS call
+const herd = await Promise.all([
+  lookupP("api.example.test", {{ family: 4 }}),
+  lookupP("API.EXAMPLE.TEST", {{ family: 4 }}),
+  lookupP("Api.Example.Test", {{ family: 4 }}),
+  lookupP("api.example.test", {{ family: 4 }}),
+  lookupP("API.example.TEST", {{ family: 4 }}),
+]);
+assert.strictEqual(liveCalls, 1, "5 concurrent lookups must coalesce into 1");
+for (const [a, f] of herd) {{ assert.strictEqual(a, "1.2.3.4"); assert.strictEqual(f, 4); }}
 
-// Second lookup within 45s TTL hits cache (no live DNS call)
-const [addr2, fam2] = await lookupP("api.example.test", {{ family: 4 }});
+// Case-insensitive cache hit within 45s TTL (no live DNS call)
+const [addr2, fam2] = await lookupP("API.EXAMPLE.TEST", {{ family: 4 }});
 assert.strictEqual(addr2, "1.2.3.4");
 assert.strictEqual(fam2, 4);
 assert.strictEqual(liveCalls, 1);
 
-// all:true lookup caches array separately
-const [arr1] = await lookupP("api.example.test", {{ all: true }});
+// all:true and different hints/order do NOT collide
+const [arr1] = await lookupP("api.example.test", {{ all: true, order: "ipv4first" }});
 assert.deepStrictEqual(arr1, [{{ address: "1.2.3.4", family: 4 }}]);
 assert.strictEqual(liveCalls, 2);
+await lookupP("api.example.test", {{ all: true, order: "verbatim" }});
+assert.strictEqual(liveCalls, 3);
 
-// Age cache entry to 60s (past 45s fresh TTL, within 10m stale window) and trigger ENOTFOUND
-for (const [k, v] of globalThis.__piDnsStaleCache.entries()) {{
-  globalThis.__piDnsStaleCache.set(k, {{ ...v, t: Date.now() - 60000 }});
+// Age cache entries to 60s (past 45s fresh TTL, within 10m stale window) and test ETIMEDOUT / EAI_FAIL / EAI_NODATA / EAI_NONAME / ENOTFOUND
+for (const code of ["ETIMEDOUT", "EAI_FAIL", "EAI_NODATA", "EAI_NONAME", "ENOTFOUND"]) {{
+  for (const [k, v] of globalThis.__piDnsStaleCache.entries()) {{
+    globalThis.__piDnsStaleCache.set(k, {{ ...v, t: Date.now() - 60000 }});
+  }}
+  failCode = code;
+  const [sa, sf] = await lookupP("api.example.test", {{ family: 4 }});
+  assert.strictEqual(sa, "1.2.3.4", "stale fallback failed for " + code);
+  assert.strictEqual(sf, 4);
+  const [sarr] = await lookupP("api.example.test", {{ all: true, order: "ipv4first" }});
+  assert.deepStrictEqual(sarr, [{{ address: "1.2.3.4", family: 4 }}]);
 }}
-failMode = true;
-const [staleAddr, staleFam] = await lookupP("api.example.test", {{ family: 4 }});
-assert.strictEqual(staleAddr, "1.2.3.4");
-assert.strictEqual(staleFam, 4);
-const [staleArr] = await lookupP("api.example.test", {{ all: true }});
-assert.deepStrictEqual(staleArr, [{{ address: "1.2.3.4", family: 4 }}]);
 
-// Age cache entry past 10m (>600s) -> ENOTFOUND must propagate
+// Age cache entry past 10m (>600s) -> ETIMEDOUT must propagate
 for (const [k, v] of globalThis.__piDnsStaleCache.entries()) {{
   globalThis.__piDnsStaleCache.set(k, {{ ...v, t: Date.now() - 700000 }});
 }}
-await assert.rejects(() => lookupP("api.example.test", {{ family: 4 }}), /ENOTFOUND/);
+failCode = "ETIMEDOUT";
+await assert.rejects(() => lookupP("api.example.test", {{ family: 4 }}), /ETIMEDOUT/);
+
+// Rejected __piDnsModP must clear itself (never latch permanently)
+const savedMod = globalThis.__piDnsModP;
+globalThis.__piDnsModP = Promise.reject(new Error("transient-import-fail"));
+await assert.rejects(() => lookupP("recover.example.test", {{ family: 4 }}), /transient-import-fail/);
+assert.strictEqual(globalThis.__piDnsModP, undefined, "rejected __piDnsModP must be cleared");
+globalThis.__piDnsModP = savedMod;
 console.log("OK_COMPACT_AND_DNS");
 "#
         );
@@ -2001,5 +2058,62 @@ console.log("OK_COMPACT_AND_DNS");
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
+    }
+
+    #[test]
+    fn patches_18_and_19_upgrade_cleanly_from_wave1_alt_olds() {
+        let base = std::env::temp_dir().join(format!("ap_pi_p18_p19_upg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        let core_ext = pi_dir.join("dist").join("core").join("extensions");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&core_ext).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.1-wave1"}"#,
+        )
+        .unwrap();
+
+        let p18 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "session_before_compact_first_wins")
+            .unwrap();
+        let p19 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "http_dns_stale_cache")
+            .unwrap();
+        fs::write(
+            chunks.join("chunk-main.js"),
+            format!(
+                "{}\n{}\n",
+                p18.hunks[0].alt_olds[0], p19.hunks[0].alt_olds[0]
+            ),
+        )
+        .unwrap();
+        fs::write(core_ext.join("runner.js"), p18.hunks[1].alt_olds[0]).unwrap();
+        fs::write(
+            pi_dir.join("dist").join("core").join("http-dispatcher.js"),
+            p19.hunks[1].alt_olds[0],
+        )
+        .unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            newly.len(),
+            4,
+            "expected all 4 p18/p19 hunks to upgrade: {newly:?}"
+        );
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&base);
     }
 }

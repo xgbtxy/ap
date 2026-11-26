@@ -107,7 +107,7 @@ pub struct ExcludeMatcher {
 }
 
 impl ExcludeMatcher {
-    pub fn compile(patterns: &[String]) -> Self {
+    pub fn compile(patterns: &[String]) -> Result<Self, String> {
         let mut globs = Vec::new();
         let mut regexes = Vec::new();
         for raw in patterns {
@@ -116,39 +116,41 @@ impl ExcludeMatcher {
                 continue;
             }
             if let Some(re_src) = trimmed.strip_prefix("re:") {
-                if let Ok(re) = Regex::new(re_src.trim()) {
-                    regexes.push(re);
-                }
+                let re = Regex::new(re_src.trim())
+                    .map_err(|e| format!("invalid --exclude regex `{trimmed}`: {e}"))?;
+                regexes.push(re);
             } else {
                 globs.push(trimmed.replace('\\', "/").to_ascii_lowercase());
             }
         }
-        Self { globs, regexes }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.globs.is_empty() && self.regexes.is_empty()
+        Ok(Self { globs, regexes })
     }
 
     pub fn is_excluded(&self, rel_path: &str) -> bool {
+        self.is_excluded_opts(rel_path, true)
+    }
+
+    pub fn is_excluded_opts(&self, rel_path: &str, apply_builtin_noise: bool) -> bool {
         let norm = rel_path.replace('\\', "/");
         let low = norm.to_ascii_lowercase();
         let fname = low.rsplit('/').next().unwrap_or(&low);
         // Built-in generic OS CRT / uninstaller / declaration / log noise exclusions
-        if fname.ends_with(".d.ts")
-            || fname.ends_with(".log")
-            || fname.starts_with("api-ms-win-")
-            || fname.starts_with("vcruntime")
-            || fname.starts_with("ucrtbase")
-            || fname.starts_with("msvcp")
-            || fname.starts_with("concrt140")
-            || fname.starts_with("vcomp")
-            || ((fname.starts_with("uninstall") || fname.starts_with("unins"))
-                && fname.ends_with(".exe"))
-            || low.contains("/node_modules/@types/")
-            || low.starts_with("node_modules/@types/")
-            || low.contains("/site-packages/")
-            || low.contains("/dist-packages/")
+        // (applied only on directory/archive sweeps, never dropping an explicit single-file target)
+        if apply_builtin_noise
+            && (fname.ends_with(".d.ts")
+                || fname.ends_with(".log")
+                || fname.starts_with("api-ms-win-")
+                || fname.starts_with("vcruntime")
+                || fname.starts_with("ucrtbase")
+                || fname.starts_with("msvcp")
+                || fname.starts_with("concrt140")
+                || fname.starts_with("vcomp")
+                || ((fname.starts_with("uninstall") || fname.starts_with("unins"))
+                    && fname.ends_with(".exe"))
+                || low.contains("/node_modules/@types/")
+                || low.starts_with("node_modules/@types/")
+                || low.contains("/site-packages/")
+                || low.contains("/dist-packages/"))
         {
             return true;
         }
@@ -582,9 +584,12 @@ fn scan_text_into(
                 classify_guard_proximity(text, m.start(), m.end())
             };
 
-            let mut score = (rule.base_score as i32 + guard_delta).max(10) as u32;
+            // Scale pure static surface hits cleanly into [10..=85] to avoid ceiling saturation at 100
+            // while preserving full relative ranking (guard_after > none_nearby > guard_before).
+            let raw_static = (rule.base_score as i32 - 20 + guard_delta).max(10) as u32;
+            let mut score = raw_static;
             if rel_target.contains("!/") {
-                score += 4;
+                score = score.saturating_add(2);
             }
             if is_manifest {
                 score = score.saturating_sub(6);
@@ -592,6 +597,7 @@ fn scan_text_into(
             if low_rel.contains("node_modules/") {
                 score = score.saturating_sub(18);
             }
+            score = score.clamp(10, 85);
             let key = format!("{}|{}|{}", rule.axis, rel_target, sym.to_ascii_lowercase());
             let id = format!("{}:{}", rule.axis, fnv1a_hex(&key));
             acc.candidates.push(SurfaceItem {
@@ -785,9 +791,38 @@ pub fn build_surface_map_with_excludes(
     include_binaries: bool,
     excludes: &[String],
 ) -> SurfaceMap {
+    try_build_surface_map_with_excludes(
+        root,
+        max_files,
+        max_per_axis,
+        include_vendor,
+        include_binaries,
+        excludes,
+    )
+    .unwrap_or_else(|_| {
+        try_build_surface_map_with_excludes(
+            root,
+            max_files,
+            max_per_axis,
+            include_vendor,
+            include_binaries,
+            &[],
+        )
+        .expect("empty excludes always compile")
+    })
+}
+
+pub fn try_build_surface_map_with_excludes(
+    root: &Path,
+    max_files: usize,
+    max_per_axis: usize,
+    include_vendor: bool,
+    include_binaries: bool,
+    excludes: &[String],
+) -> Result<SurfaceMap, String> {
     let t0 = Instant::now();
     let rules = axis_rules();
-    let matcher = ExcludeMatcher::compile(excludes);
+    let matcher = ExcludeMatcher::compile(excludes)?;
     let mut acc = ScanAcc::new();
     let mut scanned_files = 0usize;
     let mut scanned_archives = 0usize;
@@ -817,7 +852,7 @@ pub fn build_surface_map_with_excludes(
             .and_then(|s| s.to_str())
             .unwrap_or("target")
             .to_string();
-        if matcher.is_excluded(&rel) {
+        if matcher.is_excluded_opts(&rel, false) {
             excluded_files += 1;
         } else {
             let ext = root
@@ -1004,7 +1039,7 @@ pub fn build_surface_map_with_excludes(
         }
     }
 
-    SurfaceMap {
+    Ok(SurfaceMap {
         root: root.to_string_lossy().to_string(),
         elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0,
         scanned_files,
@@ -1015,7 +1050,7 @@ pub fn build_surface_map_with_excludes(
         axes_absent,
         axis_summaries,
         items: final_items,
-    }
+    })
 }
 
 pub fn render_surface_md(map: &SurfaceMap) -> String {
@@ -1223,12 +1258,39 @@ mod tests {
         fs::write(&ef, "# comment\nscratch/*\n*_probe.js\n").unwrap();
 
         let pats = load_exclude_file(&ef).unwrap();
-        let map = build_surface_map_with_excludes(&dir, 100, 10, false, true, &pats);
+        let map = try_build_surface_map_with_excludes(&dir, 100, 10, false, true, &pats).unwrap();
         assert!(map.excluded_files >= 3, "expected excluded files: {map:?}");
         assert!(map.items.iter().any(|i| i.target == "src/app.js"));
         assert!(!map.items.iter().any(|i| i.target.contains("scratch/")));
         assert!(!map.items.iter().any(|i| i.target.contains("types.d.ts")));
         assert!(!map.items.iter().any(|i| i.target.contains("vcruntime140")));
+        // Pure static hits must stay differentiated and <= 85 (no saturation at 100)
+        assert!(
+            map.items.iter().all(|i| i.score <= 85),
+            "static surface scores must not saturate above 85: {:?}",
+            map.items
+        );
+        // Invalid `re:` regex must fail explicitly (not be silently ignored)
+        assert!(
+            try_build_surface_map_with_excludes(
+                &dir,
+                100,
+                10,
+                false,
+                false,
+                &["re:[unclosed".to_string()],
+            )
+            .is_err(),
+            "invalid re: regex must return Err"
+        );
+        // Explicit single-file target named `.log` must NOT be dropped by built-in dir noise filter
+        let single_log = dir.join("explicit_target.log");
+        fs::write(&single_log, "child_process.execSync(userInput);\n").unwrap();
+        let single_map =
+            try_build_surface_map_with_excludes(&single_log, 100, 10, false, false, &[]).unwrap();
+        assert_eq!(single_map.excluded_files, 0);
+        assert_eq!(single_map.scanned_files, 1);
+        assert!(!single_map.items.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

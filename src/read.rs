@@ -1248,14 +1248,9 @@ fn read_single_target(
             if cli.semantic {
                 if let Some(ref old_path_str) = cli.diff {
                     let norm_old = crate::ls::normalize_cli_path(old_path_str);
-                    let md =
-                        crate::semantic_diff::diff_semantic_paths(Path::new(&norm_old), p, false)
+                    let (md, mut jv) =
+                        crate::semantic_diff::diff_semantic_paths_both(Path::new(&norm_old), p)
                             .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
-                    let jv_str =
-                        crate::semantic_diff::diff_semantic_paths(Path::new(&norm_old), p, true)
-                            .unwrap_or_else(|_| "{}".to_string());
-                    let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
-                        .unwrap_or_else(|_| json!({ "content": &md }));
                     if let Some(m) = jv.as_object_mut() {
                         m.insert("ok".into(), json!(true));
                         m.insert("format".into(), json!("dir-js-semantic-diff"));
@@ -1308,12 +1303,9 @@ fn read_single_target(
                         .is_some_and(|e| e.eq_ignore_ascii_case("asar"))
                 {
                     if cli.semantic {
-                        let rendered = crate::semantic_diff::diff_semantic_paths(old_p, p, false)
-                            .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
-                        let jv_str = crate::semantic_diff::diff_semantic_paths(old_p, p, true)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
-                            .unwrap_or_else(|_| json!({ "content": &rendered }));
+                        let (rendered, mut jv) =
+                            crate::semantic_diff::diff_semantic_paths_both(old_p, p)
+                                .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
                         if let Some(m) = jv.as_object_mut() {
                             m.insert("ok".into(), json!(true));
                             m.insert("format".into(), json!("asar-semantic-diff"));
@@ -1589,20 +1581,11 @@ fn read_single_target(
                 }
             }
             if cli.semantic {
-                let rendered = crate::semantic_diff::diff_semantic_paths(
+                let (rendered, mut diff_jv) = crate::semantic_diff::diff_semantic_paths_both(
                     Path::new(&norm_old),
                     Path::new(target),
-                    false,
                 )
                 .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
-                let jv_str = crate::semantic_diff::diff_semantic_paths(
-                    Path::new(&norm_old),
-                    Path::new(target),
-                    true,
-                )
-                .unwrap_or_else(|_| "{}".to_string());
-                let mut diff_jv = serde_json::from_str::<serde_json::Value>(&jv_str)
-                    .unwrap_or_else(|_| json!({ "content": &rendered }));
                 record_event(
                     "read",
                     (raw_bytes.len() + old_bytes.len()) as u64,
@@ -2098,13 +2081,82 @@ fn read_single_target(
                     | "pyc"
             ) || (!is_url && crate::binary::is_binary_magic(&raw_bytes))
             {
+                let bin_modes = usize::from(cli.ioctl || cli.pipes)
+                    + usize::from(cli.rpc_com_alpc)
+                    + usize::from(cli.surface);
+                if bin_modes >= 2 {
+                    format_tag = "binary-combined";
+                    let mut md_parts: Vec<String> = Vec::new();
+                    let mut merged = serde_json::Map::new();
+                    let mut modes_run: Vec<&str> = Vec::new();
+                    if cli.ioctl || cli.pipes {
+                        modes_run.push("ioctl_pipes");
+                        let (r_md, r_jv) = crate::binary::inspect_pe_ioctl_and_pipes(
+                            &raw_bytes,
+                            &label,
+                            cli.ioctl,
+                            cli.pipes || cli.ioctl,
+                            cli.query.as_deref(),
+                        );
+                        md_parts.push(r_md);
+                        if let Some(m) = r_jv.as_object() {
+                            for (k, v) in m {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    if cli.rpc_com_alpc {
+                        modes_run.push("rpc_com_alpc");
+                        let r_md =
+                            crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, false)
+                                .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
+                        let r_jstr =
+                            crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, true)
+                                .unwrap_or_else(|_| "{}".to_string());
+                        md_parts.push(r_md);
+                        if let Ok(serde_json::Value::Object(m)) =
+                            serde_json::from_str::<serde_json::Value>(&r_jstr)
+                        {
+                            for (k, v) in m {
+                                merged.insert(k, v);
+                            }
+                        }
+                    }
+                    if cli.surface {
+                        modes_run.push("surface");
+                        let surf_json = crate::binary::inspect_binary_surface(&raw_bytes);
+                        md_parts.push(crate::binary::format_binary_surface_md(&surf_json));
+                        if let Some(m) = surf_json.as_object() {
+                            for (k, v) in m {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    let rendered = md_parts.join("\n\n");
+                    record_event(
+                        "read",
+                        raw_bytes.len() as u64,
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        format_tag,
+                    );
+                    merged.insert("ok".to_string(), json!(true));
+                    merged.insert("target".to_string(), json!(label));
+                    merged.insert("format_tag".to_string(), json!(format_tag));
+                    merged.insert("modes_run".to_string(), json!(modes_run));
+                    if !cli.json {
+                        merged.insert("content".to_string(), json!(rendered));
+                    }
+                    return Ok((rendered, serde_json::Value::Object(merged)));
+                }
                 if cli.ioctl || cli.pipes {
                     format_tag = "binary-ioctl-pipes";
                     let (rendered, mut jv) = crate::binary::inspect_pe_ioctl_and_pipes(
                         &raw_bytes,
                         &label,
                         cli.ioctl,
-                        cli.pipes,
+                        cli.pipes || cli.ioctl,
                         cli.query.as_deref(),
                     );
                     record_event(

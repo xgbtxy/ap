@@ -878,7 +878,16 @@ pub fn run_cdp_attach(
     let targets = match CdpSession::list_targets(host, port) {
         Ok(ts) => ts,
         Err(e) => {
-            eprintln!("[probe cdp] Failed to query http://{host}:{port}/json/list: {e}");
+            let msg = format!("[probe cdp] Failed to query http://{host}:{port}/json/list: {e}");
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                        .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 1;
         }
     };
@@ -934,14 +943,32 @@ pub fn run_cdp_attach(
             .or_else(|| targets.first())
     };
     let Some(tgt) = picked else {
-        eprintln!("[probe cdp] No matching CDP target found on {host}:{port}");
+        let msg = format!("[probe cdp] No matching CDP target found on {host}:{port}");
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                    .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
         return 1;
     };
 
     let mut sess = match CdpSession::attach(&tgt.ws_url) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[probe cdp] Attach failed (`{}`): {e}", tgt.title);
+            let msg = format!("[probe cdp] Attach failed (`{}`): {e}", tgt.title);
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                        .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 1;
         }
     };
