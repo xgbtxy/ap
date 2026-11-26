@@ -131,6 +131,18 @@ struct ReadCli {
     /// Patch-diff this binary/archive (PE/ELF/Go/.asar/.zip/.jar/.vsix) against an older file path
     #[arg(long)]
     diff: Option<String>,
+    /// Build Tree-sitter cross-file Electron/JS/TS IPC bridge stitcher (`bridge -> channel -> handler -> sink + guard`)
+    #[arg(long = "ipc-graph")]
+    ipc_graph: bool,
+    /// When used with `--diff`, perform AST/CFG-normalized semantic patch-diff ignoring chunk hashes & mangled names
+    #[arg(long)]
+    semantic: bool,
+    /// Extract PE MIDL RPC `DispatchTable` opnums, embedded COM `TYPELIB`, ALPC ports, and `.rdata` dispatch vectors
+    #[arg(long = "rpc-com-alpc")]
+    rpc_com_alpc: bool,
+    /// Scan raw firmware/embedded images for SquashFS/uImage/DTB/TRX/CPIO/ELF magic, entropy bands, CGI hints & TLV clusters
+    #[arg(long = "fw-surface")]
+    fw_surface: bool,
     /// Extract ONLY the matching Markdown `# Heading` section cleanly (substring match, auto-ends at next heading of same/higher level)
     #[arg(long, alias = "heading")]
     section: Option<String>,
@@ -1233,6 +1245,40 @@ fn read_single_target(
                 });
                 return Ok((rendered, jv));
             }
+            if cli.semantic {
+                if let Some(ref old_path_str) = cli.diff {
+                    let norm_old = crate::ls::normalize_cli_path(old_path_str);
+                    let md =
+                        crate::semantic_diff::diff_semantic_paths(Path::new(&norm_old), p, false)
+                            .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
+                    let jv_str =
+                        crate::semantic_diff::diff_semantic_paths(Path::new(&norm_old), p, true)
+                            .unwrap_or_else(|_| "{}".to_string());
+                    let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
+                        .unwrap_or_else(|_| json!({ "content": &md }));
+                    if let Some(m) = jv.as_object_mut() {
+                        m.insert("ok".into(), json!(true));
+                        m.insert("format".into(), json!("dir-js-semantic-diff"));
+                        if !cli.json {
+                            m.insert("content".into(), json!(md));
+                        }
+                    }
+                    return Ok((md, jv));
+                }
+            }
+            if cli.ipc_graph {
+                let (rendered, mut jv) =
+                    crate::ipc_graph::inspect_ipc_graph_path(p, target, cli.query.as_deref())
+                        .map_err(|e| (1, format!("[ap read --ipc-graph] {e}")))?;
+                if let Some(m) = jv.as_object_mut() {
+                    m.insert("ok".into(), json!(true));
+                    m.insert("format".into(), json!("ipc-graph"));
+                    if !cli.json {
+                        m.insert("content".into(), json!(rendered));
+                    }
+                }
+                return Ok((rendered, jv));
+            }
             let data = ap_atlas::scan_workspace(p, "", 35, 14);
             let md = ap_atlas::render_atlas_md(&data);
             return Ok((
@@ -1261,6 +1307,22 @@ fn read_single_target(
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| e.eq_ignore_ascii_case("asar"))
                 {
+                    if cli.semantic {
+                        let rendered = crate::semantic_diff::diff_semantic_paths(old_p, p, false)
+                            .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
+                        let jv_str = crate::semantic_diff::diff_semantic_paths(old_p, p, true)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
+                            .unwrap_or_else(|_| json!({ "content": &rendered }));
+                        if let Some(m) = jv.as_object_mut() {
+                            m.insert("ok".into(), json!(true));
+                            m.insert("format".into(), json!("asar-semantic-diff"));
+                            if !cli.json {
+                                m.insert("content".into(), json!(rendered));
+                            }
+                        }
+                        return Ok((rendered, jv));
+                    }
                     let (rendered, mut diff_jv) = crate::binary::diff_asar_files_streaming(
                         p, old_p, &lbl, &norm_old, true, 25,
                     )
@@ -1284,6 +1346,33 @@ fn read_single_target(
                     return Ok((rendered, diff_jv));
                 }
             }
+        }
+        if !cli.hex
+            && cli.diff.is_none()
+            && cli.entry.is_none()
+            && cli.ipc_graph
+            && (ext_s == "asar" || crate::semantic_diff::is_js_or_ts_path(&lbl))
+        {
+            let (rendered, mut jv) =
+                crate::ipc_graph::inspect_ipc_graph_path(p, &lbl, cli.query.as_deref())
+                    .map_err(|e| (1, format!("[ap read --ipc-graph] {e}")))?;
+            record_event(
+                "read",
+                rendered.len() as u64,
+                rendered.len() as u64,
+                0,
+                1,
+                "ipc-graph",
+            );
+            if let Some(m) = jv.as_object_mut() {
+                m.insert("ok".into(), json!(true));
+                m.insert("target".into(), json!(target));
+                m.insert("format".into(), json!("ipc-graph"));
+                if !cli.json {
+                    m.insert("content".into(), json!(rendered));
+                }
+            }
+            return Ok((rendered, jv));
         }
         if !cli.hex
             && cli.diff.is_none()
@@ -1498,6 +1587,38 @@ fn read_single_target(
                         return Ok((rendered, jv));
                     }
                 }
+            }
+            if cli.semantic {
+                let rendered = crate::semantic_diff::diff_semantic_paths(
+                    Path::new(&norm_old),
+                    Path::new(target),
+                    false,
+                )
+                .map_err(|e| (1, format!("[ap read --semantic] {e}")))?;
+                let jv_str = crate::semantic_diff::diff_semantic_paths(
+                    Path::new(&norm_old),
+                    Path::new(target),
+                    true,
+                )
+                .unwrap_or_else(|_| "{}".to_string());
+                let mut diff_jv = serde_json::from_str::<serde_json::Value>(&jv_str)
+                    .unwrap_or_else(|_| json!({ "content": &rendered }));
+                record_event(
+                    "read",
+                    (raw_bytes.len() + old_bytes.len()) as u64,
+                    rendered.len() as u64,
+                    0,
+                    1,
+                    "semantic-diff",
+                );
+                if let Some(m) = diff_jv.as_object_mut() {
+                    m.insert("ok".into(), json!(true));
+                    m.insert("format".into(), json!("semantic-diff"));
+                    if !cli.json {
+                        m.insert("content".into(), json!(rendered));
+                    }
+                }
+                return Ok((rendered, diff_jv));
             }
             let (rendered, mut diff_jv) = crate::binary::diff_binaries_or_archives(
                 &raw_bytes, &old_bytes, &label, &norm_old, &ext, true, 25,
@@ -1930,6 +2051,32 @@ fn read_single_target(
             &mut win_heals,
         )?,
         _ => {
+            if cli.fw_surface {
+                format_tag = "firmware-surface";
+                let rendered =
+                    crate::binary_ext::inspect_firmware_surface(&raw_bytes, &label, false)
+                        .map_err(|e| (1, format!("[ap read --fw-surface] {e}")))?;
+                let jv_str = crate::binary_ext::inspect_firmware_surface(&raw_bytes, &label, true)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
+                    .unwrap_or_else(|_| json!({ "content": &rendered }));
+                record_event(
+                    "read",
+                    raw_bytes.len() as u64,
+                    rendered.len() as u64,
+                    0,
+                    1,
+                    format_tag,
+                );
+                if let Some(m) = jv.as_object_mut() {
+                    m.insert("ok".into(), json!(true));
+                    m.insert("format_tag".into(), json!(format_tag));
+                    if !cli.json {
+                        m.insert("content".into(), json!(rendered));
+                    }
+                }
+                return Ok((rendered, jv));
+            }
             if let Some(img_meta) = try_extract_image_meta(&raw_bytes, &ext) {
                 format_tag = "image-meta";
                 img_meta
@@ -1972,6 +2119,33 @@ fn read_single_target(
                         m.insert("format_tag".to_string(), json!(format_tag));
                         if !cli.json {
                             m.insert("content".to_string(), json!(rendered));
+                        }
+                    }
+                    return Ok((rendered, jv));
+                }
+                if cli.rpc_com_alpc {
+                    format_tag = "pe-rpc-com-alpc";
+                    let rendered =
+                        crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, false)
+                            .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
+                    let jv_str =
+                        crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, true)
+                            .unwrap_or_else(|_| "{}".to_string());
+                    let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
+                        .unwrap_or_else(|_| json!({ "content": &rendered }));
+                    record_event(
+                        "read",
+                        raw_bytes.len() as u64,
+                        rendered.len() as u64,
+                        0,
+                        1,
+                        format_tag,
+                    );
+                    if let Some(m) = jv.as_object_mut() {
+                        m.insert("ok".into(), json!(true));
+                        m.insert("format_tag".into(), json!(format_tag));
+                        if !cli.json {
+                            m.insert("content".into(), json!(rendered));
                         }
                     }
                     return Ok((rendered, jv));

@@ -2650,3 +2650,405 @@ fn corpus_16_ioctl_ntstatus_filter_and_msvc_sub_chain() {
         );
     }
 }
+
+#[test]
+fn corpus_17_wave24_ipc_graph_semantic_rpc_fw_and_har_probe() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn sha1_sum(msg: &str) -> [u8; 20] {
+        let mut h = [
+            0x67452301u32,
+            0xEFCDAB89,
+            0x98BADCFE,
+            0x10325476,
+            0xC3D2E1F0,
+        ];
+        let mut data = msg.as_bytes().to_vec();
+        let bit_len = (data.len() as u64) * 8;
+        data.push(0x80);
+        while (data.len() % 64) != 56 {
+            data.push(0);
+        }
+        data.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in data.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for (i, c) in chunk.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = h;
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                    _ => (b ^ c ^ d, 0xCA62C1D6),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut out = [0u8; 20];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+
+    // 1. ASAR IPC graph (`ap read --ipc-graph --json`)
+    let preload = br#"
+const { contextBridge, ipcRenderer } = require("electron");
+function sendIpc(ch, payload) { return ipcRenderer.invoke(ch, payload); }
+contextBridge.exposeInMainWorld("desktopApi", {
+  runTask: (cmd) => sendIpc("task:run", cmd)
+});
+"#;
+    let main_js = br#"
+const { ipcMain } = require("electron");
+const { execSync } = require("child_process");
+ipcMain.handle("task:run", async (_e, cmd) => execSync(cmd));
+"#;
+    let mut payload = Vec::new();
+    let p_off = 0usize;
+    let m_off = preload.len();
+    payload.extend_from_slice(preload);
+    payload.extend_from_slice(main_js);
+    let idx_json = serde_json::json!({
+        "files": {
+            "preload.js": { "offset": p_off.to_string(), "size": preload.len() },
+            "main.js": { "offset": m_off.to_string(), "size": main_js.len() }
+        }
+    })
+    .to_string();
+    let j_bytes = idx_json.as_bytes();
+    let pad = (4 - (j_bytes.len() % 4)) % 4;
+    let aligned_len = j_bytes.len() + pad;
+    let mut asar = Vec::new();
+    asar.extend_from_slice(&4u32.to_le_bytes());
+    asar.extend_from_slice(&((aligned_len + 8) as u32).to_le_bytes());
+    asar.extend_from_slice(&((aligned_len + 4) as u32).to_le_bytes());
+    asar.extend_from_slice(&(j_bytes.len() as u32).to_le_bytes());
+    asar.extend_from_slice(j_bytes);
+    asar.extend(std::iter::repeat_n(0u8, pad));
+    asar.extend_from_slice(&payload);
+    let asar_path = root.join("desktop.asar");
+    fs::write(&asar_path, &asar).unwrap();
+
+    let ipc_out = run_ap(
+        root,
+        &["read", asar_path.to_str().unwrap(), "--ipc-graph", "--json"],
+        None,
+        &[],
+    );
+    assert!(
+        ipc_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ipc_out.stderr)
+    );
+    let ipc_jv: Value = serde_json::from_slice(&ipc_out.stdout).unwrap();
+    assert!(
+        ipc_jv["counts"]["edges"].as_u64().unwrap_or(0) >= 1,
+        "{ipc_jv}"
+    );
+    assert!(
+        ipc_jv["counts"]["critical_unguarded"].as_u64().unwrap_or(0) >= 1,
+        "{ipc_jv}"
+    );
+    assert!(
+        ipc_jv["edges"].as_array().unwrap().iter().any(|e| {
+            e["channel"] == "task:run"
+                && e["bridge_apis"].as_array().is_some_and(|arr| {
+                    arr.iter()
+                        .any(|a| a.as_str().unwrap_or("").contains("desktopApi.runTask"))
+                })
+        }),
+        "{ipc_jv}"
+    );
+
+    // 2. Semantic JS patch-diff (`ap diff old_dir new_dir --semantic --json`)
+    let old_dir = root.join("bundle_v1");
+    let new_dir = root.join("bundle_v2");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::create_dir_all(&new_dir).unwrap();
+    fs::write(
+        old_dir.join("app.1111aaaa.js"),
+        "function pureCheck(e,t){return e.startsWith('https://')&&t>0;}\nfunction openUrl(e,t){return shell.openExternal(t);}\n",
+    )
+    .unwrap();
+    fs::write(
+        new_dir.join("app.2222bbbb.js"),
+        "function pureCheck(n,r){return n.startsWith('https://')&&r>0;}\nfunction openUrl(n,r){if(!r.startsWith('https://'))return false;return shell.openExternal(r);}\n",
+    )
+    .unwrap();
+
+    let sem_out = run_ap(
+        root,
+        &[
+            "diff",
+            old_dir.to_str().unwrap(),
+            new_dir.to_str().unwrap(),
+            "--semantic",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        sem_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sem_out.stderr)
+    );
+    let sem_jv: Value = serde_json::from_slice(&sem_out.stdout).unwrap();
+    assert_eq!(sem_jv["unchanged_normalized_functions"], 1, "{sem_jv}");
+    assert!(
+        sem_jv["changed_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["function"] == "openUrl" && c["status"] == "GUARD_ADDED"),
+        "{sem_jv}"
+    );
+
+    // 3. PE RPC / COM / ALPC (`ap read --rpc-com-alpc --json`)
+    let image_base: u64 = 0x0001_4000_0000;
+    let mut rdata = vec![0u8; 0x400];
+    rdata[0..4].copy_from_slice(&0x60u32.to_le_bytes());
+    rdata[4..20].copy_from_slice(&[0x22; 16]);
+    rdata[0x18..0x28].copy_from_slice(&[
+        0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48,
+        0x60,
+    ]);
+    rdata[0x30..0x38].copy_from_slice(&(image_base + 0x2080).to_le_bytes());
+    rdata[0x50..0x58].copy_from_slice(&(image_base + 0x20A0).to_le_bytes());
+    rdata[0x80..0x84].copy_from_slice(&2u32.to_le_bytes());
+    rdata[0xA8..0xB0].copy_from_slice(&(image_base + 0x2100).to_le_bytes());
+    rdata[0x100..0x108].copy_from_slice(&(image_base + 0x1000).to_le_bytes());
+    rdata[0x108..0x110].copy_from_slice(&(image_base + 0x1010).to_le_bytes());
+    rdata[0x110..0x118].copy_from_slice(&(image_base + 0x1020).to_le_bytes());
+    rdata[0x118..0x120].copy_from_slice(&(image_base + 0x1030).to_le_bytes());
+    rdata[0x200..0x204].copy_from_slice(b"MSFT");
+    rdata[0x250..0x25B].copy_from_slice(b"IRpcService");
+    let pe_path = root.join("rpc_srv.dll");
+    let mut pe_code = vec![0xC3u8; 0x80];
+    pe_code[0] = 0x90;
+    fs::write(&pe_path, build_synthetic_pe64_driver(&pe_code, &rdata)).unwrap();
+
+    let rpc_out = run_ap(
+        root,
+        &[
+            "read",
+            pe_path.to_str().unwrap(),
+            "--rpc-com-alpc",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        rpc_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rpc_out.stderr)
+    );
+    let rpc_jv: Value = serde_json::from_slice(&rpc_out.stdout).unwrap();
+    assert!(
+        !rpc_jv["rpc_interfaces"].as_array().unwrap().is_empty(),
+        "{rpc_jv}"
+    );
+    assert!(
+        !rpc_jv["typelibs"].as_array().unwrap().is_empty(),
+        "{rpc_jv}"
+    );
+    assert!(
+        !rpc_jv["dispatch_tables"].as_array().unwrap().is_empty(),
+        "{rpc_jv}"
+    );
+
+    // 4. Firmware surface (`ap read fw.bin --fw-surface --json`)
+    let mut fw = vec![0xFFu8; 2048];
+    fw[0x40..0x44].copy_from_slice(b"hsqs");
+    fw[0x44..0x48].copy_from_slice(&12u32.to_le_bytes());
+    fw[0x4C..0x50].copy_from_slice(&65536u32.to_le_bytes());
+    fw[0x54..0x56].copy_from_slice(&4u16.to_le_bytes());
+    fw[0x5C..0x5E].copy_from_slice(&4u16.to_le_bytes());
+    let hint = b"/cgi-bin/apply.cgi\0";
+    fw[0x300..0x300 + hint.len()].copy_from_slice(hint);
+    let fw_path = root.join("router_fw.bin");
+    fs::write(&fw_path, &fw).unwrap();
+
+    let fw_out = run_ap(
+        root,
+        &["read", fw_path.to_str().unwrap(), "--fw-surface", "--json"],
+        None,
+        &[],
+    );
+    assert!(
+        fw_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fw_out.stderr)
+    );
+    let fw_jv: Value = serde_json::from_slice(&fw_out.stdout).unwrap();
+    assert!(
+        fw_jv["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["kind"] == "squashfs-le"),
+        "{fw_jv}"
+    );
+    assert!(
+        fw_jv["service_hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h.as_str().unwrap_or("").contains("/cgi-bin/apply.cgi")),
+        "{fw_jv}"
+    );
+
+    // 5. HAR HTTP + WS replay (`ap probe http --from-har --fuzz-schema` + `ap probe ws --replay-har`)
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv_handle = thread::spawn(move || {
+        for _ in 0..8 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                if req.contains("upgrade: websocket") {
+                    let key_line = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                        .unwrap_or("")
+                        .to_string();
+                    let k = key_line.split_once(':').map(|x| x.1.trim()).unwrap_or("");
+                    use base64::Engine;
+                    let accept = base64::engine::general_purpose::STANDARD.encode(sha1_sum(
+                        &format!("{k}258EAFA5-E914-47DA-95CA-C5AB0DC85B11"),
+                    ));
+                    let resp = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if req.contains("authorization: bearer secret_tok") {
+                    let body = r#"{"ok":true,"user":{"id":42}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let body = r#"{"error":"unauthorized"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        }
+    });
+
+    let har_path = root.join("capture.har");
+    let har_json = serde_json::json!({
+        "log": {
+            "entries": [
+                {
+                    "request": {
+                        "method": "POST",
+                        "url": format!("http://127.0.0.1:{port}/v1/users/42/profile?tab=main"),
+                        "headers": [
+                            {"name": "Authorization", "value": "Bearer secret_tok"},
+                            {"name": "Content-Type", "value": "application/json"}
+                        ],
+                        "postData": { "text": "{\"user\":{\"name\":\"alice\"}}" }
+                    },
+                    "response": { "status": 200 }
+                },
+                {
+                    "request": {
+                        "method": "GET",
+                        "url": format!("ws://127.0.0.1:{port}/events"),
+                        "headers": []
+                    },
+                    "response": { "status": 101 },
+                    "_webSocketMessages": [{"type": "send", "data": "ping"}]
+                }
+            ]
+        }
+    });
+    fs::write(&har_path, har_json.to_string()).unwrap();
+
+    let http_out = run_ap(
+        root,
+        &[
+            "probe",
+            "http",
+            "--from-har",
+            har_path.to_str().unwrap(),
+            "--fuzz-schema",
+            "--max-variants",
+            "3",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        http_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&http_out.stderr)
+    );
+    let http_jv: Value = serde_json::from_slice(&http_out.stdout).unwrap();
+    assert_eq!(http_jv["endpoint_clusters"], 1, "{http_jv}");
+    assert_eq!(http_jv["ws_flows_detected"], 1, "{http_jv}");
+    assert_eq!(http_jv["endpoints"][0]["baseline_status"], 200, "{http_jv}");
+
+    let ws_out = run_ap(
+        root,
+        &[
+            "probe",
+            "ws",
+            "--replay-har",
+            har_path.to_str().unwrap(),
+            "--wait-ms",
+            "150",
+            "--json",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        ws_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ws_out.stderr)
+    );
+    let ws_jv: Value = serde_json::from_slice(&ws_out.stdout).unwrap();
+    assert_eq!(ws_jv["ok"], true, "{ws_jv}");
+    assert!(
+        ws_jv["handshake"].as_str().unwrap_or("").contains("101"),
+        "{ws_jv}"
+    );
+    drop(srv_handle);
+}

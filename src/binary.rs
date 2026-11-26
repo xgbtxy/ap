@@ -87,24 +87,24 @@ pub struct AsarEntry {
     pub hash: Option<String>,
 }
 
-fn read_u64_le(b: &[u8], off: usize) -> Option<u64> {
+pub(crate) fn read_u64_le(b: &[u8], off: usize) -> Option<u64> {
     let s = b.get(off..off + 8)?;
     Some(u64::from_le_bytes([
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
     ]))
 }
 
-fn read_u32_le(b: &[u8], off: usize) -> Option<u32> {
+pub(crate) fn read_u32_le(b: &[u8], off: usize) -> Option<u32> {
     let s = b.get(off..off + 4)?;
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-fn read_u16_le(b: &[u8], off: usize) -> Option<u16> {
+pub(crate) fn read_u16_le(b: &[u8], off: usize) -> Option<u16> {
     let s = b.get(off..off + 2)?;
     Some(u16::from_le_bytes([s[0], s[1]]))
 }
 
-fn read_cstr(b: &[u8], off: usize, max_len: usize) -> Option<String> {
+pub(crate) fn read_cstr(b: &[u8], off: usize, max_len: usize) -> Option<String> {
     if off >= b.len() {
         return None;
     }
@@ -1589,7 +1589,7 @@ fn scan_electron_ipc_flags(text: &str) -> std::collections::BTreeSet<String> {
     flags
 }
 
-fn extract_pe_exports_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+pub(crate) fn extract_pe_exports_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
     let mut exports = std::collections::BTreeSet::new();
     if !bytes.starts_with(b"MZ") || bytes.len() <= 0x44 {
         return exports;
@@ -1641,7 +1641,7 @@ fn extract_pe_exports_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
     exports
 }
 
-fn extract_elf_dynsyms_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+pub(crate) fn extract_elf_dynsyms_set(bytes: &[u8]) -> std::collections::BTreeSet<String> {
     let mut syms = std::collections::BTreeSet::new();
     if !bytes.starts_with(b"\x7FELF") || bytes.len() < 64 || bytes[4] != 2 {
         return syms;
@@ -3088,16 +3088,16 @@ pub fn extract_pyc_searchable_text(bytes: &[u8]) -> String {
     out
 }
 
-struct PeSection {
-    name: String,
-    vsize: u32,
-    vaddr: u32,
-    raw_size: u32,
-    raw_ptr: u32,
-    chars: u32,
+pub(crate) struct PeSection {
+    pub(crate) name: String,
+    pub(crate) vsize: u32,
+    pub(crate) vaddr: u32,
+    pub(crate) raw_size: u32,
+    pub(crate) raw_ptr: u32,
+    pub(crate) chars: u32,
 }
 
-fn rva_to_file_offset(rva: u32, secs: &[PeSection]) -> Option<usize> {
+pub(crate) fn rva_to_file_offset(rva: u32, secs: &[PeSection]) -> Option<usize> {
     if rva == 0 {
         return None;
     }
@@ -3113,7 +3113,7 @@ fn rva_to_file_offset(rva: u32, secs: &[PeSection]) -> Option<usize> {
     None
 }
 
-fn file_offset_to_rva(off: usize, secs: &[PeSection]) -> Option<(u32, &str)> {
+pub(crate) fn file_offset_to_rva(off: usize, secs: &[PeSection]) -> Option<(u32, &str)> {
     for s in secs {
         let start = s.raw_ptr as usize;
         let end = start.saturating_add(s.raw_size as usize);
@@ -3125,11 +3125,11 @@ fn file_offset_to_rva(off: usize, secs: &[PeSection]) -> Option<(u32, &str)> {
     None
 }
 
-struct PeContext {
-    is_pe64: bool,
-    image_base: u64,
-    secs: Vec<PeSection>,
-    iat_map: Vec<(u32, String)>,
+pub(crate) struct PeContext {
+    pub(crate) is_pe64: bool,
+    pub(crate) image_base: u64,
+    pub(crate) secs: Vec<PeSection>,
+    pub(crate) iat_map: Vec<(u32, String)>,
 }
 
 fn is_notable_import(fn_name: &str) -> bool {
@@ -3174,7 +3174,7 @@ fn is_notable_import(fn_name: &str) -> bool {
     NOTABLE.iter().any(|k| fn_name.contains(k))
 }
 
-fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeContext {
+pub(crate) fn parse_pe_details(bytes: &[u8], pe_off: usize, out: &mut Vec<String>) -> PeContext {
     let machine = read_u16_le(bytes, pe_off + 4).unwrap_or(0);
     let n_sec = read_u16_le(bytes, pe_off + 6).unwrap_or(0) as usize;
     let opt_sz = read_u16_le(bytes, pe_off + 20).unwrap_or(0) as usize;
@@ -3772,7 +3772,11 @@ fn append_pe_manifest_and_version_info(bytes: &[u8], secs: &[PeSection], out: &m
     }
 }
 
-fn find_enclosing_x64_func_rva(sec_bytes: &[u8], sec_vaddr: u32, insn_rel: usize) -> u32 {
+pub(crate) fn find_enclosing_x64_func_rva(
+    sec_bytes: &[u8],
+    sec_vaddr: u32,
+    insn_rel: usize,
+) -> u32 {
     let min_back = insn_rel.saturating_sub(4096);
     let mut cur = insn_rel;
     while cur > min_back {
@@ -3805,7 +3809,7 @@ fn find_enclosing_x64_func_rva(sec_bytes: &[u8], sec_vaddr: u32, insn_rel: usize
 }
 
 /// Pure-Rust `<20ms` x64 PE RIP-relative String (`LEA`) & IAT Import (`CALL`/`JMP`) cross-reference scanner.
-fn scan_pe64_xrefs(
+pub(crate) fn scan_pe64_xrefs(
     bytes: &[u8],
     pe: &PeContext,
     str_rvas: &[(u32, String)],
@@ -3905,7 +3909,7 @@ fn scan_pe64_xrefs(
     out
 }
 
-fn format_guid_le(b: &[u8]) -> Option<String> {
+pub(crate) fn format_guid_le(b: &[u8]) -> Option<String> {
     if b.len() < 16 {
         return None;
     }
@@ -3919,7 +3923,7 @@ fn format_guid_le(b: &[u8]) -> Option<String> {
 }
 
 /// Pure-Rust scanner for embedded Windows MS-RPC `RPC_SERVER_INTERFACE` descriptors (NDR20 & NDR64).
-fn scan_pe_rpc_interfaces(bytes: &[u8], is_pe64: bool) -> Vec<String> {
+pub(crate) fn scan_pe_rpc_interfaces(bytes: &[u8], is_pe64: bool) -> Vec<String> {
     // NDR20 TransferSyntax UUID: 8a885d04-1ceb-11c9-9fe8-08002b104860
     const NDR20: [u8; 16] = [
         0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48,
@@ -6249,7 +6253,7 @@ fn is_plausible_ctl_code(code: u32) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum X86InsnKind {
+pub(crate) enum X86InsnKind {
     MovImm32 { reg: u8, imm: u32 },
     SubImm { reg: u8, delta: u32 },
     CmpImm { reg: u8, delta: u32 },
@@ -6263,9 +6267,9 @@ enum X86InsnKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DecodedX86Insn {
-    len: usize,
-    kind: X86InsnKind,
+pub(crate) struct DecodedX86Insn {
+    pub(crate) len: usize,
+    pub(crate) kind: X86InsnKind,
 }
 
 fn modrm_len_and_fields(
@@ -6309,7 +6313,7 @@ fn modrm_len_and_fields(
     Some((extra, md, reg_f, rm))
 }
 
-fn decode_x86_insn(code: &[u8], pos: usize, is_64: bool) -> Option<DecodedX86Insn> {
+pub(crate) fn decode_x86_insn(code: &[u8], pos: usize, is_64: bool) -> Option<DecodedX86Insn> {
     if pos >= code.len() {
         return None;
     }
@@ -6766,7 +6770,11 @@ fn decode_x86_insn(code: &[u8], pos: usize, is_64: bool) -> Option<DecodedX86Ins
     }
 }
 
-fn extract_pe64_pdata_ranges(bytes: &[u8], pe_off: usize, secs: &[PeSection]) -> Vec<(u32, u32)> {
+pub(crate) fn extract_pe64_pdata_ranges(
+    bytes: &[u8],
+    pe_off: usize,
+    secs: &[PeSection],
+) -> Vec<(u32, u32)> {
     let opt_sz = read_u16_le(bytes, pe_off + 20).unwrap_or(0) as usize;
     let opt_off = pe_off + 24;
     if opt_sz < 144 || read_u16_le(bytes, opt_off).unwrap_or(0) != 0x020B {

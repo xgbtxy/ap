@@ -1,6 +1,7 @@
 pub mod cdp;
 pub mod fs_diff;
 pub mod fuzz;
+pub mod har_probe;
 pub mod http_probe;
 pub mod mutate;
 pub mod net_probe;
@@ -213,6 +214,12 @@ struct HttpArgs {
     /// JSON body key name(s) (comma-separated) whose values should be rewritten using target owner's `--role-var` in `--roles-matrix`
     #[arg(long = "vary-json-field")]
     vary_json_field: Option<String>,
+    /// Ingest a `.har` or JSONL HTTP trace, cluster endpoints, infer nested JSON schemas, and replay/fuzz
+    #[arg(long = "from-har")]
+    from_har: Option<String>,
+    /// With `--from-har`, run bounded nested-key, HPP, mass-assignment, and cross-principal differential probes
+    #[arg(long = "fuzz-schema")]
+    fuzz_schema: bool,
     #[arg(long)]
     json: bool,
 }
@@ -397,7 +404,8 @@ enum SubCmd {
     Listen(Box<ListenArgs>),
     /// Deadline-bounded RFC 6455 generic WebSocket (`ws://`) send/recv & CSWSH cross-origin handshake auditor (zero hangs)
     Ws {
-        url: String,
+        /// Optional `ws://` or `wss://` URL (omit when using `--replay-har`)
+        url: Option<String>,
         #[arg(long = "send")]
         send: Vec<String>,
         #[arg(short = 'H', long = "header")]
@@ -410,6 +418,9 @@ enum SubCmd {
         /// Optional custom Origin header(s) for `--origin-matrix` (repeatable)
         #[arg(long = "origin")]
         origins: Vec<String>,
+        /// Replay recorded WebSocket URLs, headers, and frames from a `.har` or JSONL trace
+        #[arg(long = "replay-har")]
+        replay_har: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -795,8 +806,37 @@ pub fn run_cli(args: &[String]) -> i32 {
                 methods,
                 cross_id,
                 vary_json_field,
+                from_har,
+                fuzz_schema,
                 json,
             } = *boxed;
+            if let Some(har) = from_har.as_deref().filter(|s| !s.trim().is_empty()) {
+                let mut principal_hdrs = Vec::new();
+                for p in &principals {
+                    if let Some((lhs, rhs)) = p.split_once('=') {
+                        if !lhs.contains(':') && rhs.contains(':') {
+                            principal_hdrs.push(rhs.trim().to_string());
+                        } else {
+                            principal_hdrs.push(p.trim().to_string());
+                        }
+                    } else if !p.trim().is_empty() {
+                        principal_hdrs.push(p.trim().to_string());
+                    }
+                }
+                return har_probe::run_http_from_har(har_probe::HarProbeConfig {
+                    har_path: har,
+                    fuzz_schema,
+                    dry_run,
+                    max_variants,
+                    rate_ms,
+                    principal_headers: &principal_hdrs,
+                    sentinels: &sentinels,
+                    timeout_sec: timeout,
+                    insecure,
+                    follow,
+                    as_json: json,
+                });
+            }
             let vary_fields_vec: Vec<String> = vary_json_field
                 .as_deref()
                 .map(|s| {
@@ -998,14 +1038,29 @@ pub fn run_cli(args: &[String]) -> i32 {
             wait_ms,
             origin_matrix,
             origins,
+            replay_har,
             json,
         } => {
-            if origin_matrix || !origins.is_empty() {
-                return net_probe::run_ws_origin_matrix(
-                    &url, &send, &headers, &origins, wait_ms, json,
+            if let Some(har) = replay_har.as_deref().filter(|s| !s.trim().is_empty()) {
+                return har_probe::run_ws_replay_har(
+                    har,
+                    &send,
+                    &origins,
+                    origin_matrix,
+                    wait_ms,
+                    json,
                 );
             }
-            net_probe::run_ws_cli(&url, &send, &headers, wait_ms, json)
+            let Some(ws_url) = url.as_deref().filter(|s| !s.trim().is_empty()) else {
+                eprintln!("ap probe ws: pass <url> or --replay-har <file>");
+                return 2;
+            };
+            if origin_matrix || !origins.is_empty() {
+                return net_probe::run_ws_origin_matrix(
+                    ws_url, &send, &headers, &origins, wait_ms, json,
+                );
+            }
+            net_probe::run_ws_cli(ws_url, &send, &headers, wait_ms, json)
         }
         SubCmd::Tls {
             addr,

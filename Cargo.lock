@@ -31,6 +31,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-typescript",
  "zip",
 ]
 

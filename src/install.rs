@@ -1157,6 +1157,7 @@ const MISSING_CLI_MAP: ReadonlyArray<[RegExp, string]> = [
 	[/\bsqlite3\b/i, "ap query -f db=<file.sqlite> <sql>"],
 	[/\bpdftotext\b/i, "ap read <file.pdf>"],
 	[/\bstrings\b/i, "ap read <binary> or ap search <pattern> <binary>"],
+	[/\bidat64(?:\.exe)?\b/i, "idat.exe or ap read <bin> --xref --ioctl --rpc-com-alpc"],
 ];
 const CODE_FILE_EXT = /\.(?:rs|ts|tsx|js|jsx|mjs|cjs|py|go|c|cc|cpp|h|hpp)$/i;
 const EDIT_TOOLS = new Set(["write", "edit", "ap_edit", "ap_rename"]);
@@ -2589,7 +2590,7 @@ export function classifyCodemodeFailureTip(outText: string): string {{
 export const AP_DEEPSEEK_GUIDELINES: readonly string[] = [
 	"Parallel-first execution: batch 2+ independent reads/searches/checks in parallel tool calls OR one codemode script via `const res = await Promise.allSettled([tools.read({{path}}), tools.bash({{command}})]);` (cuts latency & thinking tokens ~40%); persist cross-turn state via `store(key, val)`/`load(key)`.",
 	"In codemode (QuickJS sandbox — NO Node fs/path/require/process/fetch; `await sleep(ms)` is available): prefer typed MCP primitives `tools.mcp__agent_primitives__ap_search({{pattern, path, only_matching: true, unique: true, json: true}})`, `ap_read({{target, routes: true, section, json: true}})`, `ap_http`, `ap_cdp` over bash python/grep one-liners; `tools.bash({{command}})` returns `{{ output, exit_code }}`.",
-	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--asar-surface|--routes --mutating-only|--ioctl --pipes|--xref`, `ap diff <old> <new> --json`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>|--weak-acl|--unquoted|--com|--rpc --non-ms`, `ap cdp --export-role <port>`, `ap http --roles-matrix`, `ap atlas map .`.',
+	'Fast local CLI & exact edits: `read` on code/config shows `L:HH|` anchors (pass `L:HH|` in `edit` `oldText`). In bash, prefer zero-dep `ap` over grep/python/PS: `ap ls <d>`, `ap search -o -u --around 160 --pretty "<re>" [d]`, `ap read <file> --outline|--symbol <S>|--lines 1-80|--json-path <P>|--hex|--surface|--asar-surface|--ipc-graph|--fw-surface|--rpc-com-alpc|--routes --mutating-only|--ioctl --pipes|--xref`, `ap diff <old> <new> --semantic --json`, `ap sieve peek <id> --lines A-B --raw --max-chars 8000`, `ap ps|ports`, `ap win --pipes|--acl|--reg|--services|--sig <f>|--weak-acl|--unquoted|--com|--rpc --non-ms`, `ap cdp --export-role <port>`, `ap http --roles-matrix|--from-har <f> --fuzz-schema`, `ap ws --replay-har <f>`, `ap atlas map .`.',
 ];
 
 export function injectDeepSeekGuidelines(guidelines: string[]): boolean {{
@@ -2795,6 +2796,15 @@ export function classifyShellFailureTip(
 	}}
 	if (/\b(?:ModuleNotFoundError|ImportError)\b/i.test(outText)) {{
 		return `[ap py-tip] Missing Python package; zero-dependency \`ap read\` (.docx/.xlsx/.pdf/PE/ELF/hex/JSON-path), \`ap query\` (SQLite/CSV/Excel) & \`ap search\` work without pip packages.`;
+	}}
+	if (/\.asar\b/i.test(cmd)) {{
+		return `[ap surface-tip] For Electron archives/bundles, prefer \`ap read <app.asar> --asar-surface\` or \`--ipc-graph\`.`;
+	}}
+	if (/\.sys\b|ioctl/i.test(cmd)) {{
+		return `[ap bin-tip] For Windows drivers/PE binaries, prefer \`ap read <bin> --ioctl --pipes --rpc-com-alpc\` or \`--xref\`.`;
+	}}
+	if (/\.har\b|\bplaywright\b|\bfetch\b/i.test(cmd)) {{
+		return `[ap probe-tip] Replay & fuzz captured HTTP/WS flows directly via \`ap probe http --from-har <f> --fuzz-schema\` or \`ap probe ws --replay-har <f> --origin-matrix\`.`;
 	}}
 	return undefined;
 }}
@@ -8943,6 +8953,9 @@ fn inspect_pi_runtime(home: &Path) -> Value {
                 && s.contains("loadApProfile")
                 && s.contains("normalizeEditArgs")
                 && s.contains("findAllEditOccurrenceLines")
+                && s.contains("--fw-surface")
+                && s.contains("--ipc-graph")
+                && s.contains("ap surface-tip")
                 && s.contains("extractAllToolResultText")
                 && s.contains("sieveCodemodeContentBlocks")
                 && s.contains("formatInstantSyntaxAlert")

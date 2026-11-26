@@ -40,6 +40,10 @@ fn mcp_tools_schema() -> Value {
                     "routes": { "type": "boolean", "description": "Extract JS/TS/HTML routes, sinks & origins" },
                     "mutating_only": { "type": "boolean", "description": "Filter --routes to POST/PUT/PATCH/DELETE, mutations & WS emits with body_keys" },
                     "asar_surface": { "type": "boolean", "description": "Compact Electron .asar security surface extractor (minified flags, IPC channels, sinks & .unpacked)" },
+                    "ipc_graph": { "type": "boolean", "description": "Build Tree-sitter cross-file Electron/JS/TS IPC bridge stitcher (bridge -> channel -> handler -> sink + guard)" },
+                    "semantic": { "type": "boolean", "description": "With diff, run AST/CFG-normalized semantic patch-diff ignoring chunk hashes & mangled names" },
+                    "rpc_com_alpc": { "type": "boolean", "description": "Extract PE MIDL RPC DispatchTable opnums, COM TypeLib, ALPC ports & .rdata dispatch tables" },
+                    "fw_surface": { "type": "boolean", "description": "Scan firmware images for SquashFS/uImage/DTB/TRX/CPIO/ELF magic, entropy bands, CGI hints & TLV clusters" },
                     "ioctl": { "type": "boolean", "description": "Extract PE/driver Windows CTL_CODE IOCTLs, IAT XREFs & exports" },
                     "pipes": { "type": "boolean", "description": "Extract binary ASCII/UTF-16LE \\\\.\\pipe\\* and \\Device\\* / \\DosDevices\\* artifacts + XREFs" },
                     "candidates": { "type": "boolean", "description": "Spotlight synthesized --race/--flow probe candidates" },
@@ -349,6 +353,8 @@ fn mcp_tools_schema() -> Value {
                 "methods": { "type": "string", "description": "Comma-separated methods for roles_matrix (e.g. 'GET,POST,DELETE')" },
                 "cross_id": { "type": "boolean", "description": "Expand cross-tenant (actor, target_owner) matrix cells" },
                 "vary_json_field": { "type": "string", "description": "JSON body key name(s) rewritten via target owner role_vars in roles_matrix" },
+                "from_har": { "type": "string", "description": "Ingest a .har or JSONL HTTP trace, cluster endpoints, infer JSON schemas & replay" },
+                "fuzz_schema": { "type": "boolean", "description": "With from_har, run bounded nested-key, HPP, mass-assignment & cross-principal differential probes" },
                 "sentinels": { "type": "array", "description": "Sentinel strings flagged if leaked", "items": { "type": "string" } },
                 "timeout": { "type": "integer", "description": "Timeout sec (default: 15)" },
                 "insecure": { "type": "boolean", "description": "Skip TLS verify (-k)" },
@@ -447,14 +453,14 @@ fn mcp_tools_schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "Target ws://host:port/path URL" },
+                "url": { "type": "string", "description": "Target ws://host:port/path URL (omit when using replay_har)" },
                 "send": { "type": "array", "items": { "type": "string" }, "description": "Text frames to send after handshake" },
                 "headers": { "type": "array", "items": { "type": "string" }, "description": "Optional extra HTTP upgrade headers" },
                 "origin_matrix": { "type": "boolean", "description": "Run CSWSH cross-origin WebSocket handshake matrix (omitted / https://evil.example / null / localhost)" },
                 "origins": { "type": "array", "items": { "type": "string" }, "description": "Custom Origin values for origin_matrix" },
+                "replay_har": { "type": "string", "description": "Replay recorded WebSocket URLs, headers & frames from a .har or JSONL file" },
                 "wait_ms": { "type": "integer", "description": "Max receive window in ms (default: 1000)" }
-            },
-            "required": ["url"]
+            }
         }
     },
     {
@@ -1409,6 +1415,34 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 .unwrap_or(false)
             {
                 cli.push("--asar-surface".to_string());
+            }
+            if args
+                .get("ipc_graph")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--ipc-graph".to_string());
+            }
+            if args
+                .get("semantic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--semantic".to_string());
+            }
+            if args
+                .get("rpc_com_alpc")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--rpc-com-alpc".to_string());
+            }
+            if args
+                .get("fw_surface")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                cli.push("--fw-surface".to_string());
             }
             if args.get("ioctl").and_then(Value::as_bool).unwrap_or(false) {
                 cli.push("--ioctl".to_string());
@@ -2509,6 +2543,23 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push("--vary-json-field".into());
                 cli.push(vjf.to_string());
             }
+            if let Some(fh) = args
+                .get("from_har")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                cli.push("--from-har".into());
+                cli.push(fh.to_string());
+                if args
+                    .get("fuzz_schema")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    cli.push("--fuzz-schema".into());
+                }
+                return run_self_captured(&cli, None);
+            }
             if let Some(rm) = args
                 .get("roles_matrix")
                 .and_then(Value::as_str)
@@ -2741,13 +2792,25 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
         }
         "ap_ws" => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or("").trim();
-            if url.is_empty() {
+            let replay_har = args
+                .get("replay_har")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if url.is_empty() && replay_har.is_empty() {
                 return (
                     false,
-                    "Pass non-empty `url` (ws://...) to `ap_ws`.".to_string(),
+                    "Pass non-empty `url` (ws://...) or `replay_har` to `ap_ws`.".to_string(),
                 );
             }
-            let mut cli = vec!["probe".into(), "ws".into(), url.to_string()];
+            let mut cli = vec!["probe".into(), "ws".into()];
+            if !url.is_empty() {
+                cli.push(url.to_string());
+            }
+            if !replay_har.is_empty() {
+                cli.push("--replay-har".into());
+                cli.push(replay_har.to_string());
+            }
             if let Some(arr) = args.get("send").and_then(Value::as_array) {
                 for m in arr.iter().filter_map(Value::as_str) {
                     cli.push("--send".into());

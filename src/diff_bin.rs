@@ -19,6 +19,9 @@ struct DiffCli {
     /// Maximum added/removed/changed entries per bucket (default: 25, max: 100)
     #[arg(long, default_value_t = 25)]
     max: usize,
+    /// AST-normalized semantic patch-diff (JS/ASAR/dir & PE/ELF normalized function signatures)
+    #[arg(long)]
+    semantic: bool,
     /// Emit structured compact JSON (`<= 16 KB`)
     #[arg(long)]
     json: bool,
@@ -69,10 +72,28 @@ pub fn run_diff_paths(
     deep: bool,
     max_items: usize,
 ) -> Result<(String, Value), String> {
+    run_diff_paths_opts(old_raw, new_raw, deep, max_items, false)
+}
+
+pub fn run_diff_paths_opts(
+    old_raw: &str,
+    new_raw: &str,
+    deep: bool,
+    max_items: usize,
+    semantic: bool,
+) -> Result<(String, Value), String> {
     let old_norm = crate::ls::normalize_cli_path(old_raw);
     let new_norm = crate::ls::normalize_cli_path(new_raw);
     let old_p = Path::new(&old_norm);
     let new_p = Path::new(&new_norm);
+    if semantic {
+        let md = crate::semantic_diff::diff_semantic_paths(old_p, new_p, false)
+            .map_err(|e| format!("[ap diff --semantic] {e}"))?;
+        let jv_str = crate::semantic_diff::diff_semantic_paths(old_p, new_p, true)
+            .unwrap_or_else(|_| "{}".to_string());
+        let jv = serde_json::from_str::<Value>(&jv_str).unwrap_or_else(|_| json!({ "raw": md }));
+        return Ok((md, jv));
+    }
     let new_ext = new_p
         .extension()
         .and_then(|e| e.to_str())
@@ -178,7 +199,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
-    match run_diff_paths(&cli.old_path, &cli.new_path, cli.deep, cli.max) {
+    match run_diff_paths_opts(
+        &cli.old_path,
+        &cli.new_path,
+        cli.deep,
+        cli.max,
+        cli.semantic,
+    ) {
         Ok((md, jv)) => {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&jv).unwrap_or_default());
