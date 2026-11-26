@@ -168,9 +168,10 @@ fn record_event_inner(
         ms,
         err,
     };
-    if let Ok(line) = serde_json::to_string(&ev) {
+    if let Ok(mut line) = serde_json::to_string(&ev) {
+        line.push('\n');
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{line}");
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
@@ -303,4 +304,61 @@ pub fn run_cli(args: &[String]) -> i32 {
         println!("  Top Primitives Breakdown     : {summary}");
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_concurrent_16_threads_zero_malformed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap_home = dir.path().join("ap_home");
+        fs::create_dir_all(&ap_home).unwrap();
+        let _guard = ApHomeTestGuard::set(&ap_home);
+
+        let threads = 16usize;
+        let per_thread = 20usize;
+        std::thread::scope(|s| {
+            for tid in 0..threads {
+                s.spawn(move || {
+                    for iter in 0..per_thread {
+                        let ok = !(tid == 0 && iter == 0);
+                        let err = (!ok).then_some("simulated error");
+                        record_event_ex(
+                            "search",
+                            (tid * 100 + iter) as u64,
+                            42,
+                            0,
+                            0,
+                            "concurrent-test",
+                            ok,
+                            (iter as u64) + 1,
+                            err,
+                        );
+                    }
+                });
+            }
+        });
+
+        let raw = fs::read_to_string(stats_file_path(None)).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(
+            lines.len(),
+            threads * per_thread,
+            "expected exact line count without blank/merged lines"
+        );
+        let mut err_cnt = 0usize;
+        for (idx, ln) in lines.iter().enumerate() {
+            let ev: StatEvent = serde_json::from_str(ln)
+                .unwrap_or_else(|e| panic!("malformed stats.jsonl line {}: {e}: {ln:?}", idx + 1));
+            assert!(ev.ok.is_some());
+            assert!(ev.ms.is_some());
+            if ev.ok == Some(false) {
+                err_cnt += 1;
+                assert_eq!(ev.err.as_deref(), Some("simulated error"));
+            }
+        }
+        assert_eq!(err_cnt, 1);
+    }
 }

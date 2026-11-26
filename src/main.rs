@@ -130,11 +130,14 @@ enum TopCmd {
 }
 
 fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
+    let t0 = std::time::Instant::now();
     let mut sub_argv = Vec::with_capacity(tail_args.len() + 1);
     sub_argv.push(name.to_string());
     sub_argv.extend_from_slice(tail_args);
     let is_help = tail_args.iter().any(|a| a == "--help" || a == "-h");
     let from_mcp = std::env::var("AP_MCP_CHILD").ok().as_deref() == Some("1");
+    let mut stats_kind = name;
+    let mut stats_sub: Option<&str> = None;
     let code = match name {
         "read" => return Some(read::run_cli(&sub_argv)),
         "diff" => return Some(diff_bin::run_cli(&sub_argv)),
@@ -255,7 +258,9 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
             probe_argv.push("probe".to_string());
             probe_argv.push(name.to_string());
             probe_argv.extend_from_slice(tail_args);
-            return Some(ap_probe::run_cli(&probe_argv));
+            stats_kind = "probe";
+            stats_sub = Some(name);
+            Some(ap_probe::run_cli(&probe_argv))
         }
         "query" => return Some(query::run_cli(&sub_argv)),
         "search" => return Some(search::run_cli(&sub_argv)),
@@ -282,25 +287,40 @@ fn dispatch_primitive(name: &str, tail_args: &[String]) -> Option<i32> {
         "audit" => return Some(audit::run_cli(&sub_argv)),
         _ => None,
     };
-    if code.is_some() && !is_help && !from_mcp {
-        let sub_action = tail_args.first().map(String::as_str).unwrap_or("");
-        let guards = if matches!(
-            (name, sub_action),
-            ("splice", "apply" | "check")
-                | ("probe", "smoke")
-                | ("guard", "verify" | "stop-gate")
-                | ("atlas", "impact" | "product")
-        ) {
-            1
-        } else {
-            0
-        };
-        let win_heals = if name == "probe" && sub_action == "smoke" && cfg!(windows) {
-            1
-        } else {
-            0
-        };
-        stats::record_event(name, 0, 0, win_heals, guards, sub_action);
+    if let Some(rc) = code {
+        if !is_help && !from_mcp {
+            let sub_action = stats_sub
+                .or_else(|| tail_args.first().map(String::as_str))
+                .unwrap_or("");
+            let guards = if matches!(
+                (stats_kind, sub_action),
+                ("splice", "apply" | "check")
+                    | ("probe", "smoke")
+                    | ("guard", "verify" | "stop-gate")
+                    | ("atlas", "impact" | "product")
+            ) {
+                1
+            } else {
+                0
+            };
+            let win_heals = if stats_kind == "probe" && sub_action == "smoke" && cfg!(windows) {
+                1
+            } else {
+                0
+            };
+            let err_note = (rc != 0).then(|| format!("exit_code={rc}"));
+            stats::record_event_ex(
+                stats_kind,
+                0,
+                0,
+                win_heals,
+                guards,
+                sub_action,
+                rc == 0,
+                t0.elapsed().as_millis() as u64,
+                err_note.as_deref(),
+            );
+        }
     }
     code
 }

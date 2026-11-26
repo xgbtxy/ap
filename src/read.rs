@@ -1,4 +1,4 @@
-use crate::stats::record_event;
+use crate::stats::record_event_ex;
 use clap::Parser;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use regex::Regex;
@@ -889,6 +889,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         return if had_err { 1 } else { 0 };
     }
 
+    let t0 = std::time::Instant::now();
     let norm_target = crate::ls::normalize_cli_path(&cli.target);
     match read_single_target(&cli, norm_target.trim()) {
         Ok((mut rendered, mut jv)) => {
@@ -903,7 +904,28 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         Err((code, msg)) => {
-            if !msg.is_empty() {
+            record_event_ex(
+                "read",
+                0,
+                0,
+                0,
+                0,
+                "read-err",
+                false,
+                t0.elapsed().as_millis() as u64,
+                Some(&msg),
+            );
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "target": norm_target,
+                        "error": msg,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else if !msg.is_empty() {
                 eprintln!("{msg}");
             }
             code
@@ -1150,6 +1172,20 @@ fn read_single_target(
     cli: &ReadCli,
     target: &str,
 ) -> Result<(String, serde_json::Value), (i32, String)> {
+    let t0 = std::time::Instant::now();
+    let record_event = |kind: &str, raw: u64, out: u64, wh: u32, g: u32, tag: &str| {
+        record_event_ex(
+            kind,
+            raw,
+            out,
+            wh,
+            g,
+            tag,
+            true,
+            t0.elapsed().as_millis() as u64,
+            None,
+        );
+    };
     let is_url = target.starts_with("http://") || target.starts_with("https://");
 
     let (raw_bytes, ext, label) = if is_url {
@@ -2107,25 +2143,32 @@ fn read_single_target(
                     }
                     if cli.rpc_com_alpc {
                         modes_run.push("rpc_com_alpc");
-                        let r_md =
-                            crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, false)
-                                .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
-                        let r_jstr =
-                            crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, true)
-                                .unwrap_or_else(|_| "{}".to_string());
-                        md_parts.push(r_md);
-                        if let Ok(serde_json::Value::Object(m)) =
-                            serde_json::from_str::<serde_json::Value>(&r_jstr)
-                        {
-                            for (k, v) in m {
-                                merged.insert(k, v);
+                        if cli.json {
+                            let r_jstr = crate::binary_ext::inspect_pe_rpc_com_alpc(
+                                &raw_bytes, &label, true,
+                            )
+                            .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
+                            if let Ok(serde_json::Value::Object(m)) =
+                                serde_json::from_str::<serde_json::Value>(&r_jstr)
+                            {
+                                for (k, v) in m {
+                                    merged.insert(k, v);
+                                }
                             }
+                        } else {
+                            let r_md = crate::binary_ext::inspect_pe_rpc_com_alpc(
+                                &raw_bytes, &label, false,
+                            )
+                            .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
+                            md_parts.push(r_md);
                         }
                     }
                     if cli.surface {
                         modes_run.push("surface");
                         let surf_json = crate::binary::inspect_binary_surface(&raw_bytes);
-                        md_parts.push(crate::binary::format_binary_surface_md(&surf_json));
+                        if !cli.json {
+                            md_parts.push(crate::binary::format_binary_surface_md(&surf_json));
+                        }
                         if let Some(m) = surf_json.as_object() {
                             for (k, v) in m {
                                 merged.insert(k.clone(), v.clone());
@@ -2133,14 +2176,6 @@ fn read_single_target(
                         }
                     }
                     let rendered = md_parts.join("\n\n");
-                    record_event(
-                        "read",
-                        raw_bytes.len() as u64,
-                        rendered.len() as u64,
-                        0,
-                        1,
-                        format_tag,
-                    );
                     merged.insert("ok".to_string(), json!(true));
                     merged.insert("target".to_string(), json!(label));
                     merged.insert("format_tag".to_string(), json!(format_tag));
@@ -2148,6 +2183,14 @@ fn read_single_target(
                     if !cli.json {
                         merged.insert("content".to_string(), json!(rendered));
                     }
+                    let out_bytes = if cli.json {
+                        serde_json::to_string(&merged)
+                            .map(|s| s.len() as u64)
+                            .unwrap_or(0)
+                    } else {
+                        rendered.len() as u64
+                    };
+                    record_event("read", raw_bytes.len() as u64, out_bytes, 0, 1, format_tag);
                     return Ok((rendered, serde_json::Value::Object(merged)));
                 }
                 if cli.ioctl || cli.pipes {
@@ -2177,14 +2220,20 @@ fn read_single_target(
                 }
                 if cli.rpc_com_alpc {
                     format_tag = "pe-rpc-com-alpc";
-                    let rendered =
-                        crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, false)
-                            .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
-                    let jv_str =
-                        crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, true)
-                            .unwrap_or_else(|_| "{}".to_string());
-                    let mut jv = serde_json::from_str::<serde_json::Value>(&jv_str)
-                        .unwrap_or_else(|_| json!({ "content": &rendered }));
+                    let (rendered, mut jv) = if cli.json {
+                        let jv_str =
+                            crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, true)
+                                .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
+                        let parsed = serde_json::from_str::<serde_json::Value>(&jv_str)
+                            .unwrap_or_else(|_| json!({ "content": &jv_str }));
+                        (jv_str, parsed)
+                    } else {
+                        let md =
+                            crate::binary_ext::inspect_pe_rpc_com_alpc(&raw_bytes, &label, false)
+                                .map_err(|e| (1, format!("[ap read --rpc-com-alpc] {e}")))?;
+                        let parsed = json!({ "content": &md });
+                        (md, parsed)
+                    };
                     record_event(
                         "read",
                         raw_bytes.len() as u64,

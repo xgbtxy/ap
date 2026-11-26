@@ -1,5 +1,5 @@
 use crate::audit::default_home_dir;
-use crate::stats::record_event;
+use crate::stats::record_event_ex;
 use base64::Engine;
 use clap::Parser;
 use regex::Regex;
@@ -2359,7 +2359,7 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     if shell_str.is_none() && clean_argv.is_empty() {
         if let Some(port) = cli.free_port {
-            record_event("exec", 0, 0, win_heals, 0, "free-port");
+            record_event_ex("exec", 0, 0, win_heals, 0, "free-port", true, 0, None);
             if cli.json {
                 println!(
                     "{}",
@@ -2375,7 +2375,17 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             return 0;
         }
-        eprintln!("[ap exec] provide `-c \"<cmd>\"`, `--base64 <b64>`, `--free-port <p>`, or `-- <prog> <args...>`");
+        let msg = "[ap exec] provide `-c \"<cmd>\"`, `--base64 <b64>`, `--free-port <p>`, or `-- <prog> <args...>`";
+        record_event_ex("exec", 0, 0, 0, 0, "exec-err", false, 0, Some(msg));
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                    .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
         return 2;
     }
 
@@ -2497,10 +2507,31 @@ pub fn run_cli(args: &[String]) -> i32 {
         Err(e) => {
             let _ = fs::remove_file(&out_file_p);
             let _ = fs::remove_file(&err_file_p);
-            eprintln!("[ap exec] failed to spawn `{label}`: {e}");
+            let msg = format!("[ap exec] failed to spawn `{label}`: {e}");
+            record_event_ex(
+                "exec",
+                0,
+                0,
+                win_heals,
+                0,
+                "spawn-err",
+                false,
+                t0.elapsed().as_millis() as u64,
+                Some(&msg),
+            );
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                        .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 127;
         }
     };
+    let mut job_guard = crate::win_job::WinJobGuard::attach(&child);
     if let (Some(bytes), Some(mut sin)) = (stdin_bytes.take(), child.stdin.take()) {
         use std::io::Write;
         thread::spawn(move || {
@@ -2508,7 +2539,6 @@ pub fn run_cli(args: &[String]) -> i32 {
             drop(sin);
         });
     }
-    let mut job_guard = crate::win_job::WinJobGuard::attach(&child);
 
     let deadline = Duration::from_secs(cli.timeout.max(1));
     let mut timed_out = false;
@@ -2564,16 +2594,61 @@ pub fn run_cli(args: &[String]) -> i32 {
                 .env("PYTHONIOENCODING", "utf-8")
                 .env("LC_ALL", "C.UTF-8")
                 .env("LANG", "C.UTF-8")
-                .stdin(Stdio::null());
-            if let Ok(rout) = rcmd.output() {
-                let r_code = rout.status.code().unwrap_or(1);
-                let mut r_comb = String::from_utf8_lossy(strip_bom(&rout.stdout)).to_string();
-                let r_err = String::from_utf8_lossy(strip_bom(&rout.stderr));
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Ok(mut rchild) = rcmd.spawn() {
+                let mut rjob = crate::win_job::WinJobGuard::attach(&rchild);
+                let r_out_pipe = rchild.stdout.take();
+                let r_err_pipe = rchild.stderr.take();
+                let r_out_h = thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    if let Some(mut r) = r_out_pipe {
+                        let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                    }
+                    buf
+                });
+                let r_err_h = thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    if let Some(mut r) = r_err_pipe {
+                        let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                    }
+                    buf
+                });
+                let r_deadline = Instant::now() + Duration::from_secs(cli.timeout.clamp(5, 60));
+                let mut r_timed_out = false;
+                let r_code = loop {
+                    match rchild.try_wait() {
+                        Ok(Some(st)) => break st.code().unwrap_or(1),
+                        Ok(None) => {
+                            if Instant::now() >= r_deadline {
+                                r_timed_out = true;
+                                drop(rjob.take());
+                                kill_tree(&mut rchild);
+                                break 124;
+                            }
+                            thread::sleep(Duration::from_millis(15));
+                        }
+                        Err(_) => {
+                            drop(rjob.take());
+                            kill_tree(&mut rchild);
+                            break 1;
+                        }
+                    }
+                };
+                drop(rjob);
+                let r_stdout = r_out_h.join().unwrap_or_default();
+                let r_stderr = r_err_h.join().unwrap_or_default();
+                let mut r_comb = String::from_utf8_lossy(strip_bom(&r_stdout)).to_string();
+                let r_err = String::from_utf8_lossy(strip_bom(&r_stderr));
                 if !r_err.is_empty() {
                     if !r_comb.is_empty() && !r_comb.ends_with('\n') {
                         r_comb.push('\n');
                     }
                     r_comb.push_str(&r_err);
+                }
+                if r_timed_out {
+                    timed_out = true;
                 }
                 exit_code = r_code;
                 combined = format!(
@@ -2643,7 +2718,24 @@ pub fn run_cli(args: &[String]) -> i32 {
     } else {
         heals.join("+")
     };
-    record_event("exec", raw_len, out_len, win_heals, 0, &note);
+    let err_note = (exit_code != 0).then(|| {
+        if timed_out {
+            "timeout".to_string()
+        } else {
+            format!("exit_code={exit_code}")
+        }
+    });
+    record_event_ex(
+        "exec",
+        raw_len,
+        out_len,
+        win_heals,
+        0,
+        &note,
+        exit_code == 0,
+        elapsed_ms.round() as u64,
+        err_note.as_deref(),
+    );
 
     if cli.json {
         println!(

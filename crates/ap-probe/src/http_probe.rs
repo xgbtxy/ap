@@ -79,9 +79,7 @@ fn execute_http_probe_with_raw(
         cmd.args(["-H", h]);
     }
     if let Some(b) = body.filter(|s| !s.is_empty()) {
-        let has_ct = headers
-            .iter()
-            .any(|h| h.to_ascii_lowercase().starts_with("content-type:"));
+        let has_ct = has_header_name(headers, "content-type");
         if !has_ct && (b.trim_start().starts_with('{') || b.trim_start().starts_with('[')) {
             cmd.args(["-H", "Content-Type: application/json"]);
         }
@@ -439,8 +437,9 @@ pub fn run_http_cli(
         }
     }
     if jobs.is_empty() {
-        eprintln!(
-            "[probe http] Provide a URL or pass `--batch-stdin` with `METHOD URL [BODY]` lines or JSON/JSONL request objects."
+        emit_http_err(
+            as_json,
+            "[probe http] Provide a URL or pass `--batch-stdin` with `METHOD URL [BODY]` lines or JSON/JSONL request objects.",
         );
         return 2;
     }
@@ -960,7 +959,7 @@ pub fn run_http_vary(
         match load_saved_request(rf) {
             Ok(spec) => spec,
             Err(e) => {
-                eprintln!("[probe http vary] {e}");
+                emit_http_err(as_json, &format!("[probe http vary] {e}"));
                 return 2;
             }
         }
@@ -972,7 +971,10 @@ pub fn run_http_vary(
             body.map(str::to_string),
         )
     } else {
-        eprintln!("[probe http vary] Provide a URL or `--vary-request <file>`.");
+        emit_http_err(
+            as_json,
+            "[probe http vary] Provide a URL or `--vary-request <file>`.",
+        );
         return 2;
     };
     hdrs.extend(headers.iter().cloned());
@@ -983,7 +985,10 @@ pub fn run_http_vary(
                     Ok((Some(ch), _)) => hdrs.push(ch),
                     Ok((None, _)) => {}
                     Err(e) => {
-                        eprintln!("[probe http vary] cdp-cookies:{port}: {e}");
+                        emit_http_err(
+                            as_json,
+                            &format!("[probe http vary] cdp-cookies:{port}: {e}"),
+                        );
                         return 1;
                     }
                 }
@@ -1733,7 +1738,7 @@ pub fn run_http_auth_matrix(
         match load_saved_request(rf) {
             Ok(spec) => spec,
             Err(e) => {
-                eprintln!("[probe http auth-matrix] {e}");
+                emit_http_err(as_json, &format!("[probe http auth-matrix] {e}"));
                 return 2;
             }
         }
@@ -1745,7 +1750,10 @@ pub fn run_http_auth_matrix(
             body.map(str::to_string),
         )
     } else {
-        eprintln!("[probe http auth-matrix] Provide a URL or `--vary-request <file>`.");
+        emit_http_err(
+            as_json,
+            "[probe http auth-matrix] Provide a URL or `--vary-request <file>`.",
+        );
         return 2;
     };
     base_hdrs.extend(headers.iter().cloned());
@@ -1781,7 +1789,7 @@ pub fn run_http_auth_matrix(
                 }),
             },
             Err(e) => {
-                eprintln!("[probe http auth-matrix] {e}");
+                emit_http_err(as_json, &format!("[probe http auth-matrix] {e}"));
                 return 2;
             }
         }
@@ -2741,7 +2749,7 @@ pub fn run_http_roles_matrix(
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[probe http roles-matrix] {e}");
+            emit_http_err(as_json, &format!("[probe http roles-matrix] {e}"));
             return 2;
         }
     };
@@ -2970,7 +2978,7 @@ pub fn run_http_race(
         match load_saved_request(rf) {
             Ok(spec) => spec,
             Err(e) => {
-                eprintln!("[probe http race] {e}");
+                emit_http_err(as_json, &format!("[probe http race] {e}"));
                 return 2;
             }
         }
@@ -2982,7 +2990,10 @@ pub fn run_http_race(
             body.map(str::to_string),
         )
     } else {
-        eprintln!("[probe http race] Provide a URL or `--vary-request <file>`.");
+        emit_http_err(
+            as_json,
+            "[probe http race] Provide a URL or `--vary-request <file>`.",
+        );
         return 2;
     };
     hdrs.extend(headers.iter().cloned());
@@ -2992,7 +3003,10 @@ pub fn run_http_race(
                 Ok((Some(ch), _)) => hdrs.push(ch),
                 Ok((None, _)) => {}
                 Err(e) => {
-                    eprintln!("[probe http race] cdp-cookies:{port}: {e}");
+                    emit_http_err(
+                        as_json,
+                        &format!("[probe http race] cdp-cookies:{port}: {e}"),
+                    );
                     return 1;
                 }
             }
@@ -4088,7 +4102,7 @@ pub fn run_http_mutate_matrix(
         match load_saved_request(rf) {
             Ok(spec) => spec,
             Err(e) => {
-                eprintln!("[probe http mutate-matrix] {e}");
+                emit_http_err(as_json, &format!("[probe http mutate-matrix] {e}"));
                 return 2;
             }
         }
@@ -4100,7 +4114,10 @@ pub fn run_http_mutate_matrix(
             body.map(str::to_string),
         )
     } else {
-        eprintln!("[probe http mutate-matrix] Provide a URL or `--vary-request <file>`.");
+        emit_http_err(
+            as_json,
+            "[probe http mutate-matrix] Provide a URL or `--vary-request <file>`.",
+        );
         return 2;
     };
     hdrs.extend(headers.iter().cloned());
@@ -4111,7 +4128,10 @@ pub fn run_http_mutate_matrix(
                     Ok((Some(ch), _)) => hdrs.push(ch),
                     Ok((None, _)) => {}
                     Err(e) => {
-                        eprintln!("[probe http mutate-matrix] cdp-cookies:{port}: {e}");
+                        emit_http_err(
+                            as_json,
+                            &format!("[probe http mutate-matrix] cdp-cookies:{port}: {e}"),
+                        );
                         return 1;
                     }
                 }

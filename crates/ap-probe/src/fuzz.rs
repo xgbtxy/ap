@@ -170,17 +170,64 @@ fn run_cli_fuzz(cwd: &Path, cli_cmd: &str, as_json: bool) -> i32 {
             .stderr(Stdio::piped())
             .spawn()
         {
+            let mut job = crate::smoke::ProbeJobGuard::attach(&ch);
             if let Some(mut sin) = ch.stdin.take() {
                 let _ = sin.write_all(stdin_payload.as_bytes());
             }
-            if let Ok(out) = ch.wait_with_output() {
-                let code = out.status.code().unwrap_or(1);
+            let out_p = ch.stdout.take();
+            let err_p = ch.stderr.take();
+            let out_h = thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut r) = out_p {
+                    let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                }
+                buf
+            });
+            let err_h = thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut r) = err_p {
+                    let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                }
+                buf
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut timed_out = false;
+            let exit_code = loop {
+                match ch.try_wait() {
+                    Ok(Some(st)) => break st.code().unwrap_or(1),
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            timed_out = true;
+                            drop(job.take());
+                            kill_process_tree(&mut ch);
+                            break 124;
+                        }
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    Err(_) => {
+                        drop(job.take());
+                        kill_process_tree(&mut ch);
+                        break 1;
+                    }
+                }
+            };
+            drop(job);
+            let stdout_b = out_h.join().unwrap_or_default();
+            let stderr_b = err_h.join().unwrap_or_default();
+            if timed_out {
+                failures.push(FuzzFailure {
+                    category: format!("cli-{label}"),
+                    target: full,
+                    status: 124,
+                    detail: "CLI fuzz probe timed out after 10s (killed process tree)".to_string(),
+                });
+            } else {
                 let comb = format!(
                     "{}\n{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
+                    String::from_utf8_lossy(&stdout_b),
+                    String::from_utf8_lossy(&stderr_b)
                 );
-                let crashed = code >= 128
+                let crashed = exit_code >= 128
                     || comb.contains("panicked at")
                     || comb.contains("Traceback (most recent call last)")
                     || comb.contains("TypeError:")
@@ -190,7 +237,7 @@ fn run_cli_fuzz(cwd: &Path, cli_cmd: &str, as_json: bool) -> i32 {
                     failures.push(FuzzFailure {
                         category: format!("cli-{label}"),
                         target: full,
-                        status: code,
+                        status: exit_code,
                         detail: first_err.chars().take(160).collect(),
                     });
                 }
@@ -210,6 +257,17 @@ fn run_cli_fuzz(cwd: &Path, cli_cmd: &str, as_json: bool) -> i32 {
     )
 }
 
+fn emit_fuzz_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 pub fn run_fuzz(
     cwd: &Path,
     start_opt: Option<&str>,
@@ -224,6 +282,7 @@ pub fn run_fuzz(
     let t0 = Instant::now();
     let (routes, fields) = discover_routes_and_fields(cwd);
     let mut child_opt: Option<Child> = None;
+    let mut _child_job: Option<crate::smoke::ProbeJobGuard> = None;
     let pid = std::process::id();
     let out_f = std::env::temp_dir().join(format!("ap_fuzz_{pid}.out.log"));
     let err_f = std::env::temp_dir().join(format!("ap_fuzz_{pid}.err.log"));
@@ -236,18 +295,23 @@ pub fn run_fuzz(
             .map(str::to_string)
             .or_else(|| auto_detect_start_cmd(cwd))
         else {
-            eprintln!(
-                "[probe fuzz] Provide --start \"<cmd>\", --url http://..., or --cli \"<cmd>\""
+            emit_fuzz_err(
+                as_json,
+                "[probe fuzz] Provide --start \"<cmd>\", --url http://..., or --cli \"<cmd>\"",
             );
             return 2;
         };
         let Ok(port) = pick_free_port() else {
+            emit_fuzz_err(as_json, "[probe fuzz] Failed to allocate a free local port");
             return 2;
         };
         match spawn_detached_logged_server(&sc, cwd, port, &[], &out_f, &err_f) {
-            Ok(ch) => child_opt = Some(ch),
+            Ok(ch) => {
+                _child_job = crate::smoke::ProbeJobGuard::attach(&ch);
+                child_opt = Some(ch);
+            }
             Err(e) => {
-                eprintln!("[probe fuzz] {e}");
+                emit_fuzz_err(as_json, &format!("[probe fuzz] {e}"));
                 return 1;
             }
         }

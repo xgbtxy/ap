@@ -112,6 +112,57 @@ impl Drop for FrontierLockGuard {
     }
 }
 
+fn parse_lock_pid(content: &str) -> Option<u32> {
+    content
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("pid=")?.parse::<u32>().ok())
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(5);
+    }
+    let mut exit_code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(h, &mut exit_code) };
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    ok != 0 && exit_code == STILL_ACTIVE
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn is_pid_alive(_pid: u32) -> bool {
+    true
+}
+
 pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String> {
     if let Some(parent) = store_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -148,7 +199,12 @@ pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
                 if let Ok(meta) = fs::metadata(&lock_path) {
                     if let Ok(mtime) = meta.modified() {
                         if let Ok(age) = SystemTime::now().duration_since(mtime) {
-                            if age > Duration::from_secs(15) {
+                            let dead_holder = age >= Duration::from_millis(500)
+                                && fs::read_to_string(&lock_path)
+                                    .ok()
+                                    .and_then(|s| parse_lock_pid(&s))
+                                    .is_some_and(|holder| holder != pid && !is_pid_alive(holder));
+                            if dead_holder || age > Duration::from_secs(8) {
                                 let _ = fs::remove_file(&lock_path);
                                 continue;
                             }
@@ -3336,6 +3392,31 @@ mod tests {
             lock_file.is_file(),
             "Drop must NOT delete a lockfile whose owner token changed"
         );
+
+        // Dead-PID stale lock fast reclaim (must recover in <3s, never wait 10s timeout!)
+        let dead_child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+        };
+        if let Ok(mut ch) = dead_child {
+            let dead_pid = ch.id();
+            let _ = ch.wait();
+            let dead_target = td.join("dead_pid_test.json");
+            let dead_lock = td.join("dead_pid_test.json.lock");
+            fs::write(&dead_lock, format!("pid={dead_pid} seq=1 ns=1\n")).unwrap();
+            let t0 = Instant::now();
+            let _g_reclaimed = acquire_file_lock(&dead_target).expect("must reclaim dead-PID lock");
+            assert!(
+                t0.elapsed() < Duration::from_secs(4),
+                "dead-PID lock reclaim took too long: {:?}",
+                t0.elapsed()
+            );
+        }
         let _ = fs::remove_dir_all(&td);
     }
 }

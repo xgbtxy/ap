@@ -683,7 +683,20 @@ pub fn run_cli(args: &[String]) -> i32 {
                     match er_port_str.trim().parse::<u16>() {
                         Ok(p) if p > 0 => p,
                         _ => {
-                            eprintln!("[probe cdp] invalid --export-role port `{er_port_str}`");
+                            let msg =
+                                format!("[probe cdp] invalid --export-role port `{er_port_str}`");
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "ok": false,
+                                        "error": msg
+                                    }))
+                                    .unwrap_or_default()
+                                );
+                            } else {
+                                eprintln!("{msg}");
+                            }
                             return 2;
                         }
                     }
@@ -1126,7 +1139,19 @@ pub fn run_cli(args: &[String]) -> i32 {
                 );
             }
             let Some(ws_url) = url.as_deref().filter(|s| !s.trim().is_empty()) else {
-                eprintln!("ap probe ws: pass <url> or --replay-har <file>");
+                let msg = "ap probe ws: pass <url> or --replay-har <file>";
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "error": msg
+                        }))
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{msg}");
+                }
                 return 2;
             };
             if origin_matrix || !origins.is_empty() {

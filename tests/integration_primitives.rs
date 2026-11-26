@@ -25,6 +25,23 @@ fn isolated_test_ap_home(cwd: &Path) -> PathBuf {
     ))
 }
 
+fn isolated_node_cmd() -> Command {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NODE_ISO_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = NODE_ISO_SEQ.fetch_add(1, Ordering::Relaxed);
+    let iso = std::env::temp_dir()
+        .join("ap_test_node_homes")
+        .join(format!("p{}_{seq}", std::process::id()));
+    let sieve = iso.join("sieve");
+    let _ = fs::create_dir_all(&sieve);
+    let mut cmd = Command::new("node");
+    cmd.env("HOME", &iso)
+        .env("USERPROFILE", &iso)
+        .env("AP_HOME", &iso)
+        .env("SIEVE_HOME", &sieve);
+    cmd
+}
+
 fn run_ap(
     cwd: &Path,
     args: &[&str],
@@ -1134,6 +1151,7 @@ fn test_windows_exec_shield_bom_utf16_splice_and_stats_ledger() {
     shield_cmd
         .args(["guard", "shield"])
         .current_dir(root)
+        .env("AP_HOME", isolated_test_ap_home(root))
         .env("AP_FORCE_WIN_SHIELD", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -6587,6 +6605,7 @@ fn test_v240_mcp_profiles_ast_code_search_and_resilient_splice() {
         cmd.arg("mcp")
             .args(profile_args)
             .current_dir(cwd)
+            .env("AP_HOME", isolated_test_ap_home(cwd))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -6861,6 +6880,7 @@ fn test_v241_ls_aliases_read_section_search_ergonomics_and_exec_rg_heal() {
     mcp_cmd
         .args(["mcp", "--profile", "deferred"])
         .current_dir(root)
+        .env("AP_HOME", isolated_test_ap_home(root))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -6973,6 +6993,7 @@ fn test_v242_search_only_matching_unique_exec_dir_heal_and_pi_accelerator() {
     mcp_cmd
         .args(["mcp", "--profile", "deferred"])
         .current_dir(root)
+        .env("AP_HOME", isolated_test_ap_home(root))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -9561,7 +9582,7 @@ assert.ok(
 // Destructive commands remain untouched
 assert.equal(healCommand('rm -rf build && grep -rn foo .', "bash"), undefined);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -9796,7 +9817,7 @@ assert.equal(sieveCodemodeContentBlocks(blocks, (b) => "[sieve id=d] " + b.slice
 const sievedFast = sieveCodemodeContentBlocks(blocks, (b) => "[sieve id=d] " + b.slice(0, 40), true);
 assert.ok(Array.isArray(sievedFast) && sievedFast.length === 2 && String(sievedFast[1].text).includes("[sieve id=d]"));
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -9952,7 +9973,7 @@ assert.equal(shouldAutoSieveUnboundedRead(txt15k, { path: "a.md" }, true), true)
 assert.equal(shouldAutoSieveUnboundedRead(txt15k, { path: "a.md" }, false), false);
 assert.equal(shouldAutoSieveUnboundedRead(txt30k, { path: "a.md", offset: 1, limit: 200 }, true), false);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -10160,7 +10181,7 @@ assert.equal(healCommand("ls -r | head -10", "bash"), undefined);
 const edited = healEditBlock("| colA  | colB  |\n| 1     | 2     |\n", "| colA | colB |", "| colA | colC |");
 assert.ok(edited && edited.oldText === "| colA  | colB  |" && edited.strategy === "punctuation-loose-unique", JSON.stringify(edited));
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -10344,7 +10365,7 @@ const cTimed = guardUnboundedCurlTimeout("curl -s https://example.com/health");
 assert.equal(cTimed, "curl --max-time 30 -s https://example.com/health");
 assert.equal(guardUnboundedCurlTimeout("curl -s -m 10 https://example.com"), undefined);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -10489,7 +10510,7 @@ assert.equal(repairHallucinatedToolName("bashx", active), "bash");
 assert.equal(repairHallucinatedToolName("xyzzy", active), undefined);
 assert.equal(repairHallucinatedToolName("ap_xead", new Set(["ap_read", "ap_head"])), undefined);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -10817,7 +10838,7 @@ assert.equal(
 assert.equal(shouldAutoSieveUnboundedRead("a".repeat(18000), { offset: 1, limit: 200 }, true), false);
 assert.equal(shouldAutoSieveUnboundedRead("x".repeat(35000), { offset: 1, limit: 50 }, true), true);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -11387,7 +11408,7 @@ const psJsonTip = classifyShellFailureTip(
 );
 assert.ok(psJsonTip && psJsonTip.includes("[ap json-tip]"), psJsonTip);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -11603,7 +11624,7 @@ assert.ok(ms2 && ms2.includes('read "app.rs" --lines 2-2,10-15 --width 120'), ms
 const ga2 = healCommand("grep -ao 'err_[0-9]+' app.log | sort -u | head -10", "bash");
 assert.ok(ga2 && ga2.includes("search --max 10 --unique -o 'err_[0-9]+' \"app.log\""), ga2);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -11798,7 +11819,7 @@ assert.ok(d1 && d1.includes('ls "src" --du'), d1);
 
 assert.equal(healCommand("du -sh * | sort -h", "bash"), undefined);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -11934,7 +11955,7 @@ assert.equal(shouldAutoSieveUnboundedRead("x".repeat(28000), { path: 'AGENTS.md'
 assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log' }, false, 16000, 125000), true);
 assert.equal(shouldAutoSieveUnboundedRead(multiline11k, { path: 'big.log', offset: 1, limit: 100 }, false, 16000, 125000), false);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -12218,7 +12239,7 @@ assert.equal(classifyDeepSeekEffort("fix the parser race"), "high");
 assert.deepEqual(decideDeepSeekCacheWarming({ provider: "deepseek", modelId: "deepseek-flash", warmCost: 0.0003, missCost: 0.006, isIdle: true }), { action: "warm" });
 assert.equal(decideDeepSeekCacheWarming({ provider: "deepseek", modelId: "deepseek-flash", warmCost: 0.0003, missCost: 0.006, isIdle: false }), undefined);
 "#;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -12502,7 +12523,7 @@ assert.equal(capturedOpts.reasoning, "low");
 assert.equal(capturedOpts.cacheRetention, "none");
 assert.ok(treeRes.summary.includes("<codemode-store-keys>") && treeRes.summary.includes("my_key"));
 "###;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -12735,7 +12756,7 @@ for (let i = 0; i < 3; i++) {
 const loopEvt = events.find((e) => e.ch === "ap:tool_loop");
 assert.ok(loopEvt && loopEvt.data.tool === "bash" && loopEvt.data.count >= 2 && loopEvt.data.isError === true);
 "###;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -12983,7 +13004,7 @@ const compact7k = mod.sieveCodemodeContentBlocks(
 assert.equal(sieve7kCalled, false, ">4.5KB compacted JSON under 20KB limit must NOT fall back to sieve");
 assert.deepEqual(JSON.parse(compact7k[1].text), payload7k);
 "###;
-        let run = Command::new("node")
+        let run = isolated_node_cmd()
             .args([
                 "--experimental-strip-types",
                 "--input-type=module",
@@ -14355,4 +14376,245 @@ fn test_cycle2_hardening_migration_failclosed_json_contracts_and_mcp_errors() {
     let stv: Value = serde_json::from_slice(&stats_out.stdout).unwrap();
     assert!(stv["error_count"].as_u64().unwrap_or(0) >= 1, "{stv}");
     assert!(stv["p95_ms"].is_u64(), "{stv}");
+}
+
+#[test]
+fn test_cycle3_stats_atomicity_cli_telemetry_search_fastpath_recall_prune_and_probe_json_errors() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // 1. Concurrent 16-thread CLI `ap read` writes to isolated `AP_HOME/stats.jsonl`: 0 malformed lines + ok/ms present
+    let conc_ap_home = root.join("c3_conc_ap_home");
+    fs::create_dir_all(&conc_ap_home).unwrap();
+    let sample_file = root.join("sample.txt");
+    fs::write(&sample_file, "alpha line\nbeta line\n").unwrap();
+    std::thread::scope(|s| {
+        for _ in 0..16 {
+            let root_p = root.to_path_buf();
+            let ap_h = conc_ap_home.clone();
+            s.spawn(move || {
+                for _ in 0..3 {
+                    let out = run_ap(
+                        &root_p,
+                        &["read", "sample.txt", "--lines", "1-2"],
+                        None,
+                        &[("AP_HOME", ap_h.as_path())],
+                    );
+                    assert!(out.status.success());
+                }
+            });
+        }
+    });
+    let conc_stats = fs::read_to_string(conc_ap_home.join("stats.jsonl")).unwrap();
+    let conc_lines: Vec<&str> = conc_stats.lines().collect();
+    assert_eq!(
+        conc_lines.len(),
+        48,
+        "expected 48 atomic lines, got {}",
+        conc_lines.len()
+    );
+    for (idx, ln) in conc_lines.iter().enumerate() {
+        let v: Value = serde_json::from_str(ln)
+            .unwrap_or_else(|e| panic!("corrupt stats.jsonl line {}: {e}: {ln:?}", idx + 1));
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["ms"].is_u64(), "{v}");
+    }
+
+    // 2. CLI telemetry across search/read(ok+err)/ls/baton + valid JSON errors on read/search
+    let cli_ap_home = root.join("c3_cli_ap_home");
+    fs::create_dir_all(&cli_ap_home).unwrap();
+    let r_miss = run_ap(
+        root,
+        &["read", "does_not_exist_c3.txt", "--json"],
+        None,
+        &[("AP_HOME", cli_ap_home.as_path())],
+    );
+    assert!(!r_miss.status.success());
+    let r_miss_v: Value =
+        serde_json::from_slice(&r_miss.stdout).expect("ap read --json error must emit valid JSON");
+    assert_eq!(r_miss_v["ok"], false, "{r_miss_v}");
+
+    let s_miss = run_ap(
+        root,
+        &["search", "NEEDLE", "does_not_exist_dir_c3", "--json"],
+        None,
+        &[("AP_HOME", cli_ap_home.as_path())],
+    );
+    assert!(!s_miss.status.success());
+    let s_miss_v: Value = serde_json::from_slice(&s_miss.stdout)
+        .expect("ap search --json error must emit valid JSON");
+    assert_eq!(s_miss_v["ok"], false, "{s_miss_v}");
+
+    let ls_ok = run_ap(
+        root,
+        &["ls", ".", "--json"],
+        None,
+        &[("AP_HOME", cli_ap_home.as_path())],
+    );
+    assert!(ls_ok.status.success());
+
+    let bt_ok = run_ap(
+        root,
+        &["baton", "resume", "--json"],
+        None,
+        &[("AP_HOME", cli_ap_home.as_path())],
+    );
+    assert!(bt_ok.status.success());
+
+    let cli_stats = fs::read_to_string(cli_ap_home.join("stats.jsonl")).unwrap();
+    let mut saw_read_err = false;
+    let mut saw_search_err = false;
+    let mut saw_ls = false;
+    let mut saw_baton = false;
+    for ln in cli_stats.lines() {
+        let v: Value = serde_json::from_str(ln).unwrap();
+        assert!(
+            v.get("ok").and_then(Value::as_bool).is_some(),
+            "missing ok: {v}"
+        );
+        assert!(
+            v.get("ms").and_then(Value::as_u64).is_some(),
+            "missing ms: {v}"
+        );
+        match (v["kind"].as_str(), v["ok"].as_bool()) {
+            (Some("read"), Some(false)) => saw_read_err = true,
+            (Some("search"), Some(false)) => saw_search_err = true,
+            (Some("ls"), Some(true)) => saw_ls = true,
+            (Some("baton"), Some(true)) => saw_baton = true,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_read_err && saw_search_err && saw_ls && saw_baton,
+        "missing CLI telemetry rows:\n{cli_stats}"
+    );
+
+    // 3. `ap search` 512B binary peek + dir-walk archive skip + multi-pattern AST once + minified bundle
+    let sdir = root.join("search_c3");
+    fs::create_dir_all(&sdir).unwrap();
+    let mut big_bin = vec![0u8; 256 * 1024];
+    big_bin[16..25].copy_from_slice(b"NEEDLE_C3");
+    fs::write(sdir.join("opaque_cache_blob"), &big_bin).unwrap();
+    let mut fake_zip = vec![b'P', b'K', 3, 4, 0, 0, 0, 0];
+    fake_zip.extend_from_slice(b"NEEDLE_C3");
+    fake_zip.resize(128 * 1024, 0);
+    fs::write(sdir.join("bundle.zip"), &fake_zip).unwrap();
+    fs::write(
+        sdir.join("code.rs"),
+        "pub fn alpha_c3() {\n    let a = \"NEEDLE_C3\";\n    let b = \"SECOND_C3\";\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        sdir.join("app.min.js"),
+        format!("var x=1;{};var z='NEEDLE_C3';", "y=2;".repeat(200)),
+    )
+    .unwrap();
+
+    let s_out = run_ap(
+        root,
+        &[
+            "search",
+            "NEEDLE_C3",
+            "--pat",
+            "SECOND_C3",
+            "search_c3",
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", cli_ap_home.as_path())],
+    );
+    assert!(
+        s_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&s_out.stderr)
+    );
+    let sv: Value = serde_json::from_slice(&s_out.stdout).unwrap();
+    assert_eq!(sv["ok"], true);
+    assert_eq!(
+        sv["scanned_files"].as_u64(),
+        Some(2),
+        "256KiB binary blob & .zip must be skipped before fs::read: {sv}"
+    );
+    let matches = sv["matches"].as_array().unwrap();
+    assert!(
+        matches.iter().any(|m| m["file"] == "code.rs"
+            && m["pattern"] == "NEEDLE_C3"
+            && m["scope"].as_str().unwrap_or("").contains("alpha_c3")),
+        "{sv}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m["file"] == "code.rs" && m["pattern"] == "SECOND_C3"),
+        "{sv}"
+    );
+    assert!(matches.iter().any(|m| m["file"] == "app.min.js"), "{sv}");
+
+    // 4. All 6 `ap probe` `--json` error envelopes emit valid JSON `{ok: false, error}`
+    for (args, expected_rc) in [
+        (vec!["probe", "tcp", "not_a_valid_host_spec", "--json"], 2),
+        (vec!["probe", "http", "--json"], 2),
+        (vec!["probe", "http", "--vary-field", "id", "--json"], 2),
+        (vec!["probe", "mutate", "missing_c3_file.rs", "--json"], 1),
+        (vec!["probe", "fuzz", "--json"], 2),
+        (vec!["probe", "ws", "--json"], 2),
+    ] {
+        let out = run_ap(root, &args, None, &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(expected_rc),
+            "args={args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let jv: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "expected valid JSON error for {args:?}: {e}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(jv["ok"], false, "args={args:?} jv={jv}");
+        assert!(
+            jv["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "args={args:?} jv={jv}"
+        );
+    }
+
+    // 5. MCP strict `ap_frontier` on corrupt `frontier.json` + exact 37 tools
+    let corrupt_ws = root.join("corrupt_mcp_ws");
+    fs::create_dir_all(corrupt_ws.join(".baton")).unwrap();
+    let corrupt_fp = corrupt_ws.join(".baton").join("frontier.json");
+    fs::write(&corrupt_fp, "{ broken frontier json").unwrap();
+    let cws_str = corrupt_ws.to_string_lossy().to_string();
+    let mcp_req = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ap_frontier", "arguments": {"action": "status", "cwd": cws_str}}}).to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ap_frontier", "arguments": {"action": "next", "cwd": cws_str}}}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let mcp_out = run_ap(&corrupt_ws, &["mcp"], Some(&mcp_req), &[]);
+    assert!(mcp_out.status.success());
+    let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(resps[0]["result"]["tools"].as_array().unwrap().len(), 37);
+    assert_eq!(resps[1]["result"]["isError"], true, "{}", resps[1]);
+    assert_eq!(
+        resps[1]["result"]["structuredContent"]["ok"], false,
+        "{}",
+        resps[1]
+    );
+    assert_eq!(resps[2]["result"]["isError"], true, "{}", resps[2]);
+    assert_eq!(
+        resps[2]["result"]["structuredContent"]["ok"], false,
+        "{}",
+        resps[2]
+    );
+    assert_eq!(
+        fs::read_to_string(&corrupt_fp).unwrap(),
+        "{ broken frontier json"
+    );
 }

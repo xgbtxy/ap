@@ -369,6 +369,57 @@ impl Drop for VaultLockGuard {
     }
 }
 
+fn parse_lock_pid(content: &str) -> Option<u32> {
+    content
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("pid=")?.parse::<u32>().ok())
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(5);
+    }
+    let mut exit_code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(h, &mut exit_code) };
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    ok != 0 && exit_code == STILL_ACTIVE
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn is_pid_alive(_pid: u32) -> bool {
+    true
+}
+
 fn acquire_vault_lock(db_path: &Path) -> Result<VaultLockGuard, String> {
     if let Some(parent) = db_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -405,7 +456,12 @@ fn acquire_vault_lock(db_path: &Path) -> Result<VaultLockGuard, String> {
                 if let Ok(meta) = fs::metadata(&lock_path) {
                     if let Ok(mtime) = meta.modified() {
                         if let Ok(age) = SystemTime::now().duration_since(mtime) {
-                            if age > Duration::from_secs(15) {
+                            let dead_holder = age >= Duration::from_millis(500)
+                                && fs::read_to_string(&lock_path)
+                                    .ok()
+                                    .and_then(|s| parse_lock_pid(&s))
+                                    .is_some_and(|holder| holder != pid && !is_pid_alive(holder));
+                            if dead_holder || age > Duration::from_secs(8) {
                                 let _ = fs::remove_file(&lock_path);
                                 continue;
                             }
@@ -601,7 +657,12 @@ fn open_vault_inner(db_path: &Path, already_locked: bool) -> rusqlite::Result<Co
         let _mig_lock = if already_locked {
             None
         } else {
-            acquire_vault_lock(db_path).ok()
+            Some(acquire_vault_lock(db_path).map_err(|msg| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some(msg),
+                )
+            })?)
         };
         if vault_needs_migration(&conn)? {
             migrate_vault_schema(&mut conn)?;
@@ -1162,10 +1223,30 @@ fn matches_any_glob(rel_path: &str, file_name: &str, globs: &[String]) -> bool {
         .any(|g| wildcard_match(g, &name_low) || wildcard_match(g, &rel_low))
 }
 
+fn is_symlink_or_reparse_point(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_sync_files(root: &Path, globs: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if root.is_file() {
-        out.push(root.to_path_buf());
+        if !is_symlink_or_reparse_point(root) {
+            out.push(root.to_path_buf());
+        }
         return out;
     }
     let skip_dirs = [
@@ -1180,6 +1261,10 @@ fn collect_sync_files(root: &Path, globs: &[String]) -> Vec<PathBuf> {
         ".venv",
         "venv",
     ];
+    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
+    if let Ok(c) = fs::canonicalize(root) {
+        visited_dirs.insert(c);
+    }
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(rd) = fs::read_dir(&dir) else {
@@ -1187,12 +1272,21 @@ fn collect_sync_files(root: &Path, globs: &[String]) -> Vec<PathBuf> {
         };
         for ent in rd.flatten() {
             let p = ent.path();
+            if is_symlink_or_reparse_point(&p) {
+                continue;
+            }
             let fname = ent.file_name().to_string_lossy().to_string();
-            if p.is_dir() {
+            let Ok(ft) = ent.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
                 if !skip_dirs.iter().any(|s| s.eq_ignore_ascii_case(&fname)) {
-                    stack.push(p);
+                    let canon = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+                    if visited_dirs.insert(canon) {
+                        stack.push(p);
+                    }
                 }
-            } else if p.is_file() {
+            } else if ft.is_file() {
                 let rel = p
                     .strip_prefix(root)
                     .unwrap_or(&p)
@@ -1520,11 +1614,12 @@ fn normalize_drive_letter_case(p: String) -> String {
 }
 
 fn normalize_sync_key(cwd: &Path, file_path: &Path) -> String {
-    let cwd_c = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let file_c = fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
-    if let Ok(rel) = file_c.strip_prefix(&cwd_c) {
-        return normalize_drive_letter_case(normalize_source_file(&rel.to_string_lossy()));
-    }
+    let abs = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        cwd.join(file_path)
+    };
+    let file_c = fs::canonicalize(&abs).unwrap_or(abs);
     let s = file_c.to_string_lossy().to_string();
     let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
     normalize_drive_letter_case(normalize_source_file(stripped))
@@ -1777,17 +1872,44 @@ pub fn sync_path(
                 continue;
             }
             // Strictly scope pruning to tracked files inside the synced root matching current --glob,
-            // so syncing one directory/glob/CWD never wipes entries from other roots, globs, or manual rules.
+            // canonicalizing both absolute and legacy relative keys so cross-CWD sync --prune works cleanly
+            // without ever wiping entries from other roots, globs, or manual rules.
+            let is_abs_tracked = tracked_fp.starts_with('/')
+                || (tracked_fp.len() >= 2 && tracked_fp.as_bytes()[1] == b':');
+            let canon_tracked = if is_abs_tracked {
+                normalize_drive_letter_case(normalize_source_file(tracked_fp))
+            } else {
+                normalize_sync_key(cwd, &cwd.join(tracked_fp))
+            };
+            if seen_keys.contains(&canon_tracked) {
+                // Legacy relative key superseded by canonical key for the exact same live file: drop duplicate row
+                let old_ids: Vec<String> = {
+                    let mut st = tx
+                        .prepare("SELECT id FROM rules WHERE source_file = ?1 AND origin = 'sync'")
+                        .map_err(|e| e.to_string())?;
+                    let rows = st
+                        .query_map(params![tracked_fp], |r| r.get::<_, String>(0))
+                        .map_err(|e| e.to_string())?;
+                    rows.flatten().collect()
+                };
+                for oid in &old_ids {
+                    let _ = tx.execute("DELETE FROM rules WHERE id = ?1", params![oid]);
+                    let _ = tx.execute("DELETE FROM rules_fts WHERE id = ?1", params![oid]);
+                }
+                let _ = tx.execute(
+                    "DELETE FROM sync_files WHERE file_path = ?1",
+                    params![tracked_fp],
+                );
+                continue;
+            }
             let rel_within_root: Option<&str> = if resolved_root.is_file() {
-                (tracked_fp == &root_key).then_some(tracked_fp.as_str())
+                (canon_tracked == root_key).then_some(canon_tracked.as_str())
             } else if root_prefix.is_empty() {
-                let is_abs_other = tracked_fp.starts_with('/')
-                    || (tracked_fp.len() >= 2 && tracked_fp.as_bytes()[1] == b':');
-                (!is_abs_other).then_some(tracked_fp.as_str())
-            } else if let Some(rest) = tracked_fp.strip_prefix(&root_prefix) {
+                (!is_abs_tracked).then_some(tracked_fp.as_str())
+            } else if let Some(rest) = canon_tracked.strip_prefix(&root_prefix) {
                 Some(rest)
-            } else if tracked_fp == &root_key {
-                Some(tracked_fp.as_str())
+            } else if canon_tracked == root_key {
+                Some(canon_tracked.as_str())
             } else {
                 None
             };
@@ -2665,6 +2787,180 @@ mod tests {
                 .unwrap();
         assert_eq!(man_hits.len(), 1);
         drop(conn2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_junction_cycle_skip_cross_cwd_prune_and_dead_pid_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "ap_recall_c3_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ws = dir.join("ws");
+        let sub = ws.join("prune_test");
+        let outside = dir.join("outside_secret");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            sub.join("a.md"),
+            "# Keep Rule\nAlways verify token signatures cleanly.\n",
+        )
+        .unwrap();
+        fs::write(
+            sub.join("b.md"),
+            "# Temp Rule\nTemporary rule slated for deletion.\n",
+        )
+        .unwrap();
+        fs::write(
+            outside.join("leak.md"),
+            "# Outside\nOUTSIDE_JUNCTION_MUST_NEVER_INDEX\n",
+        )
+        .unwrap();
+
+        // Create both an out-of-tree junction/symlink AND a self-loop junction/symlink
+        #[cfg(windows)]
+        {
+            let _ = Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &sub.join("ext_junc").to_string_lossy(),
+                    &outside.to_string_lossy(),
+                ])
+                .output();
+            let _ = Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &sub.join("self_loop").to_string_lossy(),
+                    &sub.to_string_lossy(),
+                ])
+                .output();
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&outside, sub.join("ext_junc"));
+            let _ = std::os::unix::fs::symlink(&sub, sub.join("self_loop"));
+        }
+
+        let db = ws.join(".recall").join("vault.db");
+        // 1. Initial sync from cwd = ws targeting relative "prune_test"
+        let r1 = sync_path(
+            &db,
+            &ws,
+            Path::new("prune_test"),
+            &[],
+            "c3",
+            "doc",
+            1.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r1.scanned_files, 2,
+            "junction/self-loop must be skipped cleanly: {r1:?}"
+        );
+        assert_eq!(r1.indexed_files, 2);
+
+        // Confirm outside junction content was NEVER indexed
+        let conn = open_vault(&db).unwrap();
+        let (leak_hits, _) = match_rules_scoped(
+            &conn,
+            &ws,
+            "OUTSIDE_JUNCTION_MUST_NEVER_INDEX",
+            &[],
+            5,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(leak_hits.is_empty(), "junction escaped root: {leak_hits:?}");
+        drop(conn);
+
+        // 2. Cross-CWD sync --prune from DIFFERENT cwd (`dir`, parent of `ws`) after deleting b.md
+        fs::remove_file(sub.join("b.md")).unwrap();
+        let r2 = sync_path(&db, &dir, &sub, &[], "c3", "doc", 1.0, true).unwrap();
+        assert_eq!(r2.scanned_files, 1, "{r2:?}");
+        assert_eq!(
+            r2.skipped_unchanged, 1,
+            "must NOT duplicate a.md across CWDs: {r2:?}"
+        );
+        assert_eq!(r2.indexed_files, 0, "a.md unchanged across CWDs: {r2:?}");
+        assert_eq!(r2.pruned_files, 1, "b.md must prune across CWDs: {r2:?}");
+
+        let conn2 = open_vault(&db).unwrap();
+        let (keep_hits, _) = match_rules_scoped(
+            &conn2,
+            &dir,
+            "verify token signatures",
+            &[],
+            5,
+            None,
+            Some("c3"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            keep_hits.len(),
+            1,
+            "a.md must have exactly 1 row (no dup): {keep_hits:?}"
+        );
+        let (gone_hits, _) = match_rules_scoped(
+            &conn2,
+            &dir,
+            "Temporary slated",
+            &[],
+            5,
+            None,
+            Some("c3"),
+            0,
+        )
+        .unwrap();
+        assert!(gone_hits.is_empty(), "b.md must be pruned: {gone_hits:?}");
+        let b_rows: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM rules WHERE source_file LIKE '%b.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_rows, 0, "b.md rows must be 0 after cross-CWD prune");
+        drop(conn2);
+
+        // 3. Dead-PID stale vault lock fast reclaim
+        let dead_child = if cfg!(windows) {
+            Command::new("cmd").args(["/C", "exit", "0"]).spawn()
+        } else {
+            Command::new("sh").args(["-c", "exit 0"]).spawn()
+        };
+        if let Ok(mut ch) = dead_child {
+            let dead_pid = ch.id();
+            let _ = ch.wait();
+            let lock_p = PathBuf::from(format!("{}.lock", db.display()));
+            fs::write(&lock_p, format!("pid={dead_pid} seq=1 ns=1\n")).unwrap();
+            let t0 = Instant::now();
+            let _g = acquire_vault_lock(&db).expect("must reclaim dead-PID recall lock");
+            assert!(
+                t0.elapsed() < Duration::from_secs(4),
+                "dead-PID recall lock reclaim took {:?}",
+                t0.elapsed()
+            );
+        }
+
+        // Remove junctions before recursive cleanup on Windows
+        #[cfg(windows)]
+        {
+            let _ = fs::remove_dir(sub.join("ext_junc"));
+            let _ = fs::remove_dir(sub.join("self_loop"));
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

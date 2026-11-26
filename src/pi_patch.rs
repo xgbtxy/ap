@@ -56,6 +56,39 @@ struct PatchSpec {
     hunks: &'static [PatchHunk],
 }
 
+/// Placeholder for esbuild-suffixed minified identifiers (e.g. `ext2` -> `ext3`, `spawn2` -> `spawn3`)
+/// used strictly on the 2 bundle hunks whose upstream identifier can be renumbered across Pi releases.
+const IDENT_PLACEHOLDER: &str = "{{PI_ID}}";
+
+fn find_ident_template_matches(text: &str, template: &str) -> Vec<(usize, usize, String)> {
+    let parts: Vec<&str> = template.split(IDENT_PLACEHOLDER).collect();
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+    let mut re_src = String::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            re_src.push_str(r"([A-Za-z_$][A-Za-z0-9_$]*)");
+        }
+        re_src.push_str(&regex::escape(part));
+    }
+    let Ok(re) = regex::Regex::new(&re_src) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for caps in re.captures_iter(text) {
+        let Some(m0) = caps.get(0) else { continue };
+        let Some(first_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let consistent = (2..caps.len()).all(|i| caps.get(i).map(|m| m.as_str()) == Some(first_id));
+        if consistent {
+            out.push((m0.start(), m0.end(), first_id.to_string()));
+        }
+    }
+    out
+}
+
 const CODEMODE_BUILTINS_OLD: &str = "\tfor (const [namespace, members] of namespaces) {\n\t\tObject.freeze(members);\n\t\tconst value = guard(members, namespace, Object.keys(members));\n\t\tObject.defineProperty(globalThis, namespace, { value, enumerable: true });\n\t}";
 
 const CODEMODE_BUILTINS_ALT: &str = "\tfor (const [namespace, members] of namespaces) {\n\t\tObject.freeze(members);\n\t\tconst value = guard(members, namespace, Object.keys(members));\n\t\tObject.defineProperty(globalThis, namespace, { value, enumerable: true });\n\t}\n\t(function(){\n\t\tconst _t = new Set(); let _id = 1;\n\t\tif (typeof globalThis.setTimeout !== \"function\") {\n\t\t\tObject.defineProperty(globalThis, \"setTimeout\", { value: function(fn, ms) { const id = _id++; _t.add(id); const a = Array.prototype.slice.call(arguments, 2); const w = Math.max(0, Number(ms) || 0); Promise.resolve(typeof globalThis.sleep === \"function\" ? globalThis.sleep(w) : 0).then(function() { if (!_t.delete(id)) return; if (typeof fn === \"function\") fn.apply(undefined, a); }, function() { _t.delete(id); }); return id; }, enumerable: true });\n\t\t\tObject.defineProperty(globalThis, \"clearTimeout\", { value: function(id) { _t.delete(id); }, enumerable: true });\n\t\t}\n\t\tconst _B = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\";\n\t\tconst _u8e = function(str) { const s = String(str), o = []; for (let i = 0; i < s.length; i++) { let c = s.charCodeAt(i); if (c < 128) o.push(c); else if (c < 2048) o.push(192 | (c >> 6), 128 | (c & 63)); else if ((c & 64512) === 55296 && i + 1 < s.length && (s.charCodeAt(i + 1) & 64512) === 56320) { c = 65536 + ((c & 1023) << 10) + (s.charCodeAt(++i) & 1023); o.push(240 | (c >> 18), 128 | ((c >> 12) & 63), 128 | ((c >> 6) & 63), 128 | (c & 63)); } else o.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63)); } return new Uint8Array(o); };\n\t\tconst _u8d = function(b) { const u = b instanceof Uint8Array ? b : new Uint8Array(b); let o = \"\", i = 0; while (i < u.length) { const c = u[i++]; if (c < 128) o += String.fromCharCode(c); else if ((c & 224) === 192) o += String.fromCharCode(((c & 31) << 6) | (u[i++] & 63)); else if ((c & 240) === 224) o += String.fromCharCode(((c & 15) << 12) | ((u[i++] & 63) << 6) | (u[i++] & 63)); else { const cp = (((c & 7) << 18) | ((u[i++] & 63) << 12) | ((u[i++] & 63) << 6) | (u[i++] & 63)) - 65536; o += String.fromCharCode(55296 + (cp >> 10), 56320 + (cp & 1023)); } } return o; };\n\t\tconst _b64e = function(u) { let o = \"\"; for (let i = 0; i < u.length; i += 3) { const a = u[i], b = i + 1 < u.length ? u[i + 1] : 0, c = i + 2 < u.length ? u[i + 2] : 0; o += _B[a >> 2] + _B[((a & 3) << 4) | (b >> 4)] + (i + 1 < u.length ? _B[((b & 15) << 2) | (c >> 6)] : \"=\") + (i + 2 < u.length ? _B[c & 63] : \"=\"); } return o; };\n\t\tconst _b64d = function(s) { let cl = \"\"; const st = String(s); for (let i = 0; i < st.length; i++) { const ch = st[i], cc = st.charCodeAt(i); if (cc <= 32 || ch === \"=\") continue; cl += ch === \"-\" ? \"+\" : ch === \"_\" ? \"/\" : ch; } const o = []; for (let i = 0; i < cl.length; i += 4) { const a = _B.indexOf(cl[i]), b = _B.indexOf(cl[i + 1]), c = i + 2 < cl.length ? _B.indexOf(cl[i + 2]) : -1, d = i + 3 < cl.length ? _B.indexOf(cl[i + 3]) : -1; o.push((a << 2) | (b >> 4)); if (c >= 0) o.push(((b & 15) << 4) | (c >> 2)); if (d >= 0) o.push(((c & 3) << 6) | d); } return new Uint8Array(o); };\n\t\tif (typeof globalThis.btoa !== \"function\") Object.defineProperty(globalThis, \"btoa\", { value: function(s) { const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 255; return _b64e(u); }, enumerable: true });\n\t\tif (typeof globalThis.atob !== \"function\") Object.defineProperty(globalThis, \"atob\", { value: function(s) { const u = _b64d(s); let r = \"\"; for (let i = 0; i < u.length; i++) r += String.fromCharCode(u[i]); return r; }, enumerable: true });\n\t\tif (typeof globalThis.TextEncoder !== \"function\") Object.defineProperty(globalThis, \"TextEncoder\", { value: function TextEncoder() { this.encode = _u8e; }, enumerable: true });\n\t\tif (typeof globalThis.TextDecoder !== \"function\") Object.defineProperty(globalThis, \"TextDecoder\", { value: function TextDecoder() { this.decode = _u8d; }, enumerable: true });\n\t\tif (typeof globalThis.Buffer !== \"function\") { const _wb = function(u) { u.toString = function(enc) { const e = String(enc || \"utf8\").toLowerCase(); if (e === \"base64\" || e === \"base64url\") return e === \"base64url\" ? _b64e(u).replace(/[+]/g, \"-\").replace(/[/]/g, \"_\").replace(/[=]+$/g, \"\") : _b64e(u); if (e === \"hex\") { let h = \"\"; for (let i = 0; i < u.length; i++) h += (u[i] < 16 ? \"0\" : \"\") + u[i].toString(16); return h; } if (e === \"latin1\" || e === \"binary\") { let r = \"\"; for (let i = 0; i < u.length; i++) r += String.fromCharCode(u[i]); return r; } return _u8d(u); }; return u; }; Object.defineProperty(globalThis, \"Buffer\", { value: { isBuffer: function(v) { return v instanceof Uint8Array; }, from: function(v, enc) { if (v instanceof Uint8Array || Array.isArray(v)) return _wb(new Uint8Array(v)); const e = String(enc || \"utf8\").toLowerCase(); if (e === \"base64\" || e === \"base64url\") return _wb(_b64d(v)); if (e === \"hex\") { let h = \"\"; const sv = String(v); for (let i = 0; i < sv.length; i++) if (sv.charCodeAt(i) > 32) h += sv[i]; const o = new Uint8Array(Math.floor(h.length / 2)); for (let i = 0; i < o.length; i++) o[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16) || 0; return _wb(o); } return _wb(_u8e(v)); }, concat: function(l) { let t = 0; for (let i = 0; i < l.length; i++) t += l[i].length; const o = new Uint8Array(t); let off = 0; for (let i = 0; i < l.length; i++) { o.set(l[i], off); off += l[i].length; } return _wb(o); } }, enumerable: true }); }\n\t})();";
@@ -74,9 +107,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
             PatchHunk {
                 id: "bundle_emit_before_agent_start",
                 rel_hint: None,
-                old: r#"let messages=[];for(let{ext:ext2,handlers}of snapshotEventHandlers(this.extensions,"before_agent_start"))for(let handler of handlers)try{let event={...trigger,type:"before_agent_start",get systemPrompt(){return renderCurrentSystemPrompt()},systemPromptOptions:currentOptions},handlerResult=await handler(event,ctx);if(handlerResult){let result=handlerResult;result.message&&messages.push(result.message),result.systemPrompt!==void 0&&(currentOptions.forceSystemPrompt=result.systemPrompt)}}catch(err){let message=err instanceof Error?err.message:String(err),stack=err instanceof Error?err.stack:void 0;this.emitError({extensionPath:ext2.path,event:"before_agent_start",error:message,stack})}return{messages,systemPromptOptions:currentOptions}"#,
+                old: r#"let messages=[];for(let{ext:{{PI_ID}},handlers}of snapshotEventHandlers(this.extensions,"before_agent_start"))for(let handler of handlers)try{let event={...trigger,type:"before_agent_start",get systemPrompt(){return renderCurrentSystemPrompt()},systemPromptOptions:currentOptions},handlerResult=await handler(event,ctx);if(handlerResult){let result=handlerResult;result.message&&messages.push(result.message),result.systemPrompt!==void 0&&(currentOptions.forceSystemPrompt=result.systemPrompt)}}catch(err){let message=err instanceof Error?err.message:String(err),stack=err instanceof Error?err.stack:void 0;this.emitError({extensionPath:{{PI_ID}}.path,event:"before_agent_start",error:message,stack})}return{messages,systemPromptOptions:currentOptions}"#,
                 alt_olds: &[],
-                new: r#"let messages=[],entries=[];for(let{ext:ext2,handlers}of snapshotEventHandlers(this.extensions,"before_agent_start"))for(let handler of handlers)try{let event={...trigger,type:"before_agent_start",get systemPrompt(){return renderCurrentSystemPrompt()},systemPromptOptions:currentOptions},handlerResult=await handler(event,ctx);if(handlerResult){let result=handlerResult;result.message&&messages.push(result.message),Array.isArray(result.entries)&&entries.push(...result.entries),result.systemPrompt!==void 0&&(currentOptions.forceSystemPrompt=result.systemPrompt)}}catch(err){let message=err instanceof Error?err.message:String(err),stack=err instanceof Error?err.stack:void 0;this.emitError({extensionPath:ext2.path,event:"before_agent_start",error:message,stack})}return{messages,entries,systemPromptOptions:currentOptions}"#,
+                new: r#"let messages=[],entries=[];for(let{ext:{{PI_ID}},handlers}of snapshotEventHandlers(this.extensions,"before_agent_start"))for(let handler of handlers)try{let event={...trigger,type:"before_agent_start",get systemPrompt(){return renderCurrentSystemPrompt()},systemPromptOptions:currentOptions},handlerResult=await handler(event,ctx);if(handlerResult){let result=handlerResult;result.message&&messages.push(result.message),Array.isArray(result.entries)&&entries.push(...result.entries),result.systemPrompt!==void 0&&(currentOptions.forceSystemPrompt=result.systemPrompt)}}catch(err){let message=err instanceof Error?err.message:String(err),stack=err instanceof Error?err.stack:void 0;this.emitError({extensionPath:{{PI_ID}}.path,event:"before_agent_start",error:message,stack})}return{messages,entries,systemPromptOptions:currentOptions}"#,
                 already_present_markers: &[],
             },
             PatchHunk {
@@ -584,7 +617,7 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "http_dns_stale_cache",
-        summary: "Inject an LRU 45s fresh-TTL + 10m stale-IP coalescing DNS lookup cache onto EnvHttpProxyAgent's plain connect options (preserves keepAlive/timeouts and HTTP-CONNECT proxy tunnels; leaves createUndiciClient untouched)",
+        summary: "Inject an LRU 45s fresh-TTL + 10m stale-IP coalescing DNS lookup cache onto EnvHttpProxyAgent's plain connect options (re-entrant/double-cb/opts-snapshot safe; preserves keepAlive/timeouts and HTTP-CONNECT proxy tunnels)",
         hunks: &[
             PatchHunk {
                 id: "bundle_http_dns_stale_cache",
@@ -592,8 +625,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: r#"withUndiciErrorListener(new undici.EnvHttpProxyAgent("#,
                 alt_olds: &[
                     r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let fam=typeof opts=="number"?opts:opts?.family??0,all=Boolean(typeof opts=="object"&&opts?.all),key=`${host}|${fam}|${all?1:0}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}_dp.then(m=>{m.lookup(host,opts,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(v.length>0){if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}all?cb(null,a):cb(null,a,b);return}if(hit&&Date.now()-hit.t<6e5&&(err?.code==="ENOTFOUND"||err?.code==="EAI_AGAIN"||err?.code==="ETIMEOUT"||err?.code==="ESERVFAIL")){all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]);return}cb(err)})},e=>cb(e))}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
+                    r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_inf=globalThis.__piDnsInFlight??(globalThis.__piDnsInFlight=new Map),_se=new Set(["ENOTFOUND","EAI_AGAIN","ETIMEOUT","ETIMEDOUT","ESERVFAIL","EAI_FAIL","EAI_NODATA","EAI_NONAME"]);_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let h=String(host||"").toLowerCase(),fam=typeof opts=="number"?opts:opts?.family??0,all=Boolean(typeof opts=="object"&&opts?.all),hints=typeof opts=="object"&&opts?.hints?opts.hints:0,ord=typeof opts=="object"?opts?.order??(opts?.verbatim?"verbatim":""):"",key=`${h}|${fam}|${all?1:0}|${hints}|${ord}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){_c.delete(key);_c.set(key,hit);queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}let q=_inf.get(key);if(q){q.push(cb);return}q=[cb];_inf.set(key,q);let _fin=(err,a,b)=>{let list=_inf.get(key)||q;_inf.delete(key);for(let fn of list)try{err?fn(err):all?fn(null,Array.isArray(a)?a.map(x=>({...x})):[]):fn(null,a,b)}catch{}},_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_dp.then(m=>{try{m.lookup(host,opts,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(v.length>0){_c.delete(key);if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}return _fin(null,a,b)}if(hit&&Date.now()-hit.t<6e5&&_se.has(err?.code))return _fin(null,all?hit.v:hit.v[0],all?void 0:hit.v[1]);_fin(err)})}catch(e){_fin(e)}},e=>{globalThis.__piDnsModP===_dp&&(globalThis.__piDnsModP=void 0);_fin(e)})}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
                 ],
-                new: r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_inf=globalThis.__piDnsInFlight??(globalThis.__piDnsInFlight=new Map),_se=new Set(["ENOTFOUND","EAI_AGAIN","ETIMEOUT","ETIMEDOUT","ESERVFAIL","EAI_FAIL","EAI_NODATA","EAI_NONAME"]);_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let h=String(host||"").toLowerCase(),fam=typeof opts=="number"?opts:opts?.family??0,all=Boolean(typeof opts=="object"&&opts?.all),hints=typeof opts=="object"&&opts?.hints?opts.hints:0,ord=typeof opts=="object"?opts?.order??(opts?.verbatim?"verbatim":""):"",key=`${h}|${fam}|${all?1:0}|${hints}|${ord}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){_c.delete(key);_c.set(key,hit);queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}let q=_inf.get(key);if(q){q.push(cb);return}q=[cb];_inf.set(key,q);let _fin=(err,a,b)=>{let list=_inf.get(key)||q;_inf.delete(key);for(let fn of list)try{err?fn(err):all?fn(null,Array.isArray(a)?a.map(x=>({...x})):[]):fn(null,a,b)}catch{}},_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_dp.then(m=>{try{m.lookup(host,opts,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(v.length>0){_c.delete(key);if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}return _fin(null,a,b)}if(hit&&Date.now()-hit.t<6e5&&_se.has(err?.code))return _fin(null,all?hit.v:hit.v[0],all?void 0:hit.v[1]);_fin(err)})}catch(e){_fin(e)}},e=>{globalThis.__piDnsModP===_dp&&(globalThis.__piDnsModP=void 0);_fin(e)})}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
+                new: r#"withUndiciErrorListener(((_o)=>{if(_o&&typeof _o.connect==="object"&&_o.connect&&!_o.connect.lookup){let _c=globalThis.__piDnsStaleCache??(globalThis.__piDnsStaleCache=new Map),_inf=globalThis.__piDnsInFlight??(globalThis.__piDnsInFlight=new Map),_se=new Set(["ENOTFOUND","EAI_AGAIN","ETIMEOUT","ETIMEDOUT","ESERVFAIL","EAI_FAIL","EAI_NODATA","EAI_NONAME"]);_o={..._o,connect:{..._o.connect,lookup(host,opts,cb){typeof opts=="function"&&(cb=opts,opts={});let _so=typeof opts==="object"&&opts?{...opts}:opts,h=String(host||"").toLowerCase(),fam=typeof _so=="number"?_so:_so?.family??0,all=Boolean(typeof _so=="object"&&_so?.all),hints=typeof _so=="object"&&_so?.hints?_so.hints:0,ord=typeof _so=="object"?_so?.order??(_so?.verbatim?"verbatim":""):"",key=`${h}|${fam}|${all?1:0}|${hints}|${ord}`,now=Date.now(),hit=_c.get(key);if(hit&&now-hit.t<45e3){_c.delete(key);_c.set(key,hit);queueMicrotask(()=>all?cb(null,hit.v.map(x=>({...x}))):cb(null,hit.v[0],hit.v[1]));return}let q=_inf.get(key);if(q){q.push(cb);return}q=[cb];_inf.set(key,q);let _done=!1,_fin=(err,a,b)=>{if(_done)return;_done=!0;_inf.get(key)===q&&_inf.delete(key);for(let fn of q)try{err?fn(err):all?fn(null,Array.isArray(a)?a.map(x=>({...x})):[]):fn(null,a,b)}catch{}},_dp=globalThis.__piDnsModP??(globalThis.__piDnsModP=import("node:dns"));_dp.then(m=>{try{m.lookup(host,_so,(err,a,b)=>{if(!err){let v=all?Array.isArray(a)?a.map(x=>({address:x.address,family:x.family})):[]:[a,b];if(all?v.length>0:typeof a==="string"&&a.length>0){_c.delete(key);if(_c.size>=256)_c.delete(_c.keys().next().value);_c.set(key,{v,t:Date.now()})}return _fin(null,a,b)}if(hit&&Date.now()-hit.t<6e5&&_se.has(err?.code))return _fin(null,all?hit.v:hit.v[0],all?void 0:hit.v[1]);_fin(err)})}catch(e){_fin(e)}},e=>{globalThis.__piDnsModP===_dp&&(globalThis.__piDnsModP=void 0);_fin(e)})}}}}return new undici.EnvHttpProxyAgent(_o)})("#,
                 already_present_markers: &[],
             },
             PatchHunk {
@@ -602,8 +636,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 old: "withUndiciErrorListener(new undici.EnvHttpProxyAgent(",
                 alt_olds: &[
                     "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const fam = typeof opts === \"number\" ? opts : (opts?.family ?? 0);\n                        const all = Boolean(typeof opts === \"object\" && opts?.all);\n                        const key = `${host}|${fam}|${all ? 1 : 0}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        _dp.then((m) => {\n                            m.lookup(host, opts, (err, a, b) => {\n                                if (!err) {\n                                    const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                    if (v.length > 0) {\n                                        if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                        _c.set(key, { v, t: Date.now() });\n                                    }\n                                    if (all) cb(null, a); else cb(null, a, b);\n                                    return;\n                                }\n                                if (hit && Date.now() - hit.t < 600000 && (err?.code === \"ENOTFOUND\" || err?.code === \"EAI_AGAIN\" || err?.code === \"ETIMEOUT\" || err?.code === \"ESERVFAIL\")) {\n                                    if (all) cb(null, hit.v.map((x) => ({ ...x }))); else cb(null, hit.v[0], hit.v[1]);\n                                    return;\n                                }\n                                cb(err);\n                            });\n                        }, (e) => cb(e));\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
+                    "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _inf = globalThis.__piDnsInFlight ?? (globalThis.__piDnsInFlight = new Map());\n            const _se = new Set([\"ENOTFOUND\", \"EAI_AGAIN\", \"ETIMEOUT\", \"ETIMEDOUT\", \"ESERVFAIL\", \"EAI_FAIL\", \"EAI_NODATA\", \"EAI_NONAME\"]);\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const h = String(host || \"\").toLowerCase();\n                        const fam = typeof opts === \"number\" ? opts : (opts?.family ?? 0);\n                        const all = Boolean(typeof opts === \"object\" && opts?.all);\n                        const hints = typeof opts === \"object\" && opts?.hints ? opts.hints : 0;\n                        const ord = typeof opts === \"object\" ? (opts?.order ?? (opts?.verbatim ? \"verbatim\" : \"\")) : \"\";\n                        const key = `${h}|${fam}|${all ? 1 : 0}|${hints}|${ord}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            _c.delete(key);\n                            _c.set(key, hit);\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        let q = _inf.get(key);\n                        if (q) { q.push(cb); return; }\n                        q = [cb];\n                        _inf.set(key, q);\n                        const _fin = (err, a, b) => {\n                            const list = _inf.get(key) || q;\n                            _inf.delete(key);\n                            for (const fn of list) {\n                                try {\n                                    if (err) fn(err);\n                                    else if (all) fn(null, Array.isArray(a) ? a.map((x) => ({ ...x })) : []);\n                                    else fn(null, a, b);\n                                } catch { }\n                            }\n                        };\n                        const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n                        _dp.then((m) => {\n                            try {\n                                m.lookup(host, opts, (err, a, b) => {\n                                    if (!err) {\n                                        const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                        if (v.length > 0) {\n                                            _c.delete(key);\n                                            if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                            _c.set(key, { v, t: Date.now() });\n                                        }\n                                        _fin(null, a, b);\n                                        return;\n                                    }\n                                    if (hit && Date.now() - hit.t < 600000 && _se.has(err?.code)) {\n                                        _fin(null, all ? hit.v : hit.v[0], all ? undefined : hit.v[1]);\n                                        return;\n                                    }\n                                    _fin(err);\n                                });\n                            } catch (e) {\n                                _fin(e);\n                            }\n                        }, (e) => {\n                            if (globalThis.__piDnsModP === _dp) globalThis.__piDnsModP = undefined;\n                            _fin(e);\n                        });\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
                 ],
-                new: "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _inf = globalThis.__piDnsInFlight ?? (globalThis.__piDnsInFlight = new Map());\n            const _se = new Set([\"ENOTFOUND\", \"EAI_AGAIN\", \"ETIMEOUT\", \"ETIMEDOUT\", \"ESERVFAIL\", \"EAI_FAIL\", \"EAI_NODATA\", \"EAI_NONAME\"]);\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const h = String(host || \"\").toLowerCase();\n                        const fam = typeof opts === \"number\" ? opts : (opts?.family ?? 0);\n                        const all = Boolean(typeof opts === \"object\" && opts?.all);\n                        const hints = typeof opts === \"object\" && opts?.hints ? opts.hints : 0;\n                        const ord = typeof opts === \"object\" ? (opts?.order ?? (opts?.verbatim ? \"verbatim\" : \"\")) : \"\";\n                        const key = `${h}|${fam}|${all ? 1 : 0}|${hints}|${ord}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            _c.delete(key);\n                            _c.set(key, hit);\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        let q = _inf.get(key);\n                        if (q) { q.push(cb); return; }\n                        q = [cb];\n                        _inf.set(key, q);\n                        const _fin = (err, a, b) => {\n                            const list = _inf.get(key) || q;\n                            _inf.delete(key);\n                            for (const fn of list) {\n                                try {\n                                    if (err) fn(err);\n                                    else if (all) fn(null, Array.isArray(a) ? a.map((x) => ({ ...x })) : []);\n                                    else fn(null, a, b);\n                                } catch { }\n                            }\n                        };\n                        const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n                        _dp.then((m) => {\n                            try {\n                                m.lookup(host, opts, (err, a, b) => {\n                                    if (!err) {\n                                        const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                        if (v.length > 0) {\n                                            _c.delete(key);\n                                            if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                            _c.set(key, { v, t: Date.now() });\n                                        }\n                                        _fin(null, a, b);\n                                        return;\n                                    }\n                                    if (hit && Date.now() - hit.t < 600000 && _se.has(err?.code)) {\n                                        _fin(null, all ? hit.v : hit.v[0], all ? undefined : hit.v[1]);\n                                        return;\n                                    }\n                                    _fin(err);\n                                });\n                            } catch (e) {\n                                _fin(e);\n                            }\n                        }, (e) => {\n                            if (globalThis.__piDnsModP === _dp) globalThis.__piDnsModP = undefined;\n                            _fin(e);\n                        });\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
+                new: "withUndiciErrorListener(((_o) => {\n        if (_o && typeof _o.connect === \"object\" && _o.connect && !_o.connect.lookup) {\n            const _c = globalThis.__piDnsStaleCache ?? (globalThis.__piDnsStaleCache = new Map());\n            const _inf = globalThis.__piDnsInFlight ?? (globalThis.__piDnsInFlight = new Map());\n            const _se = new Set([\"ENOTFOUND\", \"EAI_AGAIN\", \"ETIMEOUT\", \"ETIMEDOUT\", \"ESERVFAIL\", \"EAI_FAIL\", \"EAI_NODATA\", \"EAI_NONAME\"]);\n            _o = {\n                ..._o,\n                connect: {\n                    ..._o.connect,\n                    lookup(host, opts, cb) {\n                        if (typeof opts === \"function\") { cb = opts; opts = {}; }\n                        const _so = typeof opts === \"object\" && opts ? { ...opts } : opts;\n                        const h = String(host || \"\").toLowerCase();\n                        const fam = typeof _so === \"number\" ? _so : (_so?.family ?? 0);\n                        const all = Boolean(typeof _so === \"object\" && _so?.all);\n                        const hints = typeof _so === \"object\" && _so?.hints ? _so.hints : 0;\n                        const ord = typeof _so === \"object\" ? (_so?.order ?? (_so?.verbatim ? \"verbatim\" : \"\")) : \"\";\n                        const key = `${h}|${fam}|${all ? 1 : 0}|${hints}|${ord}`;\n                        const now = Date.now();\n                        const hit = _c.get(key);\n                        if (hit && now - hit.t < 45000) {\n                            _c.delete(key);\n                            _c.set(key, hit);\n                            queueMicrotask(() => (all ? cb(null, hit.v.map((x) => ({ ...x }))) : cb(null, hit.v[0], hit.v[1])));\n                            return;\n                        }\n                        let q = _inf.get(key);\n                        if (q) { q.push(cb); return; }\n                        q = [cb];\n                        _inf.set(key, q);\n                        let _done = false;\n                        const _fin = (err, a, b) => {\n                            if (_done) return;\n                            _done = true;\n                            if (_inf.get(key) === q) _inf.delete(key);\n                            for (const fn of q) {\n                                try {\n                                    if (err) fn(err);\n                                    else if (all) fn(null, Array.isArray(a) ? a.map((x) => ({ ...x })) : []);\n                                    else fn(null, a, b);\n                                } catch { }\n                            }\n                        };\n                        const _dp = globalThis.__piDnsModP ?? (globalThis.__piDnsModP = import(\"node:dns\"));\n                        _dp.then((m) => {\n                            try {\n                                m.lookup(host, _so, (err, a, b) => {\n                                    if (!err) {\n                                        const v = all ? (Array.isArray(a) ? a.map((x) => ({ address: x.address, family: x.family })) : []) : [a, b];\n                                        if (all ? v.length > 0 : typeof a === \"string\" && a.length > 0) {\n                                            _c.delete(key);\n                                            if (_c.size >= 256) _c.delete(_c.keys().next().value);\n                                            _c.set(key, { v, t: Date.now() });\n                                        }\n                                        _fin(null, a, b);\n                                        return;\n                                    }\n                                    if (hit && Date.now() - hit.t < 600000 && _se.has(err?.code)) {\n                                        _fin(null, all ? hit.v : hit.v[0], all ? undefined : hit.v[1]);\n                                        return;\n                                    }\n                                    _fin(err);\n                                });\n                            } catch (e) {\n                                _fin(e);\n                            }\n                        }, (e) => {\n                            if (globalThis.__piDnsModP === _dp) globalThis.__piDnsModP = undefined;\n                            _fin(e);\n                        });\n                    },\n                },\n            };\n        }\n        return new undici.EnvHttpProxyAgent(_o);\n    })(",
                 already_present_markers: &[],
             },
         ],
@@ -683,9 +718,9 @@ const PATCH_SPECS: &[PatchSpec] = &[
             PatchHunk {
                 id: "bundle_windows_bash_cmd_spill",
                 rel_hint: None,
-                old: r#"let commandFromStdin=shellConfig.commandTransport==="stdin",child=spawn2(shellConfig.shell,commandFromStdin?shellConfig.args:[...shellConfig.args,command],"#,
+                old: r#"let commandFromStdin=shellConfig.commandTransport==="stdin",child={{PI_ID}}(shellConfig.shell,commandFromStdin?shellConfig.args:[...shellConfig.args,command],"#,
                 alt_olds: &[],
-                new: r#"let commandFromStdin=shellConfig.commandTransport==="stdin",__piCleanCmd=typeof command==="string"&&command.indexOf("\0")!==-1?command.replace(/\0/g,""):command,__piSpillFile,__piExecCmd=__piCleanCmd;if(process.platform==="win32"&&!commandFromStdin&&Buffer.byteLength(__piCleanCmd,"utf8")>20000){try{let __fs=require("node:fs"),__os=require("node:os"),__pt=require("node:path"),__dir=__pt.join(__os.tmpdir(),"pi-cmd-spill"),__st=`${Date.now()}-${Math.random().toString(36).slice(2,8)}`;__fs.mkdirSync(__dir,{recursive:!0});if(shellName==="powershell"){__piSpillFile=__pt.join(__dir,`pi-cmd-${__st}.ps1`);__fs.writeFileSync(__piSpillFile,"\uFEFF"+__piCleanCmd,"utf8");__piExecCmd=`& '${__piSpillFile.replace(/'/g,"''")}'`;}else{__piSpillFile=__pt.join(__dir,`pi-cmd-${__st}.sh`);__fs.writeFileSync(__piSpillFile,__piCleanCmd.replace(/\r\n/g,"\n"),"utf8");__piExecCmd=`. "${__piSpillFile.replace(/\\/g,"/")}"`;}}catch{__piSpillFile=void 0;__piExecCmd=__piCleanCmd}}let child=spawn2(shellConfig.shell,commandFromStdin?shellConfig.args:[...shellConfig.args,__piExecCmd],"#,
+                new: r#"let commandFromStdin=shellConfig.commandTransport==="stdin",__piCleanCmd=typeof command==="string"&&command.indexOf("\0")!==-1?command.replace(/\0/g,""):command,__piSpillFile,__piExecCmd=__piCleanCmd;if(process.platform==="win32"&&!commandFromStdin&&Buffer.byteLength(__piCleanCmd,"utf8")>20000){try{let __fs=require("node:fs"),__os=require("node:os"),__pt=require("node:path"),__dir=__pt.join(__os.tmpdir(),"pi-cmd-spill"),__st=`${Date.now()}-${Math.random().toString(36).slice(2,8)}`;__fs.mkdirSync(__dir,{recursive:!0});if(shellName==="powershell"){__piSpillFile=__pt.join(__dir,`pi-cmd-${__st}.ps1`);__fs.writeFileSync(__piSpillFile,"\uFEFF"+__piCleanCmd,"utf8");__piExecCmd=`& '${__piSpillFile.replace(/'/g,"''")}'`;}else{__piSpillFile=__pt.join(__dir,`pi-cmd-${__st}.sh`);__fs.writeFileSync(__piSpillFile,__piCleanCmd.replace(/\r\n/g,"\n"),"utf8");__piExecCmd=`. "${__piSpillFile.replace(/\\/g,"/")}"`;}}catch{__piSpillFile=void 0;__piExecCmd=__piCleanCmd}}let child={{PI_ID}}(shellConfig.shell,commandFromStdin?shellConfig.args:[...shellConfig.args,__piExecCmd],"#,
                 already_present_markers: &["cmd-spill", "pi-cmd-", "Buffer.byteLength("],
             },
             PatchHunk {
@@ -889,19 +924,26 @@ fn resolve_hunk_files(
     hunk: &PatchHunk,
 ) -> Vec<(PathBuf, bool, Option<&'static str>)> {
     // Returns all matching (file_path, has_new, matched_old_pattern) targets so duplicated bundler chunks are all patched.
+    let matches_pat = |text: &str, pat: &str| -> bool {
+        if pat.contains(IDENT_PLACEHOLDER) {
+            !find_ident_template_matches(text, pat).is_empty()
+        } else {
+            text.contains(pat)
+        }
+    };
     let match_old = |text: &str| -> Option<&'static str> {
-        if text.contains(hunk.old) {
+        if matches_pat(text, hunk.old) {
             return Some(hunk.old);
         }
         for alt in hunk.alt_olds {
-            if text.contains(alt) {
+            if matches_pat(text, alt) {
                 return Some(*alt);
             }
         }
         None
     };
     let is_applied = |text: &str| -> bool {
-        if text.contains(hunk.new) {
+        if matches_pat(text, hunk.new) {
             return true;
         }
         !hunk.already_present_markers.is_empty()
@@ -1090,17 +1132,33 @@ pub fn apply_pi_patches(pi_dir_opt: Option<&str>, dry_run: bool) -> Result<Value
                     let raw = fs::read_to_string(&fp).map_err(|e| e.to_string())?;
                     let uses_crlf = raw.contains("\r\n");
                     let norm = normalize_lf(&raw);
-                    let count = norm.matches(old_pat).count();
-                    if count != 1 {
-                        return Err(format!(
-                            "Refusing ambiguous patch {}:{} in {} (expected 1 match, found {})",
-                            spec.id,
-                            h.id,
-                            fp.display(),
-                            count
-                        ));
-                    }
-                    let updated_lf = norm.replacen(old_pat, h.new, 1);
+                    let updated_lf = if old_pat.contains(IDENT_PLACEHOLDER) {
+                        let m_list = find_ident_template_matches(&norm, old_pat);
+                        if m_list.len() != 1 {
+                            return Err(format!(
+                                "Refusing ambiguous patch {}:{} in {} (expected 1 match, found {})",
+                                spec.id,
+                                h.id,
+                                fp.display(),
+                                m_list.len()
+                            ));
+                        }
+                        let (start, end, ref ident) = m_list[0];
+                        let rendered_new = h.new.replace(IDENT_PLACEHOLDER, ident);
+                        format!("{}{}{}", &norm[..start], rendered_new, &norm[end..])
+                    } else {
+                        let count = norm.matches(old_pat).count();
+                        if count != 1 {
+                            return Err(format!(
+                                "Refusing ambiguous patch {}:{} in {} (expected 1 match, found {})",
+                                spec.id,
+                                h.id,
+                                fp.display(),
+                                count
+                            ));
+                        }
+                        norm.replacen(old_pat, h.new, 1)
+                    };
                     let final_txt = if uses_crlf {
                         updated_lf.replace('\n', "\r\n")
                     } else {
@@ -1311,7 +1369,7 @@ mod tests {
             chunks.join("chunk-main.js"),
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                PATCH_SPECS[0].hunks[0].old,
+                PATCH_SPECS[0].hunks[0].old.replace(IDENT_PLACEHOLDER, "ext2"),
                 PATCH_SPECS[0].hunks[1].old,
                 PATCH_SPECS[3].hunks[0].old,
                 PATCH_SPECS[3].hunks[1].old,
@@ -1330,7 +1388,7 @@ mod tests {
                 PATCH_SPECS[19].hunks[0].old,
                 PATCH_SPECS[20].hunks[0].old,
                 PATCH_SPECS[20].hunks[1].old,
-                PATCH_SPECS[21].hunks[0].old,
+                PATCH_SPECS[21].hunks[0].old.replace(IDENT_PLACEHOLDER, "spawn2"),
                 PATCH_SPECS[21].hunks[1].old,
             ),
         )
@@ -2044,6 +2102,81 @@ const savedMod = globalThis.__piDnsModP;
 globalThis.__piDnsModP = Promise.reject(new Error("transient-import-fail"));
 await assert.rejects(() => lookupP("recover.example.test", {{ family: 4 }}), /transient-import-fail/);
 assert.strictEqual(globalThis.__piDnsModP, undefined, "rejected __piDnsModP must be cleared");
+
+// Cycle 3 #19 edge case A: double-callback + re-entrant lookup on same key must NOT hijack req2 or double-invoke cb1
+globalThis.__piDnsStaleCache.clear();
+globalThis.__piDnsInFlight.clear();
+let dupSeq = 0;
+let cb1Count = 0;
+const cb2Got = [];
+globalThis.__piDnsModP = Promise.resolve({{
+  lookup(host, opts, cb) {{
+    dupSeq += 1;
+    if (dupSeq === 1) {{
+      setTimeout(() => {{
+        cb(null, "1.1.1.1", 4);
+        setTimeout(() => cb(null, "9.9.9.9", 4), 10);
+      }}, 5);
+    }} else {{
+      setTimeout(() => cb(null, "2.2.2.2", 4), 30);
+    }}
+  }}
+}});
+await new Promise((res) => {{
+  lookupFn("dup.example.test", {{ family: 4 }}, (err, a) => {{
+    cb1Count += 1;
+    if (cb1Count === 1) {{
+      globalThis.__piDnsStaleCache.clear();
+      lookupFn("dup.example.test", {{ family: 4 }}, (_e2, a2) => {{ cb2Got.push(a2); }});
+    }}
+  }});
+  setTimeout(res, 90);
+}});
+assert.strictEqual(cb1Count, 1, "cb1 must fire once even when resolver fires cb twice");
+assert.deepStrictEqual(cb2Got, ["2.2.2.2"], "re-entrant req2 must NOT be hijacked by stale req1 2nd callback");
+
+// Cycle 3 #19 edge case B: sync callback followed by sync throw must invoke cb only once
+globalThis.__piDnsStaleCache.clear();
+globalThis.__piDnsInFlight.clear();
+const syncGot = [];
+globalThis.__piDnsModP = Promise.resolve({{
+  lookup(host, opts, cb) {{
+    cb(null, "3.3.3.3", 4);
+    throw new Error("sync-throw-after-cb");
+  }}
+}});
+await new Promise((res) => {{
+  lookupFn("syncthrow.example.test", {{ family: 4 }}, (err, a) => syncGot.push({{ err: err?.message ?? null, a }}));
+  setTimeout(res, 25);
+}});
+assert.deepStrictEqual(syncGot, [{{ err: null, a: "3.3.3.3" }}], "sync cb + sync throw must settle once");
+
+// Cycle 3 #19 edge case C: synchronous opts mutation before _dp.then must NOT corrupt lookup or cache
+globalThis.__piDnsStaleCache.clear();
+globalThis.__piDnsInFlight.clear();
+globalThis.__piDnsModP = Promise.resolve({{
+  lookup(host, opts, cb) {{
+    if (opts && opts.all) cb(null, [{{ address: "4.4.4.4", family: 4 }}]);
+    else cb(null, "4.4.4.4", 4);
+  }}
+}});
+const mutOpts = {{ all: false, family: 4 }};
+const mutGot = await new Promise((res) => {{
+  lookupFn("mutopts.example.test", mutOpts, (err, a, b) => res({{ err, a, b }}));
+  mutOpts.all = true;
+}});
+assert.strictEqual(mutGot.a, "4.4.4.4", "snapshotted opts must prevent async all:true corruption");
+assert.strictEqual(mutGot.b, 4);
+
+// Cycle 3 #19 edge case D: empty/undefined address for all:false must NOT be cached
+globalThis.__piDnsStaleCache.clear();
+globalThis.__piDnsInFlight.clear();
+globalThis.__piDnsModP = Promise.resolve({{
+  lookup(host, opts, cb) {{ cb(null, undefined, undefined); }}
+}});
+await new Promise((res) => lookupFn("emptyaddr.example.test", {{ family: 4 }}, () => res()));
+assert.strictEqual(globalThis.__piDnsStaleCache.has("emptyaddr.example.test|4|0|0|"), false, "empty all:false address must not be cached");
+
 globalThis.__piDnsModP = savedMod;
 console.log("OK_COMPACT_AND_DNS");
 "#
@@ -2114,6 +2247,129 @@ console.log("OK_COMPACT_AND_DNS");
         );
         let second = apply_pi_patches(Some(&pi_str), false).unwrap();
         assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn patch19_upgrades_cleanly_from_cycle2_alt_old() {
+        let base = std::env::temp_dir().join(format!("ap_pi_p19_c2_upg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        let core_dir = pi_dir.join("dist").join("core");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.1-cycle2"}"#,
+        )
+        .unwrap();
+
+        let p19 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "http_dns_stale_cache")
+            .unwrap();
+        fs::write(chunks.join("chunk-main.js"), p19.hunks[0].alt_olds[1]).unwrap();
+        fs::write(
+            core_dir.join("http-dispatcher.js"),
+            p19.hunks[1].alt_olds[1],
+        )
+        .unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            newly.len(),
+            2,
+            "expected both Cycle-2 #19 hunks to upgrade: {newly:?}"
+        );
+        assert!(fs::read_to_string(chunks.join("chunk-main.js"))
+            .unwrap()
+            .contains("_inf.get(key)===q&&_inf.delete(key)"));
+        assert!(fs::read_to_string(core_dir.join("http-dispatcher.js"))
+            .unwrap()
+            .contains("if (_inf.get(key) === q) _inf.delete(key);"));
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn patches_1_and_22_survive_esbuild_identifier_renames() {
+        let base = std::env::temp_dir().join(format!("ap_pi_esbuild_id_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.2-esbuild"}"#,
+        )
+        .unwrap();
+
+        let p1 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "before_agent_start_entries")
+            .unwrap();
+        let p22 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "windows_bash_cmd_spill")
+            .unwrap();
+        // Simulate esbuild renaming ext2 -> ext3 and spawn2 -> spawn3 in Pi 1.6.2+
+        let renamed_p1 = p1.hunks[0].old.replace(IDENT_PLACEHOLDER, "ext3");
+        let renamed_p22 = p22.hunks[0].old.replace(IDENT_PLACEHOLDER, "spawn3");
+        let chunk_file = chunks.join("chunk-renamed.js");
+        fs::write(
+            &chunk_file,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                renamed_p1, p1.hunks[1].old, renamed_p22, p22.hunks[1].old
+            ),
+        )
+        .unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(newly
+            .contains(&"before_agent_start_entries:bundle_emit_before_agent_start".to_string()));
+        assert!(newly.contains(&"windows_bash_cmd_spill:bundle_windows_bash_cmd_spill".to_string()));
+
+        let patched = fs::read_to_string(&chunk_file).unwrap();
+        assert!(patched.contains("for(let{ext:ext3,handlers}of"));
+        assert!(patched.contains("extensionPath:ext3.path"));
+        assert!(patched.contains("let child=spawn3(shellConfig.shell,"));
+        assert!(!patched.contains(IDENT_PLACEHOLDER));
+
+        // 2nd run must be 100% idempotent
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let rep = inspect_pi_patches(Some(&pi_str));
+        let p1_rep = rep
+            .patches
+            .iter()
+            .find(|p| p.id == "before_agent_start_entries")
+            .unwrap();
+        let p22_rep = rep
+            .patches
+            .iter()
+            .find(|p| p.id == "windows_bash_cmd_spill")
+            .unwrap();
+        assert_eq!(p1_rep.status, "applied");
+        assert_eq!(p22_rep.status, "applied");
         let _ = fs::remove_dir_all(&base);
     }
 }

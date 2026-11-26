@@ -1,4 +1,4 @@
-use crate::stats::record_event;
+use crate::stats::record_event_ex;
 use clap::Parser;
 use serde::Serialize;
 use serde_json::json;
@@ -425,18 +425,27 @@ fn run_metrics_mode(cli: &LsCli) -> i32 {
     };
 
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mode": mode,
-                "elapsed_ms": elapsed_ms,
-                "total_bytes": total_bytes,
-                "total_lines": total_lines,
-                "entries": entries_json,
-            }))
-            .unwrap_or_default()
+        let out = serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "mode": mode,
+            "elapsed_ms": elapsed_ms,
+            "total_bytes": total_bytes,
+            "total_lines": total_lines,
+            "entries": entries_json,
+        }))
+        .unwrap_or_default();
+        record_event_ex(
+            "ls",
+            total_bytes,
+            out.len() as u64,
+            0,
+            0,
+            mode,
+            true,
+            t0.elapsed().as_millis() as u64,
+            None,
         );
+        println!("{out}");
     } else {
         if valid_count > 1 || cli.stat || cli.lines {
             text_lines.push(format!(
@@ -450,7 +459,17 @@ fn run_metrics_mode(cli: &LsCli) -> i32 {
             ));
         }
         let out = text_lines.join("\n");
-        record_event("ls", total_bytes, out.len() as u64, 0, 0, mode);
+        record_event_ex(
+            "ls",
+            total_bytes,
+            out.len() as u64,
+            0,
+            0,
+            mode,
+            true,
+            t0.elapsed().as_millis() as u64,
+            None,
+        );
         println!("{out}");
     }
     0
@@ -474,7 +493,27 @@ pub fn run_cli(args: &[String]) -> i32 {
     let norm_path = normalize_cli_path(&cli.path);
     let root = Path::new(&norm_path);
     if !root.exists() {
-        eprintln!("[ap ls] path not found: {norm_path}");
+        let msg = format!("[ap ls] path not found: {norm_path}");
+        record_event_ex(
+            "ls",
+            0,
+            0,
+            0,
+            0,
+            "ls-err",
+            false,
+            t0.elapsed().as_millis() as u64,
+            Some(&msg),
+        );
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "ok": false, "error": msg }))
+                    .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
         return 1;
     }
 
@@ -494,27 +533,48 @@ pub fn run_cli(args: &[String]) -> i32 {
             mtime_secs,
         };
         if cli.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": true,
-                    "path": entry.path,
-                    "total": 1,
-                    "shown": 1,
-                    "dirs": 0,
-                    "files": 1,
-                    "total_bytes": size,
-                    "entries": [entry],
-                }))
-                .unwrap_or_default()
+            let out = serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "path": entry.path,
+                "total": 1,
+                "shown": 1,
+                "dirs": 0,
+                "files": 1,
+                "total_bytes": size,
+                "entries": [entry],
+            }))
+            .unwrap_or_default();
+            record_event_ex(
+                "ls",
+                size,
+                out.len() as u64,
+                0,
+                0,
+                "ap-ls-file",
+                true,
+                t0.elapsed().as_millis() as u64,
+                None,
             );
+            println!("{out}");
         } else {
-            println!(
+            let out = format!(
                 "f {:>8}  {}  {}",
                 format_bytes(size),
                 format_date_utc(mtime_secs),
                 entry.path
             );
+            record_event_ex(
+                "ls",
+                size,
+                out.len() as u64,
+                0,
+                0,
+                "ap-ls-file",
+                true,
+                t0.elapsed().as_millis() as u64,
+                None,
+            );
+            println!("{out}");
         }
         return 0;
     }
@@ -575,21 +635,30 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     if cli.json {
         let sliced: Vec<&LsEntry> = entries.iter().take(shown).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "path": root_lbl,
-                "elapsed_ms": elapsed_ms,
-                "total": total,
-                "shown": shown,
-                "dirs": dirs,
-                "files": files,
-                "total_bytes": total_bytes,
-                "entries": sliced,
-            }))
-            .unwrap_or_default()
+        let out = serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "path": root_lbl,
+            "elapsed_ms": elapsed_ms,
+            "total": total,
+            "shown": shown,
+            "dirs": dirs,
+            "files": files,
+            "total_bytes": total_bytes,
+            "entries": sliced,
+        }))
+        .unwrap_or_default();
+        record_event_ex(
+            "ls",
+            total_bytes,
+            out.len() as u64,
+            0,
+            0,
+            "ap-ls",
+            true,
+            t0.elapsed().as_millis() as u64,
+            None,
         );
+        println!("{out}");
     } else {
         let mut lines = vec![format!(
             "# LS `{root_lbl}` ({shown}/{total} shown: {dirs} dirs, {files} files, {} in {elapsed_ms}ms)",
@@ -616,7 +685,17 @@ pub fn run_cli(args: &[String]) -> i32 {
             ));
         }
         let rendered = lines.join("\n");
-        record_event("ls", total_bytes, rendered.len() as u64, 0, 0, "ap-ls");
+        record_event_ex(
+            "ls",
+            total_bytes,
+            rendered.len() as u64,
+            0,
+            0,
+            "ap-ls",
+            true,
+            t0.elapsed().as_millis() as u64,
+            None,
+        );
         println!("{rendered}");
     }
     0

@@ -199,16 +199,31 @@ fn run_cmd_bounded(cwd: &Path, cmd_str: &str, timeout_ms: u64) -> (bool, u64) {
     else {
         return (false, 0);
     };
+    let mut job = crate::smoke::ProbeJobGuard::attach(&ch);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if let Ok(Some(st)) = ch.try_wait() {
+            drop(job);
             return (st.success(), t0.elapsed().as_millis() as u64);
         }
         if Instant::now() >= deadline {
+            drop(job.take());
             kill_process_tree(&mut ch);
             return (false, timeout_ms);
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn emit_mutate_err(as_json: bool, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "ok": false, "error": msg }))
+                .unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
     }
 }
 
@@ -226,11 +241,14 @@ pub fn run_mutate(
         cwd.join(target_rel)
     };
     let Ok(orig_bytes) = fs::read(&target_p) else {
-        eprintln!("[probe mutate] file not found: {}", target_p.display());
+        emit_mutate_err(
+            as_json,
+            &format!("[probe mutate] file not found: {}", target_p.display()),
+        );
         return 1;
     };
     let Ok(src_txt) = String::from_utf8(orig_bytes.clone()) else {
-        eprintln!("[probe mutate] file must be valid UTF-8");
+        emit_mutate_err(as_json, "[probe mutate] file must be valid UTF-8");
         return 1;
     };
     let ext = target_p
@@ -239,7 +257,10 @@ pub fn run_mutate(
         .unwrap_or("")
         .to_ascii_lowercase();
     let Some(mut parser) = parser_for_ext(&ext) else {
-        eprintln!("[probe mutate] unsupported language `.{ext}`");
+        emit_mutate_err(
+            as_json,
+            &format!("[probe mutate] unsupported language `.{ext}`"),
+        );
         return 2;
     };
     let Some(test_cmd) = test_cmd_opt
@@ -247,12 +268,12 @@ pub fn run_mutate(
         .map(str::to_string)
         .or_else(|| detect_mutate_test_cmd(cwd))
     else {
-        eprintln!("[probe mutate] pass --test-cmd \"<cmd>\"");
+        emit_mutate_err(as_json, "[probe mutate] pass --test-cmd \"<cmd>\"");
         return 2;
     };
 
     let Some(tree) = parser.parse(&src_txt, None) else {
-        eprintln!("[probe mutate] failed to parse AST");
+        emit_mutate_err(as_json, "[probe mutate] failed to parse AST");
         return 1;
     };
     let mut all_sites = Vec::new();
@@ -260,7 +281,12 @@ pub fn run_mutate(
 
     let (base_ok, base_ms) = run_cmd_bounded(cwd, &test_cmd, 25_000);
     if !base_ok {
-        eprintln!("[probe mutate] baseline test command `{test_cmd}` failed before mutation; fix failing tests first.");
+        emit_mutate_err(
+            as_json,
+            &format!(
+                "[probe mutate] baseline test command `{test_cmd}` failed before mutation; fix failing tests first."
+            ),
+        );
         return 1;
     }
 

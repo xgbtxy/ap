@@ -179,6 +179,132 @@ pub(crate) fn find_headless_browser() -> Option<PathBuf> {
     None
 }
 
+#[cfg(windows)]
+mod probe_win_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::ptr;
+
+    type Handle = *mut core::ffi::c_void;
+    type Bool = i32;
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    impl Default for JobObjectBasicLimitInformation {
+        fn default() -> Self {
+            unsafe { core::mem::zeroed() }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(
+            lp_job_attributes: *const core::ffi::c_void,
+            lp_name: *const u16,
+        ) -> Handle;
+        fn SetInformationJobObject(
+            h_job: Handle,
+            job_object_info_class: i32,
+            lp_job_object_info: *const core::ffi::c_void,
+            cb_job_object_info_length: u32,
+        ) -> Bool;
+        fn AssignProcessToJobObject(h_job: Handle, h_process: Handle) -> Bool;
+        fn CloseHandle(h_object: Handle) -> Bool;
+    }
+
+    pub(crate) struct ProbeJobGuard {
+        handle: Handle,
+    }
+
+    impl ProbeJobGuard {
+        pub(crate) fn attach(child: &Child) -> Option<Self> {
+            unsafe {
+                let job = CreateJobObjectW(ptr::null(), ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                let mut info = JobObjectExtendedLimitInformation::default();
+                info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    job,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    (&info as *const JobObjectExtendedLimitInformation).cast(),
+                    core::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+                ) == 0
+                {
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+                if AssignProcessToJobObject(job, child.as_raw_handle() as Handle) == 0 {
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+                Some(Self { handle: job })
+            }
+        }
+    }
+
+    impl Drop for ProbeJobGuard {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe {
+                    let _ = CloseHandle(self.handle);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use probe_win_job::ProbeJobGuard;
+
+#[cfg(not(windows))]
+pub(crate) struct ProbeJobGuard;
+
+#[cfg(not(windows))]
+impl ProbeJobGuard {
+    pub(crate) fn attach(_child: &Child) -> Option<Self> {
+        None
+    }
+}
+
 pub(crate) fn run_cmd_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
@@ -191,6 +317,7 @@ pub(crate) fn run_cmd_with_timeout(
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let mut job = ProbeJobGuard::attach(&child);
     if let Some(bytes) = stdin_bytes {
         if let Some(mut sin) = child.stdin.take() {
             let _ = sin.write_all(bytes);
@@ -217,6 +344,7 @@ pub(crate) fn run_cmd_with_timeout(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                drop(job);
                 let stdout = out_handle.join().unwrap_or_default();
                 let stderr = err_handle.join().unwrap_or_default();
                 return Ok(std::process::Output {
@@ -227,6 +355,7 @@ pub(crate) fn run_cmd_with_timeout(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    drop(job.take());
                     kill_process_tree(&mut child);
                     let _ = out_handle.join();
                     let _ = err_handle.join();
@@ -235,6 +364,7 @@ pub(crate) fn run_cmd_with_timeout(
                 thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
+                drop(job.take());
                 kill_process_tree(&mut child);
                 let _ = out_handle.join();
                 let _ = err_handle.join();
@@ -556,6 +686,7 @@ pub fn run_smoke(
 ) -> i32 {
     let t0 = Instant::now();
     let mut child_opt: Option<Child> = None;
+    let mut _child_job: Option<ProbeJobGuard> = None;
     let pid_tag = std::process::id();
     let stdout_f = std::env::temp_dir().join(format!("ap_smoke_{pid_tag}.out.log"));
     let stderr_f = std::env::temp_dir().join(format!("ap_smoke_{pid_tag}.err.log"));
@@ -570,24 +701,59 @@ pub fn run_smoke(
         {
             Some(c) => c,
             None => {
-                eprintln!(
-                    "[probe smoke] Provide --start \"<cmd>\" or --url http://127.0.0.1:<port>"
-                );
+                let msg =
+                    "[probe smoke] Provide --start \"<cmd>\" or --url http://127.0.0.1:<port>";
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "ok": false, "error": msg })
+                        )
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{msg}");
+                }
                 return 2;
             }
         };
         let port = match pick_free_port() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[probe smoke] {e}");
+                let msg = format!("[probe smoke] {e}");
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "ok": false, "error": msg })
+                        )
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{msg}");
+                }
                 return 2;
             }
         };
         match spawn_detached_logged_server(&start_cmd, cwd, port, extra_envs, &stdout_f, &stderr_f)
         {
-            Ok(ch) => child_opt = Some(ch),
+            Ok(ch) => {
+                _child_job = ProbeJobGuard::attach(&ch);
+                child_opt = Some(ch);
+            }
             Err(e) => {
-                eprintln!("[probe smoke] {e}");
+                let msg = format!("[probe smoke] {e}");
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "ok": false, "error": msg })
+                        )
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{msg}");
+                }
                 return 1;
             }
         }

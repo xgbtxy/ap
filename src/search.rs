@@ -1,5 +1,5 @@
 use crate::read::{decode_any_bytes, extract_office_or_pdf_plain};
-use crate::stats::record_event;
+use crate::stats::record_event_ex;
 use clap::Parser;
 use ignore::{WalkBuilder, WalkState};
 use regex::{Regex, RegexBuilder};
@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -160,6 +161,99 @@ struct SearchOpts {
     code_only: bool,
     no_tests: bool,
     only_matching: bool,
+    need_scope: bool,
+}
+
+fn looks_minified_text(text: &str) -> bool {
+    if text.len() <= 512 {
+        return false;
+    }
+    let first_non_empty = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if first_non_empty.len() > 300 {
+        let line_cnt = text.bytes().filter(|&b| b == b'\n').count() + 1;
+        if text.len() / line_cnt.max(1) > 300 || (line_cnt <= 5 && text.len() > 2048) {
+            return true;
+        }
+    }
+    false
+}
+
+fn peek_is_binary_nul(path: &Path) -> bool {
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 512];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    let head = &buf[..n];
+    head.iter().filter(|&&b| b == 0).count() > 4
+        && !head.starts_with(b"\xFF\xFE")
+        && !head.starts_with(b"\xFE\xFF")
+}
+
+struct FileAstCache {
+    ast_spans: Vec<ap_splice::ast::SymbolSpan>,
+    non_code_ranges: Vec<(usize, usize)>,
+    test_ranges: Vec<(usize, usize)>,
+}
+
+impl FileAstCache {
+    fn build(text: &str, ext: &str, is_office: bool, opts: SearchOpts) -> Self {
+        let can_ast = !is_office
+            && text.len() <= 2 * 1024 * 1024
+            && ap_splice::ast::language_for_ext(ext).is_some();
+        if !can_ast {
+            return Self {
+                ast_spans: Vec::new(),
+                non_code_ranges: Vec::new(),
+                test_ranges: Vec::new(),
+            };
+        }
+        let need_ast_spans = (opts.need_scope || opts.block) && !looks_minified_text(text);
+        let ast_spans = if need_ast_spans {
+            ap_splice::ast::scan_symbols(text, ext)
+        } else {
+            Vec::new()
+        };
+        let non_code_ranges = if opts.code_only {
+            ap_splice::ast::collect_non_code_ranges(text, ext)
+        } else {
+            Vec::new()
+        };
+        let test_ranges = if opts.no_tests {
+            ap_splice::ast::collect_test_block_ranges(text, ext)
+        } else {
+            Vec::new()
+        };
+        Self {
+            ast_spans,
+            non_code_ranges,
+            test_ranges,
+        }
+    }
+}
+
+fn emit_search_err(as_json: bool, t0: Instant, msg: &str) {
+    record_event_ex(
+        "search",
+        0,
+        0,
+        0,
+        0,
+        "search-err",
+        false,
+        t0.elapsed().as_millis() as u64,
+        Some(msg),
+    );
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": false, "error": msg })).unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 fn is_non_code_ext(ext: &str) -> bool {
@@ -307,6 +401,7 @@ fn push_text_matches(
     is_office: bool,
     re: &Regex,
     opts: SearchOpts,
+    ast_cache: &FileAstCache,
     filtered_non_code: &AtomicUsize,
     filtered_tests: &AtomicUsize,
     matches: &mut Vec<SearchMatch>,
@@ -314,31 +409,16 @@ fn push_text_matches(
     if !opts.invert && !re.is_match(text) {
         return;
     }
-    let can_ast = !is_office
-        && text.len() <= 2 * 1024 * 1024
-        && ap_splice::ast::language_for_ext(ext).is_some();
-    let ast_spans = if can_ast {
-        ap_splice::ast::scan_symbols(text, ext)
-    } else {
-        Vec::new()
-    };
-    let non_code_ranges = if can_ast && opts.code_only {
-        ap_splice::ast::collect_non_code_ranges(text, ext)
-    } else {
-        Vec::new()
-    };
-    let test_ranges = if can_ast && opts.no_tests {
-        ap_splice::ast::collect_test_block_ranges(text, ext)
-    } else {
-        Vec::new()
-    };
+    let ast_spans = &ast_cache.ast_spans;
+    let non_code_ranges = &ast_cache.non_code_ranges;
+    let test_ranges = &ast_cache.test_ranges;
     let allow_span = |abs_s: usize, abs_e: usize| -> bool {
-        if !test_ranges.is_empty() && ap_splice::ast::range_is_covered(&test_ranges, abs_s, abs_e) {
+        if !test_ranges.is_empty() && ap_splice::ast::range_is_covered(test_ranges, abs_s, abs_e) {
             filtered_tests.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         if !non_code_ranges.is_empty()
-            && ap_splice::ast::range_is_covered(&non_code_ranges, abs_s, abs_e)
+            && ap_splice::ast::range_is_covered(non_code_ranges, abs_s, abs_e)
         {
             filtered_non_code.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -579,6 +659,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             return code;
         }
     };
+    let t0 = Instant::now();
     let ast_raw = cli.ast.trim();
     let ast_query: Option<ap_splice::ast_search::AstQuery> = if ast_raw.is_empty() {
         None
@@ -586,7 +667,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         match ap_splice::ast_search::AstQuery::parse(ast_raw) {
             Ok(q) => Some(q),
             Err(e) => {
-                eprintln!("{e}");
+                emit_search_err(cli.json, t0, &e);
                 return 2;
             }
         }
@@ -620,7 +701,11 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     }
     if raw_pats.is_empty() && ast_query.is_none() {
-        eprintln!("[ap search] provide a search pattern or `--ast <expr>`");
+        emit_search_err(
+            cli.json,
+            t0,
+            "[ap search] provide a search pattern or `--ast <expr>`",
+        );
         return 2;
     }
     let multi_mode = raw_pats.len() > 1;
@@ -635,7 +720,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         ) {
             Ok(r) => compiled.push((p, r)),
             Err(e) => {
-                eprintln!("[ap search] {e}");
+                emit_search_err(cli.json, t0, &format!("[ap search] {e}"));
                 return 2;
             }
         }
@@ -677,6 +762,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         code_only: cli.code_only,
         no_tests: cli.no_tests,
         only_matching: cli.only_matching,
+        need_scope: !cli.files_only && !cli.count && !cli.no_filename,
     };
 
     let multi_targets = !cli.extra_paths.is_empty();
@@ -692,7 +778,11 @@ pub fn run_cli(args: &[String]) -> i32 {
         } else if norm_root_str.contains('*') || norm_root_str.contains('?') {
             let expanded = expand_glob_target_paths(&norm_root_str);
             if expanded.is_empty() {
-                eprintln!("[ap search] path not found: {norm_root_str}");
+                emit_search_err(
+                    cli.json,
+                    t0,
+                    &format!("[ap search] path not found: {norm_root_str}"),
+                );
                 return 1;
             }
             for (disp, p) in expanded {
@@ -709,7 +799,11 @@ pub fn run_cli(args: &[String]) -> i32 {
                 targets.push((prefix, canon, is_f));
             }
         } else {
-            eprintln!("[ap search] path not found: {norm_root_str}");
+            emit_search_err(
+                cli.json,
+                t0,
+                &format!("[ap search] path not found: {norm_root_str}"),
+            );
             return 1;
         }
     } else {
@@ -753,11 +847,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
         }
         if targets.is_empty() {
-            eprintln!("[ap search] no valid search paths found");
+            emit_search_err(cli.json, t0, "[ap search] no valid search paths found");
             return 1;
         }
     }
-    let t0 = Instant::now();
     let mut ext_allow: HashSet<String> = cli
         .ext_filter
         .split(',')
@@ -822,7 +915,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             max_hits: pat_cap,
             ..s_opts
         };
+        let mut ast_cache: Option<FileAstCache> = None;
         for (pl, r) in compiled {
+            if !s_opts.invert && !r.is_match(text) {
+                continue;
+            }
+            let cache =
+                ast_cache.get_or_insert_with(|| FileAstCache::build(text, ext, is_office, s_opts));
             let lbl = if multi_mode { pl.as_str() } else { "" };
             let mut pat_hits = Vec::new();
             push_text_matches(
@@ -833,6 +932,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 is_office,
                 r,
                 pat_opts,
+                cache,
                 filtered_non_code,
                 filtered_tests,
                 &mut pat_hits,
@@ -915,11 +1015,29 @@ pub fn run_cli(args: &[String]) -> i32 {
                 | "gif"
                 | "webp"
                 | "ico"
+                | "bmp"
+                | "tif"
+                | "tiff"
+                | "cur"
                 | "woff"
                 | "woff2"
                 | "ttf"
+                | "otf"
+                | "eot"
+                | "mp3"
+                | "mp4"
+                | "wav"
+                | "ogg"
+                | "avi"
+                | "mov"
+                | "mkv"
+                | "flac"
                 | "sqlite"
+                | "sqlite-wal"
+                | "sqlite-shm"
                 | "db"
+                | "ldb"
+                | "sst"
                 | "lock"
         ) {
             return local_matches;
@@ -939,7 +1057,53 @@ pub fn run_cli(args: &[String]) -> i32 {
                 | "wasm"
                 | "bin"
         );
-        if is_bin_ext && !explicit_file && ext_allow.is_empty() {
+        let is_dir_walk_skip_bin = is_bin_ext
+            || matches!(
+                ext.as_str(),
+                "pdb"
+                    | "lib"
+                    | "obj"
+                    | "o"
+                    | "a"
+                    | "rlib"
+                    | "rmeta"
+                    | "i64"
+                    | "idb"
+                    | "dmp"
+                    | "evtx"
+                    | "etl"
+                    | "vmdk"
+                    | "qcow2"
+                    | "iso"
+                    | "msi"
+                    | "cab"
+                    | "7z"
+                    | "rar"
+                    | "pak"
+                    | "dat"
+                    | "pyc"
+                    | "pyo"
+                    | "class"
+                    | "nupkg"
+                    | "apk"
+                    | "ipa"
+                    | "deb"
+                    | "rpm"
+                    | "dex"
+                    | "zip"
+                    | "vsix"
+                    | "jar"
+                    | "war"
+                    | "ear"
+                    | "whl"
+                    | "tar"
+                    | "tgz"
+                    | "gz"
+                    | "bz2"
+                    | "xz"
+                    | "zst"
+            );
+        if is_dir_walk_skip_bin && !explicit_file && ext_allow.is_empty() {
             return local_matches;
         }
         let Ok(meta) = p.metadata() else {
@@ -947,8 +1111,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         };
         let is_archive_ext = matches!(
             ext.as_str(),
-            "asar" | "zip" | "vsix" | "jar" | "whl" | "tar" | "tgz" | "gz"
+            "asar" | "zip" | "vsix" | "jar" | "war" | "ear" | "whl" | "tar" | "tgz" | "gz"
         );
+        let is_office_ext = matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "pdf");
         let size_cap = if explicit_file {
             if is_archive_ext {
                 256 * 1024 * 1024
@@ -961,6 +1126,18 @@ pub fn run_cli(args: &[String]) -> i32 {
             16 * 1024 * 1024
         };
         if meta.len() > size_cap {
+            return local_matches;
+        }
+        // For files >64 KiB during directory walks, peek only 512 bytes for NUL binary detection
+        // before reading multi-megabyte blobs into RAM.
+        if !explicit_file
+            && meta.len() > 64 * 1024
+            && !is_archive_ext
+            && !is_bin_ext
+            && !is_office_ext
+            && ext != "pyc"
+            && peek_is_binary_nul(p)
+        {
             return local_matches;
         }
         let Ok(bytes) = fs::read(p) else {
@@ -990,7 +1167,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 .unwrap_or("js")
                                 .to_ascii_lowercase();
                             let virt_rel = format!("{rel}::{sname}");
+                            let mut ast_cache: Option<FileAstCache> = None;
                             for (pl, r) in compiled {
+                                if !s_opts.invert && !r.is_match(body) {
+                                    continue;
+                                }
+                                let cache = ast_cache.get_or_insert_with(|| {
+                                    FileAstCache::build(body, &eext, false, s_opts)
+                                });
                                 let lbl = if multi_mode { pl.as_str() } else { "" };
                                 push_text_matches(
                                     lbl,
@@ -1000,6 +1184,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                                     false,
                                     r,
                                     s_opts,
+                                    cache,
                                     filtered_non_code,
                                     filtered_tests,
                                     &mut local_matches,
@@ -1052,7 +1237,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                     if en <= bytes.len() {
                         let txt = decode_any_bytes(&bytes[st..en]).0;
                         let virt_rel = format!("{rel}::{}", ent.path);
+                        let mut ast_cache: Option<FileAstCache> = None;
                         for (pl, r) in compiled {
+                            if !s_opts.invert && !r.is_match(&txt) {
+                                continue;
+                            }
+                            let cache = ast_cache.get_or_insert_with(|| {
+                                FileAstCache::build(&txt, &eext, false, s_opts)
+                            });
                             let lbl = if multi_mode { pl.as_str() } else { "" };
                             push_text_matches(
                                 lbl,
@@ -1062,6 +1254,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                                 false,
                                 r,
                                 s_opts,
+                                cache,
                                 filtered_non_code,
                                 filtered_tests,
                                 &mut local_matches,
@@ -1618,13 +1811,16 @@ pub fn run_cli(args: &[String]) -> i32 {
         out_lines.join("\n")
     };
 
-    record_event(
+    record_event_ex(
         "search",
         total_bytes,
         rendered.len() as u64,
         0,
         0,
         "parallel-ast-office-search",
+        true,
+        t0.elapsed().as_millis() as u64,
+        None,
     );
 
     if cli.json {
@@ -1871,5 +2067,51 @@ mod tests {
             root.to_string_lossy().replace('\\', "/")
         );
         assert!(expand_glob_target_paths(&pat3).is_empty());
+    }
+
+    #[test]
+    fn binary_512b_peek_and_minified_ast_gate_work_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_f = dir.path().join("opaque_blob");
+        let mut blob = vec![0u8; 128 * 1024];
+        blob[10..18].copy_from_slice(b"NEEDLE_X");
+        fs::write(&bin_f, &blob).unwrap();
+        assert!(peek_is_binary_nul(&bin_f));
+
+        let txt_f = dir.path().join("normal.txt");
+        fs::write(&txt_f, "hello NEEDLE_X\nsecond line\n").unwrap();
+        assert!(!peek_is_binary_nul(&txt_f));
+
+        let minified = format!("var a=1;{};console.log('x');", "b=2;".repeat(250));
+        assert!(looks_minified_text(&minified));
+        let normal_code = "fn alpha() {\n    let x = 1;\n}\nfn beta() {\n    let y = 2;\n}\n";
+        assert!(!looks_minified_text(normal_code));
+
+        // FileAstCache skips scan_symbols when need_scope is false (e.g. --files-only/--count/--no-filename)
+        let opts_no_scope = SearchOpts {
+            around: 160,
+            pretty: false,
+            multiline: false,
+            block: false,
+            before_ctx: 0,
+            after_ctx: 0,
+            invert: false,
+            max_hits: 50,
+            per_pattern: 0,
+            code_only: false,
+            no_tests: false,
+            only_matching: false,
+            need_scope: false,
+        };
+        let c_skip = FileAstCache::build(normal_code, "rs", false, opts_no_scope);
+        assert!(c_skip.ast_spans.is_empty());
+        let opts_with_scope = SearchOpts {
+            need_scope: true,
+            ..opts_no_scope
+        };
+        let c_keep = FileAstCache::build(normal_code, "rs", false, opts_with_scope);
+        assert!(!c_keep.ast_spans.is_empty());
+        let c_min = FileAstCache::build(&minified, "js", false, opts_with_scope);
+        assert!(c_min.ast_spans.is_empty());
     }
 }

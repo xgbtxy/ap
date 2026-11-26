@@ -1204,6 +1204,7 @@ fn run_self_captured_in(
         Ok(c) => c,
         Err(e) => return (false, format!("spawn error: {e}")),
     };
+    let _job = crate::win_job::WinJobGuard::attach(&child);
     if let Some(inp) = stdin_data {
         if let Some(mut sin) = child.stdin.take() {
             let _ = sin.write_all(inp.as_bytes());
@@ -1226,6 +1227,20 @@ fn run_self_captured_in(
 }
 
 fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
+    let tool_t0 = std::time::Instant::now();
+    let record_sub = |kind: &str, raw: u64, out: u64, wh: u32, g: u32, note: &str| {
+        crate::stats::record_event_ex(
+            kind,
+            raw,
+            out,
+            wh,
+            g,
+            note,
+            true,
+            tool_t0.elapsed().as_millis() as u64,
+            None,
+        );
+    };
     match name {
         "ap_read" => {
             let mut all_targets: Vec<String> = Vec::new();
@@ -1816,7 +1831,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             let pm = ap_atlas::product::build_product_map(root_p, ap_atlas::SKIP_DIRS);
             let prod_txt = ap_atlas::product::render_product_map(&pm);
             let out = format!("{map_txt}\n{prod_txt}");
-            crate::stats::record_event(
+            record_sub(
                 "orient",
                 raw_b.max(out.len() as u64),
                 out.len() as u64,
@@ -1953,7 +1968,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             let (ok, mut out) = run_self_captured(&cli, Some(&spec));
             if ok {
-                crate::stats::record_event("edit", 0, 0, 0, n_ops, "mcp-edit");
+                record_sub("edit", 0, 0, 0, n_ops, "mcp-edit");
                 if let Some(ref snap) = undo_snap {
                     let warns = crate::undo::check_truncation_warnings(snap);
                     if !warns.is_empty() {
@@ -1990,7 +2005,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     ap_atlas::SKIP_DIRS,
                 );
                 let out = ap_atlas::deps::render_deps_md(&rep);
-                crate::stats::record_event("impact", 0, out.len() as u64, 0, 1, "mcp-deps");
+                record_sub("impact", 0, out.len() as u64, 0, 1, "mcp-deps");
                 return (true, out);
             }
             let sym = args
@@ -2010,7 +2025,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 ap_atlas::SKIP_DIRS,
             );
             let out = ap_atlas::impact::render_impact_md(&rep);
-            crate::stats::record_event("impact", 0, out.len() as u64, 0, 1, "mcp-impact");
+            record_sub("impact", 0, out.len() as u64, 0, 1, "mcp-impact");
             (true, out)
         }
         "ap_fuzz" => {
@@ -2042,7 +2057,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push(conc.to_string());
             }
             let (ok, out) = run_self_captured(&cli, None);
-            crate::stats::record_event("fuzz", 0, out.len() as u64, 0, 1, "mcp-fuzz");
+            record_sub("fuzz", 0, out.len() as u64, 0, 1, "mcp-fuzz");
             (ok, out)
         }
         "ap_mutate" => {
@@ -2075,7 +2090,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push(mm.to_string());
             }
             let (ok, out) = run_self_captured(&cli, None);
-            crate::stats::record_event("mutate", 0, out.len() as u64, 0, 1, "mcp-mutate");
+            record_sub("mutate", 0, out.len() as u64, 0, 1, "mcp-mutate");
             (ok, out)
         }
         "ap_ui" => {
@@ -2111,7 +2126,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push(sc.to_string());
             }
             let (ok, out) = run_self_captured(&cli, None);
-            crate::stats::record_event("ui", 0, out.len() as u64, 0, 1, "mcp-ui");
+            record_sub("ui", 0, out.len() as u64, 0, 1, "mcp-ui");
             (ok, out)
         }
         "ap_locate" => {
@@ -2131,7 +2146,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(5) as usize;
             let rep = ap_atlas::locate::locate_faults(root_p, q, top_k);
             let out = ap_atlas::locate::render_locate_md(&rep);
-            crate::stats::record_event("locate", 0, out.len() as u64, 0, 1, "mcp-locate");
+            record_sub("locate", 0, out.len() as u64, 0, 1, "mcp-locate");
             (true, out)
         }
         "ap_exec" => {
@@ -2213,7 +2228,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 cli.push(st.to_string());
             }
             let (ok, out) = run_self_captured(&cli, Some(&spec_txt));
-            crate::stats::record_event("smoke", 0, 0, 1, 1, "mcp-smoke");
+            record_sub("smoke", 0, 0, 1, 1, "mcp-smoke");
             (ok, out)
         }
         "ap_trace" => {
@@ -2250,7 +2265,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     tainted_only,
                 );
                 let out = ap_atlas::variants::render_variants_md(&rep);
-                crate::stats::record_event("trace", 0, out.len() as u64, 0, 1, "mcp-variants");
+                record_sub("trace", 0, out.len() as u64, 0, 1, "mcp-variants");
                 return (true, out);
             }
             if sym.is_empty() {
@@ -2275,7 +2290,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 depth,
             );
             let out = ap_atlas::trace::render_trace_md(&rep);
-            crate::stats::record_event("trace", 0, out.len() as u64, 0, 1, "mcp-trace");
+            record_sub("trace", 0, out.len() as u64, 0, 1, "mcp-trace");
             (true, out)
         }
         "ap_cdp" => {
@@ -3000,7 +3015,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 "findings": rep.findings,
             }))
             .unwrap_or_default();
-            crate::stats::record_event("diff-audit", 0, js.len() as u64, 0, 1, "mcp-diff-audit");
+            record_sub("diff-audit", 0, js.len() as u64, 0, 1, "mcp-diff-audit");
             (ok, js)
         }
         "ap_verify" => {
@@ -3030,7 +3045,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             }
             let (g_ok, g_txt) = run_self_captured(&v_args, None);
             let ok = g_ok && mismatch_lines.is_empty();
-            crate::stats::record_event("verify", 0, 0, 0, 1, "mcp-verify");
+            record_sub("verify", 0, 0, 0, 1, "mcp-verify");
             let combined = if mismatch_lines.is_empty() {
                 g_txt
             } else {
@@ -3143,14 +3158,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     rollback,
                 );
                 if rep.ok && !dry_run && rep.total_replacements > 0 {
-                    crate::stats::record_event(
-                        "rewrite",
-                        0,
-                        0,
-                        0,
-                        rep.files_changed as u32,
-                        "mcp-rewrite",
-                    );
+                    record_sub("rewrite", 0, 0, 0, rep.files_changed as u32, "mcp-rewrite");
                 }
                 let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
                 return (rep.ok, js);
@@ -3187,14 +3195,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 root_p, old_name, new_name, dry_run, run_tests, "", rollback,
             );
             if rep.ok && !dry_run && rep.total_replacements > 0 {
-                crate::stats::record_event(
-                    "rename",
-                    0,
-                    0,
-                    0,
-                    rep.files_changed as u32,
-                    "mcp-rename",
-                );
+                record_sub("rename", 0, 0, 0, rep.files_changed as u32, "mcp-rename");
             }
             let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
             (rep.ok, js)
@@ -3655,7 +3656,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     .clamp(1, 25) as usize;
                 let rep = ap_atlas::history::analyze_file_history(&hf_p, symbol, lines, limit);
                 let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
-                crate::stats::record_event("history", 0, js.len() as u64, 0, 1, "mcp-history");
+                record_sub("history", 0, js.len() as u64, 0, 1, "mcp-history");
                 return (true, js);
             }
             let root_p = std::path::Path::new(root);
@@ -3665,7 +3666,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
             let base = args.get("base").and_then(Value::as_str);
             let rep = ap_atlas::changes::analyze_git_changes(root_p, base, ap_atlas::SKIP_DIRS);
             let js = serde_json::to_string_pretty(&rep).unwrap_or_default();
-            crate::stats::record_event("changes", 0, js.len() as u64, 0, 1, "mcp-changes");
+            record_sub("changes", 0, js.len() as u64, 0, 1, "mcp-changes");
             (true, js)
         }
         "ap_surface" => {
@@ -3726,7 +3727,7 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                 Err(e) => return (false, format!("[atlas] {e}")),
             };
             let js = serde_json::to_string_pretty(&map).unwrap_or_default();
-            crate::stats::record_event("surface", 0, js.len() as u64, 0, 1, "mcp-surface");
+            record_sub("surface", 0, js.len() as u64, 0, 1, "mcp-surface");
             (true, js)
         }
         "ap_frontier" => {
@@ -3906,7 +3907,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     )
                 }
                 "next" => {
-                    let state = ap_baton::frontier::load_frontier(&store_path);
+                    let state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     let top_k = args
                         .get("top_k")
                         .and_then(Value::as_u64)
@@ -3988,7 +3992,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     )
                 }
                 "status" => {
-                    let state = ap_baton::frontier::load_frontier(&store_path);
+                    let state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     let top_k = args
                         .get("top_k")
                         .and_then(Value::as_u64)
@@ -3998,7 +4005,10 @@ fn dispatch_tool_call(name: &str, args: &Value) -> (bool, String) {
                     (true, serde_json::to_string_pretty(&summary).unwrap_or_default())
                 }
                 "coverage" | "challenge" => {
-                    let state = ap_baton::frontier::load_frontier(&store_path);
+                    let state = match ap_baton::frontier::load_frontier_strict(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return (false, format!("[frontier] {e}")),
+                    };
                     let top_k = args
                         .get("top_k")
                         .and_then(Value::as_u64)
@@ -4297,7 +4307,7 @@ fn read_mcp_resource(uri: &str) -> Result<Value, String> {
         }
         "ap://baton/state" => {
             let base = ap_baton::baton_dir(&cwd);
-            let mut st = ap_baton::load_state(&base);
+            let mut st = ap_baton::load_state_strict(&base).map_err(|e| format!("[baton] {e}"))?;
             st.workspace = ap_baton::probe_workspace(&cwd);
             let txt = serde_json::to_string_pretty(&st).unwrap_or_else(|_| "{}".to_string());
             Ok(json!({

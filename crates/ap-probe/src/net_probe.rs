@@ -77,6 +77,22 @@ fn mini_hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+fn emit_net_err(as_json: bool, addr: &str, msg: &str) {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": false,
+                "addr": addr,
+                "error": msg,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
 /// Deadline-bounded raw TCP banner/send/recv probe (replaces `nc`/`telnet` & hanging Python sockets).
 pub fn run_tcp_cli(
     addr_str: &str,
@@ -88,11 +104,19 @@ pub fn run_tcp_cli(
 ) -> i32 {
     let t0 = Instant::now();
     let Ok(mut addrs) = addr_str.to_socket_addrs() else {
-        eprintln!("[probe tcp] Failed to resolve `{addr_str}`");
+        emit_net_err(
+            as_json,
+            addr_str,
+            &format!("[probe tcp] Failed to resolve `{addr_str}`"),
+        );
         return 2;
     };
     let Some(sock_addr) = addrs.next() else {
-        eprintln!("[probe tcp] No socket address resolved for `{addr_str}`");
+        emit_net_err(
+            as_json,
+            addr_str,
+            &format!("[probe tcp] No socket address resolved for `{addr_str}`"),
+        );
         return 2;
     };
     let conn_dur = Duration::from_millis(timeout_ms.clamp(100, 30_000));
@@ -124,19 +148,19 @@ pub fn run_tcp_cli(
         match decode_hex_str(hx) {
             Ok(bytes) => {
                 if let Err(e) = stream.write_all(&bytes) {
-                    eprintln!("[probe tcp] write error: {e}");
+                    emit_net_err(as_json, addr_str, &format!("[probe tcp] write error: {e}"));
                     return 1;
                 }
             }
             Err(e) => {
-                eprintln!("[probe tcp] {e}");
+                emit_net_err(as_json, addr_str, &format!("[probe tcp] {e}"));
                 return 2;
             }
         }
     } else if let Some(txt) = send_txt {
         let bytes = unescape_payload(txt);
         if let Err(e) = stream.write_all(&bytes) {
-            eprintln!("[probe tcp] write error: {e}");
+            emit_net_err(as_json, addr_str, &format!("[probe tcp] write error: {e}"));
             return 1;
         }
     }
@@ -318,7 +342,20 @@ pub fn run_listen_cli(
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[probe listen] Failed to bind 127.0.0.1:{port}: {e}");
+            let msg = format!("[probe listen] Failed to bind 127.0.0.1:{port}: {e}");
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "port": port,
+                        "error": msg,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 1;
         }
     };
@@ -730,20 +767,30 @@ try{{$s.Close();$c.Close()}}catch{{}}; \
 
     #[cfg(not(windows))]
     {
-        let mut child = Command::new("openssl")
-            .args([
-                "s_client",
-                "-quiet",
-                "-servername",
-                host,
-                "-connect",
-                &format!("{host}:{port}"),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("openssl s_client spawn failed: {e}"))?;
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child_guard = KillOnDrop(
+            Command::new("openssl")
+                .args([
+                    "s_client",
+                    "-quiet",
+                    "-servername",
+                    host,
+                    "-connect",
+                    &format!("{host}:{port}"),
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("openssl s_client spawn failed: {e}"))?,
+        );
+        let child = &mut child_guard.0;
         let mut sin = child.stdin.take().ok_or("missing stdin")?;
         let mut sout = child.stdout.take().ok_or("missing stdout")?;
         sin.write_all(req_str.as_bytes())

@@ -1,5 +1,5 @@
 use crate::read::{decode_any_bytes, extract_xlsx_sheets_raw};
-use crate::stats::record_event;
+use crate::stats::record_event_ex;
 use clap::Parser;
 use rusqlite::types::Value as SqlVal;
 use rusqlite::{params_from_iter, Connection};
@@ -544,13 +544,16 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     }
     let rendered = md_lines.join("\n");
-    record_event(
+    record_event_ex(
         "query",
         total_raw_bytes,
         rendered.len() as u64,
         win_heals,
         1,
         "sql-query",
+        true,
+        t0.elapsed().as_millis() as u64,
+        None,
     );
 
     if cli.json {

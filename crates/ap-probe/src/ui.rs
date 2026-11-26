@@ -46,6 +46,7 @@ pub fn run_ui_audit(
     };
 
     let mut child_opt: Option<Child> = None;
+    let mut _child_job: Option<crate::smoke::ProbeJobGuard> = None;
     let pid = std::process::id();
     let out_f = std::env::temp_dir().join(format!("ap_ui_{pid}.out.log"));
     let err_f = std::env::temp_dir().join(format!("ap_ui_{pid}.err.log"));
@@ -58,16 +59,39 @@ pub fn run_ui_audit(
             .map(str::to_string)
             .or_else(|| auto_detect_start_cmd(cwd))
         else {
-            eprintln!("[probe ui] Provide --start \"<cmd>\" or --url http://127.0.0.1:<port>");
+            let msg = "[probe ui] Provide --start \"<cmd>\" or --url http://127.0.0.1:<port>";
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "ok": false, "error": msg }))
+                        .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{msg}");
+            }
             return 2;
         };
         let Ok(port) = pick_free_port() else {
             return 2;
         };
         match spawn_detached_logged_server(&sc, cwd, port, &[], &out_f, &err_f) {
-            Ok(ch) => child_opt = Some(ch),
+            Ok(ch) => {
+                _child_job = crate::smoke::ProbeJobGuard::attach(&ch);
+                child_opt = Some(ch);
+            }
             Err(e) => {
-                eprintln!("[probe ui] {e}");
+                let msg = format!("[probe ui] {e}");
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "ok": false, "error": msg })
+                        )
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{msg}");
+                }
                 return 1;
             }
         }

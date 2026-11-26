@@ -20,6 +20,7 @@ pub struct CdpTarget {
 
 pub struct CdpSession {
     child: Option<Child>,
+    _job: Option<crate::smoke::ProbeJobGuard>,
     profile_dir: Option<PathBuf>,
     stream: TcpStream,
     next_id: u64,
@@ -214,6 +215,7 @@ impl CdpSession {
             .stderr(Stdio::from(err_f))
             .spawn()
             .map_err(|e| format!("spawn headless browser: {e}"))?;
+        let job = crate::smoke::ProbeJobGuard::attach(&child);
 
         let deadline = Instant::now() + Duration::from_millis(15000);
         let mut ws_url = String::new();
@@ -261,6 +263,7 @@ impl CdpSession {
 
         let mut sess = Self {
             child: Some(child),
+            _job: job,
             profile_dir: Some(profile_dir),
             stream,
             next_id: 1,
@@ -325,6 +328,7 @@ impl CdpSession {
         let stream = open_cdp_websocket(ws_url)?;
         let mut sess = Self {
             child: None,
+            _job: None,
             profile_dir: None,
             stream,
             next_id: 1,

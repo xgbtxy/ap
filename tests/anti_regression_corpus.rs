@@ -26,6 +26,18 @@ fn isolated_test_ap_home(cwd: &Path) -> PathBuf {
     ))
 }
 
+fn isolated_node_cmd(root: &Path) -> Command {
+    let iso = isolated_test_ap_home(root);
+    let sieve = iso.join("sieve");
+    let _ = fs::create_dir_all(&sieve);
+    let mut cmd = Command::new("node");
+    cmd.env("HOME", &iso)
+        .env("USERPROFILE", &iso)
+        .env("AP_HOME", &iso)
+        .env("SIEVE_HOME", &sieve);
+    cmd
+}
+
 fn run_ap(
     cwd: &Path,
     args: &[&str],
@@ -1269,7 +1281,7 @@ assert.ok(AP_DEEPSEEK_GUIDELINES.join("\n").includes("ap ps|ports"));
 assert.ok(AP_DEEPSEEK_GUIDELINES.join("\n").includes("--sig"));
 "###;
 
-    let run = Command::new("node")
+    let run = isolated_node_cmd(root)
         .args([
             "--experimental-strip-types",
             "--input-type=module",
@@ -1705,7 +1717,7 @@ const g = AP_DEEPSEEK_GUIDELINES.join("\n");
 assert.ok(g.includes("ap diff") && g.includes("--weak-acl") && g.includes("--roles-matrix"), g);
 "###;
 
-    let run = Command::new("node")
+    let run = isolated_node_cmd(root)
         .args([
             "--experimental-strip-types",
             "--input-type=module",
@@ -1865,7 +1877,7 @@ const spacedGrep = healCommand('grep -n "needle" "Program Files/Vendor Dir/cfg.x
 assert.ok(spacedGrep && spacedGrep.includes(" search ") && spacedGrep.includes("Program Files/Vendor Dir/cfg.xml"), spacedGrep);
 "###;
 
-    let run = Command::new("node")
+    let run = isolated_node_cmd(root)
         .args([
             "--experimental-strip-types",
             "--input-type=module",
