@@ -2160,36 +2160,81 @@ fn resolve_json_path<'a>(mut cur: &'a Value, path: &str) -> Option<&'a Value> {
     if rest.is_empty() {
         return Some(cur);
     }
-    let mut tokens: Vec<&str> = Vec::new();
-    for seg in rest.split('.').filter(|p| !p.is_empty()) {
-        let mut s = seg;
-        while let Some(b_start) = s.find('[') {
-            let head = &s[..b_start];
-            if !head.is_empty() {
-                tokens.push(head);
+    let mut tokens: Vec<String> = Vec::new();
+    let mut chars = rest.chars().peekable();
+    let mut buf = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => {
+                if !buf.is_empty() {
+                    tokens.push(std::mem::take(&mut buf));
+                }
             }
-            let after_open = &s[b_start + 1..];
-            let b_end = after_open.find(']')?;
-            let inner = after_open[..b_end]
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"');
-            if !inner.is_empty() {
+            '[' => {
+                if !buf.is_empty() {
+                    tokens.push(std::mem::take(&mut buf));
+                }
+                while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+                    chars.next();
+                }
+                let mut inner = String::new();
+                let closed = match chars.peek().copied() {
+                    Some(q @ ('\'' | '"')) => {
+                        chars.next();
+                        let mut found_q = false;
+                        while let Some(ch) = chars.next() {
+                            if ch == '\\' {
+                                if let Some(esc) = chars.next() {
+                                    inner.push(esc);
+                                }
+                            } else if ch == q {
+                                found_q = true;
+                                break;
+                            } else {
+                                inner.push(ch);
+                            }
+                        }
+                        if !found_q {
+                            return None;
+                        }
+                        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+                            chars.next();
+                        }
+                        chars.next() == Some(']')
+                    }
+                    _ => {
+                        let mut found_end = false;
+                        for ch in chars.by_ref() {
+                            if ch == ']' {
+                                found_end = true;
+                                break;
+                            }
+                            inner.push(ch);
+                        }
+                        inner = inner.trim().to_string();
+                        found_end
+                    }
+                };
+                if !closed || inner.is_empty() {
+                    return None;
+                }
                 tokens.push(inner);
             }
-            s = &after_open[b_end + 1..];
-        }
-        if !s.is_empty() {
-            tokens.push(s);
+            ']' => return None,
+            _ => buf.push(c),
         }
     }
-    for part in tokens {
+    if !buf.is_empty() {
+        tokens.push(buf);
+    }
+    for part in &tokens {
         match cur {
             Value::Array(arr) => {
                 let idx: usize = part.parse().ok()?;
                 cur = arr.get(idx)?;
             }
             Value::Object(map) => {
-                cur = map.get(part)?;
+                cur = map.get(part.as_str())?;
             }
             _ => return None,
         }
@@ -2330,9 +2375,24 @@ pub fn search_archives(store: &Path, query: &str, limit: usize) -> (Vec<SearchHi
 }
 
 fn normalize_sieve_cli_args(args: &[String]) -> Vec<String> {
+    // Only normalize `peek` flags before `--`; never mutate wrapped commands in `sieve run -- ...`.
+    let is_peek = args
+        .iter()
+        .skip(1)
+        .take_while(|a| a.as_str() != "--")
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.as_str() == "peek")
+        .unwrap_or(false);
+    if !is_peek {
+        return args.to_vec();
+    }
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0usize;
     while i < args.len() {
+        if args[i] == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
         if i + 2 < args.len()
             && args[i] == "--grep"
             && matches!(args[i + 1].as_str(), "-i" | "--ignore-case")
@@ -3033,14 +3093,39 @@ mod tests {
     #[test]
     fn cycle6_json_path_brackets_and_auto_compact_helper() {
         let doc = json!({
+            "a": { "b.c": [{ "name": "dotted_ok" }] },
             "items": [
                 {"service": "svc_alpha", "meta": {"ok": true}},
                 {"service": "svc_beta", "meta": {"ok": false}}
             ]
         });
         assert_eq!(
+            resolve_json_path(&doc, "$.a['b.c'][0].name").and_then(Value::as_str),
+            Some("dotted_ok")
+        );
+        assert_eq!(
+            resolve_json_path(&doc, r#"$.a["b.c"][0].name"#).and_then(Value::as_str),
+            Some("dotted_ok")
+        );
+        assert_eq!(
             resolve_json_path(&doc, "$.items[0].service").and_then(Value::as_str),
             Some("svc_alpha")
+        );
+        // `normalize_sieve_cli_args` must ONLY rewrite `peek` flags before `--`, never `run` argv!
+        let run_argv: Vec<String> = [
+            "sieve", "run", "--", "python", "-c", "x", "--grep", "-i", "foo",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(normalize_sieve_cli_args(&run_argv), run_argv);
+        let peek_argv: Vec<String> = ["sieve", "peek", "abc123", "--grep", "-i", "foo"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            normalize_sieve_cli_args(&peek_argv),
+            vec!["sieve", "peek", "abc123", "-i", "--grep", "foo"]
         );
         assert_eq!(
             resolve_json_path(&doc, "items[1]['service']").and_then(Value::as_str),

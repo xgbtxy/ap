@@ -1,6 +1,42 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub struct WinFilter {
+    terms: Vec<String>,
+}
+
+impl WinFilter {
+    pub fn parse(filter: Option<&str>) -> Option<Self> {
+        let raw = filter?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let terms: Vec<String> = raw
+            .split('|')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if terms.is_empty() {
+            None
+        } else {
+            Some(Self { terms })
+        }
+    }
+
+    pub fn matches(&self, haystack: &str) -> bool {
+        let low = haystack.to_ascii_lowercase();
+        self.terms.iter().any(|t| low.contains(t.as_str()))
+    }
+
+    pub fn matches_low(&self, haystack_low: &str) -> bool {
+        self.terms.iter().any(|t| haystack_low.contains(t.as_str()))
+    }
+
+    pub fn matches_any(&self, haystacks: &[&str]) -> bool {
+        haystacks.iter().any(|h| self.matches(h))
+    }
+}
+
 fn looks_like_guid_prefix(s: &str) -> bool {
     let trimmed = s.strip_prefix('{').unwrap_or(s);
     let b = trimmed.as_bytes();
@@ -1342,17 +1378,13 @@ mod imp {
                 Err(e) => return json!({ "ok": false, "mode": "procs", "error": e }),
             },
         };
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let cap = max.clamp(1, 200);
         let mut total_matched = 0usize;
         let mut items = Vec::new();
         for p in all_procs {
-            if let Some(ref fl) = f_low {
-                let hit = p.name.to_ascii_lowercase().contains(fl)
-                    || p.exe.to_ascii_lowercase().contains(fl)
-                    || p.integrity_level.to_ascii_lowercase().contains(fl)
-                    || p.user.to_ascii_lowercase().contains(fl);
-                if !hit {
+            if let Some(ref f) = wf {
+                if !f.matches_any(&[&p.name, &p.exe, &p.integrity_level, &p.user]) {
                     continue;
                 }
             }
@@ -1480,13 +1512,13 @@ mod imp {
                 "error": format!("FindFirstFileW(\\\\.\\pipe\\*) failed (err={})", unsafe { GetLastError() }),
             });
         }
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let mut all_names: Vec<String> = Vec::new();
         loop {
             let nm = unsafe { read_wide_buf(&fd.c_file_name) };
             let nm_low = nm.to_ascii_lowercase();
             let keep_filter =
-                !nm.is_empty() && f_low.as_ref().map(|fl| nm_low.contains(fl)).unwrap_or(true);
+                !nm.is_empty() && wf.as_ref().map(|f| f.matches_low(&nm_low)).unwrap_or(true);
             let keep_ms = !non_ms || !super::is_ms_os_pipe(&nm_low);
             if keep_filter && keep_ms {
                 all_names.push(nm);
@@ -1567,6 +1599,7 @@ mod imp {
                 "server_pid": server_pid,
                 "server_process": server_process,
                 "server_il": server_il,
+                "il": server_il,
                 "signal": signal,
             }));
         }
@@ -1677,7 +1710,7 @@ mod imp {
             });
         }
         let cap = max.clamp(1, 200);
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let mut subkeys: Vec<String> = Vec::new();
         let mut idx = 0u32;
         loop {
@@ -1700,11 +1733,7 @@ mod imp {
             }
             if erc == 0 {
                 let nm = String::from_utf16_lossy(&kbuf[..klen as usize]);
-                if f_low
-                    .as_ref()
-                    .map(|fl| nm.to_ascii_lowercase().contains(fl))
-                    .unwrap_or(true)
-                {
+                if wf.as_ref().map(|f| f.matches(&nm)).unwrap_or(true) {
                     subkeys.push(nm);
                     if subkeys.len() >= cap {
                         break;
@@ -1764,9 +1793,9 @@ mod imp {
                 };
                 let (vtype, vval) = decode_reg_value(ty, &dbuf[..dlen as usize]);
                 let val_str = vval.to_string().to_ascii_lowercase();
-                let matches_f = f_low
+                let matches_f = wf
                     .as_ref()
-                    .map(|fl| disp.to_ascii_lowercase().contains(fl) || val_str.contains(fl))
+                    .map(|f| f.matches(&disp) || f.matches_low(&val_str))
                     .unwrap_or(true);
                 if matches_f {
                     values.push(json!({ "name": disp, "type": vtype, "value": vval }));
@@ -1922,7 +1951,7 @@ mod imp {
                 "error": format!("EnumServicesStatusExW failed (err={err})"),
             });
         }
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let cap = max.clamp(1, 200);
         let mut matched: Vec<Value> = Vec::new();
         let mut total_matched = 0usize;
@@ -1931,12 +1960,9 @@ mod imp {
             let item = unsafe { &*ptr_base.add(i) };
             let name = unsafe { read_wide_cstr(item.lp_service_name) };
             let display_name = unsafe { read_wide_cstr(item.lp_display_name) };
-            let match_hit = f_low
+            let match_hit = wf
                 .as_ref()
-                .map(|fl| {
-                    name.to_ascii_lowercase().contains(fl)
-                        || display_name.to_ascii_lowercase().contains(fl)
-                })
+                .map(|f| f.matches_any(&[&name, &display_name]))
                 .unwrap_or(true);
             if !match_hit {
                 continue;
@@ -2724,16 +2750,13 @@ mod imp {
             Ok(s) => s,
             Err(e) => return json!({ "ok": false, "mode": "unquoted", "error": e }),
         };
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let cap = max.clamp(1, 200);
         let mut findings = Vec::new();
         let mut exploitable_count = 0usize;
         for (name, display_name, state, pid, start_type, bin_path, account) in services {
-            if let Some(ref fl) = f_low {
-                if !name.to_ascii_lowercase().contains(fl)
-                    && !display_name.to_ascii_lowercase().contains(fl)
-                    && !bin_path.to_ascii_lowercase().contains(fl)
-                {
+            if let Some(ref f) = wf {
+                if !f.matches_any(&[&name, &display_name, &bin_path]) {
                     continue;
                 }
             }
@@ -2831,15 +2854,15 @@ mod imp {
                     .hidden(false)
                     .git_ignore(false)
                     .build();
-                let f_low = filter.map(|s| s.to_ascii_lowercase());
+                let wf = super::WinFilter::parse(filter);
                 for entry in walker.flatten() {
                     if scanned >= 1500 {
                         break;
                     }
                     let ep = entry.path();
                     let ps = ep.to_string_lossy().to_string();
-                    if let Some(ref fl) = f_low {
-                        if !ps.to_ascii_lowercase().contains(fl) {
+                    if let Some(ref f) = wf {
+                        if !f.matches(&ps) {
                             continue;
                         }
                     }
@@ -2870,7 +2893,7 @@ mod imp {
 
         // OS-wide non-admin write attack-surface sweep (pipes + services/bins/regkeys + unquoted)
         let eff_filter = filter.or(raw_tgt);
-        let f_low = eff_filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(eff_filter);
         let mut weak_pipes = Vec::new();
         if let Some(all_pipes) = cached_all_pipes {
             for p in all_pipes {
@@ -2882,8 +2905,8 @@ mod imp {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if let Some(ref fl) = f_low {
-                    if !nm_low.contains(fl) {
+                if let Some(ref f) = wf {
+                    if !f.matches_low(&nm_low) {
                         continue;
                     }
                 }
@@ -2926,10 +2949,8 @@ mod imp {
             std::collections::HashMap::new();
         if let Ok(svcs) = collect_all_services_raw() {
             for (name, _disp, state, _pid, start_type, bin_path, account) in svcs {
-                if let Some(ref fl) = f_low {
-                    if !name.to_ascii_lowercase().contains(fl)
-                        && !bin_path.to_ascii_lowercase().contains(fl)
-                    {
+                if let Some(ref f) = wf {
+                    if !f.matches_any(&[&name, &bin_path]) {
                         continue;
                     }
                 }
@@ -3042,7 +3063,7 @@ mod imp {
         {
             return json!({ "ok": false, "mode": "com", "error": "Failed to open HKLM\\SOFTWARE\\Classes\\CLSID" });
         }
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let cap = max.clamp(1, 200);
         let mut scanned = 0usize;
         let mut findings = Vec::new();
@@ -3084,11 +3105,8 @@ mod imp {
                 read_reg_dword(HKEY_LOCAL_MACHINE, &format!(r"{base}\Elevation"), "Enabled")
                     == Some(1);
             let target_raw = local_srv.as_deref().or(inproc_srv.as_deref()).unwrap_or("");
-            if let Some(ref fl) = f_low {
-                if !clsid.to_ascii_lowercase().contains(fl)
-                    && !label.to_ascii_lowercase().contains(fl)
-                    && !target_raw.to_ascii_lowercase().contains(fl)
-                {
+            if let Some(ref f) = wf {
+                if !f.matches_any(&[&clsid, &label, target_raw]) {
                     continue;
                 }
             }
@@ -3110,7 +3128,7 @@ mod imp {
             if non_ms && (is_sys || bare_name_only) && !writable && !auto_elev {
                 continue;
             }
-            if f_low.is_some() || missing || writable || auto_elev {
+            if wf.is_some() || missing || writable || auto_elev {
                 findings.push(json!({
                     "clsid": clsid,
                     "name": label,
@@ -3194,7 +3212,7 @@ mod imp {
             }
         }
 
-        let f_low = filter.map(|s| s.to_ascii_lowercase());
+        let wf = super::WinFilter::parse(filter);
         let cap = max.clamp(1, 200);
         let mut endpoints = Vec::new();
         let mut total_matched = 0usize;
@@ -3276,11 +3294,8 @@ mod imp {
             if !seen.insert(key) {
                 continue;
             }
-            if let Some(ref fl) = f_low {
-                if !uuid_str.to_ascii_lowercase().contains(fl)
-                    && !str_binding.to_ascii_lowercase().contains(fl)
-                    && !annotation.to_ascii_lowercase().contains(fl)
-                {
+            if let Some(ref f) = wf {
+                if !f.matches_any(&[&uuid_str, &str_binding, &annotation]) {
                     continue;
                 }
             }
@@ -3567,7 +3582,7 @@ pub fn run_win_cli_ex(
             if pipes {
                 modes_run.push("pipes");
                 let pp = if let Some(ref all_p) = cached_all_pipes {
-                    let f_low = filter.map(|s| s.to_ascii_lowercase());
+                    let wf = WinFilter::parse(filter);
                     let cap = max.clamp(1, 200);
                     let mut total_matched = 0usize;
                     let mut filtered_p = Vec::new();
@@ -3577,8 +3592,8 @@ pub fn run_win_cli_ex(
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        if let Some(ref fl) = f_low {
-                            if !nm_low.contains(fl) {
+                        if let Some(ref f) = wf {
+                            if !f.matches_low(&nm_low) {
                                 continue;
                             }
                         }
@@ -3861,5 +3876,27 @@ mod tests {
             !human.trim_start().starts_with('{'),
             "non-json mode must not emit raw minified JSON"
         );
+
+        // Cycle 7 P0: WinFilter case-insensitive `|` alternation & pipe `il` alias
+        let wf = WinFilter::parse(Some("EventLog | NonExistent999 | ")).unwrap();
+        assert!(wf.matches("eventlog"));
+        assert!(wf.matches("Windows EventLog Service"));
+        assert!(!wf.matches("Spooler"));
+        assert!(WinFilter::parse(Some(" | | ")).is_none());
+        #[cfg(windows)]
+        {
+            let sv = imp::query_services_opts(Some("EventLog|NonExistent999"), 5, false);
+            assert_eq!(sv["ok"], Value::Bool(true));
+            assert!(
+                !sv["services"].as_array().unwrap().is_empty(),
+                "pipe alternation filter must match EventLog: {sv}"
+            );
+            let ps = imp::query_pipes(None, 3);
+            let p0 = &ps["pipes"].as_array().unwrap()[0];
+            assert!(
+                p0.get("server_il").is_some() && p0.get("il").is_some(),
+                "{ps}"
+            );
+        }
     }
 }

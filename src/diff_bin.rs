@@ -1,6 +1,9 @@
 use clap::Parser;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 #[derive(Parser, Debug)]
@@ -66,6 +69,201 @@ fn bound_diff_json(mut v: Value, max_bytes: usize) -> Value {
     v
 }
 
+fn hash_file_streaming(path: &Path) -> Result<(u64, String), String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 32768];
+    let mut total = 0u64;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total = total.saturating_add(n as u64);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok((total, hex))
+}
+
+fn collect_dir_manifest(
+    root: &Path,
+    rel_prefix: &str,
+    out: &mut BTreeMap<String, (u64, String)>,
+    max_files: usize,
+) -> Result<(), String> {
+    if out.len() >= max_files {
+        return Ok(());
+    }
+    let dir = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix)
+    };
+    let rd = fs::read_dir(&dir)
+        .map_err(|e| format!("[ap diff] failed to read dir `{}`: {e}", dir.display()))?;
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if out.len() >= max_files {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let rel = if rel_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        if ft.is_dir() {
+            if matches!(
+                name.as_str(),
+                ".git" | ".hg" | ".svn" | "node_modules" | "__pycache__" | "target"
+            ) {
+                continue;
+            }
+            collect_dir_manifest(root, &rel, out, max_files)?;
+        } else if ft.is_file() {
+            if let Ok(meta) = hash_file_streaming(&entry.path()) {
+                out.insert(rel, meta);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn diff_directories(
+    old_root: &Path,
+    new_root: &Path,
+    old_label: &str,
+    new_label: &str,
+    max_items: usize,
+) -> Result<(String, Value), String> {
+    const MAX_WALK_FILES: usize = 20_000;
+    let mut old_map = BTreeMap::new();
+    let mut new_map = BTreeMap::new();
+    collect_dir_manifest(old_root, "", &mut old_map, MAX_WALK_FILES)?;
+    collect_dir_manifest(new_root, "", &mut new_map, MAX_WALK_FILES)?;
+
+    let mut added_all: Vec<Value> = Vec::new();
+    let mut removed_all: Vec<Value> = Vec::new();
+    let mut modified_all: Vec<Value> = Vec::new();
+    let mut unchanged_count = 0usize;
+
+    for (rel, (old_sz, old_sha)) in &old_map {
+        match new_map.get(rel) {
+            None => removed_all.push(json!({
+                "path": rel,
+                "old_size": old_sz,
+                "old_sha256": old_sha,
+            })),
+            Some((new_sz, new_sha)) => {
+                if old_sz == new_sz && old_sha == new_sha {
+                    unchanged_count += 1;
+                } else {
+                    modified_all.push(json!({
+                        "path": rel,
+                        "old_size": old_sz,
+                        "new_size": new_sz,
+                        "size_delta": (*new_sz as i64) - (*old_sz as i64),
+                        "old_sha256": old_sha,
+                        "new_sha256": new_sha,
+                    }));
+                }
+            }
+        }
+    }
+    for (rel, (new_sz, new_sha)) in &new_map {
+        if !old_map.contains_key(rel) {
+            added_all.push(json!({
+                "path": rel,
+                "new_size": new_sz,
+                "new_sha256": new_sha,
+            }));
+        }
+    }
+
+    let total_added = added_all.len();
+    let total_removed = removed_all.len();
+    let total_modified = modified_all.len();
+    let truncated =
+        total_added > max_items || total_removed > max_items || total_modified > max_items;
+    let added: Vec<Value> = added_all.into_iter().take(max_items).collect();
+    let removed: Vec<Value> = removed_all.into_iter().take(max_items).collect();
+    let modified: Vec<Value> = modified_all.into_iter().take(max_items).collect();
+
+    let mut md_lines = vec![format!(
+        "# DIR DIFF `{old_label}` -> `{new_label}` (+{total_added} added, -{total_removed} removed, ~{total_modified} modified, ={unchanged_count} unchanged)"
+    )];
+    if !added.is_empty() {
+        md_lines.push("\n## Added".to_string());
+        for a in &added {
+            md_lines.push(format!(
+                "+ {} ({}B)",
+                a["path"].as_str().unwrap_or(""),
+                a["new_size"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    if !removed.is_empty() {
+        md_lines.push("\n## Removed".to_string());
+        for r in &removed {
+            md_lines.push(format!(
+                "- {} ({}B)",
+                r["path"].as_str().unwrap_or(""),
+                r["old_size"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    if !modified.is_empty() {
+        md_lines.push("\n## Modified".to_string());
+        for m in &modified {
+            md_lines.push(format!(
+                "~ {} ({}B -> {}B, delta {:+})",
+                m["path"].as_str().unwrap_or(""),
+                m["old_size"].as_u64().unwrap_or(0),
+                m["new_size"].as_u64().unwrap_or(0),
+                m["size_delta"].as_i64().unwrap_or(0),
+            ));
+        }
+    }
+
+    let jv = json!({
+        "ok": true,
+        "format": "dir-diff",
+        "mode": "version-diff",
+        "kind": "directory",
+        "old": old_label,
+        "new": new_label,
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "unchanged_count": unchanged_count,
+        "summary": {
+            "old_files": old_map.len(),
+            "new_files": new_map.len(),
+            "added_count": total_added,
+            "removed_count": total_removed,
+            "modified_count": total_modified,
+            "unchanged_count": unchanged_count,
+            "truncated": truncated,
+        },
+    });
+    Ok((md_lines.join("\n"), bound_diff_json(jv, 16_000)))
+}
+
 pub fn run_diff_paths(
     old_raw: &str,
     new_raw: &str,
@@ -94,6 +292,14 @@ pub fn run_diff_paths_opts(
             m.insert("format".to_string(), json!("semantic-diff"));
         }
         return Ok((md, jv));
+    }
+    if old_p.is_dir() && new_p.is_dir() {
+        return diff_directories(old_p, new_p, &old_norm, &new_norm, max_items.clamp(1, 100));
+    }
+    if old_p.is_dir() != new_p.is_dir() && old_p.exists() && new_p.exists() {
+        return Err(format!(
+            "[ap diff] cannot diff directory against file (`{old_raw}` vs `{new_raw}`)"
+        ));
     }
     let new_ext = new_p
         .extension()

@@ -599,6 +599,66 @@ fn is_legal_doc_url_prose(axis: &str, text: &str) -> bool {
             || l.contains("/docs/"))
 }
 
+fn collect_multiline_es_import_export_lines(text: &str) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let starts_multiline_import = (trimmed.starts_with("import ")
+            || trimmed.starts_with("import{"))
+            && !trimmed.starts_with("import(")
+            && trimmed.contains('{')
+            && !trimmed.contains('}');
+        let starts_multiline_export = trimmed
+            .strip_prefix("export")
+            .and_then(|rest| {
+                if rest.starts_with(char::is_whitespace) || rest.starts_with('{') {
+                    let after = rest.trim_start();
+                    let after_ty = after
+                        .strip_prefix("type")
+                        .filter(|r| r.starts_with(char::is_whitespace) || r.starts_with('{'))
+                        .map(str::trim_start)
+                        .unwrap_or(after);
+                    Some(after_ty.starts_with('{') && !after_ty.contains('}'))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+        if starts_multiline_import || starts_multiline_export {
+            let max_end = (i + 32).min(lines.len());
+            let mut end_idx = None;
+            for (j, ln) in lines.iter().enumerate().take(max_end).skip(i + 1) {
+                if let Some(close_pos) = ln.find('}') {
+                    let after_close = ln[close_pos + 1..].trim_start();
+                    let next_has_from = lines
+                        .get(j + 1)
+                        .map(|n| n.trim_start().starts_with("from"))
+                        .unwrap_or(false);
+                    if after_close.starts_with("from") || next_has_from {
+                        end_idx = Some(if after_close.starts_with("from") {
+                            j
+                        } else {
+                            j + 1
+                        });
+                    }
+                    break;
+                }
+            }
+            if let Some(e) = end_idx {
+                for k in i..=e {
+                    out.insert(k + 1);
+                }
+                i = e + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn scan_text_into(
     rel_target: &str,
     text: &str,
@@ -621,15 +681,24 @@ fn scan_text_into(
     if is_test {
         return;
     }
+    let multiline_import_lines = if !is_binary_strings
+        && text.len() <= 512_000
+        && (text.contains("import") || text.contains("export"))
+    {
+        collect_multiline_es_import_export_lines(text)
+    } else {
+        HashSet::new()
+    };
 
     for rule in rules {
         let mut seen_symbols: HashSet<String> = HashSet::new();
         let mut file_axis_hits = 0usize;
         for m in rule.re.find_iter(text) {
-            // Skip obvious comment-only, bare ES import/export, and legal/docs URL prose lines
+            // Skip obvious comment-only, bare/multiline ES import/export, and legal/docs URL prose lines
             let (line_no, snippet) = clip_snippet(text, m.start(), m.end());
             if !is_binary_strings {
-                if snippet.starts_with("//")
+                if multiline_import_lines.contains(&line_no)
+                    || snippet.starts_with("//")
                     || snippet.starts_with('#')
                     || snippet.starts_with('*')
                     || is_legal_doc_url_prose(rule.axis, &snippet)
@@ -1545,6 +1614,32 @@ export function runCmd(arg: string) { return execSync(arg); }\n",
             normalize_surface_target(r"res\app.asar!dist\main.js"),
             "res/app.asar!/dist/main.js"
         );
+
+        // Cycle 7 P2 regression: multi-line ES `import { ... } from` must NOT emit dead lines
+        // or poison `seen_symbols` and shadow real sinks on later lines.
+        let ml_dir = dir.join("multiline_imp");
+        fs::create_dir_all(&ml_dir).unwrap();
+        fs::write(
+            ml_dir.join("mod.ts"),
+            "import {\n  execSync,\n  readFileSync\n} from 'node:fs';\nexport function run(arg: string) { return execSync(arg); }\n",
+        )
+        .unwrap();
+        let ml_map =
+            try_build_surface_map_with_excludes(&ml_dir, 50, 10, false, false, &[]).unwrap();
+        assert!(
+            ml_map
+                .items
+                .iter()
+                .any(|i| i.line == 5 && i.symbol == "execSync"),
+            "real execSync sink at L5 must NOT be shadowed by multiline import: {:?}",
+            ml_map.items
+        );
+        assert!(
+            !ml_map.items.iter().any(|i| i.line <= 4),
+            "multiline ES import lines L1-L4 must be skipped: {:?}",
+            ml_map.items
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

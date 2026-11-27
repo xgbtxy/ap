@@ -3105,6 +3105,8 @@ console.log("OK_PI_ACCELERATOR_NODE");
         let script = format!(
             r#"
 import assert from "node:assert/strict";
+import {{ spawnSync }} from "node:child_process";
+import {{ existsSync, writeFileSync }} from "node:fs";
 import initAccelerator, {{
   healCommand,
   healCodemodeSource,
@@ -3122,6 +3124,8 @@ import initAccelerator, {{
   normCmdFingerprint,
   isSieveSelfCommand,
   isSieveSelfCodemode,
+  shouldSkipAutoSieveForSelf,
+  SIEVE_SELF_MAX_BYPASS_CHARS,
   formatAutoSieveDigest,
   healMsysPathConv,
   healBashPowerShellCommand,
@@ -3658,15 +3662,24 @@ const clarifiedFooter = formatAutoSieveDigest(rawSieveFooter);
 assert.ok(clarifiedFooter.includes("regex: ap sieve peek abc12345 --grep REGEX"));
 assert.ok(clarifiedFooter.includes("keywords(FTS5): ap sieve search <words>"));
 
-// 4. Windows bash friction: findstr MSYS shield, whoami.exe rewrite, powershell -File UTF-8 lock
+// 4. Windows bash friction: findstr MSYS shield, System32 whoami.exe rewrite, powershell -File UTF-8 lock
 const dirFindstr = healCommand('dir /b "C:/tmp" | findstr /I /C:"usb" /C:"uhf"', "bash");
 if (process.platform === "win32") {{
   assert.ok(dirFindstr?.startsWith("export MSYS_NO_PATHCONV=1; ") && dirFindstr.includes('ls "C:/tmp" | findstr /I /C:"usb"'), `expected MSYS shield on dir|findstr, got: ${{dirFindstr}}`);
 }}
 assert.strictEqual(healMsysPathConv('echo x | findstr /I /C:"foo"', "bash"), 'export MSYS_NO_PATHCONV=1; echo x | findstr /I /C:"foo"');
-assert.strictEqual(healMsysPathConv("whoami /groups", "bash"), "MSYS_NO_PATHCONV=1 whoami.exe /groups");
-assert.strictEqual(healMsysPathConv("MSYS_NO_PATHCONV=1 whoami /groups", "bash"), "MSYS_NO_PATHCONV=1 whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("whoami /groups", "bash"), "MSYS_NO_PATHCONV=1 C:/Windows/System32/whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("whoami.exe /groups", "bash"), "MSYS_NO_PATHCONV=1 C:/Windows/System32/whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("MSYS_NO_PATHCONV=1 whoami /groups", "bash"), "MSYS_NO_PATHCONV=1 C:/Windows/System32/whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("MSYS_NO_PATHCONV=1 whoami.exe /groups", "bash"), "MSYS_NO_PATHCONV=1 C:/Windows/System32/whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("MSYS_NO_PATHCONV=1 C:/Windows/System32/whoami.exe /groups", "bash"), undefined);
 assert.strictEqual(healMsysPathConv("whoami", "bash"), undefined);
+assert.strictEqual(healMsysPathConv('echo "foo; whoami /all"', "bash"), undefined);
+assert.strictEqual(healMsysPathConv("echo 'foo; whoami /all'", "bash"), undefined);
+assert.strictEqual(
+  healMsysPathConv("whoami /all | findstr /i admin", "bash"),
+  "export MSYS_NO_PATHCONV=1; C:/Windows/System32/whoami.exe /all | findstr /i admin",
+);
 const psFileSimple = healBashPowerShellCommand('powershell -NoProfile -File "C:/tmp/probe.ps1" -Msg "hello" 2>&1 | head -20');
 assert.ok(
   psFileSimple &&
@@ -3680,6 +3693,74 @@ assert.ok(
   `unexpected ps -File var rewrite: ${{psFileVar}}`,
 );
 assert.strictEqual(healBashPowerShellCommand("powershell -NoProfile -File -"), undefined);
+
+// J) Cycle 7 red-team regression lock (compound/comment/64KB sieve cap, bare/MSYS/escaped PS -File, live Git Bash)
+assert.strictEqual(isSieveSelfCommand('ap sieve peek abc123 --grep "foo|bar" 2>&1'), true);
+assert.strictEqual(isSieveSelfCommand("ap sieve peek abc123 && cat huge.log"), false);
+assert.strictEqual(isSieveSelfCommand("ap sieve stats; ls -laR /"), false);
+assert.strictEqual(isSieveSelfCommand("ap sieve peek abc123 | head -n 20"), false);
+assert.strictEqual(isSieveSelfCommand("ap sieve run -- cat huge.log"), false);
+assert.strictEqual(isSieveSelfCommand('echo "run ap sieve peek" && cat huge.log'), false);
+assert.strictEqual(isSieveSelfCommand('python -c \'print("use ap sieve peek")\''), false);
+assert.strictEqual(isSieveSelfCodemode('await tools.ap_sieve({{ action: "peek", id: "abc" }}); await tools.bash({{ command: "cat huge.log" }});'), false);
+assert.strictEqual(isSieveSelfCodemode('await tools.bash({{ command: "ap sieve peek abc && cat huge.log" }});'), false);
+assert.strictEqual(isSieveSelfCodemode('// note: ap sieve peek abc\nawait tools.bash({{ command: "cat huge.log" }});'), false);
+assert.strictEqual(isSieveSelfCodemode('await tools.ap_sieve({{ action: "peek", id: "abc" }}); await tools.ap_sieve({{ action: "search", query: "err" }});'), true);
+assert.strictEqual(SIEVE_SELF_MAX_BYPASS_CHARS, 64000);
+assert.strictEqual(shouldSkipAutoSieveForSelf(true, 64000), true);
+assert.strictEqual(shouldSkipAutoSieveForSelf(true, 64001), false);
+assert.strictEqual(shouldSkipAutoSieveForSelf(true, 200000), false);
+assert.strictEqual(shouldSkipAutoSieveForSelf(false, 1000), false);
+
+const psFileBare = healBashPowerShellCommand("powershell -NoProfile -File probe.ps1");
+assert.ok(psFileBare && psFileBare.includes('& "./probe.ps1";'), `bare -File must prefix ./: ${{psFileBare}}`);
+const psFileMsys = healBashPowerShellCommand("powershell -NoProfile -File /c/tmp/probe.ps1");
+assert.ok(psFileMsys && psFileMsys.includes('& "C:/tmp/probe.ps1";'), `MSYS -File must normalize drive path: ${{psFileMsys}}`);
+assert.strictEqual(
+  healBashPowerShellCommand('powershell -NoProfile -File ./probe.ps1 -Arg1 "\\$literal"'),
+  undefined,
+  "escaped \\$ arg must skip -File wrapping so bash preserves literal $",
+);
+
+if (process.platform === "win32") {{
+  const gitBash = ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"].find((p) => existsSync(p));
+  if (gitBash) {{
+    const probePs1 = `${{DIR}}/probe.ps1`;
+    writeFileSync(probePs1, 'param([string]$Arg1 = "")\nWrite-Output ("OK|probe|" + $Arg1)\n', "utf8");
+    const runGitBash = (cmd) =>
+      spawnSync(gitBash, ["-lc", cmd], {{ cwd: DIR, encoding: "utf8", timeout: 20000, windowsHide: true }});
+
+    const healedWhoami = healCommand("whoami /groups", "bash");
+    assert.ok(healedWhoami && healedWhoami.includes("C:/Windows/System32/whoami.exe"));
+    const whRes = runGitBash(healedWhoami);
+    assert.strictEqual(whRes.status, 0, `live whoami /groups failed: rc=${{whRes.status}} err=${{whRes.stderr}}`);
+
+    const healedBare = healCommand("powershell -NoProfile -File probe.ps1", "bash");
+    assert.ok(healedBare);
+    const bareRes = runGitBash(healedBare);
+    assert.strictEqual(bareRes.status, 0, `live bare probe.ps1 failed: rc=${{bareRes.status}} err=${{bareRes.stderr}}`);
+    assert.ok((bareRes.stdout || "").includes("OK|probe|"), `bare probe stdout: ${{bareRes.stdout}}`);
+
+    const healedChain = healCommand(`cd "${{DIR}}" && powershell -NoProfile -File probe.ps1 && echo CHAIN_OK`, "bash");
+    assert.ok(healedChain);
+    const chainRes = runGitBash(healedChain);
+    assert.strictEqual(chainRes.status, 0, `live chained probe.ps1 failed: rc=${{chainRes.status}} err=${{chainRes.stderr}}`);
+    assert.ok((chainRes.stdout || "").includes("OK|probe|") && (chainRes.stdout || "").includes("CHAIN_OK"));
+
+    const msysPath = "/" + probePs1[0].toLowerCase() + probePs1.slice(2);
+    const healedMsys = healCommand(`powershell -NoProfile -File ${{msysPath}}`, "bash");
+    assert.ok(healedMsys);
+    const msysRes = runGitBash(healedMsys);
+    assert.strictEqual(msysRes.status, 0, `live MSYS probe.ps1 failed: rc=${{msysRes.status}} err=${{msysRes.stderr}}`);
+    assert.ok((msysRes.stdout || "").includes("OK|probe|"));
+
+    const escCmd = 'powershell -NoProfile -File ./probe.ps1 -Arg1 "\\$literal"';
+    const healedEsc = healCommand(escCmd, "bash") ?? escCmd;
+    const escRes = runGitBash(healedEsc);
+    assert.strictEqual(escRes.status, 0, `live escaped-dollar probe.ps1 failed: rc=${{escRes.status}} err=${{escRes.stderr}}`);
+    assert.ok((escRes.stdout || "").includes("OK|probe|$literal"), `escaped-dollar stdout: ${{escRes.stdout}}`);
+  }}
+}}
 
 console.log(JSON.stringify(emittedApInvocations));
 "#

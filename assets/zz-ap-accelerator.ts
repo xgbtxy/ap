@@ -2959,20 +2959,149 @@ export function countCodemodeStoreKeys(branch: ReadonlyArray<Record<string, unkn
 	return listCodemodeStoreKeys(branch).length;
 }
 
+export const SIEVE_SELF_MAX_BYPASS_CHARS = 64_000;
+
+export function shouldSkipAutoSieveForSelf(isSelf: boolean, maxBlockLen: number): boolean {
+	return isSelf && maxBlockLen <= SIEVE_SELF_MAX_BYPASS_CHARS;
+}
+
+function hasUnquotedShellChainOrPipe(s: string): boolean {
+	let q: "'" | '"' | null = null;
+	for (let i = 0; i < s.length; i++) {
+		const ch = s[i];
+		if (q) {
+			if (ch === "\\" && q === '"' && i + 1 < s.length) {
+				i++;
+				continue;
+			}
+			if (ch === q) q = null;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < s.length) {
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			q = ch;
+			continue;
+		}
+		if (ch === ";" || ch === "|" || ch === "\n" || ch === "\r") return true;
+		if (ch === "&") {
+			// Allow benign fd redirections like `2>&1` or `>&2`, reject `&&` and background `&`
+			if (s[i + 1] === "&") return true;
+			if (i === 0 || s[i - 1] !== ">") return true;
+		}
+	}
+	return false;
+}
+
+function stripJsCommentsPreserveStrings(code: string): string {
+	let out = "";
+	let q: "'" | '"' | "`" | null = null;
+	for (let i = 0; i < code.length; i++) {
+		const ch = code[i];
+		const next = code[i + 1];
+		if (q) {
+			out += ch;
+			if (ch === "\\" && i + 1 < code.length) {
+				out += code[++i];
+				continue;
+			}
+			if (ch === q) q = null;
+			continue;
+		}
+		if (ch === "/" && next === "/") {
+			i += 2;
+			while (i < code.length && code[i] !== "\n") i++;
+			if (i < code.length) out += "\n";
+			continue;
+		}
+		if (ch === "/" && next === "*") {
+			i += 2;
+			while (i + 1 < code.length && !(code[i] === "*" && code[i + 1] === "/")) i++;
+			i++;
+			out += " ";
+			continue;
+		}
+		if (ch === "'" || ch === '"' || ch === "`") {
+			q = ch;
+		}
+		out += ch;
+	}
+	return out;
+}
+
 export function isSieveSelfCommand(cmd: string): boolean {
 	if (!cmd) return false;
-	return (
-		/(?:^|[\s;&|("'/\\])ap(?:\.exe)?["']?\s+sieve\b/i.test(cmd) ||
-		/\b(?:ap_sieve|sieve_query|sieve_peek)\b/i.test(cmd)
+	let rest = cmd.trim();
+	// Strip harmless leading env prefixes (`export ...;`, `VAR=VAL `) or `cd <dir> &&`
+	let progressed = true;
+	while (progressed) {
+		progressed = false;
+		const envM = rest.match(/^(?:export\s+(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s*)+;\s*|(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s+)+)/);
+		if (envM) {
+			rest = rest.slice(envM[0].length).trimStart();
+			progressed = true;
+			continue;
+		}
+		const cdM = rest.match(/^cd(?:\s+\/d)?\s+(?:"[^"]+"|'[^']+'|\S+)\s*(?:&&|;)\s*/i);
+		if (cdM) {
+			rest = rest.slice(cdM[0].length).trimStart();
+			progressed = true;
+		}
+	}
+	if (!rest || hasUnquotedShellChainOrPipe(rest)) return false;
+	return /^(?:(?:"[^"\r\n]*[/\\]ap(?:\.exe)?"|'[^'\r\n]*[/\\]ap(?:\.exe)?'|(?:[^\s"'`;&|]*[/\\])?ap(?:\.exe)?))\s+sieve\s+(?:peek|search|list|prune|stats)\b/i.test(
+		rest,
 	);
 }
 
 export function isSieveSelfCodemode(code: string): boolean {
 	if (!code) return false;
-	return (
-		/\btools\.(?:mcp__agent_primitives__ap_sieve|ap_sieve|[a-z0-9_]*sieve_query)\s*\(/i.test(code) ||
-		/(?:^|[\s;&|("'/\\`])ap(?:\.exe)?["']?\s+sieve\s+(?:peek|search|list|prune|stats)\b/i.test(code)
-	);
+	const stripped = stripJsCommentsPreserveStrings(code);
+	const calls: Array<{ name: string; openIdx: number }> = [];
+	const callRe = /\btools\.([A-Za-z0-9_$]+)\s*\(/g;
+	let m: RegExpExecArray | null;
+	while ((m = callRe.exec(stripped)) !== null) {
+		calls.push({ name: m[1], openIdx: m.index + m[0].length });
+	}
+	if (calls.length === 0) return false;
+	for (const c of calls) {
+		if (/^(?:mcp__agent_primitives__ap_sieve|ap_sieve|[a-z0-9_]*sieve_(?:query|peek))$/i.test(c.name)) {
+			continue;
+		}
+		if (c.name === "bash" || c.name === "powershell") {
+			// Extract the balanced call argument slice and verify a static sieve-self command literal
+			let depth = 1;
+			let q: "'" | '"' | "`" | null = null;
+			let i = c.openIdx;
+			while (i < stripped.length && depth > 0) {
+				const ch = stripped[i];
+				if (q) {
+					if (ch === "\\" && i + 1 < stripped.length) {
+						i += 2;
+						continue;
+					}
+					if (ch === q) q = null;
+					i++;
+					continue;
+				}
+				if (ch === "'" || ch === '"' || ch === "`") q = ch;
+				else if (ch === "(") depth++;
+				else if (ch === ")") depth--;
+				i++;
+			}
+			const argBody = stripped.slice(c.openIdx, Math.max(c.openIdx, i - 1));
+			const cmdM = argBody.match(/\bcommand\s*:\s*(['"`])((?:\\[\s\S]|(?!\1)[\s\S])*)\1/);
+			if (!cmdM) return false;
+			if (cmdM[1] === "`" && cmdM[2].includes("${")) return false;
+			const litCmd = cmdM[2].replace(/\\(["'`\\])/g, "$1");
+			if (!isSieveSelfCommand(litCmd)) return false;
+			continue;
+		}
+		return false;
+	}
+	return true;
 }
 
 /**
@@ -3705,16 +3834,29 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {
 			}
 			const rawScriptTok = tokM[1];
 			const restArgs = tokM[2] || "";
-			const scriptTok =
-				(rawScriptTok.startsWith('"') && rawScriptTok.endsWith('"')) ||
-				(rawScriptTok.startsWith("'") && rawScriptTok.endsWith("'"))
-					? rawScriptTok
-					: `"${rawScriptTok}"`;
-			const psCall = `${scriptTok}${restArgs}`;
-			if (/'[^']*[$`][^']*'/.test(psCall)) {
+			// Bail out cleanly when bash-escaped metachars (`\$`, `` \` ``, `\"`) or single-quoted `$`/backticks cannot round-trip losslessly
+			if (/'[^']*[$`][^']*'/.test(argSpan) || /\\[$`"]/.test(argSpan)) {
 				fileCur = segEnd;
 				continue;
 			}
+			const quoteChar =
+				rawScriptTok.startsWith('"') && rawScriptTok.endsWith('"')
+					? '"'
+					: rawScriptTok.startsWith("'") && rawScriptTok.endsWith("'")
+						? "'"
+						: "";
+			let innerPath = quoteChar ? rawScriptTok.slice(1, -1) : rawScriptTok;
+			// Normalize MSYS2 `/c/...` or `/tmp/...` paths because MSYS2 does not translate paths embedded inside `-Command`
+			const normMsysScript = normalizeWindowsToolPath(innerPath, true);
+			if (normMsysScript) {
+				innerPath = normMsysScript;
+			}
+			// PowerShell `& "probe.ps1"` refuses bare filenames in CWD without `./` or `.\` (unlike `-File`)
+			if (innerPath && !/[\\/:$]/.test(innerPath)) {
+				innerPath = `./${innerPath}`;
+			}
+			const scriptTok = quoteChar ? `${quoteChar}${innerPath}${quoteChar}` : `"${innerPath}"`;
+			const psCall = `${scriptTok}${restArgs}`;
 			const needsBashExpand = /[$`]/.test(psCall) || psCall.includes("'");
 			const wrappedCmd = needsBashExpand
 				? `"[Console]::OutputEncoding=[Text.Encoding]::UTF8; \\$OutputEncoding=[Text.Encoding]::UTF8; & ${psCall.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}; if (\\$LASTEXITCODE) { exit \\$LASTEXITCODE } elseif (-not \\$?) { exit 1 }"`
@@ -3788,8 +3930,111 @@ export function clampKvSafeSleep(cmd: string, toolName: string, maxSec = 45): st
 	return undefined;
 }
 
-const MSYS_WIN_CLI_RE = /(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|findstr(?:\.exe)?|taskkill(?:\.exe)?|tasklist(?:\.exe)?|sc(?:\.exe)?|icacls(?:\.exe)?|reg(?:\.exe)?|netstat(?:\.exe)?|whoami(?:\.exe)?|schtasks(?:\.exe)?|wevtutil(?:\.exe)?|netsh(?:\.exe)?|where(?:\.exe)?|wmic(?:\.exe)?|certutil(?:\.exe)?|bcdedit(?:\.exe)?|secedit(?:\.exe)?)\b[^\r\n;&|]*?\s\/[A-Za-z?]/i;
+const WIN_SYSTEM32_WHOAMI = "C:/Windows/System32/whoami.exe";
+const MSYS_WIN_CLI_RE = /(?:^|[;&|]\s*)(?:(?:[A-Za-z]:[/\\]|\/[a-zA-Z]\/)?(?:Windows[/\\]System32[/\\])?whoami(?:\.exe)?|cmd(?:\.exe)?|findstr(?:\.exe)?|taskkill(?:\.exe)?|tasklist(?:\.exe)?|sc(?:\.exe)?|icacls(?:\.exe)?|reg(?:\.exe)?|netstat(?:\.exe)?|schtasks(?:\.exe)?|wevtutil(?:\.exe)?|netsh(?:\.exe)?|where(?:\.exe)?|wmic(?:\.exe)?|certutil(?:\.exe)?|bcdedit(?:\.exe)?|secedit(?:\.exe)?)\b[^\r\n;&|]*?\s\/[A-Za-z?]/i;
 const MSYS_OPENSSL_SUBJ_RE = /\bopenssl\b[^\r\n;&|]*?\s-subj\s+['"]?\//i;
+
+function stripQuotedShellContents(raw: string): string {
+	let out = "";
+	let q: "'" | '"' | null = null;
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i];
+		if (q) {
+			if (ch === "\\" && q === '"' && i + 1 < raw.length) {
+				i++;
+				continue;
+			}
+			if (ch === q) {
+				out += q;
+				q = null;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			q = ch;
+			out += ch;
+			continue;
+		}
+		out += ch;
+	}
+	return out;
+}
+
+/**
+ * Rewrite non-path-qualified `whoami` / `whoami.exe` followed by a Windows `/flag` strictly outside
+ * quoted strings to `C:/Windows/System32/whoami.exe`, avoiding Git Bash's `/usr/bin/whoami.exe` PATH collision.
+ */
+function rewriteUnqualifiedWhoamiFlag(raw: string): { text: string; changed: boolean } {
+	let out = "";
+	let changed = false;
+	let q: "'" | '"' | null = null;
+	let atCmdPos = true;
+	let i = 0;
+	while (i < raw.length) {
+		const ch = raw[i];
+		if (q) {
+			out += ch;
+			if (ch === "\\" && q === '"' && i + 1 < raw.length) {
+				out += raw[++i];
+			} else if (ch === q) {
+				q = null;
+			}
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			q = ch;
+			out += ch;
+			atCmdPos = false;
+			i++;
+			continue;
+		}
+		if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "\n" || ch === "\r") {
+			out += ch;
+			atCmdPos = true;
+			i++;
+			continue;
+		}
+		if (atCmdPos) {
+			if (ch === " " || ch === "\t") {
+				out += ch;
+				i++;
+				continue;
+			}
+			const tail = raw.slice(i);
+			// Skip leading inline env assignment (`FOO=bar `) or shell keyword (`then `, `do `, `else `, `elif `, `! `)
+			const envM = tail.match(/^[A-Za-z_]\w*=(?:"(?:\\.|[^"\\])*"|'[^']*'|\S+)[ \t]+/);
+			if (envM) {
+				out += envM[0];
+				i += envM[0].length;
+				continue;
+			}
+			const kwM = tail.match(/^(?:then|do|else|elif|!)(?=[ \t]+)[ \t]+/);
+			if (kwM) {
+				out += kwM[0];
+				i += kwM[0].length;
+				continue;
+			}
+			const whM = tail.match(/^whoami(?:\.exe)?(?=[ \t]+\/[A-Za-z?])/i);
+			if (whM) {
+				out += WIN_SYSTEM32_WHOAMI;
+				i += whM[0].length;
+				changed = true;
+				atCmdPos = false;
+				continue;
+			}
+			atCmdPos = false;
+		}
+		if (ch === "\\" && i + 1 < raw.length) {
+			out += ch + raw[++i];
+			i++;
+			continue;
+		}
+		out += ch;
+		i++;
+	}
+	return { text: out, changed };
+}
 
 export function normalizeWindowsToolPath(rawPath: string, isWin = process.platform === "win32"): string | undefined {
 	if (!rawPath || !isWin) return undefined;
@@ -3810,19 +4055,18 @@ export function normalizeWindowsToolPath(rawPath: string, isWin = process.platfo
 export function healMsysPathConv(raw: string, toolName = "bash"): string | undefined {
 	if (!raw || toolName !== "bash") return undefined;
 	const hasMsysEnv = /\b(?:MSYS_NO_PATHCONV|MSYS2_ARG_CONV_EXCL)=/.test(raw);
-	const hasBareWhoamiFlag = /(?:^|[\r\n;&|(]\s*)(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s+)*whoami(?=\s+\/[A-Za-z?])/i.test(raw);
-	if (hasMsysEnv && !hasBareWhoamiFlag) return undefined;
-	if (!hasBareWhoamiFlag && /(?:^|\s)\/\/[A-Za-z?]/.test(raw)) return undefined;
-	if (!hasBareWhoamiFlag && !MSYS_WIN_CLI_RE.test(raw) && !MSYS_OPENSSL_SUBJ_RE.test(raw)) return undefined;
-	let converted = raw.replace(/(^|[\s'"=])\/([a-zA-Z])\/([^\s'"`;&|<>()]*)/g, (_m, pfx: string, drv: string, tail: string) => {
-		return `${pfx}${drv.toUpperCase()}:/${tail}`;
-	});
-	if (hasBareWhoamiFlag) {
-		converted = converted.replace(
-			/((?:^|[\r\n;&|(]\s*)(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s+)*)whoami(?=\s+\/[A-Za-z?])/gi,
-			"$1whoami.exe",
-		);
-	}
+	const whoamiRewrite = rewriteUnqualifiedWhoamiFlag(raw);
+	const hasUnqualifiedWhoamiFlag = whoamiRewrite.changed;
+	if (hasMsysEnv && !hasUnqualifiedWhoamiFlag) return undefined;
+	const unquoted = stripQuotedShellContents(raw);
+	if (!hasUnqualifiedWhoamiFlag && /(?:^|\s)\/\/[A-Za-z?]/.test(unquoted)) return undefined;
+	if (!hasUnqualifiedWhoamiFlag && !MSYS_WIN_CLI_RE.test(unquoted) && !MSYS_OPENSSL_SUBJ_RE.test(raw)) return undefined;
+	let converted = whoamiRewrite.text.replace(
+		/(^|[\s'"=])\/([a-zA-Z])\/([^\s'"`;&|<>()]*)/g,
+		(_m, pfx: string, drv: string, tail: string) => {
+			return `${pfx}${drv.toUpperCase()}:/${tail}`;
+		},
+	);
 	if (hasMsysEnv) return converted !== raw ? converted : undefined;
 	const trimmed = converted.trimStart();
 	if (trimmed.includes("\n")) return `export MSYS_NO_PATHCONV=1\n${converted}`;
@@ -7808,7 +8052,13 @@ export default function (pi: ExtensionAPI) {
 		// 0. Lossless multi-block auto-sieve for oversized `codemode` dumps (content[1..N]; preserves header, Script error & images)
 		if (event.toolName === "codemode") {
 			const cmCode = typeof event.input?.code === "string" ? event.input.code : "";
-			if (!isSieveSelfCodemode(cmCode)) {
+			let maxCodemodeBlockLen = 0;
+			for (const blk of workingContent) {
+				if (blk?.type === "text" && typeof blk.text === "string" && blk.text.length > maxCodemodeBlockLen) {
+					maxCodemodeBlockLen = blk.text.length;
+				}
+			}
+			if (!shouldSkipAutoSieveForSelf(isSieveSelfCodemode(cmCode), maxCodemodeBlockLen)) {
 				const sieved = sieveCodemodeContentBlocks(
 					workingContent,
 					(rawBody) => {
@@ -8104,7 +8354,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			const boundedApMax = effContextTokens >= 120_000 ? 12000 : effContextTokens >= 80_000 ? 18000 : 24000;
-			const skipSieve = isSieveSelf || (isBoundedApCmd && maxShellBlockLen < boundedApMax && !hasGiantShellLine);
+			const skipSieve =
+				shouldSkipAutoSieveForSelf(isSieveSelf, maxShellBlockLen) ||
+				(isBoundedApCmd && maxShellBlockLen < boundedApMax && !hasGiantShellLine);
 			if (!skipSieve) {
 				const sievedShell = sieveShellContentBlocks(
 					workingContent,

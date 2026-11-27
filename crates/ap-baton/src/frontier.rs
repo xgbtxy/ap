@@ -256,18 +256,27 @@ fn prune_stale_tmp_files(store_path: &Path) {
         let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+        let Some(middle) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        // Only prune our own `<store>.<pid>.<nanos>.<seq>.tmp` artifacts; never panic on or delete
+        // unrelated sibling files such as `<store>.tmp` or `<store>.bak.tmp`.
+        let mut parts = middle.split('.');
+        let (Some(pid_tok), Some(nanos_tok), Some(seq_tok), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid_tok.parse::<u32>() else {
+            continue;
+        };
+        if nanos_tok.parse::<u128>().is_err() || seq_tok.parse::<u64>().is_err() {
             continue;
         }
-        let middle = &name[prefix.len()..name.len() - 4];
-        let mut stale = false;
-        if let Some(pid_tok) = middle.split('.').next() {
-            if let Ok(pid) = pid_tok.parse::<u32>() {
-                if pid != my_pid && !is_pid_alive(pid) {
-                    stale = true;
-                }
-            }
-        }
+        let mut stale = pid != my_pid && !is_pid_alive(pid);
         if !stale {
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mtime) = meta.modified() {
@@ -3531,6 +3540,21 @@ mod tests {
         assert!(
             leftover_tmps.is_empty(),
             "RAII guard must remove temp file on failed atomic write: {leftover_tmps:?}"
+        );
+
+        // Cycle 7 P0 regression: extensionless `--store .../frontier` with sibling `frontier.tmp`
+        // and `frontier.user.tmp` must NEVER panic or delete unrelated user `.tmp` files.
+        let noext_store = tmp_dir_test.join("frontier");
+        let sibling_short = tmp_dir_test.join("frontier.tmp");
+        let sibling_user = tmp_dir_test.join("frontier.user.tmp");
+        fs::write(&sibling_short, "user temp").unwrap();
+        fs::write(&sibling_user, "user named temp").unwrap();
+        let mut st_noext = FrontierState::default();
+        save_frontier(&noext_store, &mut st_noext).unwrap();
+        assert!(sibling_short.exists(), "frontier.tmp must survive intact");
+        assert!(
+            sibling_user.exists(),
+            "frontier.user.tmp must survive intact"
         );
 
         let _ = fs::remove_dir_all(&td);

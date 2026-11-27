@@ -15838,3 +15838,296 @@ fn test_cycle6_live_artifact_fixes_sieve_read_surface_frontier_win_and_search() 
         }
     }
 }
+
+#[test]
+fn test_cycle7_frontier_panic_win_filter_asar_ioctl_dirdiff_sieve_and_surface() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let ap_home = root.join("ap_home_c7");
+    let sv_dir = root.join("sieve_c7");
+    fs::create_dir_all(&ap_home).unwrap();
+    fs::create_dir_all(&sv_dir).unwrap();
+    let iso_env = [
+        ("AP_HOME", ap_home.as_path()),
+        ("SIEVE_HOME", sv_dir.as_path()),
+    ];
+
+    // 1. P0 Frontier extensionless store + sibling `frontier.tmp`: 0 panic & preserves user `.tmp`
+    let fdir = root.join("f_c7");
+    fs::create_dir_all(&fdir).unwrap();
+    let sib_tmp = fdir.join("frontier.tmp");
+    fs::write(&sib_tmp, "keep-me").unwrap();
+    let f_res = run_ap(
+        &fdir,
+        &[
+            "baton",
+            "frontier",
+            "seed",
+            "--store",
+            fdir.join("frontier").to_str().unwrap(),
+            "--axis",
+            "exec_spawn",
+            "--target",
+            "src/a.rs",
+            "--json",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(
+        f_res.status.success(),
+        "extensionless frontier + frontier.tmp panicked/failed: {}",
+        String::from_utf8_lossy(&f_res.stderr)
+    );
+    assert!(
+        sib_tmp.exists(),
+        "unrelated frontier.tmp must not be deleted"
+    );
+
+    // 2. P1 Sieve: `sieve run -- ... --grep -i foo` preserves argv & `$.a['b.c'][0].name` resolves
+    let dot_json = r#"{"a":{"b.c":[{"name":"DOT_BRACKET_OK"}]}}"#;
+    let p_dot = run_ap(
+        root,
+        &["sieve", "pipe", "--label", "dotk", "--json"],
+        Some(dot_json),
+        &iso_env,
+    );
+    assert!(p_dot.status.success());
+    let sid_dot = serde_json::from_slice::<Value>(&p_dot.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let jp_dot = run_ap(
+        root,
+        &[
+            "sieve",
+            "peek",
+            &sid_dot,
+            "--json-path",
+            "$.a['b.c'][0].name",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(
+        jp_dot.status.success()
+            && String::from_utf8_lossy(&jp_dot.stdout).contains("DOT_BRACKET_OK"),
+        "quoted dotted JSONPath failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&jp_dot.stdout),
+        String::from_utf8_lossy(&jp_dot.stderr)
+    );
+    let echo_argv_out = if cfg!(windows) {
+        run_ap(
+            root,
+            &[
+                "sieve", "run", "--", "cmd", "/C", "echo", "--grep", "-i", "foo",
+            ],
+            None,
+            &iso_env,
+        )
+    } else {
+        run_ap(
+            root,
+            &["sieve", "run", "--", "echo", "--grep", "-i", "foo"],
+            None,
+            &iso_env,
+        )
+    };
+    let echo_s = String::from_utf8_lossy(&echo_argv_out.stdout);
+    assert!(
+        echo_argv_out.status.success() && echo_s.contains("--grep -i foo"),
+        "sieve run must never reorder wrapped argv: {echo_s}"
+    );
+
+    // 3. P2 Atlas surface: multi-line ES import must not shadow real sink on later line
+    let surf_d = root.join("surf_ml");
+    fs::create_dir_all(surf_d.join("src")).unwrap();
+    fs::write(
+        surf_d.join("src/mod.ts"),
+        "import {\n  execSync,\n  readFileSync\n} from 'node:fs';\nexport function run(x: string) { return execSync(x); }\n",
+    )
+    .unwrap();
+    let surf_o = run_ap(
+        root,
+        &["atlas", "surface", surf_d.to_str().unwrap(), "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(surf_o.status.success());
+    let surf_v: Value = serde_json::from_slice(&surf_o.stdout).unwrap();
+    let sitems = surf_v["items"].as_array().unwrap();
+    assert!(
+        sitems
+            .iter()
+            .any(|i| i["target"] == "src/mod.ts" && i["line"] == 5 && i["symbol"] == "execSync"),
+        "real L5 execSync must survive multiline import: {surf_v}"
+    );
+    assert!(
+        !sitems.iter().any(|i| i["line"].as_u64().unwrap_or(0) <= 4),
+        "multiline import lines L1-L4 must be skipped: {surf_v}"
+    );
+
+    // 4. P0 `--asar-surface --json`: emits `ipc_channels` + `routes` & filters >64 RegExp.exec()
+    // calls before real tail sinks (`cp.exec` & `shell.openExternal`)
+    let mut main_js_str = String::from(
+        "const { ipcMain, shell } = require('electron');\n\
+const cp = require('child_process');\n\
+const rx = /token=([a-z0-9]+)/gi;\n\
+function parse(s, l, r) {\n\
+  const m1 = rx.exec(s);\n\
+  const m2 = /^foo\\d+$/i.exec(s);\n\
+  const m3 = new RegExp(s).exec(r);\n\
+  var f = l.exec(r);\n",
+    );
+    for idx in 0..80 {
+        main_js_str.push_str(&format!("  const r{idx} = /tok{idx}/g.exec(s);\n"));
+    }
+    main_js_str.push_str(
+        "  return [m1, m2, m3, f];\n\
+}\n\
+ipcMain.handle('app:run-task', (ev, cmd) => cp.exec(cmd));\n\
+function openDoc(userUrl) { return shell.openExternal(userUrl); }\n\
+fetch('/api/v1/admin/export', { method: 'POST' });\n",
+    );
+    let main_js = main_js_str.as_bytes();
+    let hdr_json = format!(
+        r#"{{"files":{{"main.js":{{"size":{},"offset":"0"}}}}}}"#,
+        main_js.len()
+    );
+    let hdr_b = hdr_json.as_bytes();
+    let pad_n = (4 - (hdr_b.len() % 4)) % 4;
+    let inner_len = 4 + hdr_b.len() + pad_n;
+    let mut asar = Vec::new();
+    asar.extend_from_slice(&4u32.to_le_bytes());
+    asar.extend_from_slice(&(inner_len as u32 + 4).to_le_bytes());
+    asar.extend_from_slice(&(inner_len as u32).to_le_bytes());
+    asar.extend_from_slice(&(hdr_b.len() as u32).to_le_bytes());
+    asar.extend_from_slice(hdr_b);
+    asar.resize(asar.len() + pad_n, 0);
+    asar.extend_from_slice(main_js);
+    let asar_p = root.join("c7_app.asar");
+    fs::write(&asar_p, &asar).unwrap();
+
+    let asar_out = run_ap(
+        root,
+        &["read", asar_p.to_str().unwrap(), "--asar-surface", "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(
+        asar_out.status.success(),
+        "asar-surface failed: {}",
+        String::from_utf8_lossy(&asar_out.stderr)
+    );
+    let asar_v: Value = serde_json::from_slice(&asar_out.stdout).unwrap();
+    assert!(
+        asar_v["ipc_channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "app:run-task"),
+        "expected top-level ipc_channels alias: {asar_v}"
+    );
+    assert!(
+        !asar_v["routes"].as_array().unwrap().is_empty(),
+        "expected top-level routes alias: {asar_v}"
+    );
+    let sinks = asar_v["dangerous_sinks"].as_array().unwrap();
+    assert!(
+        sinks.iter().any(
+            |s| s["sink"] == ".exec" && s["snippet"].as_str().unwrap_or("").contains("cp.exec")
+        ),
+        "real cp.exec sink after >64 regex.exec calls must survive: {asar_v}"
+    );
+    assert!(
+        sinks.iter().any(|s| s["sink"] == ".openExternal"
+            && s["snippet"].as_str().unwrap_or("").contains("openExternal")),
+        "real shell.openExternal sink after >64 regex.exec calls must survive: {asar_v}"
+    );
+    assert_eq!(
+        sinks.len(),
+        3,
+        "expected exactly child_process + cp.exec + shell.openExternal (0 of 84 RegExp.exec): {asar_v}"
+    );
+    assert!(
+        !sinks.iter().any(|s| {
+            let sn = s["snippet"].as_str().unwrap_or("");
+            s["sink"] == ".exec"
+                && (sn.contains("rx.exec")
+                    || sn.contains("l.exec")
+                    || sn.contains("RegExp")
+                    || sn.contains("/tok"))
+        }),
+        "RegExp.exec() calls must be filtered from dangerous_sinks: {asar_v}"
+    );
+
+    // 5. P1 Directory diff: `ap diff <old_dir> <new_dir> --json`
+    let d1 = root.join("build_v1");
+    let d2 = root.join("build_v2");
+    fs::create_dir_all(d1.join("sub")).unwrap();
+    fs::create_dir_all(d2.join("sub")).unwrap();
+    fs::write(d1.join("same.txt"), "unchanged").unwrap();
+    fs::write(d2.join("same.txt"), "unchanged").unwrap();
+    fs::write(d1.join("sub/mod.txt"), "old_body").unwrap();
+    fs::write(d2.join("sub/mod.txt"), "new_body_longer").unwrap();
+    fs::write(d1.join("gone.txt"), "removed").unwrap();
+    fs::write(d2.join("added.txt"), "added_new").unwrap();
+    let dd_out = run_ap(
+        root,
+        &["diff", d1.to_str().unwrap(), d2.to_str().unwrap(), "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(
+        dd_out.status.success(),
+        "ap diff <dir1> <dir2> failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&dd_out.stdout),
+        String::from_utf8_lossy(&dd_out.stderr)
+    );
+    let ddv: Value = serde_json::from_slice(&dd_out.stdout).unwrap();
+    assert_eq!(ddv["ok"], true);
+    assert_eq!(ddv["format"], "dir-diff");
+    assert_eq!(ddv["unchanged_count"], 1);
+    assert_eq!(ddv["added"][0]["path"], "added.txt");
+    assert_eq!(ddv["removed"][0]["path"], "gone.txt");
+    assert_eq!(ddv["modified"][0]["path"], "sub/mod.txt");
+
+    // 6. P0 Windows: `probe win --filter "A|B"` & `--ioctl --json` emits both `ioctl_codes` + `ioctls`
+    #[cfg(windows)]
+    {
+        let wf_out = run_ap(
+            root,
+            &[
+                "probe",
+                "win",
+                "--services",
+                "--filter",
+                "EventLog|NonExistent999",
+                "--json",
+            ],
+            None,
+            &iso_env,
+        );
+        assert!(wf_out.status.success());
+        let wfv: Value = serde_json::from_slice(&wf_out.stdout).unwrap();
+        assert!(
+            wfv["returned"].as_u64().unwrap_or(0) >= 1,
+            "probe win --filter alternation failed: {wfv}"
+        );
+
+        let k32 = Path::new(r"C:\Windows\System32\kernel32.dll");
+        if k32.is_file() {
+            let io_out = run_ap(
+                root,
+                &["read", k32.to_str().unwrap(), "--ioctl", "--json"],
+                None,
+                &iso_env,
+            );
+            assert!(io_out.status.success());
+            let iov: Value = serde_json::from_slice(&io_out.stdout).unwrap();
+            assert_eq!(iov["ok"], true);
+            assert!(iov["ioctl_codes"].is_array() && iov["ioctls"].is_array());
+            assert_eq!(iov["ioctl_codes"], iov["ioctls"]);
+        }
+    }
+}

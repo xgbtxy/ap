@@ -727,6 +727,74 @@ fn inspect_archive_surface_reader_opts<R: Read + Seek>(
     let snip_cap = if compact_asar_surface { 96 } else { 140 };
     let ipc_cap = if compact_asar_surface { 120 } else { 40 };
 
+    fn is_likely_regexp_exec(text: &str, dot_pos: usize) -> bool {
+        let mut pre_s = dot_pos.saturating_sub(120);
+        while pre_s < dot_pos && !text.is_char_boundary(pre_s) {
+            pre_s += 1;
+        }
+        let mut post_e = (dot_pos + 120).min(text.len());
+        while post_e > dot_pos && !text.is_char_boundary(post_e) {
+            post_e -= 1;
+        }
+        let before = text[pre_s..dot_pos].trim_end();
+        let around_low = text[pre_s..post_e].to_ascii_lowercase();
+
+        // 1. Direct regex literal: `/.../gimsuy.exec(...)`
+        let before_no_flags = before.trim_end_matches(['d', 'g', 'i', 'm', 's', 'u', 'v', 'y']);
+        if before_no_flags.ends_with('/') && before_no_flags.len() >= 2 {
+            return true;
+        }
+        // 2. Explicit `new RegExp(...).exec(...)`
+        if before.ends_with(')') && before.to_ascii_lowercase().contains("regexp(") {
+            return true;
+        }
+        // 3. Receiver identifier before `.exec(`
+        let recv: &str = before
+            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .next()
+            .unwrap_or("");
+        let recv_low = recv.to_ascii_lowercase();
+        if matches!(
+            recv_low.as_str(),
+            "child_process"
+                | "childprocess"
+                | "cp"
+                | "shell"
+                | "shelljs"
+                | "proc"
+                | "db"
+                | "sqlite"
+        ) || recv_low.contains("child")
+            || recv_low.contains("shell")
+            || recv_low.contains("proc")
+            || recv_low.contains("cmd")
+        {
+            return false;
+        }
+        if matches!(recv_low.as_str(), "re" | "rx" | "rgx" | "pat")
+            || recv_low.contains("regex")
+            || recv_low.contains("regexp")
+            || recv_low.contains("pattern")
+            || recv_low.contains("matcher")
+        {
+            return true;
+        }
+        let has_exec_ctx = around_low.contains("child_process")
+            || around_low.contains("execsync")
+            || around_low.contains("execfile")
+            || around_low.contains("shelljs")
+            || around_low.contains("sqlite");
+        let has_regex_ctx = around_low.contains("regexp")
+            || around_low.contains("lastindex")
+            || around_low.contains("!==null")
+            || around_low.contains("!=null")
+            || around_low.contains("!== null")
+            || around_low.contains("!= null")
+            || around_low.contains("while((")
+            || around_low.contains("while ((");
+        (has_regex_ctx || recv.len() == 1) && !has_exec_ctx
+    }
+
     static SINK_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let sink_re = SINK_RE.get_or_init(|| {
         Regex::new(r#"(?:\bchild_process\b|(?:\b|\.)(?:execFile|execFileSync|spawn|spawnSync|execSync)\s*\(|\.(?:exec|openExternal|openPath)\s*\(|\bvm\.runIn[A-Za-z]*\s*\(|\beval\s*\(|\bnew\s+Function\s*\(|\bfs\.(?:writeFile|writeFileSync|chmod|chmodSync)\s*\()"#).unwrap()
@@ -828,11 +896,15 @@ fn inspect_archive_surface_reader_opts<R: Read + Seek>(
                 }
             }
         }
-        for sm in sink_re.find_iter(text).take(32) {
-            if dangerous_sinks.len() >= 40 {
+        let mut kept_sinks_in_file = 0usize;
+        for sm in sink_re.find_iter(text).take(4096) {
+            if dangerous_sinks.len() >= 40 || kept_sinks_in_file >= 32 {
                 break;
             }
             let sink_tok = sm.as_str().trim_end_matches('(').trim().to_string();
+            if sink_tok == ".exec" && is_likely_regexp_exec(text, sm.start()) {
+                continue;
+            }
             if seen_sinks.insert((path.to_string(), sink_tok.clone())) {
                 let ln = text[..sm.start()].bytes().filter(|&b| b == b'\n').count() + 1;
                 let mut ws = sm.start().saturating_sub(20);
@@ -855,6 +927,7 @@ fn inspect_archive_surface_reader_opts<R: Read + Seek>(
                         continue;
                     }
                 }
+                kept_sinks_in_file += 1;
                 dangerous_sinks.push(json!({
                     "sink": sink_tok,
                     "entry_path": path,
@@ -1026,6 +1099,27 @@ fn inspect_archive_surface_reader_opts<R: Read + Seek>(
         ));
     }
 
+    let mut ipc_channels: Vec<String> = Vec::new();
+    let mut seen_chan_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in &ipc_handlers {
+        if let Some(ch) = h.get("channel").and_then(Value::as_str) {
+            let trimmed = ch.trim();
+            if !trimmed.is_empty() && seen_chan_names.insert(trimmed.to_string()) {
+                ipc_channels.push(trimmed.to_string());
+            }
+        }
+    }
+    let mut compact_routes: Vec<Value> = Vec::new();
+    if let Some(arr) = js_surface_json.get("routes").and_then(Value::as_array) {
+        for r in arr.iter().take(12) {
+            compact_routes.push(json!({
+                "method": r["method"],
+                "path": r["path"],
+                "risk_score": r["risk_score"],
+            }));
+        }
+    }
+
     let mut jv = json!({
         "ok": true,
         "format": if compact_asar_surface { "asar-surface" } else { "archive-surface" },
@@ -1043,22 +1137,14 @@ fn inspect_archive_surface_reader_opts<R: Read + Seek>(
         "native_bins": if compact_asar_surface { native_bins.iter().take(20).cloned().collect() } else { native_bins },
         "electron_security_flags": if compact_asar_surface { electron_flags.iter().take(25).cloned().collect() } else { electron_flags },
         "ipc_handlers": if compact_asar_surface { ipc_handlers.iter().take(40).cloned().collect() } else { ipc_handlers },
+        "ipc_channels": ipc_channels,
+        "routes": compact_routes,
         "dangerous_sinks": if compact_asar_surface { dangerous_sinks.iter().take(20).cloned().collect() } else { dangerous_sinks },
     });
     if compact_asar_surface {
-        let mut compact_routes: Vec<Value> = Vec::new();
-        if let Some(arr) = js_surface_json.get("routes").and_then(Value::as_array) {
-            for r in arr.iter().take(12) {
-                compact_routes.push(json!({
-                    "method": r["method"],
-                    "path": r["path"],
-                    "risk_score": r["risk_score"],
-                }));
-            }
-        }
         jv["js_surface_summary"] = json!({
             "counts": js_surface_json["counts"],
-            "top_routes": compact_routes,
+            "top_routes": jv["routes"].clone(),
         });
     } else if has_js_hits {
         jv["js_surface"] = js_surface_json;
@@ -7384,7 +7470,8 @@ pub fn inspect_pe_ioctl_and_pipes(
         "exports": exports,
         "ioctl_iat_imports": ioctl_iat_imports,
         "ioctl_iat_xrefs": ioctl_iat_xrefs,
-        "ioctl_codes": ioctl_codes,
+        "ioctl_codes": ioctl_codes.clone(),
+        "ioctls": ioctl_codes,
         "device_pipes": device_pipes,
         "pipe_str_xrefs": pipe_str_xrefs,
         "pipe_iat_imports": pipe_iat_imports,
