@@ -2974,6 +2974,10 @@ function hasUnquotedShellChainOrPipe(s: string): boolean {
 				i++;
 				continue;
 			}
+			// Double-quoted command substitutions `$(...)` and `` `...` `` still execute arbitrary commands in Bash
+			if (q === '"' && (ch === "`" || (ch === "$" && s[i + 1] === "("))) {
+				return true;
+			}
 			if (ch === q) q = null;
 			continue;
 		}
@@ -2985,6 +2989,7 @@ function hasUnquotedShellChainOrPipe(s: string): boolean {
 			q = ch;
 			continue;
 		}
+		if (ch === "`" || (ch === "$" && s[i + 1] === "(")) return true;
 		if (ch === ";" || ch === "|" || ch === "\n" || ch === "\r") return true;
 		if (ch === "&") {
 			// Allow benign fd redirections like `2>&1` or `>&2`, reject `&&` and background `&`
@@ -3115,6 +3120,53 @@ export function formatAutoSieveDigest(stdout: string): string {
 	);
 }
 
+export interface ShellLoopDetection {
+	kind: "repeat" | "oscillation";
+	count: number;
+	isError: boolean;
+}
+
+/**
+ * Detect both single-command repeats and strict 2-step oscillation ping-pong loops (`A -> B -> A -> B`)
+ * without intervening edits (Claude Code / Codex CLI loop-breaker pattern).
+ */
+export function detectShellLoopPattern(
+	history: ReadonlyArray<{ fp: string; isError: boolean }>,
+	currentFp: string,
+	effectiveErr: boolean,
+): ShellLoopDetection | undefined {
+	const repeats = history.filter((x) => x.fp === currentFp).length;
+	const threshold = effectiveErr ? LOOP_ERR_THRESHOLD : LOOP_OK_THRESHOLD;
+	if (repeats >= threshold) {
+		return { kind: "repeat", count: repeats, isError: effectiveErr };
+	}
+	const n = history.length;
+	if (n >= 4) {
+		const a1 = history[n - 4];
+		const b1 = history[n - 3];
+		const a2 = history[n - 2];
+		const b2 = history[n - 1];
+		if (a1.fp === a2.fp && b1.fp === b2.fp && a1.fp !== b1.fp) {
+			const errCount4 = [a1, b1, a2, b2].filter((x) => x.isError).length;
+			if (errCount4 >= 2) {
+				return { kind: "oscillation", count: 4, isError: true };
+			}
+		}
+	}
+	if (n >= 6) {
+		const a0 = history[n - 6];
+		const b0 = history[n - 5];
+		const a1 = history[n - 4];
+		const b1 = history[n - 3];
+		const a2 = history[n - 2];
+		const b2 = history[n - 1];
+		if (a0.fp === a1.fp && a1.fp === a2.fp && b0.fp === b1.fp && b1.fp === b2.fp && a0.fp !== b0.fp) {
+			return { kind: "oscillation", count: 6, isError: false };
+		}
+	}
+	return undefined;
+}
+
 export function normCmdFingerprint(raw: string): string {
 	const norm = raw
 		.replace(/^export\s+PYTHONUTF8=1\s+PYTHONIOENCODING=utf-8;\s*/i, "")
@@ -3167,7 +3219,7 @@ function translateGrepBreToRustRegex(pat: string, flags: string): string {
 function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undefined {
 	// Match optional leading `cd <dir> && ` or `cd <dir>; `, strip `2>/dev/null`/`2>NUL`/`2>&1` & trailing pagers (`| more`/`| less`).
 	const cleaned = cmd
-		.replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)(?=\s*(?:$|\|))/gi, "")
+		.replace(/\s+2>\s*(?:\/dev\/null|NUL|&1)(?=\s*(?:$|\||&&|;))/gi, "")
 		.replace(/\s+--exclude-dir=(?:'[^']+'|"[^"]+"|[^\s|&;]+)/g, "")
 		.replace(/\s*\|\s*(?:more|less)\s*$/i, "");
 	if (/>/.test(cleaned)) return undefined;
@@ -3191,24 +3243,51 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		}
 	}
 
-	// Fast-path A: slow minified-JS context regex `grep -oE '.{0,N}PAT.{0,M}' file [| head ...]` -> `<25ms` `ap search --around`
+	// Fast-path A: slow minified-JS context regex `grep -oE '[.{0,N}]PAT[.{0,M}]' file [| head/grep -v ...]`
+	// Rewrites two-sided `<=1200` bounded windows to `<25ms` `ap search --around <min(800,max)> --pretty`, and one-sided /
+	// wide `>1200` / internal `{m,n}` / `| head -c` / `| grep -v` probes to linear-time Rust-DFA `rg -a --no-ignore -o`.
 	const aroundMatch = cleaned.match(
-		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aAoEPirRhHn]+\s+)+)['"]\.\\?\{0,(\d+)\\?\}([^'"]+?)(\.\\?\{0,(\d+)\\?\})?['"]\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))(\s*\|\s*(?:head|tail|wc|sort|cut)\b[^;&|>]*)?\s*$/,
+		/^(\s*cd\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?\s*grep\s+((?:-[aAoEPirRhHn]+\s+)+)(?:'([^']+)'|"((?:[^"\\]|\\.)+)")\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&]+))((?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr|grep)\b[^;&|<>]*)+)?\s*$/,
 	);
 	if (aroundMatch && aroundMatch[2].includes("o")) {
 		const cdPrefix = aroundMatch[1] || "";
 		const rawFlags = aroundMatch[2] || "";
-		const leftN = Math.min(800, Math.max(40, Number(aroundMatch[3]) || 160));
-		const rightN = Math.min(800, Math.max(40, Number(aroundMatch[6]) || leftN));
-		const around = Math.max(leftN, rightN);
-		const rawPat = aroundMatch[4] || "";
-		const target = aroundMatch[7] || aroundMatch[8] || aroundMatch[9] || ".";
-		const pipeSuffix = aroundMatch[10] || "";
-		if (rawPat && !rawPat.includes("{")) {
-			const prefix = toolName === "powershell" ? "& " : "";
-			const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${rawPat.replace(/"/g, '\\"')}"`;
-			const icFlag = rawFlags.includes("i") ? " -i" : "";
-			return `${cdPrefix}${prefix}"${AP_BIN}" search${icFlag} --around ${around} --pretty ${quotedPat} "${target}"${pipeSuffix}`;
+		const patQuote = aroundMatch[3] !== undefined ? "'" : '"';
+		const fullPat = aroundMatch[3] !== undefined ? aroundMatch[3] : aroundMatch[4] || "";
+		const target = aroundMatch[5] || aroundMatch[6] || aroundMatch[7] || ".";
+		const pipeSuffix = aroundMatch[8] || "";
+		const ctxM = fullPat.match(/^(?:\.\\?\{0,(\d+)\\?\})?([\s\S]+?)(?:\.\\?\{0,(\d+)\\?\})?$/);
+		const leftN = Number(ctxM?.[1] || 0);
+		const rightN = Number(ctxM?.[3] || 0);
+		const rawPat = ctxM?.[2] || "";
+		if (rawPat && (leftN > 0 || rightN > 0)) {
+			const hasByteSliceOrFilterPipe = /\|\s*(?:grep\b|head\s+-c\b)/i.test(pipeSuffix);
+			const maxSpan = Math.max(leftN, rightN);
+			const canUseApAround =
+				leftN > 0 &&
+				rightN > 0 &&
+				maxSpan <= 1200 &&
+				!rawPat.includes("{") &&
+				!hasByteSliceOrFilterPipe;
+			if (canUseApAround) {
+				const around = Math.min(800, Math.max(40, maxSpan));
+				const prefix = toolName === "powershell" ? "& " : "";
+				const quotedPat = toolName === "bash" ? shellQuoteBashPat(rawPat) : `"${rawPat.replace(/"/g, '\\"')}"`;
+				const icFlag = rawFlags.includes("i") ? " -i" : "";
+				return `${cdPrefix}${prefix}"${AP_BIN}" search${icFlag} --around ${around} --pretty ${quotedPat} "${target}"${pipeSuffix}`;
+			}
+			const isEre = rawFlags.includes("E") || rawFlags.includes("P");
+			const canTranslate = isEre || patQuote === "'" || !/\\[|(){}+?]/.test(fullPat);
+			if (canTranslate) {
+				const rustPat = isEre ? fullPat : translateGrepBreToRustRegex(fullPat, "");
+				const quotedRustPat =
+					toolName === "bash" && patQuote === "'"
+						? shellQuoteBashPat(rustPat)
+						: `${patQuote}${rustPat}${patQuote}`;
+				const icFlag = rawFlags.includes("i") ? " -i" : "";
+				const noFile = rawFlags.includes("h") ? " --no-filename" : "";
+				return `${cdPrefix}rg -a --no-ignore -o${noFile}${icFlag} ${quotedRustPat} "${target}"${pipeSuffix}`;
+			}
 		}
 	}
 
@@ -3293,35 +3372,45 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		}
 	}
 
-	// Collect one or more `--include=*.ext` / `--include=<glob>` flags anywhere in the grep command
+	// Collect one or more `--include=*.ext` / `--include *.ext` / `--exclude=*.ext` flags anywhere in the grep command
 	const exts: string[] = [];
 	const extraIncludes: string[] = [];
 	const globs: string[] = [];
-	const withoutIncludes = cleaned.replace(
-		/\s+--include=(?:'([^']+)'|"([^"]+)"|([^\s|&;]+))/g,
-		(_m, g1: string, g2: string, g3: string) => {
-			const glob = g1 || g2 || g3 || "";
-			const em = glob.match(/^\*\.([A-Za-z0-9]+)$/);
-			if (em) exts.push(em[1]);
-			else if (glob) extraIncludes.push(glob);
-			if (glob) globs.push(`-g '${glob}'`);
-			return "";
-		},
-	);
+	const withoutIncludes = cleaned
+		.replace(
+			/\s+--include(?:=|\s+)(?:'([^']+)'|"([^"]+)"|([^\s|&;]+))/g,
+			(_m, g1: string, g2: string, g3: string) => {
+				const glob = g1 || g2 || g3 || "";
+				const em = glob.match(/^\*\.([A-Za-z0-9]+)$/);
+				if (em) exts.push(em[1]);
+				else if (glob) extraIncludes.push(glob);
+				if (glob) globs.push(`-g '${glob}'`);
+				return "";
+			},
+		)
+		.replace(
+			/\s+--exclude(?:=|\s+)(?:'([^']+)'|"([^"]+)"|([^\s|&;]+))/g,
+			(_m, g1: string, g2: string, g3: string) => {
+				const glob = g1 || g2 || g3 || "";
+				if (glob) globs.push(`-g '!${glob}'`);
+				return "";
+			},
+		);
 
-	// Trailing `-l` / `-c`, multi-target, AppData, arbitrary-pipe, or backtick-safe recursive grep -> fast bounded `rg`
+	// Trailing `-l` / `-c`, multi-target, AppData, arbitrary-pipe, `--exclude`, or backtick-safe recursive grep -> fast bounded `rg`
 	const complexRec = withoutIncludes.match(
-		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRniEHhlcIFso]+\s+)+)(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|[^;&<>]+)+)?$/,
+		/^(\s*cd(?:\s+\/d)?\s+(?:'[^']+'|"[^"]+"|[^\s&|;]+)\s*(?:&&|;)\s*)?grep\s+((?:-[aArRniEHhlcIFso]+\s+)+)(?:-e\s+)?(?:'([^']+)'|"((?:[^"\\]|\\.)+)"|((?!-)[^\s'"|;&]+))([\s\S]*?)((?:\s*\|[^;&<>]+)+)?$/,
 	);
 	if (complexRec && /[rR]/.test(complexRec[2])) {
 		const cdPrefix = complexRec[1] || "";
 		const rawFlags = complexRec[2];
+		const rawFlagsCompact = rawFlags.replace(/[\s-]+/g, "");
 		const patRaw =
 			complexRec[3] !== undefined
-				? `'${complexRec[3]}'`
+				? `'${translateGrepBreToRustRegex(complexRec[3], rawFlagsCompact)}'`
 				: complexRec[4] !== undefined
-					? `"${complexRec[4]}"`
-					: complexRec[5];
+					? `"${rawFlagsCompact.includes("E") || rawFlagsCompact.includes("F") ? complexRec[4] : complexRec[4]}"`
+					: translateGrepBreToRustRegex(complexRec[5], rawFlagsCompact);
 		const restArgs = (complexRec[6] || "").trim();
 		const pipeSuffix = complexRec[7] || "";
 		const hasBacktickPat = complexRec[3]?.includes("`") || complexRec[4]?.includes("`");
@@ -3330,10 +3419,14 @@ function rewriteSlowRecursiveGrep(cmd: string, toolName: string): string | undef
 		const hasTrailingFlag = /(?:^|\s)-[lch](?:\s|$)/.test(restArgs);
 		const isAppData = /AppData[/\\]Roaming/i.test(restArgs);
 		const multiTarget = restArgs.split(/\s+/).filter(Boolean).length > 1;
+		const hasExcludeGlob = globs.some((g) => g.startsWith("-g '!"));
 		const hasArbitraryPipe =
 			Boolean(pipeSuffix) &&
 			!/^(?:\s*\|\s*(?:head|tail|wc|sort|uniq|cut|tr)\b[^;&|<>]*)+$/.test(pipeSuffix);
-		if (!hasCompoundOps && (hasBacktickPat || hasTrailingFlag || isAppData || multiTarget || hasArbitraryPipe)) {
+		if (
+			!hasCompoundOps &&
+			(hasBacktickPat || hasTrailingFlag || isAppData || multiTarget || hasExcludeGlob || hasArbitraryPipe)
+		) {
 			const rFlags = [
 				/[a]/.test(rawFlags) ? "-a" : "",
 				/[n]/.test(rawFlags) ? "-n --no-heading" : "",
@@ -3804,9 +3897,14 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {
 					ch === "&" ||
 					ch === ">" ||
 					ch === "<" ||
+					ch === ")" ||
 					ch === "\n" ||
 					ch === "\r"
 				) {
+					break;
+				}
+				// Stop before unquoted Bash comment `# ...` (preceded by whitespace) so `#` never swallows `; if ($LASTEXITCODE)...`
+				if (ch === "#" && (segEnd === segStart || /\s/.test(cmd[segEnd - 1]))) {
 					break;
 				}
 				// Stop before `2>&1` / `1>&2` / `2>file`
@@ -3989,7 +4087,7 @@ function rewriteUnqualifiedWhoamiFlag(raw: string): { text: string; changed: boo
 			i++;
 			continue;
 		}
-		if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "\n" || ch === "\r") {
+		if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "`" || ch === "\n" || ch === "\r") {
 			out += ch;
 			atCmdPos = true;
 			i++;
@@ -4002,8 +4100,8 @@ function rewriteUnqualifiedWhoamiFlag(raw: string): { text: string; changed: boo
 				continue;
 			}
 			const tail = raw.slice(i);
-			// Skip leading inline env assignment (`FOO=bar `) or shell keyword (`then `, `do `, `else `, `elif `, `! `)
-			const envM = tail.match(/^[A-Za-z_]\w*=(?:"(?:\\.|[^"\\])*"|'[^']*'|\S+)[ \t]+/);
+			// Skip leading inline env assignment (`FOO=bar `), but stop before `$(...)` / `` `...` `` so `out=$(whoami /groups)` rewrites inside subshell
+			const envM = tail.match(/^[A-Za-z_]\w*=(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s(`]+)[ \t]+/);
 			if (envM) {
 				out += envM[0];
 				i += envM[0].length;
@@ -4070,7 +4168,12 @@ export function healMsysPathConv(raw: string, toolName = "bash"): string | undef
 	if (hasMsysEnv) return converted !== raw ? converted : undefined;
 	const trimmed = converted.trimStart();
 	if (trimmed.includes("\n")) return `export MSYS_NO_PATHCONV=1\n${converted}`;
-	if (/(?:&&|\|\||[;|])/.test(trimmed)) return `export MSYS_NO_PATHCONV=1; ${converted}`;
+	if (
+		/(?:&&|\|\||[;|`])|\$\(/.test(trimmed) ||
+		/^(?:[({!]|(?:if|for|while|until|case|select|time|coproc)(?=\s|$))/.test(trimmed)
+	) {
+		return `export MSYS_NO_PATHCONV=1; ${converted}`;
+	}
 	return `MSYS_NO_PATHCONV=1 ${converted}`;
 }
 
@@ -6649,7 +6752,7 @@ export default function (pi: ExtensionAPI) {
 			compactionTriggerTokens: cachedCompactionTriggerTokens,
 		});
 	};
-	const recentShellFps: string[] = [];
+	const recentShellFps: Array<{ fp: string; isError: boolean }> = [];
 	const unchangedReads = new Map<string, number>();
 	const outlinedPaths = new Set<string>();
 	const editedFilesThisRun = new Set<string>();
@@ -8403,17 +8506,21 @@ export default function (pi: ExtensionAPI) {
 
 			const fp = normCmdFingerprint(cmd);
 			if (fp.length >= 8) {
-				recentShellFps.push(fp);
+				const effectiveErr = event.isError && !benignGrep;
+				recentShellFps.push({ fp, isError: Boolean(effectiveErr) });
 				if (recentShellFps.length > LOOP_WINDOW) {
 					recentShellFps.shift();
 				}
-				const repeats = recentShellFps.filter((x) => x === fp).length;
-				const effectiveErr = event.isError && !benignGrep;
-				const threshold = effectiveErr ? LOOP_ERR_THRESHOLD : LOOP_OK_THRESHOLD;
-				if (repeats >= threshold) {
-					const hint = effectiveErr
-						? `\n[ap loop-breaker] Repeated failing shell command (${repeats}/${LOOP_WINDOW} calls) without intervening edits. Pause, inspect root cause, edit code or switch strategy instead of retrying identically.`
-						: `\n[ap loop-breaker] Identical shell command repeated (${repeats}/${LOOP_WINDOW} calls) without edits. Avoid redundant polling; summarize findings or pivot to the next concrete action.`;
+				const loopHit = detectShellLoopPattern(recentShellFps, fp, Boolean(effectiveErr));
+				if (loopHit) {
+					const hint =
+						loopHit.kind === "oscillation"
+							? loopHit.isError
+								? `\n[ap loop-breaker] Alternating failing 2-step shell loop (A->B->A->B across ${loopHit.count} calls) without intervening edits. Break the cycle, inspect root cause, edit code or change approach.`
+								: `\n[ap loop-breaker] Alternating 2-step shell loop (A->B->A->B->A->B across ${loopHit.count} calls) without edits. Stop ping-pong polling and pivot to a concrete action.`
+							: loopHit.isError
+								? `\n[ap loop-breaker] Repeated failing shell command (${loopHit.count}/${LOOP_WINDOW} calls) without intervening edits. Pause, inspect root cause, edit code or switch strategy instead of retrying identically.`
+								: `\n[ap loop-breaker] Identical shell command repeated (${loopHit.count}/${LOOP_WINDOW} calls) without edits. Avoid redundant polling; summarize findings or pivot to the next concrete action.`;
 					outText = `${outText}${hint}`;
 					guardsTriggered += 1;
 					mutated = true;
@@ -8421,9 +8528,10 @@ export default function (pi: ExtensionAPI) {
 					if (typeof evBus?.emit === "function") {
 						evBus.emit("ap:tool_loop", {
 							tool: event.toolName,
-							count: repeats,
+							kind: loopHit.kind,
+							count: loopHit.count,
 							signature: fp.slice(0, 120),
-							isError: Boolean(effectiveErr),
+							isError: loopHit.isError,
 						});
 					}
 				}

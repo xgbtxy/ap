@@ -5802,6 +5802,21 @@ pub fn extract_strings_md(
     max_strings: usize,
     encoding: &str,
 ) -> String {
+    extract_strings_md_ex(bytes, query, min_len, max_strings, encoding, 0, false)
+}
+
+/// Extended binary string search supporting `ripgrep -a` / `strings -t x` / `r2`-style
+/// pattern-centered long-string slicing, `±around_bytes` ASCII+UTF-16LE neighbor context,
+/// PE/ELF/Mach-O section+RVA mapping, and optional `--hex` byte dumps.
+pub fn extract_strings_md_ex(
+    bytes: &[u8],
+    query: Option<&str>,
+    min_len: usize,
+    max_strings: usize,
+    encoding: &str,
+    around_bytes: usize,
+    include_hex: bool,
+) -> String {
     let enc_low = encoding.trim().to_ascii_lowercase();
     let scan_ascii = !matches!(enc_low.as_str(), "l" | "utf16" | "utf-16le" | "wide");
     let scan_wide = !matches!(enc_low.as_str(), "s" | "ascii");
@@ -5812,27 +5827,176 @@ pub fn extract_strings_md(
             .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(q))))
             .ok()
     });
-    let cap_hits = if max_strings == 0 { 200 } else { max_strings };
+    let with_ctx = around_bytes > 0 && q_re.is_some();
+    let around_win = around_bytes.clamp(16, 4096);
+    let cap_hits = if max_strings == 0 {
+        if with_ctx {
+            40
+        } else {
+            200
+        }
+    } else if with_ctx {
+        max_strings.min(100)
+    } else {
+        max_strings
+    };
+    let max_run_ascii = if q_re.is_some() { 2048 } else { 240 };
+    let max_run_wide = if q_re.is_some() { 2048 } else { 200 };
     let scan_lim = bytes.len().min(if query.is_some() {
         24 * 1024 * 1024
     } else {
         8 * 1024 * 1024
     });
     let data = &bytes[..scan_lim];
+
+    // Optional PE/ELF/Mach-O address mapping when emitting context windows
+    let mut pe_ctx: Option<PeContext> = None;
+    let mut elf_ctx: Option<ElfContext> = None;
+    let mut macho_ctx: Option<MachoContext> = None;
+    if with_ctx {
+        if bytes.starts_with(b"MZ") && bytes.len() > 0x44 {
+            let pe_off = read_u32_le(bytes, 0x3C).unwrap_or(0) as usize;
+            if bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
+                let mut sink = Vec::new();
+                pe_ctx = Some(parse_pe_details(bytes, pe_off, &mut sink));
+            }
+        } else if bytes.starts_with(b"\x7FELF") {
+            let mut sink = Vec::new();
+            elf_ctx = Some(parse_elf_details(bytes, &mut sink));
+        } else if resolve_macho_slice(bytes).is_some() {
+            let mut sink = Vec::new();
+            macho_ctx = parse_macho_details(bytes, &mut sink);
+        }
+    }
+
+    let format_loc = |off: usize| -> String {
+        if let Some(ref pe) = pe_ctx {
+            if let Some((rva, sec_nm)) = file_offset_to_rva(off, &pe.secs) {
+                let va = pe.image_base.saturating_add(rva as u64);
+                return format!(" rva=0x{rva:x} va=0x{va:x} ({sec_nm})");
+            }
+        } else if let Some(ref elf) = elf_ctx {
+            if let Some((va, sec_nm)) = elf_file_offset_to_vaddr(off, &elf.secs) {
+                return format!(" va=0x{va:x} ({sec_nm})");
+            }
+        } else if let Some(ref macho) = macho_ctx {
+            if let Some((va, seg_nm)) = macho_file_offset_to_vmaddr(off, macho) {
+                return format!(" va=0x{va:x} ({seg_nm})");
+            }
+        }
+        String::new()
+    };
+
+    let center_hit_str = |s: &str, m_start: usize, m_end: usize| -> String {
+        if s.len() <= 280 {
+            return s.to_string();
+        }
+        let mut ws = m_start.saturating_sub(120);
+        while ws < s.len() && !s.is_char_boundary(ws) {
+            ws += 1;
+        }
+        let mut we = m_end.saturating_add(120).min(s.len());
+        while we > ws && !s.is_char_boundary(we) {
+            we -= 1;
+        }
+        let lead = if ws > 0 { "..." } else { "" };
+        let trail = if we < s.len() { "..." } else { "" };
+        format!("{lead}{}{trail}", &s[ws..we])
+    };
+
+    let collect_neighbors = |hit_start: usize, hit_end: usize| -> Vec<String> {
+        let win_s = hit_start.saturating_sub(around_win);
+        let win_e = hit_end.saturating_add(around_win).min(data.len());
+        let mut neigh: Vec<(usize, &'static str, String)> = Vec::new();
+        // Neighbor ASCII strings (>= 4 chars)
+        let mut p = win_s;
+        while p < win_e {
+            if (0x20..=0x7E).contains(&data[p]) {
+                let st = p;
+                while p < win_e && (0x20..=0x7E).contains(&data[p]) && p - st < 160 {
+                    p += 1;
+                }
+                if p - st >= 4 && (p <= hit_start || st >= hit_end) {
+                    let s = String::from_utf8_lossy(&data[st..p]).into_owned();
+                    neigh.push((st, "ascii", s));
+                }
+            } else {
+                p += 1;
+            }
+        }
+        // Neighbor UTF-16LE strings (>= 4 chars)
+        let mut q = win_s;
+        while q + 1 < win_e {
+            if (0x20..=0x7E).contains(&data[q]) && data[q + 1] == 0 {
+                let st = q;
+                let mut s = String::new();
+                while q + 1 < win_e
+                    && (0x20..=0x7E).contains(&data[q])
+                    && data[q + 1] == 0
+                    && s.len() < 120
+                {
+                    s.push(data[q] as char);
+                    q += 2;
+                }
+                if s.len() >= 4 && (q <= hit_start || st >= hit_end) {
+                    neigh.push((st, "utf16le", s));
+                }
+            } else {
+                q += 1;
+            }
+        }
+        neigh.sort_by_key(|x| x.0);
+        neigh
+            .into_iter()
+            .take(6)
+            .map(|(off, kind, s)| format!("  ctx @0x{off:x} [{kind}]: {s}"))
+            .collect()
+    };
+
     let mut hits: Vec<String> = Vec::new();
+    let mut hit_count = 0usize;
+
+    let mut push_match =
+        |hit_count: &mut usize, kind: &str, st: usize, byte_len: usize, disp: String| {
+            *hit_count += 1;
+            let loc = if with_ctx {
+                format_loc(st)
+            } else {
+                String::new()
+            };
+            hits.push(format!("[{kind} @0x{st:x}{loc}] {disp}"));
+            if with_ctx {
+                for nb in collect_neighbors(st, st.saturating_add(byte_len)) {
+                    hits.push(nb);
+                }
+                if include_hex {
+                    let hex_len = around_win.min(128);
+                    let hex_s = st.saturating_sub(hex_len / 4);
+                    let dump = format_hex_dump(data, hex_s, hex_len);
+                    for hln in dump.lines() {
+                        hits.push(format!("  {hln}"));
+                    }
+                }
+            }
+        };
 
     if scan_ascii {
         let mut i = 0usize;
-        while i < data.len() && hits.len() < cap_hits {
+        while i < data.len() && hit_count < cap_hits {
             if (0x20..=0x7E).contains(&data[i]) {
                 let st = i;
-                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < 240 {
+                while i < data.len() && (0x20..=0x7E).contains(&data[i]) && i - st < max_run_ascii {
                     i += 1;
                 }
                 if i - st >= min_ascii {
                     let s = String::from_utf8_lossy(&data[st..i]);
-                    if q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
-                        hits.push(format!("[ascii @0x{st:x}] {s}"));
+                    if let Some(ref r) = q_re {
+                        if let Some(m) = r.find(&s) {
+                            let disp = center_hit_str(&s, m.start(), m.end());
+                            push_match(&mut hit_count, "ascii", st, i - st, disp);
+                        }
+                    } else {
+                        push_match(&mut hit_count, "ascii", st, i - st, s.into_owned());
                     }
                 }
             } else {
@@ -5843,20 +6007,27 @@ pub fn extract_strings_md(
 
     if scan_wide {
         let mut j = 0usize;
-        while j + 1 < data.len() && hits.len() < cap_hits {
+        while j + 1 < data.len() && hit_count < cap_hits {
             if (0x20..=0x7E).contains(&data[j]) && data[j + 1] == 0 {
                 let st = j;
                 let mut s = String::new();
                 while j + 1 < data.len()
                     && (0x20..=0x7E).contains(&data[j])
                     && data[j + 1] == 0
-                    && s.len() < 200
+                    && s.len() < max_run_wide
                 {
                     s.push(data[j] as char);
                     j += 2;
                 }
-                if s.len() >= min_wide && q_re.as_ref().map(|r| r.is_match(&s)).unwrap_or(true) {
-                    hits.push(format!("[utf16le @0x{st:x}] {s}"));
+                if s.len() >= min_wide {
+                    if let Some(ref r) = q_re {
+                        if let Some(m) = r.find(&s) {
+                            let disp = center_hit_str(&s, m.start(), m.end());
+                            push_match(&mut hit_count, "utf16le", st, j - st, disp);
+                        }
+                    } else {
+                        push_match(&mut hit_count, "utf16le", st, j - st, s);
+                    }
                 }
             } else {
                 j += 1;
@@ -5871,12 +6042,19 @@ pub fn extract_strings_md(
     } else {
         "ascii"
     };
+    let ctx_suffix = if with_ctx {
+        format!(
+            " | around=±{around_win}B{}",
+            if include_hex { "+hex" } else { "" }
+        )
+    } else {
+        String::new()
+    };
     let mut lines = vec![format!(
-        "## Strings ({} B | min_len={} | encoding={} | {} hit(s))",
+        "## Strings ({} B | min_len={} | encoding={} | {hit_count} hit(s){ctx_suffix})",
         bytes.len(),
         if scan_ascii { min_ascii } else { min_wide },
         enc_label,
-        hits.len()
     )];
     if hits.is_empty() {
         lines.push("*(no matching printable strings found)*".to_string());

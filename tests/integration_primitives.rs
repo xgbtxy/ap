@@ -16131,3 +16131,188 @@ fetch('/api/v1/admin/export', { method: 'POST' });\n",
         }
     }
 }
+
+#[test]
+fn test_cycle8_binary_strings_context_dir_diff_deep_surface_semicolon_and_audit() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let ap_home = root.join("ap_home_c8");
+    let sv_dir = root.join("sieve_c8");
+    fs::create_dir_all(&ap_home).unwrap();
+    fs::create_dir_all(&sv_dir).unwrap();
+    let iso_env = [
+        ("AP_HOME", ap_home.as_path()),
+        ("SIEVE_HOME", sv_dir.as_path()),
+    ];
+
+    // 1. P1 `ap diff <existing_dir> <missing_dir> --json` clean not-found (NOT os error 5)
+    //    AND `dir-diff --deep` emits `json_diff` + `hunk_preview`
+    let d1 = root.join("c8_v1");
+    let d2 = root.join("c8_v2");
+    let missing_d = root.join("c8_does_not_exist");
+    fs::create_dir_all(&d1).unwrap();
+    fs::create_dir_all(&d2).unwrap();
+    fs::write(d1.join("cfg.json"), r#"{"timeout":30,"mode":"safe"}"#).unwrap();
+    fs::write(d2.join("cfg.json"), r#"{"timeout":60,"mode":"fast"}"#).unwrap();
+    fs::write(d1.join("app.ts"), "export const VER = 1;\n").unwrap();
+    fs::write(d2.join("app.ts"), "export const VER = 2;\n").unwrap();
+
+    let miss_out = run_ap(
+        root,
+        &[
+            "diff",
+            d1.to_str().unwrap(),
+            missing_d.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(!miss_out.status.success());
+    let miss_v: Value = serde_json::from_slice(&miss_out.stdout).unwrap();
+    assert_eq!(miss_v["ok"], false);
+    let miss_err = miss_v["error"].as_str().unwrap_or("").to_ascii_lowercase();
+    assert!(
+        miss_err.contains("not found") && !miss_err.contains("os error 5"),
+        "expected clean not-found error, got: {miss_v}"
+    );
+
+    let deep_out = run_ap(
+        root,
+        &["diff", d1.to_str().unwrap(), d2.to_str().unwrap(), "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(deep_out.status.success());
+    let deep_v: Value = serde_json::from_slice(&deep_out.stdout).unwrap();
+    let mods = deep_v["modified"].as_array().unwrap();
+    let cfg_m = mods.iter().find(|m| m["path"] == "cfg.json").unwrap();
+    let app_m = mods.iter().find(|m| m["path"] == "app.ts").unwrap();
+    assert!(
+        cfg_m.get("json_diff").is_some(),
+        "expected json_diff on modified JSON in dir-diff --deep: {deep_v}"
+    );
+    assert!(
+        app_m["hunk_preview"]
+            .as_str()
+            .unwrap_or("")
+            .contains("VER = 2"),
+        "expected hunk_preview on modified TS in dir-diff --deep: {deep_v}"
+    );
+
+    // 2. P1 `ap atlas surface`: semicolon-chained import + call keeps real sink
+    let sdir = root.join("c8_surf");
+    fs::create_dir_all(&sdir).unwrap();
+    fs::write(
+        sdir.join("semi.ts"),
+        "import { a } from 'x'; execSync(userCmd);\n",
+    )
+    .unwrap();
+    let s_out = run_ap(
+        root,
+        &["atlas", "surface", sdir.to_str().unwrap(), "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(s_out.status.success());
+    let s_v: Value = serde_json::from_slice(&s_out.stdout).unwrap();
+    assert!(
+        s_v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["target"] == "semi.ts" && i["symbol"] == "execSync"),
+        "same-line import + semicolon sink must not be dropped: {s_v}"
+    );
+
+    // 3. P1 `ap read <bin> --strings --query <pat> --around 96 --hex`:
+    //    >300-char string with deep match past byte 260 + ASCII & UTF-16LE neighbors + hex dump
+    let mut bin_blob = Vec::new();
+    bin_blob.extend_from_slice(&[0x00, 0x01, 0x02, 0x03, 0x00, 0x00]);
+    bin_blob.extend_from_slice(b"BEFORE_ASCII_NEIGHBOR");
+    bin_blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    let long_payload = format!("{}DEEP_NEEDLE_AT_300_OK_tail_value", "P".repeat(280));
+    bin_blob.extend_from_slice(long_payload.as_bytes());
+    bin_blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    for ch in "AFTER_WIDE_NEIGHBOR".encode_utf16() {
+        bin_blob.extend_from_slice(&ch.to_le_bytes());
+    }
+    bin_blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    let bin_p = root.join("c8_sample.bin");
+    fs::write(&bin_p, &bin_blob).unwrap();
+
+    let str_ctx = run_ap(
+        root,
+        &[
+            "read",
+            bin_p.to_str().unwrap(),
+            "--strings",
+            "--query",
+            "DEEP_NEEDLE_AT_300_OK",
+            "--around",
+            "96",
+            "--hex",
+        ],
+        None,
+        &iso_env,
+    );
+    let str_s = String::from_utf8_lossy(&str_ctx.stdout);
+    assert!(
+        str_ctx.status.success()
+            && str_s.contains("DEEP_NEEDLE_AT_300_OK")
+            && str_s.contains("BEFORE_ASCII_NEIGHBOR")
+            && str_s.contains("AFTER_WIDE_NEIGHBOR")
+            && str_s.contains("[utf16le]")
+            && str_s.contains("0000"),
+        "binary --strings --query --around --hex missing match/neighbors/hex:\nstdout={str_s}\nstderr={}",
+        String::from_utf8_lossy(&str_ctx.stderr)
+    );
+
+    // 4. P1 Windows `--weak-acl` exposes `weak_autoruns` & `weak_tasks`
+    #[cfg(windows)]
+    {
+        let wa_out = run_ap(
+            root,
+            &[
+                "probe",
+                "win",
+                "--weak-acl",
+                "--non-ms",
+                "--filter",
+                "NonExistentC8Filter",
+                "--json",
+            ],
+            None,
+            &iso_env,
+        );
+        assert!(wa_out.status.success());
+        let wa_v: Value = serde_json::from_slice(&wa_out.stdout).unwrap();
+        assert_eq!(wa_v["ok"], true);
+        assert!(wa_v["weak_autoruns"].is_array() && wa_v["weak_tasks"].is_array());
+    }
+
+    // 5. P2 `ap audit` maintainer_targets references `assets/zz-ap-accelerator.ts`
+    let fake_home = root.join("audit_home_c8");
+    let pi_sess_dir = fake_home.join(".pi/agent/sessions/s1");
+    fs::create_dir_all(&pi_sess_dir).unwrap();
+    fs::write(
+        pi_sess_dir.join("trace.jsonl"),
+        "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"edit\",\"arguments\":{\"path\":\"a.txt\"}}]}}\n\
+{\"type\":\"message\",\"message\":{\"role\":\"toolResult\",\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"Failed to find expected lines\"}]}}\n",
+    )
+    .unwrap();
+    let aud_out = run_ap(
+        root,
+        &["audit", "--home", fake_home.to_str().unwrap(), "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(aud_out.status.success());
+    let aud_s = String::from_utf8_lossy(&aud_out.stdout);
+    let aud_v: Value = serde_json::from_slice(&aud_out.stdout).unwrap();
+    let mt_str = serde_json::to_string(&aud_v["maintainer_targets"]).unwrap_or_default();
+    assert!(
+        mt_str.contains("assets/zz-ap-accelerator.ts") && !mt_str.contains("src/install.rs"),
+        "maintainer_targets must point to assets/zz-ap-accelerator.ts: {aud_s}"
+    );
+}

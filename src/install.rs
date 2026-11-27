@@ -3122,6 +3122,7 @@ import initAccelerator, {{
   classifyCacheDropCause,
   resolveEffectiveMaskHighWaterTokens,
   normCmdFingerprint,
+  detectShellLoopPattern,
   isSieveSelfCommand,
   isSieveSelfCodemode,
   shouldSkipAutoSieveForSelf,
@@ -3759,8 +3760,133 @@ if (process.platform === "win32") {{
     const escRes = runGitBash(healedEsc);
     assert.strictEqual(escRes.status, 0, `live escaped-dollar probe.ps1 failed: rc=${{escRes.status}} err=${{escRes.stderr}}`);
     assert.ok((escRes.stdout || "").includes("OK|probe|$literal"), `escaped-dollar stdout: ${{escRes.stdout}}`);
+
+    // K) Cycle 8 live Git Bash checks: subshell/cmd-subst whoami, subshell/comment PS -File exit 42, slow-grep acceleration
+    const healedSubWhoami = healCommand("(whoami /user)", "bash");
+    assert.strictEqual(healedSubWhoami, "export MSYS_NO_PATHCONV=1; (C:/Windows/System32/whoami.exe /user)");
+    const subWhRes = runGitBash(healedSubWhoami);
+    assert.strictEqual(subWhRes.status, 0, `live (whoami /user) failed: rc=${{subWhRes.status}} err=${{subWhRes.stderr}}`);
+
+    const healedEchoSubst = healCommand("echo $(whoami /user)", "bash");
+    assert.strictEqual(healedEchoSubst, "export MSYS_NO_PATHCONV=1; echo $(C:/Windows/System32/whoami.exe /user)");
+    const echoSubstRes = runGitBash(healedEchoSubst);
+    assert.strictEqual(echoSubstRes.status, 0, `live echo $(whoami /user) failed: rc=${{echoSubstRes.status}} err=${{echoSubstRes.stderr}}`);
+
+    const healedOutSubst = healCommand("out=$(whoami /groups); echo OK_SUB", "bash");
+    assert.strictEqual(healedOutSubst, "export MSYS_NO_PATHCONV=1; out=$(C:/Windows/System32/whoami.exe /groups); echo OK_SUB");
+    const outSubstRes = runGitBash(healedOutSubst);
+    assert.strictEqual(outSubstRes.status, 0, `live out=$(whoami /groups) failed: rc=${{outSubstRes.status}} err=${{outSubstRes.stderr}}`);
+    assert.ok((outSubstRes.stdout || "").includes("OK_SUB") && !(outSubstRes.stderr || "").includes("extra operand"));
+
+    const healedSubPs = healCommand("(powershell -NoProfile -File probe.ps1)", "bash");
+    assert.ok(healedSubPs && healedSubPs.startsWith("(powershell -NoProfile -Command ") && healedSubPs.endsWith(")"));
+    const subPsRes = runGitBash(healedSubPs);
+    assert.strictEqual(subPsRes.status, 0, `live (powershell -File) failed: rc=${{subPsRes.status}} err=${{subPsRes.stderr}}`);
+    assert.ok((subPsRes.stdout || "").includes("OK|probe|"));
+
+    const exit42Ps1 = `${{DIR}}/exit42.ps1`;
+    writeFileSync(exit42Ps1, 'Write-Output "E42"\nexit 42\n', "utf8");
+    const healedCommentPs = healCommand("powershell -NoProfile -File ./exit42.ps1 # note", "bash");
+    assert.ok(healedCommentPs && healedCommentPs.endsWith("' # note"), `comment must stay outside -Command: ${{healedCommentPs}}`);
+    const commentPsRes = runGitBash(healedCommentPs);
+    assert.strictEqual(commentPsRes.status, 42, `live PS -File # comment must preserve exit 42, got ${{commentPsRes.status}}`);
+
+    const healedRil = healCommand(`cd "${{DIR}}" && grep -ril "ERROR" --include=*.log --include=*.md . 2>/dev/null | grep -v missing_tag`, "bash");
+    assert.ok(healedRil && healedRil.includes("rg -l -i") && healedRil.includes("-g '*.log'") && healedRil.includes("-g '*.md'"));
+    const rilRes = runGitBash(healedRil);
+    assert.strictEqual(rilRes.status, 0, `live healed grep -ril failed: rc=${{rilRes.status}} err=${{rilRes.stderr}}`);
+
+    const healedRightOnly = healCommand(`grep -o -E 'ERROR.{{0,2400}}' "${{FILE}}" | head -c 2600`, "bash");
+    assert.ok(healedRightOnly && healedRightOnly.startsWith("rg -a --no-ignore -o 'ERROR.{{0,2400}}'"), `right-only grep -o -E must accelerate to rg: ${{healedRightOnly}}`);
+    const rightOnlyRes = runGitBash(healedRightOnly);
+    assert.strictEqual(rightOnlyRes.status, 0, `live healed right-only grep -o -E failed: rc=${{rightOnlyRes.status}} err=${{rightOnlyRes.stderr}}`);
+    assert.ok((rightOnlyRes.stdout || "").includes("ERROR"));
   }}
 }}
+
+// K2) Cross-platform Cycle 8 assertions: command-substitution sieve guard, compound slow-grep, 2-step oscillation loop-breaker
+assert.strictEqual(isSieveSelfCommand("ap sieve peek $(cat huge.log)"), false);
+assert.strictEqual(isSieveSelfCommand('ap sieve peek "$(cat huge.log)"'), false);
+assert.strictEqual(isSieveSelfCommand("ap sieve peek `cat huge.log`"), false);
+assert.strictEqual(isSieveSelfCommand("ap sieve peek abc123 --grep 'a$(b)'"), true);
+const healedCompoundGrep = healCommand(`grep -o -E '.{{0,220}}ERROR.{{0,200}}' "${{FILE}}" | grep -v nope; echo ===; grep -o -E '.{{0,220}}token.{{0,200}}' "${{FILE}}"`, "bash");
+assert.ok(
+  healedCompoundGrep &&
+  healedCompoundGrep.includes("rg -a --no-ignore -o '.{{0,220}}ERROR.{{0,200}}'") &&
+  !healedCompoundGrep.includes("grep -o -E"),
+  `compound grep -o -E | grep -v must accelerate cleanly: ${{healedCompoundGrep}}`,
+);
+const healedTwoSided900 = healCommand("cd /tmp/work && grep -o '.\\{{0,700\\}}api_service/v1.\\{{0,900\\}}' app-api.min.js | head -2", "bash");
+assert.strictEqual(
+  healedTwoSided900,
+  'cd /tmp/work && "ap" search --around 800 --pretty \'api_service/v1\' "app-api.min.js" | head -2',
+  `two-sided <=1200 grep -o must keep ap search --around 800 --pretty, got: ${{healedTwoSided900}}`,
+);
+const healedOneSided2400 = healCommand("grep -o -E 'api_service/v1.{{0,2400}}' app-api.min.js | head -c 4000", "bash");
+assert.strictEqual(
+  healedOneSided2400,
+  "rg -a --no-ignore -o 'api_service/v1.{{0,2400}}' \"app-api.min.js\" | head -c 4000",
+  `one-sided 2400 grep -o -E must stay on rg, got: ${{healedOneSided2400}}`,
+);
+const fp1 = normCmdFingerprint("cargo test --bin ap test_alpha");
+const fp2 = normCmdFingerprint("git status --short --branch");
+const fp3 = normCmdFingerprint("ap search pattern_gamma src/");
+const fp4 = normCmdFingerprint("ap read src/main.rs --lines 1-40");
+assert.deepStrictEqual(
+  detectShellLoopPattern(
+    [
+      {{ fp: fp1, isError: true }},
+      {{ fp: fp2, isError: false }},
+      {{ fp: fp1, isError: true }},
+      {{ fp: fp2, isError: false }},
+    ],
+    fp2,
+    false,
+  ),
+  {{ kind: "oscillation", count: 4, isError: true }},
+);
+assert.strictEqual(
+  detectShellLoopPattern(
+    [
+      {{ fp: fp1, isError: false }},
+      {{ fp: fp2, isError: false }},
+      {{ fp: fp1, isError: false }},
+      {{ fp: fp2, isError: false }},
+    ],
+    fp2,
+    false,
+  ),
+  undefined,
+  "4 non-error alternating probes must not false-positive",
+);
+assert.deepStrictEqual(
+  detectShellLoopPattern(
+    [
+      {{ fp: fp1, isError: false }},
+      {{ fp: fp2, isError: false }},
+      {{ fp: fp1, isError: false }},
+      {{ fp: fp2, isError: false }},
+      {{ fp: fp1, isError: false }},
+      {{ fp: fp2, isError: false }},
+    ],
+    fp2,
+    false,
+  ),
+  {{ kind: "oscillation", count: 6, isError: false }},
+);
+assert.strictEqual(
+  detectShellLoopPattern(
+    [
+      {{ fp: fp1, isError: true }},
+      {{ fp: fp2, isError: false }},
+      {{ fp: fp3, isError: true }},
+      {{ fp: fp4, isError: false }},
+    ],
+    fp4,
+    false,
+  ),
+  undefined,
+);
 
 console.log(JSON.stringify(emittedApInvocations));
 "#

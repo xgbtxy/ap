@@ -50,6 +50,24 @@ fn bound_diff_json(mut v: Value, max_bytes: usize) -> Value {
             }
             members.truncate(6);
         }
+        if let Some(mods) = obj.get_mut("modified").and_then(Value::as_array_mut) {
+            for m in mods.iter_mut() {
+                if let Some(mo) = m.as_object_mut() {
+                    if let Some(hp) = mo.get("hunk_preview").and_then(Value::as_str) {
+                        let clipped: String = hp.chars().take(240).collect();
+                        mo.insert("hunk_preview".to_string(), json!(clipped));
+                    }
+                    if mo.contains_key("json_diff") {
+                        let jd_len = serde_json::to_string(&mo["json_diff"])
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        if jd_len > 1000 {
+                            mo.remove("json_diff");
+                        }
+                    }
+                }
+            }
+        }
         for key in [
             "exports_added",
             "exports_removed",
@@ -144,11 +162,75 @@ fn collect_dir_manifest(
     Ok(())
 }
 
+fn enrich_modified_entry_deep(old_file: &Path, new_file: &Path, rel_path: &str, entry: &mut Value) {
+    const MAX_DEEP_FILE_BYTES: u64 = 512 * 1024;
+    let old_sz = entry["old_size"].as_u64().unwrap_or(u64::MAX);
+    let new_sz = entry["new_size"].as_u64().unwrap_or(u64::MAX);
+    if old_sz > MAX_DEEP_FILE_BYTES || new_sz > MAX_DEEP_FILE_BYTES {
+        return;
+    }
+    let (Ok(old_b), Ok(new_b)) = (fs::read(old_file), fs::read(new_file)) else {
+        return;
+    };
+    if crate::binary::is_binary_magic(&old_b) || crate::binary::is_binary_magic(&new_b) {
+        return;
+    }
+    let head_old = &old_b[..old_b.len().min(512)];
+    let head_new = &new_b[..new_b.len().min(512)];
+    if head_old.iter().filter(|&&b| b == 0).count() > 4
+        || head_new.iter().filter(|&&b| b == 0).count() > 4
+    {
+        return;
+    }
+    let Some(obj) = entry.as_object_mut() else {
+        return;
+    };
+    if let (Ok(old_v), Ok(new_v)) = (
+        serde_json::from_slice::<Value>(&old_b),
+        serde_json::from_slice::<Value>(&new_b),
+    ) {
+        if matches!(old_v, Value::Object(_) | Value::Array(_))
+            && matches!(new_v, Value::Object(_) | Value::Array(_))
+        {
+            let (_, jdiff) =
+                crate::inspect::diff_json_structural_md(&new_v, &old_v, rel_path, rel_path);
+            obj.insert("json_diff".to_string(), jdiff);
+            return;
+        }
+    }
+    let old_txt = String::from_utf8_lossy(&old_b);
+    let new_txt = String::from_utf8_lossy(&new_b);
+    let ext = Path::new(rel_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if let (Some((_, old_v)), Some((_, new_v))) = (
+        crate::inspect::parse_structured_config_to_json(&old_txt, &ext),
+        crate::inspect::parse_structured_config_to_json(&new_txt, &ext),
+    ) {
+        if matches!(old_v, Value::Object(_) | Value::Array(_))
+            && matches!(new_v, Value::Object(_) | Value::Array(_))
+        {
+            let (_, jdiff) =
+                crate::inspect::diff_json_structural_md(&new_v, &old_v, rel_path, rel_path);
+            obj.insert("json_diff".to_string(), jdiff);
+            return;
+        }
+    }
+    let hunk = crate::binary::compact_text_hunk(&old_txt, &new_txt, 10);
+    if !hunk.trim().is_empty() {
+        let clipped: String = hunk.chars().take(600).collect();
+        obj.insert("hunk_preview".to_string(), json!(clipped));
+    }
+}
+
 fn diff_directories(
     old_root: &Path,
     new_root: &Path,
     old_label: &str,
     new_label: &str,
+    deep: bool,
     max_items: usize,
 ) -> Result<(String, Value), String> {
     const MAX_WALK_FILES: usize = 20_000;
@@ -202,7 +284,21 @@ fn diff_directories(
         total_added > max_items || total_removed > max_items || total_modified > max_items;
     let added: Vec<Value> = added_all.into_iter().take(max_items).collect();
     let removed: Vec<Value> = removed_all.into_iter().take(max_items).collect();
-    let modified: Vec<Value> = modified_all.into_iter().take(max_items).collect();
+    let mut modified: Vec<Value> = modified_all.into_iter().take(max_items).collect();
+    if deep {
+        let mut enriched = 0usize;
+        for m in &mut modified {
+            if enriched >= 6 {
+                break;
+            }
+            if let Some(rel) = m["path"].as_str().map(str::to_string) {
+                enrich_modified_entry_deep(&old_root.join(&rel), &new_root.join(&rel), &rel, m);
+                if m.get("hunk_preview").is_some() || m.get("json_diff").is_some() {
+                    enriched += 1;
+                }
+            }
+        }
+    }
 
     let mut md_lines = vec![format!(
         "# DIR DIFF `{old_label}` -> `{new_label}` (+{total_added} added, -{total_removed} removed, ~{total_modified} modified, ={unchanged_count} unchanged)"
@@ -284,6 +380,12 @@ pub fn run_diff_paths_opts(
     let new_norm = crate::ls::normalize_cli_path(new_raw);
     let old_p = Path::new(&old_norm);
     let new_p = Path::new(&new_norm);
+    if !old_p.exists() {
+        return Err(format!("[ap diff] old path not found: `{old_raw}`"));
+    }
+    if !new_p.exists() {
+        return Err(format!("[ap diff] new path not found: `{new_raw}`"));
+    }
     if semantic {
         let (md, mut jv) = crate::semantic_diff::diff_semantic_paths_both(old_p, new_p)
             .map_err(|e| format!("[ap diff --semantic] {e}"))?;
@@ -294,9 +396,16 @@ pub fn run_diff_paths_opts(
         return Ok((md, jv));
     }
     if old_p.is_dir() && new_p.is_dir() {
-        return diff_directories(old_p, new_p, &old_norm, &new_norm, max_items.clamp(1, 100));
+        return diff_directories(
+            old_p,
+            new_p,
+            &old_norm,
+            &new_norm,
+            deep,
+            max_items.clamp(1, 100),
+        );
     }
-    if old_p.is_dir() != new_p.is_dir() && old_p.exists() && new_p.exists() {
+    if old_p.is_dir() != new_p.is_dir() {
         return Err(format!(
             "[ap diff] cannot diff directory against file (`{old_raw}` vs `{new_raw}`)"
         ));

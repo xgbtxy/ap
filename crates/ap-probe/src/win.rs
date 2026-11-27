@@ -37,6 +37,108 @@ impl WinFilter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTaskXml {
+    pub command: String,
+    pub arguments: String,
+    pub user_id: String,
+    pub run_level: String,
+    pub is_elevated: bool,
+}
+
+fn decode_xml_bytes_utf8_or_utf16(raw: &[u8]) -> String {
+    if raw.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if raw.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if raw.len() >= 4 && raw[1] == 0 && raw[3] == 0 {
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let slice = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+    String::from_utf8_lossy(slice).into_owned()
+}
+
+fn unescape_basic_xml(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn extract_xml_tag_value(xml: &str, tag: &str) -> Option<String> {
+    let low = xml.to_ascii_lowercase();
+    let open = format!("<{}", tag.to_ascii_lowercase());
+    let close = format!("</{}>", tag.to_ascii_lowercase());
+    let mut off = 0usize;
+    while let Some(rel) = low[off..].find(&open) {
+        let start = off + rel;
+        let after_name = start + open.len();
+        let next_ch = low.as_bytes().get(after_name).copied();
+        if !matches!(next_ch, Some(b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/')) {
+            off = after_name;
+            continue;
+        }
+        let gt_rel = low[after_name..].find('>')?;
+        let gt_idx = after_name + gt_rel;
+        if gt_idx > 0 && low.as_bytes()[gt_idx - 1] == b'/' {
+            off = gt_idx + 1;
+            continue;
+        }
+        let body_start = gt_idx + 1;
+        let close_rel = low[body_start..].find(&close)?;
+        let raw_val = xml[body_start..body_start + close_rel].trim();
+        return Some(unescape_basic_xml(raw_val));
+    }
+    None
+}
+
+/// Pure-Rust parser for Windows Scheduled Task XML files (`UTF-16LE` or `UTF-8`),
+/// extracting `<Command>`, `<Arguments>`, `<UserId>`, `<RunLevel>` without spawning `schtasks.exe`.
+pub fn parse_scheduled_task_xml(raw_bytes: &[u8]) -> Option<ParsedTaskXml> {
+    let xml = decode_xml_bytes_utf8_or_utf16(raw_bytes);
+    let command = extract_xml_tag_value(&xml, "Command")?
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if command.is_empty() {
+        return None;
+    }
+    let arguments = extract_xml_tag_value(&xml, "Arguments").unwrap_or_default();
+    let user_id = extract_xml_tag_value(&xml, "UserId").unwrap_or_default();
+    let run_level = extract_xml_tag_value(&xml, "RunLevel").unwrap_or_default();
+    let uid_low = user_id.to_ascii_lowercase();
+    let is_elevated = run_level.eq_ignore_ascii_case("HighestAvailable")
+        || uid_low == "s-1-5-18"
+        || uid_low == "s-1-5-19"
+        || uid_low == "s-1-5-20"
+        || uid_low == "system"
+        || uid_low == "localsystem"
+        || uid_low.ends_with("\\system")
+        || uid_low.contains("administrators");
+    Some(ParsedTaskXml {
+        command,
+        arguments,
+        user_id,
+        run_level,
+        is_elevated,
+    })
+}
+
 fn looks_like_guid_prefix(s: &str) -> bool {
     let trimmed = s.strip_prefix('{').unwrap_or(s);
     let b = trimmed.as_bytes();
@@ -2990,6 +3092,48 @@ mod imp {
                 if rw {
                     issues.push(json!({ "kind": "service_regkey", "key": format!("HKLM\\{svc_reg}"), "sddl": rsddl }));
                 }
+                let params_reg = format!(r"{svc_reg}\Parameters");
+                let (prw, prsddl) = query_reg_key_non_admin_write(&params_reg);
+                if prw {
+                    issues.push(json!({ "kind": "service_params_regkey", "key": format!("HKLM\\{params_reg}"), "sddl": prsddl }));
+                }
+                if let Some(svc_dll_raw) =
+                    read_reg_default_str(HKEY_LOCAL_MACHINE, &params_reg, Some("ServiceDll"))
+                {
+                    let svc_dll = super::resolve_windows_exe_candidate(
+                        &super::extract_service_exe_path(&svc_dll_raw),
+                    );
+                    let dll_low = svc_dll.to_ascii_lowercase();
+                    let is_sys_dll = super::is_ms_os_path(&dll_low);
+                    if !svc_dll.is_empty()
+                        && (!non_ms || !is_sys_dll)
+                        && !is_sys_dll
+                        && std::path::Path::new(&svc_dll).exists()
+                    {
+                        let (dw, _dsddl, dt) = path_non_admin_write_summary(&svc_dll);
+                        if dw {
+                            issues.push(json!({
+                                "kind": "service_dll",
+                                "path": svc_dll,
+                                "trustees": dt,
+                            }));
+                        }
+                        if let Some(pdir) = std::path::Path::new(&svc_dll).parent() {
+                            let pds = pdir.to_string_lossy().to_string();
+                            let (pdw, pdt) = checked_dirs.entry(pds.clone()).or_insert_with(|| {
+                                let (w, _s, t) = path_non_admin_write_summary(&pds);
+                                (w, t)
+                            });
+                            if *pdw {
+                                issues.push(json!({
+                                    "kind": "service_dll_dir",
+                                    "path": pds,
+                                    "trustees": pdt,
+                                }));
+                            }
+                        }
+                    }
+                }
                 if !issues.is_empty() && weak_services.len() < cap {
                     weak_services.push(json!({
                         "service": name,
@@ -3030,15 +3174,225 @@ mod imp {
             }
         }
 
+        // Sysinternals `autoruns`/`accesschk` parity: HKLM Run/RunOnce keys & referenced binaries
+        let mut weak_autoruns: Vec<Value> = Vec::new();
+        const AUTORUN_SUBKEYS: &[&str] = &[
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
+        ];
+        for subkey in AUTORUN_SUBKEYS {
+            if weak_autoruns.len() >= cap {
+                break;
+            }
+            let full_key = format!("HKLM\\{subkey}");
+            let (kw, ksddl) = query_reg_key_non_admin_write(subkey);
+            if kw && wf.as_ref().map(|f| f.matches(&full_key)).unwrap_or(true) {
+                weak_autoruns.push(json!({
+                    "kind": "autorun_regkey",
+                    "key": full_key,
+                    "sddl": ksddl,
+                }));
+            }
+            let sub_w = to_wide(subkey);
+            let mut hk: isize = 0;
+            if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_w.as_ptr(), 0, KEY_READ, &mut hk) }
+                != 0
+            {
+                continue;
+            }
+            for v_idx in 0u32..100u32 {
+                if weak_autoruns.len() >= cap {
+                    break;
+                }
+                let mut nbuf = [0u16; 260];
+                let mut nlen = nbuf.len() as u32;
+                let mut ty = 0u32;
+                let mut dlen = 2048u32;
+                let mut dbuf = vec![0u8; dlen as usize];
+                let vrc = unsafe {
+                    RegEnumValueW(
+                        hk,
+                        v_idx,
+                        nbuf.as_mut_ptr(),
+                        &mut nlen,
+                        ptr::null_mut(),
+                        &mut ty,
+                        dbuf.as_mut_ptr(),
+                        &mut dlen,
+                    )
+                };
+                if vrc == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if vrc != 0 {
+                    continue;
+                }
+                let vname = String::from_utf16_lossy(&nbuf[..nlen as usize]);
+                let (_vt, vval) = decode_reg_value(ty, &dbuf[..dlen as usize]);
+                let Some(cmd_str) = vval.as_str() else {
+                    continue;
+                };
+                if let Some(ref f) = wf {
+                    if !f.matches_any(&[&full_key, &vname, cmd_str]) {
+                        continue;
+                    }
+                }
+                let exe =
+                    super::resolve_windows_exe_candidate(&super::extract_service_exe_path(cmd_str));
+                if exe.is_empty() {
+                    continue;
+                }
+                let exe_low = exe.to_ascii_lowercase();
+                let is_sys_exe = super::is_ms_os_path(&exe_low);
+                if (non_ms && is_sys_exe) || is_sys_exe || !std::path::Path::new(&exe).exists() {
+                    continue;
+                }
+                let mut a_issues = Vec::new();
+                let (ew, _esddl, et) = path_non_admin_write_summary(&exe);
+                if ew {
+                    a_issues.push(json!({ "kind": "autorun_binary", "path": exe, "trustees": et }));
+                }
+                if let Some(pdir) = std::path::Path::new(&exe).parent() {
+                    let pds = pdir.to_string_lossy().to_string();
+                    let (dw, dt) = checked_dirs.entry(pds.clone()).or_insert_with(|| {
+                        let (w, _s, t) = path_non_admin_write_summary(&pds);
+                        (w, t)
+                    });
+                    if *dw {
+                        a_issues
+                            .push(json!({ "kind": "autorun_dir", "path": pds, "trustees": dt }));
+                    }
+                }
+                if !a_issues.is_empty() {
+                    weak_autoruns.push(json!({
+                        "kind": "autorun_value",
+                        "key": full_key,
+                        "name": vname,
+                        "command": cmd_str,
+                        "exe": exe,
+                        "issues": a_issues,
+                    }));
+                }
+            }
+            unsafe {
+                RegCloseKey(hk);
+            }
+        }
+
+        // Pure-Rust Scheduled Tasks XML audit (`%SystemRoot%\System32\Tasks`, zero `schtasks.exe` spawn)
+        let mut weak_tasks: Vec<Value> = Vec::new();
+        let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let tasks_root = std::path::PathBuf::from(&sys_root)
+            .join("System32")
+            .join("Tasks");
+        if tasks_root.is_dir() {
+            let walker = ignore::WalkBuilder::new(&tasks_root)
+                .max_depth(Some(4))
+                .hidden(false)
+                .git_ignore(false)
+                .filter_entry(move |e| {
+                    if e.depth() == 0 {
+                        return true;
+                    }
+                    if non_ms
+                        && e.depth() == 1
+                        && e.file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case("Microsoft")
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .build();
+            let mut scanned_tasks = 0usize;
+            for entry in walker.flatten() {
+                if scanned_tasks >= 400 || weak_tasks.len() >= cap {
+                    break;
+                }
+                let ep = entry.path();
+                if !ep.is_file() {
+                    continue;
+                }
+                let Ok(meta) = ep.metadata() else {
+                    continue;
+                };
+                if meta.len() == 0 || meta.len() > 128 * 1024 {
+                    continue;
+                }
+                scanned_tasks += 1;
+                let Ok(raw) = std::fs::read(ep) else {
+                    continue;
+                };
+                let Some(parsed) = super::parse_scheduled_task_xml(&raw) else {
+                    continue;
+                };
+                let rel_task = ep
+                    .strip_prefix(&tasks_root)
+                    .unwrap_or(ep)
+                    .to_string_lossy()
+                    .replace('/', "\\");
+                if let Some(ref f) = wf {
+                    if !f.matches_any(&[&rel_task, &parsed.command, &parsed.arguments]) {
+                        continue;
+                    }
+                }
+                let exe = super::resolve_windows_exe_candidate(&super::extract_service_exe_path(
+                    &parsed.command,
+                ));
+                if exe.is_empty() {
+                    continue;
+                }
+                let exe_low = exe.to_ascii_lowercase();
+                let is_sys_exe = super::is_ms_os_path(&exe_low);
+                if (non_ms && is_sys_exe) || is_sys_exe || !std::path::Path::new(&exe).exists() {
+                    continue;
+                }
+                let mut t_issues = Vec::new();
+                let (ew, _esddl, et) = path_non_admin_write_summary(&exe);
+                if ew {
+                    t_issues.push(json!({ "kind": "task_binary", "path": exe, "trustees": et }));
+                }
+                if let Some(pdir) = std::path::Path::new(&exe).parent() {
+                    let pds = pdir.to_string_lossy().to_string();
+                    let (dw, dt) = checked_dirs.entry(pds.clone()).or_insert_with(|| {
+                        let (w, _s, t) = path_non_admin_write_summary(&pds);
+                        (w, t)
+                    });
+                    if *dw {
+                        t_issues.push(json!({ "kind": "task_dir", "path": pds, "trustees": dt }));
+                    }
+                }
+                if !t_issues.is_empty() {
+                    weak_tasks.push(json!({
+                        "task": rel_task,
+                        "command": parsed.command,
+                        "arguments": parsed.arguments,
+                        "exe": exe,
+                        "user_id": parsed.user_id,
+                        "run_level": parsed.run_level,
+                        "elevated": parsed.is_elevated,
+                        "issues": t_issues,
+                    }));
+                }
+            }
+        }
+
         json!({
             "ok": true,
             "mode": "weak_acl",
             "weak_pipes_count": weak_pipes.len(),
             "weak_services_count": weak_services.len(),
             "exploitable_unquoted_count": unquoted_services.len(),
+            "weak_autoruns_count": weak_autoruns.len(),
+            "weak_tasks_count": weak_tasks.len(),
             "weak_pipes": weak_pipes,
             "weak_services": weak_services,
             "exploitable_unquoted": unquoted_services,
+            "weak_autoruns": weak_autoruns,
+            "weak_tasks": weak_tasks,
         })
     }
 
@@ -3897,6 +4251,41 @@ mod tests {
                 p0.get("server_il").is_some() && p0.get("il").is_some(),
                 "{ps}"
             );
+            let wa = imp::query_weak_acl_opts(None, Some("NonExistentC8Filter"), 5, true);
+            assert_eq!(wa["ok"], Value::Bool(true));
+            assert!(
+                wa.get("weak_autoruns").is_some() && wa.get("weak_tasks").is_some(),
+                "expected weak_autoruns & weak_tasks arrays: {wa}"
+            );
         }
+
+        // Cycle 8 P1: pure-Rust Scheduled Task XML parser (UTF-8 and UTF-16LE BOM)
+        let xml_utf8 = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2">
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"C:\ProgramData\Acme\agent.exe"</Command>
+      <Arguments>--sync &amp; --quiet</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+        let p_u8 = parse_scheduled_task_xml(xml_utf8.as_bytes()).unwrap();
+        assert_eq!(p_u8.command, r"C:\ProgramData\Acme\agent.exe");
+        assert_eq!(p_u8.arguments, "--sync & --quiet");
+        assert_eq!(p_u8.user_id, "S-1-5-18");
+        assert!(p_u8.is_elevated);
+
+        let mut xml_u16le = vec![0xFFu8, 0xFEu8];
+        for u in xml_utf8.encode_utf16() {
+            xml_u16le.extend_from_slice(&u.to_le_bytes());
+        }
+        let p_u16 = parse_scheduled_task_xml(&xml_u16le).unwrap();
+        assert_eq!(p_u16, p_u8);
     }
 }

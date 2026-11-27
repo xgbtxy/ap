@@ -1023,7 +1023,7 @@ pub fn build_maintainer_targets(totals: &Counters) -> Vec<Value> {
         totals.shell_quoting_collision + totals.encoding_utf8_crash + totals.path_translation_errors,
         "shell_os_friction",
         "Shell quoting collisions, UTF-8/GBK crashes, or cross-OS path translation failures",
-        &["src/exec.rs", "src/install.rs"],
+        &["src/exec.rs", "assets/zz-ap-accelerator.ts"],
         "Expand pre-execution command auto-healing, quote/backslash normalization, and UTF-8 locking without breaking destructive-command boundaries",
     );
     push_if(
@@ -1044,7 +1044,7 @@ pub fn build_maintainer_targets(totals: &Counters) -> Vec<Value> {
         totals.patch_target_mismatch,
         "edit_patch_mismatch",
         "Edit/patch target mismatches causing retry round-trips",
-        &["crates/ap-splice/src/lib.rs", "src/install.rs"],
+        &["crates/ap-splice/src/lib.rs", "assets/zz-ap-accelerator.ts"],
         "Tighten fuzzy anchor recovery (indentation/blank-line/hashline tolerance) and closest-window diagnostics",
     );
     push_if(
@@ -1075,7 +1075,7 @@ pub fn build_maintainer_targets(totals: &Counters) -> Vec<Value> {
             + totals.kv_cache_cold_drops,
         "reasoning_and_cache_friction",
         "Heavy-thinking churn, DSML tool leaks, serial 1-tool loops, or KV-cache cold drops",
-        &["src/pi_patch.rs", "src/install.rs", "src/profile.rs"],
+        &["src/pi_patch.rs", "assets/zz-ap-accelerator.ts", "src/profile.rs"],
         "Refine Pi runtime patches, KV-cache prefix stability, model-tier profiles, parallel tool batching hints, and tool-name self-healing",
     );
     items.sort_by_key(|a| std::cmp::Reverse(a.0));

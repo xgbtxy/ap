@@ -599,12 +599,19 @@ fn is_legal_doc_url_prose(axis: &str, text: &str) -> bool {
             || l.contains("/docs/"))
 }
 
-fn collect_multiline_es_import_export_lines(text: &str) -> HashSet<usize> {
-    let mut out = HashSet::new();
-    let lines: Vec<&str> = text.lines().collect();
+fn collect_multiline_es_import_export_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut line_spans: Vec<(usize, usize, &str)> = Vec::new();
+    let mut off = 0usize;
+    for raw_ln in text.split('\n') {
+        let ln = raw_ln.strip_suffix('\r').unwrap_or(raw_ln);
+        line_spans.push((off, off + ln.len(), ln));
+        off += raw_ln.len() + 1;
+    }
     let mut i = 0usize;
-    while i < lines.len() {
-        let trimmed = lines[i].trim_start();
+    while i < line_spans.len() {
+        let (start_off, _, ln_i) = line_spans[i];
+        let trimmed = ln_i.trim_start();
         let starts_multiline_import = (trimmed.starts_with("import ")
             || trimmed.starts_with("import{"))
             && !trimmed.starts_with("import(")
@@ -627,30 +634,34 @@ fn collect_multiline_es_import_export_lines(text: &str) -> HashSet<usize> {
             })
             .unwrap_or(false);
         if starts_multiline_import || starts_multiline_export {
-            let max_end = (i + 32).min(lines.len());
-            let mut end_idx = None;
-            for (j, ln) in lines.iter().enumerate().take(max_end).skip(i + 1) {
-                if let Some(close_pos) = ln.find('}') {
-                    let after_close = ln[close_pos + 1..].trim_start();
-                    let next_has_from = lines
-                        .get(j + 1)
-                        .map(|n| n.trim_start().starts_with("from"))
-                        .unwrap_or(false);
-                    if after_close.starts_with("from") || next_has_from {
-                        end_idx = Some(if after_close.starts_with("from") {
-                            j
-                        } else {
-                            j + 1
-                        });
+            let max_end = (i + 32).min(line_spans.len());
+            let mut end_info: Option<(usize, usize)> = None;
+            for (j, &(j_start, j_end, ln_j)) in
+                line_spans.iter().enumerate().take(max_end).skip(i + 1)
+            {
+                if let Some(close_pos) = ln_j.find('}') {
+                    let after_close = &ln_j[close_pos + 1..];
+                    let after_trim = after_close.trim_start();
+                    if after_trim.starts_with("from") {
+                        // Terminate right at `;` if trailing code follows on the same closing line!
+                        let rel_end = after_close
+                            .find(';')
+                            .map(|s| close_pos + 1 + s + 1)
+                            .unwrap_or(ln_j.len());
+                        end_info = Some((j, j_start + rel_end));
+                    } else if let Some(&(n_start, n_end, n_ln)) = line_spans.get(j + 1) {
+                        if n_ln.trim_start().starts_with("from") {
+                            let rel_end = n_ln.find(';').map(|s| s + 1).unwrap_or(n_end - n_start);
+                            end_info = Some((j + 1, n_start + rel_end));
+                        }
                     }
+                    let _ = j_end;
                     break;
                 }
             }
-            if let Some(e) = end_idx {
-                for k in i..=e {
-                    out.insert(k + 1);
-                }
-                i = e + 1;
+            if let Some((e_idx, end_byte)) = end_info {
+                out.push((start_off, end_byte));
+                i = e_idx + 1;
                 continue;
             }
         }
@@ -681,13 +692,13 @@ fn scan_text_into(
     if is_test {
         return;
     }
-    let multiline_import_lines = if !is_binary_strings
+    let multiline_import_ranges = if !is_binary_strings
         && text.len() <= 512_000
         && (text.contains("import") || text.contains("export"))
     {
-        collect_multiline_es_import_export_lines(text)
+        collect_multiline_es_import_export_ranges(text)
     } else {
-        HashSet::new()
+        Vec::new()
     };
 
     for rule in rules {
@@ -697,7 +708,10 @@ fn scan_text_into(
             // Skip obvious comment-only, bare/multiline ES import/export, and legal/docs URL prose lines
             let (line_no, snippet) = clip_snippet(text, m.start(), m.end());
             if !is_binary_strings {
-                if multiline_import_lines.contains(&line_no)
+                let in_ml_import = multiline_import_ranges
+                    .iter()
+                    .any(|&(s, e)| m.start() >= s && m.start() < e);
+                if in_ml_import
                     || snippet.starts_with("//")
                     || snippet.starts_with('#')
                     || snippet.starts_with('*')
@@ -710,8 +724,18 @@ fn scan_text_into(
                     .find('\n')
                     .map(|i| m.end() + i)
                     .unwrap_or(text.len());
-                if line_end.saturating_sub(line_start) <= 400
-                    && is_bare_es_import_export_line(&text[line_start..line_end])
+                // Evaluate single-line ES import/export ONLY on the `;`-delimited statement slice
+                // containing `m.start()` so `import { a } from 'x'; execSync(y);` keeps `execSync`.
+                let stmt_start = text[line_start..m.start()]
+                    .rfind(';')
+                    .map(|i| line_start + i + 1)
+                    .unwrap_or(line_start);
+                let stmt_end = text[m.end()..line_end]
+                    .find(';')
+                    .map(|i| m.end() + i)
+                    .unwrap_or(line_end);
+                if stmt_end.saturating_sub(stmt_start) <= 400
+                    && is_bare_es_import_export_line(&text[stmt_start..stmt_end])
                 {
                     continue;
                 }
@@ -1638,6 +1662,39 @@ export function runCmd(arg: string) { return execSync(arg); }\n",
             !ml_map.items.iter().any(|i| i.line <= 4),
             "multiline ES import lines L1-L4 must be skipped: {:?}",
             ml_map.items
+        );
+
+        // Cycle 8 P1 regression: same-line `import { a } from 'x'; execSync(y);` and
+        // multi-line closing `} from 'x'; execSync(y);` must NEVER drop code after `;`.
+        let sl_dir = dir.join("semicolon_imp");
+        fs::create_dir_all(&sl_dir).unwrap();
+        fs::write(
+            sl_dir.join("same.ts"),
+            "import { execSync } from 'child_process'; execSync(userCmd);\n",
+        )
+        .unwrap();
+        fs::write(
+            sl_dir.join("ml_close.ts"),
+            "import {\n  spawnSync\n} from 'child_process'; spawnSync(userCmd);\n",
+        )
+        .unwrap();
+        let sl_map =
+            try_build_surface_map_with_excludes(&sl_dir, 50, 10, false, false, &[]).unwrap();
+        assert!(
+            sl_map
+                .items
+                .iter()
+                .any(|i| i.target == "same.ts" && i.line == 1 && i.symbol == "execSync"),
+            "same-line import + semicolon call must keep execSync: {:?}",
+            sl_map.items
+        );
+        assert!(
+            sl_map
+                .items
+                .iter()
+                .any(|i| i.target == "ml_close.ts" && i.line == 3 && i.symbol == "spawnSync"),
+            "multiline import closing line + semicolon call must keep spawnSync: {:?}",
+            sl_map.items
         );
 
         let _ = fs::remove_dir_all(&dir);

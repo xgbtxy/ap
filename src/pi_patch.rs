@@ -157,7 +157,13 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 r#").join(delimiter);return{...process.env,...process.platform==="win32"?{PYTHONUTF8:process.env.PYTHONUTF8??"1",PYTHONIOENCODING:process.env.PYTHONIOENCODING??"utf-8"}:{},[pathKey]:updatedPath}}function sanitize"#,
             ],
             new: r#").join(delimiter);return{...process.env,...process.platform==="win32"?{PYTHONUTF8:process.env.PYTHONUTF8??"1",PYTHONIOENCODING:process.env.PYTHONIOENCODING??"utf-8",LANG:process.env.LANG??"C.UTF-8",LC_ALL:process.env.LC_ALL??"C.UTF-8"}:{},[pathKey]:updatedPath}}function sanitize"#,
-            already_present_markers: &[],
+            already_present_markers: &[
+                "PYTHONUTF8",
+                "PYTHONIOENCODING",
+                "LANG",
+                "LC_ALL",
+                "function sanitize",
+            ],
         }],
     },
     PatchSpec {
@@ -487,23 +493,37 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "windows_utf8_shell_env",
-        summary: "Lock PYTHONUTF8=1, PYTHONIOENCODING=utf-8, LANG=C.UTF-8 & LC_ALL=C.UTF-8 in Pi Windows getShellEnv() (prevents GBK crashes even on write/destructive shell commands)",
+        summary: "Lock Windows UTF-8 env (PYTHONUTF8/LANG/LC_ALL) and non-interactive subprocess defaults (GIT_TERMINAL_PROMPT=0, GCM_INTERACTIVE=never, PAGER=cat, GIT_EDITOR=true, PIP_NO_INPUT=1, npm_config_yes=true) in Pi getShellEnv()",
         hunks: &[
             PatchHunk {
                 id: "bundle_windows_utf8_shell_env",
                 rel_hint: None,
                 old: "function getShellEnv(){let binDir=getBinDir(),pathKey=Object.keys(process.env).find(key=>key.toLowerCase()===\"path\")??\"PATH\",currentPath=process.env[pathKey]??\"\",updatedPath=currentPath.split(delimiter).filter(Boolean).includes(binDir)?currentPath:[binDir,currentPath].filter(Boolean).join(delimiter);return{...process.env,[pathKey]:updatedPath}}",
-                alt_olds: &[],
-                new: "function getShellEnv(){let binDir=getBinDir(),pathKey=Object.keys(process.env).find(key=>key.toLowerCase()===\"path\")??\"PATH\",currentPath=process.env[pathKey]??\"\",updatedPath=currentPath.split(delimiter).filter(Boolean).includes(binDir)?currentPath:[binDir,currentPath].filter(Boolean).join(delimiter);return{...process.env,...process.platform===\"win32\"?{PYTHONUTF8:process.env.PYTHONUTF8??\"1\",PYTHONIOENCODING:process.env.PYTHONIOENCODING??\"utf-8\",LANG:process.env.LANG??\"C.UTF-8\",LC_ALL:process.env.LC_ALL??\"C.UTF-8\"}:{},[pathKey]:updatedPath}}",
-                already_present_markers: &[],
+                alt_olds: &[
+                    "function getShellEnv(){let binDir=getBinDir(),pathKey=Object.keys(process.env).find(key=>key.toLowerCase()===\"path\")??\"PATH\",currentPath=process.env[pathKey]??\"\",updatedPath=currentPath.split(delimiter).filter(Boolean).includes(binDir)?currentPath:[binDir,currentPath].filter(Boolean).join(delimiter);return{...process.env,...process.platform===\"win32\"?{PYTHONUTF8:process.env.PYTHONUTF8??\"1\",PYTHONIOENCODING:process.env.PYTHONIOENCODING??\"utf-8\",LANG:process.env.LANG??\"C.UTF-8\",LC_ALL:process.env.LC_ALL??\"C.UTF-8\"}:{},[pathKey]:updatedPath}}",
+                ],
+                new: "function getShellEnv(){let binDir=getBinDir(),pathKey=Object.keys(process.env).find(key=>key.toLowerCase()===\"path\")??\"PATH\",currentPath=process.env[pathKey]??\"\",updatedPath=currentPath.split(delimiter).filter(Boolean).includes(binDir)?currentPath:[binDir,currentPath].filter(Boolean).join(delimiter);return{...process.env,GIT_TERMINAL_PROMPT:process.env.GIT_TERMINAL_PROMPT??\"0\",GCM_INTERACTIVE:process.env.GCM_INTERACTIVE??\"never\",GIT_PAGER:process.env.GIT_PAGER??\"cat\",PAGER:process.env.PAGER??\"cat\",GIT_EDITOR:process.env.GIT_EDITOR??\"true\",GIT_MERGE_AUTOEDIT:process.env.GIT_MERGE_AUTOEDIT??\"no\",PIP_NO_INPUT:process.env.PIP_NO_INPUT??\"1\",npm_config_yes:process.env.npm_config_yes??\"true\",...process.platform===\"win32\"?{PYTHONUTF8:process.env.PYTHONUTF8??\"1\",PYTHONIOENCODING:process.env.PYTHONIOENCODING??\"utf-8\",LANG:process.env.LANG??\"C.UTF-8\",LC_ALL:process.env.LC_ALL??\"C.UTF-8\"}:{},[pathKey]:updatedPath}}",
+                already_present_markers: &[
+                    "PYTHONUTF8",
+                    "GIT_TERMINAL_PROMPT",
+                    "GCM_INTERACTIVE",
+                    "PIP_NO_INPUT",
+                ],
             },
             PatchHunk {
                 id: "shell_windows_utf8_shell_env",
                 rel_hint: Some("dist/utils/shell.js"),
                 old: "    return {\n        ...process.env,\n        [pathKey]: updatedPath,\n    };",
-                alt_olds: &[],
-                new: "    return {\n        ...process.env,\n        ...(process.platform === \"win32\" ? { PYTHONUTF8: process.env.PYTHONUTF8 ?? \"1\", PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? \"utf-8\", LANG: process.env.LANG ?? \"C.UTF-8\", LC_ALL: process.env.LC_ALL ?? \"C.UTF-8\" } : {}),\n        [pathKey]: updatedPath,\n    };",
-                already_present_markers: &[],
+                alt_olds: &[
+                    "    return {\n        ...process.env,\n        ...(process.platform === \"win32\" ? { PYTHONUTF8: process.env.PYTHONUTF8 ?? \"1\", PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? \"utf-8\", LANG: process.env.LANG ?? \"C.UTF-8\", LC_ALL: process.env.LC_ALL ?? \"C.UTF-8\" } : {}),\n        [pathKey]: updatedPath,\n    };",
+                ],
+                new: "    return {\n        ...process.env,\n        GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT ?? \"0\",\n        GCM_INTERACTIVE: process.env.GCM_INTERACTIVE ?? \"never\",\n        GIT_PAGER: process.env.GIT_PAGER ?? \"cat\",\n        PAGER: process.env.PAGER ?? \"cat\",\n        GIT_EDITOR: process.env.GIT_EDITOR ?? \"true\",\n        GIT_MERGE_AUTOEDIT: process.env.GIT_MERGE_AUTOEDIT ?? \"no\",\n        PIP_NO_INPUT: process.env.PIP_NO_INPUT ?? \"1\",\n        npm_config_yes: process.env.npm_config_yes ?? \"true\",\n        ...(process.platform === \"win32\" ? { PYTHONUTF8: process.env.PYTHONUTF8 ?? \"1\", PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? \"utf-8\", LANG: process.env.LANG ?? \"C.UTF-8\", LC_ALL: process.env.LC_ALL ?? \"C.UTF-8\" } : {}),\n        [pathKey]: updatedPath,\n    };",
+                already_present_markers: &[
+                    "PYTHONUTF8",
+                    "GIT_TERMINAL_PROMPT",
+                    "GCM_INTERACTIVE",
+                    "PIP_NO_INPUT",
+                ],
             },
         ],
     },
@@ -2449,6 +2469,129 @@ console.log("OK_COMPACT_AND_DNS");
             .find(|p| p.id == "temp_log_cap_and_gc")
             .unwrap();
         assert_eq!(p21_after.status, "applied");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn patch14_upgrades_cleanly_and_locks_non_interactive_env() {
+        let base = std::env::temp_dir().join(format!("ap_pi_p14_c8_upg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        let utils_dir = pi_dir.join("dist").join("utils");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&utils_dir).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.1-cycle7"}"#,
+        )
+        .unwrap();
+
+        let p14 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "windows_utf8_shell_env")
+            .unwrap();
+        assert_eq!(PATCH_SPECS.len(), 22);
+        // Seed files with prior Cycle 7 #14 (stored in alt_olds[0])
+        fs::write(
+            chunks.join("chunk-shell.js"),
+            format!("const delimiter = ';'; function getBinDir(){{return '/bin';}}\n{}\nexport {{ getShellEnv }};\n", p14.hunks[0].alt_olds[0]),
+        )
+        .unwrap();
+        fs::write(
+            utils_dir.join("shell.js"),
+            format!(
+                "const delimiter = ';';\nfunction getBinDir() {{ return '/bin'; }}\nexport function getShellEnv() {{\n    const pathKey = 'PATH';\n    const updatedPath = '/bin';\n{}\n}}\n",
+                p14.hunks[1].alt_olds[0]
+            ),
+        )
+        .unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let before = inspect_pi_patches(Some(&pi_str));
+        let p14_before = before
+            .patches
+            .iter()
+            .find(|p| p.id == "windows_utf8_shell_env")
+            .unwrap();
+        assert_ne!(
+            p14_before.status, "applied",
+            "old #14 without non-interactive defaults must be detected as upgradable"
+        );
+
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(newly.contains(&"windows_utf8_shell_env:bundle_windows_utf8_shell_env".to_string()));
+        assert!(newly.contains(&"windows_utf8_shell_env:shell_windows_utf8_shell_env".to_string()));
+
+        // Verify 2nd run is 100% idempotent
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let after = inspect_pi_patches(Some(&pi_str));
+        let p14_after = after
+            .patches
+            .iter()
+            .find(|p| p.id == "windows_utf8_shell_env")
+            .unwrap();
+        assert_eq!(p14_after.status, "applied");
+
+        // Execute upgraded shell.js & chunk-shell.js in Node to prove syntax + defaults + `??` user-override precedence
+        let shell_url = format!(
+            "file:///{}",
+            utils_dir
+                .join("shell.js")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+        let chunk_url = format!(
+            "file:///{}",
+            chunks
+                .join("chunk-shell.js")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+        let verify_js = format!(
+            r#"
+import assert from "node:assert/strict";
+import {{ getShellEnv as coreEnv }} from "{shell_url}";
+import {{ getShellEnv as bundleEnv }} from "{chunk_url}";
+for (const k of ["GIT_TERMINAL_PROMPT","GCM_INTERACTIVE","GIT_PAGER","PAGER","GIT_EDITOR","GIT_MERGE_AUTOEDIT","PIP_NO_INPUT","npm_config_yes"]) {{
+  delete process.env[k];
+}}
+for (const fn of [coreEnv, bundleEnv]) {{
+  const e = fn();
+  assert.strictEqual(e.GIT_TERMINAL_PROMPT, "0");
+  assert.strictEqual(e.GCM_INTERACTIVE, "never");
+  assert.strictEqual(e.GIT_PAGER, "cat");
+  assert.strictEqual(e.PAGER, "cat");
+  assert.strictEqual(e.GIT_EDITOR, "true");
+  assert.strictEqual(e.GIT_MERGE_AUTOEDIT, "no");
+  assert.strictEqual(e.PIP_NO_INPUT, "1");
+  assert.strictEqual(e.npm_config_yes, "true");
+}}
+process.env.GIT_PAGER = "less";
+assert.strictEqual(coreEnv().GIT_PAGER, "less");
+assert.strictEqual(bundleEnv().GIT_PAGER, "less");
+"#
+        );
+        let verify_mjs = base.join("verify_p14.mjs");
+        fs::write(&verify_mjs, verify_js).unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&verify_mjs)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "Node verification of upgraded Patch #14 failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

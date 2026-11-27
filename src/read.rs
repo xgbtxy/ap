@@ -1534,7 +1534,7 @@ fn read_single_target(
         }
     };
 
-    if cli.hex {
+    if cli.hex && !cli.strings {
         let mut offs: Vec<usize> = Vec::new();
         if let Some(ref spec) = cli.offset {
             for part in spec.split(',') {
@@ -1834,13 +1834,21 @@ fn read_single_target(
     }
 
     if cli.strings {
-        let max_hits = if cli.max_hits > 0 { cli.max_hits } else { 200 };
-        let raw_rendered = crate::binary::extract_strings_md(
+        let max_hits = if cli.max_hits > 0 {
+            cli.max_hits
+        } else if cli.around > 0 && cli.query.is_some() {
+            40
+        } else {
+            200
+        };
+        let raw_rendered = crate::binary::extract_strings_md_ex(
             &raw_bytes,
             cli.query.as_deref(),
             cli.min_len,
             max_hits,
             &cli.str_encoding,
+            cli.around,
+            cli.hex,
         );
         let rendered = if cli.width > 0 {
             raw_rendered
