@@ -42,7 +42,7 @@ Pass `--pi-dir <path>` (or set `PI_PACKAGE_DIR`) if Pi is installed in a non-sta
 18. **`session_before_compact_first_wins`**: Enforces first-non-null compaction ownership in `ExtensionRunner.emit()` (setting `event.compactionClaimed = true` while preserving `cancel: true` preemption and ensuring later truthy non-compaction returns like `{}` or `{ cancel: false }` never wipe out an earlier handler's compaction summary).
 19. **`http_dns_stale_cache`**: Injects an LRU 45s fresh-TTL + 10-minute stale-IP coalescing DNS lookup cache onto `EnvHttpProxyAgent`'s plain `connect` options in `configureHttpDispatcher()` (`all: true`/`all: false` + `hints`/`order` safe, case-insensitive host keys, concurrent lookup deduplication, per-lookup single-settlement/re-entrancy guard, snapshotted `opts`, leaving `createUndiciClient()` untouched so HTTP-CONNECT proxy tunnels and keepAlive/timeout options stay intact) to survive transient `ENOTFOUND` / `EAI_AGAIN` / `ETIMEOUT` / `ETIMEDOUT` / `ESERVFAIL` / `EAI_FAIL` / `EAI_NODATA` / `EAI_NONAME` bursts.
 20. **`read_eof_clamp`**: Returns a structured `[Offset ... is beyond end of file ...]` notice with `details = { eofClamped: true, totalFileLines }` instead of throwing an uncaught tool error when `read` offset exceeds file length.
-21. **`temp_log_cap_and_gc`**: Caps Pi `OutputAccumulator` temp logs at `PI_TEMP_LOG_MAX_BYTES` (default 32 MB) with an explicit cap marker and runs lazy 12-hour GC on stale `pi-bash-*.log` files in `os.tmpdir()`.
+21. **`temp_log_cap_and_gc`**: Caps Pi `OutputAccumulator` temp logs at `PI_TEMP_LOG_MAX_BYTES` (default 32 MB) with an explicit cap marker and runs lazy 12-hour GC on stale `pi-bash-*.log` and `pi-codemode-*.txt` files in `os.tmpdir()`.
 22. **`windows_bash_cmd_spill`**: Strips embedded NUL bytes and transparently spills >20 KB Windows `bash`/`powershell` command lines to `%TEMP%/pi-cmd-spill/pi-cmd-*.{sh,ps1}` with guaranteed `finally` unlink to prevent `ENAMETOOLONG` / `CreateProcess` command-line truncation (esbuild identifier-rename resilient).
 
 ## Multi-Extension Compaction Yield & Dynamic Observation Masking
@@ -52,7 +52,7 @@ Pass `--pi-dir <path>` (or set `PI_PACKAGE_DIR`) if Pi is installed in a non-sta
   2. `AP_YIELD_COMPACT=1` in the environment,
   3. `"yield_compact": true` (or `"yieldCompact": true`) in `~/.ap/profile.json` (`ap profile set --yield-compact true`), or
   4. A peer extension emitted `"ap:claim_compaction"` on `pi.events`.
-- **Dynamic masking calibration**: `zz-ap-accelerator.ts` reads active model `compaction.modelOverrides[<model>].reserveTokens` from `~/.pi/agent/settings.json` and caps observation masking below `floor(triggerTokens * 0.85)` (with the `deepseek` Layer 3 profile calibrated to `135k`), keeping `/ap status` (`mask@<N>k`) and HUD warnings aligned with real compaction triggers.
+- **Dynamic masking calibration**: `zz-ap-accelerator.ts` reads active model `compaction.modelOverrides[<model>].reserveTokens` from `~/.pi/agent/settings.json`. For standard models it caps observation masking below `floor(triggerTokens * 0.85)`; for deep cache-discount models (e.g. 50:1 KV-cache discount such as DeepSeek V4.1 Flash) it keeps masking emergency-only at `210k` (never clamping below `compactionTriggerTokens`), preventing costly mid-prefix KV-cache busts right before compaction while keeping `/ap status` (`mask@210k`) truthful.
 
 ## Pairing with Guard-Aware `ap atlas surface` & `ap baton frontier`
 

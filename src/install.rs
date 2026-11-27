@@ -2938,11 +2938,13 @@ assert.strictEqual(shouldYieldCompaction({{ profileYieldCompact: true }}), true)
 assert.strictEqual(shouldYieldCompaction({{ peerClaimed: true }}), true);
 assert.strictEqual(shouldYieldCompaction({{}}), false);
 
-// 2. Dynamic masking threshold below 160k DeepSeek Flash compaction trigger
+// 2. Dynamic masking threshold: preserve emergency 210k on deep-cache-discount models (never bust hot KV-cache before 160k compaction!), while standard models cap at 85%
 const trigger = readModelCompactionTriggerTokens({{ provider: "deepseek", id: "flash-auto", contextWindow: 1000000 }}, "{st_str}");
 assert.strictEqual(trigger, 160000);
-const effMask = resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: true, compactionTriggerTokens: trigger }});
-assert.strictEqual(effMask, 136000, "must clamp below 85% of 160k compaction trigger");
+const effMaskDeep = resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: true, compactionTriggerTokens: trigger }});
+assert.strictEqual(effMaskDeep, 210000, "deepCacheDiscount models must NOT clamp below 160k compaction trigger");
+const effMaskStd = resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: false, compactionTriggerTokens: trigger }});
+assert.strictEqual(effMaskStd, 136000, "standard models must clamp below 85% of 160k compaction trigger");
 
 // 3. Tool alias + arg healing + DSML/tool_call scrubbing
 const active = new Set(["bash", "read", "edit", "write", "codemode", "grep"]);
@@ -3058,14 +3060,11 @@ assert.strictEqual(compactRes, undefined);
 console.log("OK_PI_ACCELERATOR_NODE");
 "#
         );
+        let suite_mjs = dir.path().join("adversarial_suite.mjs");
+        std::fs::write(&suite_mjs, &script).unwrap();
         let run = std::process::Command::new("node")
-            .args([
-                "--experimental-strip-types",
-                "--no-warnings",
-                "--input-type=module",
-                "-e",
-                &script,
-            ])
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&suite_mjs)
             .output()
             .unwrap();
         assert!(
@@ -3119,6 +3118,13 @@ import initAccelerator, {{
   isDeepSeekModel,
   snapshotProviderRequestHashes,
   classifyCacheDropCause,
+  resolveEffectiveMaskHighWaterTokens,
+  normCmdFingerprint,
+  isSieveSelfCommand,
+  isSieveSelfCodemode,
+  formatAutoSieveDigest,
+  healMsysPathConv,
+  healBashPowerShellCommand,
 }} from "{url}";
 
 const DIR = "{fix_dir_s}";
@@ -3574,18 +3580,116 @@ for (const spacedMember of [
 const nonStrSliceTip = classifyCodemodeFailureTip("TypeError: not a function");
 assert.ok(nonStrSliceTip.includes("JSON.stringify(undefined)") && nonStrSliceTip.includes('typeof v === "string"'));
 
+// H) Cycle 5 micro-polish regression checks:
+// 1. Blockquoted tilde/unclosed fences & CRLF clean closing (no dangling `\r`)
+const bqTildeXml = '> ~~~xml\n> <tool_call>{{"name":"bash","arguments":{{"command":"echo pwn"}}}}</tool_call>\n> ~~~';
+assert.strictEqual(extractXmlJsonToolCalls(bqTildeXml, activeTools), undefined, "blockquoted tilde XML must never extract");
+assert.strictEqual(scrubLeakedToolMarkup(bqTildeXml), bqTildeXml, "blockquoted tilde XML must stay verbatim");
+const bqTildeDsml = '> ~~~xml\n> <｜DSML｜invoke name="bash"><｜DSML｜parameter name="command">echo pwn</｜DSML｜parameter></｜DSML｜invoke>\n> ~~~';
+assert.strictEqual(extractDsmlToolCalls(bqTildeDsml, activeTools), undefined, "blockquoted tilde DSML must never extract");
+const bqUnclosedBt = '> ```xml\n> <tool_call>{{"name":"bash","arguments":{{"command":"echo pwn"}}}}</tool_call>';
+assert.strictEqual(extractXmlJsonToolCalls(bqUnclosedBt, activeTools), undefined, "unclosed blockquoted fence must never extract");
+const bqExitThenProse =
+  '> ```xml\n> <tool_call>{{"name":"bash","arguments":{{"command":"doc"}}}}</tool_call>\n<tool_call>{{"name":"read","arguments":{{"path":"a.txt"}}}}</tool_call>';
+const bqExitRec = extractXmlJsonToolCalls(bqExitThenProse, activeTools);
+assert.strictEqual(bqExitRec?.calls.length, 1);
+assert.strictEqual(bqExitRec?.calls[0].name, "read");
+assert.ok(bqExitRec?.cleanedText.includes('"command":"doc"') && !bqExitRec?.cleanedText.includes("a.txt"));
+const crlfMixed =
+  'Docs:\r\n```xml\r\n<tool_call>{{"name":"bash","arguments":{{"command":"doc"}}}}</tool_call>\r\n```\r\n<tool_call>{{"name":"read","arguments":{{"path":"a.txt"}}}}</tool_call>\r\n';
+const crlfRec = extractXmlJsonToolCalls(crlfMixed, activeTools);
+assert.strictEqual(crlfRec?.calls.length, 1);
+assert.strictEqual(crlfRec?.cleanedText.endsWith("\r"), false, "CRLF mixed clean text must not leave dangling \\r");
+assert.strictEqual(scrubLeakedToolMarkup(crlfMixed).endsWith("\r"), false, "CRLF mixed scrub must not leave dangling \\r");
+
+// 2. stripTsTypesInCodemode nested arrow/function defaults & bare optional `x?`
+const nestedTsDefaults = [
+  ["const f = (x = (a: number) => a + 1) => x(1);", 2],
+  ["const f = (x = (a: number): number => a + 1) => x(1);", 2],
+  ["const f = (fn: (a: number) => string = (a: number) => String(a)) => fn(1);", "1"],
+  ["function f(x = function(a: number): number {{ return a + 1; }}) {{ return x(1); }}", 2],
+  ["const f = (x = true ? (a: number) => a + 2 : (b: number) => b + 1) => x(1);", 3],
+  ["const f = (x?, y: number = 1) => y;", 1],
+  ["const f = (x?) => x ?? 9;", 9],
+];
+for (const [src, expected] of nestedTsDefaults) {{
+  const healed = healCodemodeSource(src);
+  assert.ok(healed, `expected TS default stripping for: ${{src}}`);
+  assert.strictEqual(new Function(`${{healed}}; return f();`)(), expected, `healed JS failed runtime check: ${{healed}}`);
+}}
+const asyncNested = healCodemodeSource("const f = async (x = async (a: number): Promise<number> => a) => await x(1);");
+assert.ok(asyncNested && !asyncNested.includes("Promise<number>"));
+new Function(asyncNested);
+
+// 3. healCmdCdSlashD after shell keywords `then`/`do`/`else`
+assert.strictEqual(healCommand("if true; then cd /d C:\\temp; fi", "bash"), "if true; then cd C:/temp; fi");
+assert.strictEqual(healCommand('for d in a; do cd /d "C:\\temp"; done', "bash"), 'for d in a; do cd "C:/temp"; done');
+assert.strictEqual(healCommand("if false; then ls; else cd /d C:\\temp; fi", "bash"), "if false; then ls; else cd C:/temp; fi");
+assert.strictEqual(healCommand("if true; then cd /d; fi", "bash"), undefined);
+
+// I) Cycle 6 transcript-proven regression checks:
+// 1. resolveEffectiveMaskHighWaterTokens: deepCacheDiscount never clamps below compactionTriggerTokens
+assert.strictEqual(resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: true, compactionTriggerTokens: 160000 }}), 210000);
+assert.strictEqual(resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: true, compactionTriggerTokens: 120000 }}), 210000);
+assert.strictEqual(resolveEffectiveMaskHighWaterTokens({{ deepCacheDiscount: false, compactionTriggerTokens: 160000 }}), 136000);
+
+// 2. normCmdFingerprint: full-command SHA-256 eliminates >180-char prefix collisions while preserving true duplicates
+const longPfx = "cd /very/long/workspace/path/that/exceeds/one/hundred/and/eighty/characters/easily/when/combined/with/subdirectories/and/runner/flags/alpha/beta/gamma && cat <<'EOF' | python -X utf8 runner.py\n";
+const fpA = normCmdFingerprint(longPfx + "strace -f target_a\nEOF");
+const fpB = normCmdFingerprint(longPfx + "readelf -S target_b\nEOF");
+assert.notStrictEqual(fpA, fpB, "distinct heredoc bodies past char 180 must never collide");
+assert.strictEqual(
+  normCmdFingerprint("export PYTHONUTF8=1 PYTHONIOENCODING=utf-8; " + longPfx + "ptr=0xdeadbeef ts=2026-11-26T10:00:00Z\nEOF"),
+  normCmdFingerprint(longPfx + "ptr=0xcafebabe ts=2026-11-27T11:22:33Z\nEOF"),
+  "true identical commands (modulo env/hex/ts) must still match",
+);
+assert.ok(normCmdFingerprint("ls").length < 8, "short commands must stay below length-8 loop gate");
+
+// 3. Anti-double-sieve detection & clarified auto-sieve footer
+assert.strictEqual(isSieveSelfCommand('"C:/Users/example/.local/bin/ap.exe" sieve peek abcd1234 --lines 1:80'), true);
+assert.strictEqual(isSieveSelfCommand("cd /tmp && ap sieve search foo"), true);
+assert.strictEqual(isSieveSelfCommand("echo hello"), false);
+assert.strictEqual(isSieveSelfCodemode('await tools.mcp__agent_primitives__ap_sieve({{ action: "peek", id: "abc" }});'), true);
+assert.strictEqual(isSieveSelfCodemode('await tools.custom_sieve_query({{ id: "abc", mode: "peek" }});'), true);
+assert.strictEqual(isSieveSelfCodemode('await tools.bash({{ command: "ap sieve peek abc --grep foo" }});'), true);
+assert.strictEqual(isSieveSelfCodemode('await tools.read({{ path: "a.ts" }});'), false);
+const rawSieveFooter = "Head:\nL1: hi\n[sieve id=abc12345 | kind=log | exit=0 | raw=20000B (~5000 tok) | peek: ap sieve peek abc12345 --lines A:B | --grep REGEX]";
+const clarifiedFooter = formatAutoSieveDigest(rawSieveFooter);
+assert.ok(clarifiedFooter.includes("regex: ap sieve peek abc12345 --grep REGEX"));
+assert.ok(clarifiedFooter.includes("keywords(FTS5): ap sieve search <words>"));
+
+// 4. Windows bash friction: findstr MSYS shield, whoami.exe rewrite, powershell -File UTF-8 lock
+const dirFindstr = healCommand('dir /b "C:/tmp" | findstr /I /C:"usb" /C:"uhf"', "bash");
+if (process.platform === "win32") {{
+  assert.ok(dirFindstr?.startsWith("export MSYS_NO_PATHCONV=1; ") && dirFindstr.includes('ls "C:/tmp" | findstr /I /C:"usb"'), `expected MSYS shield on dir|findstr, got: ${{dirFindstr}}`);
+}}
+assert.strictEqual(healMsysPathConv('echo x | findstr /I /C:"foo"', "bash"), 'export MSYS_NO_PATHCONV=1; echo x | findstr /I /C:"foo"');
+assert.strictEqual(healMsysPathConv("whoami /groups", "bash"), "MSYS_NO_PATHCONV=1 whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("MSYS_NO_PATHCONV=1 whoami /groups", "bash"), "MSYS_NO_PATHCONV=1 whoami.exe /groups");
+assert.strictEqual(healMsysPathConv("whoami", "bash"), undefined);
+const psFileSimple = healBashPowerShellCommand('powershell -NoProfile -File "C:/tmp/probe.ps1" -Msg "hello" 2>&1 | head -20');
+assert.ok(
+  psFileSimple &&
+  psFileSimple.includes("-Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; & \"C:/tmp/probe.ps1\" -Msg \"hello\"; if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }}' 2>&1 | head -20"),
+  `unexpected ps -File rewrite: ${{psFileSimple}}`,
+);
+const psFileVar = healBashPowerShellCommand('powershell -NoProfile -File "${{dir}}/probe.ps1" -Msg "hi"');
+assert.ok(
+  psFileVar &&
+  psFileVar.includes('-Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \\$OutputEncoding=[Text.Encoding]::UTF8; & \\"${{dir}}/probe.ps1\\" -Msg \\"hi\\"; if (\\$LASTEXITCODE) {{ exit \\$LASTEXITCODE }} elseif (-not \\$?) {{ exit 1 }}"'),
+  `unexpected ps -File var rewrite: ${{psFileVar}}`,
+);
+assert.strictEqual(healBashPowerShellCommand("powershell -NoProfile -File -"), undefined);
+
 console.log(JSON.stringify(emittedApInvocations));
 "#
         );
 
+        let suite_mjs = dir.path().join("adversarial_suite.mjs");
+        std::fs::write(&suite_mjs, &script).unwrap();
         let run = std::process::Command::new("node")
-            .args([
-                "--experimental-strip-types",
-                "--no-warnings",
-                "--input-type=module",
-                "-e",
-                &script,
-            ])
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&suite_mjs)
             .output()
             .unwrap();
         assert!(

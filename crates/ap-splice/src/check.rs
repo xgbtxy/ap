@@ -494,14 +494,14 @@ pub fn collect_check_payload(
             .to_string_lossy()
             .replace('\\', "/");
         let Ok(raw_b) = fs::read(&p) else { continue };
-        let raw_txt = match std::str::from_utf8(&raw_b) {
-            Ok(s) => s,
+        let txt_owned = match crate::decode_source_bytes_clean(&raw_b, &rel_s) {
+            Ok((s, _)) => s,
             Err(uerr) => {
-                issues.push(format!("{rel_s}: Invalid UTF-8 encoding ({uerr})"));
+                issues.push(format!("{rel_s}: Invalid UTF-8/UTF-16 encoding ({uerr})"));
                 continue;
             }
         };
-        let txt = raw_txt.strip_prefix('\u{FEFF}').unwrap_or(raw_txt);
+        let txt = txt_owned.as_str();
         if conflict_re.is_match(txt) {
             issues.push(format!("{rel_s}: Unresolved git merge conflict marker"));
         }
@@ -560,13 +560,20 @@ pub fn collect_check_payload(
         .filter_map(|m| m.split('.').next().map(String::from))
         .collect();
 
+    let read_clean = |path: &Path| -> Option<String> {
+        let raw_b = fs::read(path).ok()?;
+        crate::decode_source_bytes_clean(&raw_b, &path.to_string_lossy())
+            .ok()
+            .map(|(s, _)| s)
+    };
+
     for pf in &py_files {
         let rel_s = pf
             .strip_prefix(&root_canon)
             .unwrap_or(pf)
             .to_string_lossy()
             .replace('\\', "/");
-        let Ok(txt) = fs::read_to_string(pf) else {
+        let Some(txt) = read_clean(pf) else {
             continue;
         };
         let parts: Vec<String> = pf
@@ -614,7 +621,7 @@ pub fn collect_check_payload(
 
     let mut ts_interfaces: HashMap<PathBuf, TsModuleInterface> = HashMap::new();
     for tf in &ts_js_files {
-        if let Ok(txt) = fs::read_to_string(tf) {
+        if let Some(txt) = read_clean(tf) {
             let key = fs::canonicalize(tf).unwrap_or_else(|_| tf.clone());
             ts_interfaces.insert(key, extract_ts_interface(&txt));
         }
@@ -627,7 +634,7 @@ pub fn collect_check_payload(
             .unwrap_or(tf)
             .to_string_lossy()
             .replace('\\', "/");
-        let Ok(txt) = fs::read_to_string(tf) else {
+        let Some(txt) = read_clean(tf) else {
             continue;
         };
         for cap in ts_rel_re.captures_iter(&txt) {

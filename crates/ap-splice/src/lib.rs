@@ -1202,11 +1202,13 @@ fn run_post_edit_hook(explicit_root: &Path) -> i32 {
         let Ok(raw) = fs::read(&path) else {
             continue;
         };
-        let Ok(raw_text) = std::str::from_utf8(&raw) else {
-            issues.push(format!("{}: non-UTF-8 bytes after edit", path.display()));
+        let Ok((text, _)) = decode_source_bytes_clean(&raw, &path.display().to_string()) else {
+            issues.push(format!(
+                "{}: non-UTF-8/UTF-16 bytes after edit",
+                path.display()
+            ));
             continue;
         };
-        let text = raw_text.strip_prefix('\u{FEFF}').unwrap_or(raw_text);
         if text.lines().any(|l| {
             l.starts_with("<<<<<<< ") || l.trim_end() == "=======" || l.starts_with(">>>>>>> ")
         }) {
@@ -1216,7 +1218,7 @@ fn run_post_edit_hook(explicit_root: &Path) -> i32 {
             ));
             continue;
         }
-        if let Err(err) = verify_syntax(text, ext) {
+        if let Err(err) = verify_syntax(&text, ext) {
             let disp = path.to_string_lossy().replace('\\', "/");
             issues.push(format!("{disp}: {err}"));
         }
@@ -1609,14 +1611,12 @@ mod tests {
         let (rw_le_txt, _, _) = decode_source_bytes_with_encoding(&rw_le, "u16le.py").unwrap();
         assert!(rw_le_txt.contains("new_call(2)"), "{rw_le_txt}");
 
-        // 4. `splice check` passes cleanly on UTF-8 BOM JSON file
-        let _ = fs::remove_file(&p_u16le);
-        let _ = fs::remove_file(&p_u16be);
+        // 4. `splice check` passes cleanly on UTF-8 BOM JSON + UTF-16LE/BE BOM Python files
         let chk = collect_check_payload(&dir, false, "");
         let _ = fs::remove_dir_all(&dir);
         assert!(
             chk.ok,
-            "UTF-8 BOM json/py must pass check: {:?}",
+            "UTF-8 BOM json & UTF-16 BOM py must pass check: {:?}",
             chk.issues
         );
     }

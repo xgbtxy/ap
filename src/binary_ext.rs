@@ -366,7 +366,13 @@ pub fn inspect_pe_rpc_com_alpc(bytes: &[u8], label: &str, as_json: bool) -> Resu
     let mut rpc_endpoints = BTreeSet::new();
     for sec in &pe.secs {
         let start = sec.raw_ptr as usize;
-        let len = (sec.raw_size as usize).min(bytes.len().saturating_sub(start));
+        if start >= bytes.len() {
+            continue;
+        }
+        let len = (sec.raw_size as usize).min(bytes.len() - start);
+        if len == 0 {
+            continue;
+        }
         let slice = &bytes[start..start + len];
         let mut i = 0usize;
         while i < slice.len() {

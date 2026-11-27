@@ -479,7 +479,7 @@ enum SubCmd {
         #[arg(long)]
         filter: Option<String>,
         /// Maximum entries to return (1..=200)
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, alias = "limit", default_value_t = 50)]
         max: usize,
         /// Emit structured JSON output
         #[arg(long)]

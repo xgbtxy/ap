@@ -8257,7 +8257,13 @@ def test_validate():
     ]
     .join("\n")
         + "\n";
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(mcp_out.status.success());
     let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
         .lines()
@@ -8415,7 +8421,13 @@ export function poll() {
     ]
     .join("\n")
         + "\n";
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(mcp_out.status.success());
     let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
         .lines()
@@ -8808,7 +8820,13 @@ fn test_v253_dead_code_audit_codex_patch_read_limit_and_sed_accel() {
     ]
     .join("\n")
         + "\n";
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(mcp_out.status.success());
     let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
         .lines()
@@ -8958,7 +8976,13 @@ fn test_v254_supply_chain_sec_breaking_api_diff_and_mcp_codex_edit() {
     ]
     .join("\n")
         + "\n";
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(mcp_out.status.success());
     let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
         .lines()
@@ -9105,7 +9129,13 @@ fn test_v255_recall_provenance_baton_drift_and_read_tail() {
     ]
     .join("\n")
         + "\n";
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(mcp_out.status.success());
     let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
         .lines()
@@ -9248,7 +9278,13 @@ fn test_v256_scrub_sanitizer_enclosing_impact_trace_and_dir_heal() {
     ]
     .join("\n")
         + "\n";
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(mcp_out.status.success());
     let resps: Vec<Value> = String::from_utf8_lossy(&mcp_out.stdout)
         .lines()
@@ -9874,7 +9910,13 @@ fn test_v261_grep_pipeline_null_arg_strip_ps_multiblock_unbounded_read_sieve_and
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -10086,7 +10128,13 @@ fn test_v262_fair_multipattern_search_ls_cat_headc_accel_and_edit_tier3() {
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -10294,7 +10342,13 @@ fn test_v263_json_structural_diff_rg_pipe_sed_single_and_http_timeout_guards() {
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -10772,7 +10826,13 @@ fn test_v265_structured_config_xml_plist_toml_ini_outline_query_diff_max_count_a
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -11144,7 +11204,13 @@ fn test_v266_yaml_jsonc_config_multitarget_search_strings_alias_and_sieve_giant_
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -11268,7 +11334,13 @@ fn test_v267_multiblock_sieve_hashline_glob_search_and_drive_path_heal() {
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -11712,7 +11784,13 @@ fn test_v269_ast_symbol_insert_delete_ls_metrics_aliases_and_du_accel() {
             }
         })
     );
-    let mcp_out = run_ap(root, &["mcp"], Some(&mcp_req), &[]);
+    let ap_home_mcp = root.join(".ap_home_mcp");
+    let mcp_out = run_ap(
+        root,
+        &["mcp"],
+        Some(&mcp_req),
+        &[("AP_HOME", ap_home_mcp.as_path())],
+    );
     assert!(
         mcp_out.status.success(),
         "{}",
@@ -14928,4 +15006,835 @@ fn test_cycle4_sieve_concurrency_isolation_splice_bom_atlas_and_fail_closed_json
         "MCP ap_changes must log exactly once (no double-log): {mcp_stats:?}"
     );
     assert_eq!(mcp_stats[0]["kind"], "mcp");
+}
+
+#[test]
+fn test_cycle5_crash_guards_undo_bom_sieve_tilde_and_query_hardening() {
+    use rusqlite::Connection;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let ap_home = root.join("c5_ap_home");
+    fs::create_dir_all(&ap_home).unwrap();
+
+    // 1. P0 crash/OOM guards:
+    // 1a. Truncated PE with PointerToRawData > file_size (`src/binary_ext.rs`)
+    let mut bad_pe = vec![0u8; 0x200];
+    bad_pe[0..2].copy_from_slice(b"MZ");
+    bad_pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    bad_pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+    bad_pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+    bad_pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    bad_pe[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+    bad_pe[0x98..0x9A].copy_from_slice(&0x020Bu16.to_le_bytes());
+    let sec_off = 0x98 + 0xF0;
+    bad_pe[sec_off..sec_off + 8].copy_from_slice(b".rdata\0\0");
+    bad_pe[sec_off + 8..sec_off + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+    bad_pe[sec_off + 12..sec_off + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    bad_pe[sec_off + 16..sec_off + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+    bad_pe[sec_off + 20..sec_off + 24].copy_from_slice(&0x99999u32.to_le_bytes());
+    bad_pe[sec_off + 36..sec_off + 40].copy_from_slice(&0x40000040u32.to_le_bytes());
+    let bad_pe_p = root.join("bad_sec_ptr.exe");
+    fs::write(&bad_pe_p, &bad_pe).unwrap();
+    let pe_o = run_ap(
+        root,
+        &[
+            "read",
+            bad_pe_p.to_str().unwrap(),
+            "--rpc-com-alpc",
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        pe_o.status.success(),
+        "truncated PE --rpc-com-alpc must not panic: stderr={}",
+        String::from_utf8_lossy(&pe_o.stderr)
+    );
+    let pe_v: Value = serde_json::from_slice(&pe_o.stdout).unwrap();
+    assert_eq!(pe_v["ok"], true);
+
+    // 1b. 4-byte truncated `\x7FELF` (`src/binary.rs::parse_elf_details`)
+    let elf4_p = root.join("elf4.bin");
+    fs::write(&elf4_p, b"\x7FELF").unwrap();
+    let elf_o = run_ap(
+        root,
+        &[
+            "read",
+            elf4_p.to_str().unwrap(),
+            "--find-bytes",
+            "7F 45",
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        elf_o.status.success(),
+        "4-byte ELF --find-bytes must not panic: stderr={}",
+        String::from_utf8_lossy(&elf_o.stderr)
+    );
+    let elf_v: Value = serde_json::from_slice(&elf_o.stdout).unwrap();
+    assert_eq!(elf_v["ok"], true);
+
+    // 1c. Malformed `.xlsx` with 8B-column ref `<c r="ZZZZZZZ1">` (`src/read.rs`)
+    let bad_xlsx_p = root.join("huge_col.xlsx");
+    {
+        let f = fs::File::create(&bad_xlsx_p).unwrap();
+        let mut zw = ZipWriter::new(f);
+        zw.start_file("xl/workbook.xml", SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(br#"<workbook><sheets><sheet name="S1" sheetId="1"/></sheets></workbook>"#)
+            .unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(br#"<worksheet><sheetData><row r="1"><c r="A1"><v>ok</v></c><c r="ZZZZZZZ1"><v>boom</v></c></row></sheetData></worksheet>"#)
+            .unwrap();
+        zw.finish().unwrap();
+    }
+    let x_read = run_ap(
+        root,
+        &["read", bad_xlsx_p.to_str().unwrap(), "--json"],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        x_read.status.success(),
+        "ZZZZZZZ1 xlsx must not OOM: stderr={}",
+        String::from_utf8_lossy(&x_read.stderr)
+    );
+    let x_query = run_ap(
+        root,
+        &[
+            "query",
+            "-f",
+            &format!("t={}", bad_xlsx_p.display()),
+            "SELECT COUNT(*) FROM t",
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        x_query.status.success(),
+        "ZZZZZZZ1 xlsx query must not OOM: stderr={}",
+        String::from_utf8_lossy(&x_query.stderr)
+    );
+
+    // 1d. Corrupt ASAR with OOB JS member skips cleanly in `ap diff --semantic --json`
+    let bad_asar_p = root.join("oob.asar");
+    {
+        let hdr_json = br#"{"files":{"a.js":{"size":100,"offset":"9999999"}}}"#;
+        let pad = (4 - (hdr_json.len() % 4)) % 4;
+        let str_pickle_sz = (4 + hdr_json.len() + pad) as u32;
+        let hdr_pickle_sz = 4 + str_pickle_sz;
+        let mut asar_b = Vec::new();
+        asar_b.extend_from_slice(&4u32.to_le_bytes());
+        asar_b.extend_from_slice(&hdr_pickle_sz.to_le_bytes());
+        asar_b.extend_from_slice(&str_pickle_sz.to_le_bytes());
+        asar_b.extend_from_slice(&(hdr_json.len() as u32).to_le_bytes());
+        asar_b.extend_from_slice(hdr_json);
+        asar_b.resize(asar_b.len() + pad, 0);
+        fs::write(&bad_asar_p, &asar_b).unwrap();
+    }
+    let sd_o = run_ap(
+        root,
+        &[
+            "diff",
+            bad_asar_p.to_str().unwrap(),
+            bad_asar_p.to_str().unwrap(),
+            "--semantic",
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        sd_o.status.success(),
+        "OOB ASAR entry must skip cleanly: stdout={} stderr={}",
+        String::from_utf8_lossy(&sd_o.stdout),
+        String::from_utf8_lossy(&sd_o.stderr)
+    );
+
+    // 2. P1 `ap undo`: read-only restore fails closed (`rc=1, ok:false`) AND preserves checkpoint;
+    // once writable, restore succeeds and recovers exact UTF-16LE BOM+CRLF bytes!
+    let undo_ws = root.join("undo_ws");
+    fs::create_dir_all(&undo_ws).unwrap();
+    let mut u16_orig = vec![0xFFu8, 0xFEu8];
+    for u in "line_one\r\nline_two\r\n".encode_utf16() {
+        u16_orig.extend_from_slice(&u.to_le_bytes());
+    }
+    let uf = undo_ws.join("u16.txt");
+    fs::write(&uf, &u16_orig).unwrap();
+    let u_save = run_ap(
+        &undo_ws,
+        &[
+            "undo",
+            "--cwd",
+            undo_ws.to_str().unwrap(),
+            "--save",
+            "c5_chk",
+            "--json",
+            uf.to_str().unwrap(),
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(u_save.status.success());
+    let save_v: Value = serde_json::from_slice(&u_save.stdout).unwrap();
+    let tx_id = save_v["id"].as_str().unwrap().to_string();
+
+    fs::write(&uf, b"corrupted_bytes").unwrap();
+    let mut ro_perms = fs::metadata(&uf).unwrap().permissions();
+    ro_perms.set_readonly(true);
+    fs::set_permissions(&uf, ro_perms).unwrap();
+
+    let u_fail = run_ap(
+        &undo_ws,
+        &[
+            "undo",
+            "--cwd",
+            undo_ws.to_str().unwrap(),
+            "--id",
+            &tx_id,
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        !u_fail.status.success(),
+        "undo restore onto read-only file must fail closed: {}",
+        String::from_utf8_lossy(&u_fail.stdout)
+    );
+    let fail_v: Value = serde_json::from_slice(&u_fail.stdout).unwrap();
+    assert_eq!(fail_v["ok"], false);
+    assert_eq!(fail_v["kept"], true);
+    assert!(!fail_v["failed"].as_array().unwrap().is_empty());
+
+    // Checkpoint MUST still be present in `--list`
+    let u_list = run_ap(
+        &undo_ws,
+        &["undo", "--list", "--json"],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    let list_v: Value = serde_json::from_slice(&u_list.stdout).unwrap();
+    assert!(
+        list_v
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|it| it["id"].as_str() == Some(tx_id.as_str())),
+        "failed undo must preserve checkpoint: {list_v}"
+    );
+
+    // Clear read-only and restore -> exact UTF-16LE BOM+CRLF bytes recovered
+    let mut rw_perms = fs::metadata(&uf).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    rw_perms.set_readonly(false);
+    fs::set_permissions(&uf, rw_perms).unwrap();
+    let u_ok = run_ap(
+        &undo_ws,
+        &[
+            "undo",
+            "--cwd",
+            undo_ws.to_str().unwrap(),
+            "--id",
+            &tx_id,
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        u_ok.status.success(),
+        "undo restore after making writable failed: {}",
+        String::from_utf8_lossy(&u_ok.stdout)
+    );
+    assert_eq!(fs::read(&uf).unwrap(), u16_orig);
+
+    // 3. P1 `ap-splice`: repo with UTF-16LE BOM `.py` alongside UTF-8 BOM `.py`
+    // MUST pass `splice apply --test-cmd ... --rollback-on-test-fail` AND `splice check --hook`!
+    let sp_ws = root.join("c5_splice_u16");
+    fs::create_dir_all(&sp_ws).unwrap();
+    fs::write(
+        sp_ws.join("u8.py"),
+        b"\xEF\xBB\xBFdef a_fn():\r\n    return 1\r\n",
+    )
+    .unwrap();
+    let mut u16_py = vec![0xFFu8, 0xFEu8];
+    for u in "def b_fn():\r\n    return 1\r\n".encode_utf16() {
+        u16_py.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(sp_ws.join("u16.py"), &u16_py).unwrap();
+
+    let pass_cmd = if cfg!(windows) {
+        "cmd /c exit 0"
+    } else {
+        "true"
+    };
+    let sp_apply = run_ap(
+        &sp_ws,
+        &[
+            "splice",
+            "apply",
+            "--cwd",
+            sp_ws.to_str().unwrap(),
+            "--stdin",
+            "--test-cmd",
+            pass_cmd,
+            "--rollback-on-test-fail",
+            "--json",
+        ],
+        Some("@@ FILE: u8.py\n<<<\n    return 1\n===\n    return 9\n>>>\n"),
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        sp_apply.status.success(),
+        "splice apply with sibling UTF-16LE BOM .py must pass: {}",
+        String::from_utf8_lossy(&sp_apply.stdout)
+    );
+    let sp_v: Value = serde_json::from_slice(&sp_apply.stdout).unwrap();
+    assert_eq!(sp_v["ok"], true);
+    assert_eq!(sp_v["rolled_back"], false);
+
+    let hook_payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": sp_ws.to_string_lossy(),
+        "tool_input": { "file_path": "u16.py" }
+    })
+    .to_string();
+    let hk_o = run_ap(
+        &sp_ws,
+        &["splice", "check", "--hook"],
+        Some(&hook_payload),
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(hk_o.status.success());
+    assert!(
+        String::from_utf8_lossy(&hk_o.stdout).trim().is_empty(),
+        "splice check --hook must emit zero warnings on valid UTF-16LE BOM .py: {}",
+        String::from_utf8_lossy(&hk_o.stdout)
+    );
+
+    // 4. P1 `ap-sieve`: 16-proc `pipe` + `search` + `prune --max-mb 0 --vacuum` -> 0 orphan FTS5 rows!
+    let sv_dir = root.join("c5_sieve_stress");
+    fs::create_dir_all(&sv_dir).unwrap();
+    let mut handles = Vec::new();
+    for i in 0..16usize {
+        let root_c = root.to_path_buf();
+        let sv_c = sv_dir.clone();
+        let ap_c = ap_home.clone();
+        handles.push(std::thread::spawn(move || {
+            if i % 4 == 3 {
+                run_ap(
+                    &root_c,
+                    &["sieve", "prune", "--max-mb", "0", "--vacuum", "--json"],
+                    None,
+                    &[("SIEVE_HOME", sv_c.as_path()), ("AP_HOME", ap_c.as_path())],
+                )
+            } else if i % 3 == 2 {
+                run_ap(
+                    &root_c,
+                    &["sieve", "search", "C5_STRESS_TOK", "--json"],
+                    None,
+                    &[("SIEVE_HOME", sv_c.as_path()), ("AP_HOME", ap_c.as_path())],
+                )
+            } else {
+                let mut payload = String::new();
+                for ln in 0..60 {
+                    payload.push_str(&format!(
+                        "line {ln} C5_STRESS_TOK worker_{i} payload_block_{ln}\n"
+                    ));
+                }
+                let lbl = format!("w{i}");
+                run_ap(
+                    &root_c,
+                    &["sieve", "pipe", "--label", &lbl, "--json"],
+                    Some(&payload),
+                    &[("SIEVE_HOME", sv_c.as_path()), ("AP_HOME", ap_c.as_path())],
+                )
+            }
+        }));
+    }
+    for h in handles {
+        let out = h.join().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent sieve worker failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let raw_ids: std::collections::HashSet<String> = fs::read_dir(&sv_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("raw") {
+                p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let db_p = sv_dir.join("index.sqlite");
+    if db_p.is_file() {
+        let conn = Connection::open(&db_p).unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM chunks").unwrap();
+        let fts_ids: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        let orphans: Vec<&String> = fts_ids.iter().filter(|id| !raw_ids.contains(*id)).collect();
+        assert!(
+            orphans.is_empty(),
+            "orphan FTS5 rows found after concurrent pipe+prune: raw={raw_ids:?} fts={fts_ids:?} orphans={orphans:?}"
+        );
+    }
+
+    // 5. P1 leading `~/` home expansion across `read`, `search`, `ls`, `query`
+    let fake_home = root.join("c5_fake_home");
+    fs::create_dir_all(&fake_home).unwrap();
+    fs::write(fake_home.join("tfile.txt"), "C5_TILDE_VERIFIED_OK\n").unwrap();
+    fs::write(fake_home.join("t.csv"), "id,val\n1,alpha\n").unwrap();
+    let env_tilde = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AP_HOME", ap_home.as_path()),
+    ];
+    let r_tilde = run_ap(root, &["read", "~/tfile.txt"], None, &env_tilde);
+    assert!(
+        r_tilde.status.success()
+            && String::from_utf8_lossy(&r_tilde.stdout).contains("C5_TILDE_VERIFIED_OK"),
+        "ap read ~/tfile.txt failed: {}",
+        String::from_utf8_lossy(&r_tilde.stderr)
+    );
+    let s_tilde = run_ap(
+        root,
+        &["search", "C5_TILDE_VERIFIED_OK", "~/tfile.txt", "--json"],
+        None,
+        &env_tilde,
+    );
+    assert!(s_tilde.status.success());
+    let l_tilde = run_ap(root, &["ls", "~/tfile.txt", "--json"], None, &env_tilde);
+    assert!(l_tilde.status.success());
+    let q_tilde = run_ap(
+        root,
+        &["query", "-f", "t=~/t.csv", "SELECT val FROM t", "--json"],
+        None,
+        &env_tilde,
+    );
+    assert!(q_tilde.status.success());
+    let q_tv: Value = serde_json::from_slice(&q_tilde.stdout).unwrap();
+    assert_eq!(q_tv["rows"][0][0], "alpha");
+
+    // 6. P2 `ap query --out` to missing parent dir fails closed with valid JSON
+    let bad_out = root.join("no_such_parent_dir_c5").join("out.csv");
+    let q_bad_out = run_ap(
+        root,
+        &[
+            "query",
+            "-f",
+            &format!("t={}", fake_home.join("t.csv").display()),
+            "SELECT * FROM t",
+            "--out",
+            bad_out.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &[("AP_HOME", ap_home.as_path())],
+    );
+    assert!(
+        !q_bad_out.status.success(),
+        "query --out to missing dir must fail closed: {}",
+        String::from_utf8_lossy(&q_bad_out.stdout)
+    );
+    let q_bv: Value = serde_json::from_slice(&q_bad_out.stdout).unwrap();
+    assert_eq!(q_bv["ok"], false);
+    assert!(q_bv["error"].as_str().is_some_and(|s| s.contains("--out")));
+}
+
+#[test]
+fn test_cycle6_live_artifact_fixes_sieve_read_surface_frontier_win_and_search() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let ap_home = root.join("ap_home_c6");
+    let sv_dir = root.join("sieve_c6");
+    fs::create_dir_all(&ap_home).unwrap();
+    fs::create_dir_all(&sv_dir).unwrap();
+    let iso_env = [
+        ("AP_HOME", ap_home.as_path()),
+        ("SIEVE_HOME", sv_dir.as_path()),
+    ];
+
+    // 1. Sieve peek: JSONPath `$.` + `[0]`, `--grep -i` centered on 13KB 1-line JSON, and `--pretty --grep`
+    let pad = "a".repeat(9000);
+    let one_line_json = format!(
+        r#"{{"ok":true,"padding":"{pad}","exploitable_unquoted":[{{"service":"AcmeSvc","bin":"C:\\Program Files\\Acme\\svc.exe","marker":"NEEDLE_DEEP_9KB"}}]}}"#
+    );
+    let pipe_out = run_ap(
+        root,
+        &["sieve", "pipe", "--label", "c6_json", "--json"],
+        Some(&one_line_json),
+        &iso_env,
+    );
+    assert!(
+        pipe_out.status.success(),
+        "sieve pipe failed: {}",
+        String::from_utf8_lossy(&pipe_out.stderr)
+    );
+    let pipe_v: Value = serde_json::from_slice(&pipe_out.stdout).unwrap();
+    let sid = pipe_v["id"].as_str().unwrap();
+
+    let jp_out = run_ap(
+        root,
+        &[
+            "sieve",
+            "peek",
+            sid,
+            "--json-path",
+            "$.exploitable_unquoted[0].service",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(
+        jp_out.status.success() && String::from_utf8_lossy(&jp_out.stdout).contains("AcmeSvc"),
+        "JSONPath $.arr[0].field failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&jp_out.stdout),
+        String::from_utf8_lossy(&jp_out.stderr)
+    );
+
+    let grep_long = run_ap(
+        root,
+        &["sieve", "peek", sid, "--grep", "-i", "needle_deep_9kb"],
+        None,
+        &iso_env,
+    );
+    let grep_long_s = String::from_utf8_lossy(&grep_long.stdout);
+    assert!(
+        grep_long.status.success()
+            && grep_long_s.contains("NEEDLE_DEEP_9KB")
+            && grep_long_s.contains("@off="),
+        "long-line sieve peek --grep -i must center around deep match: stdout={grep_long_s} stderr={}",
+        String::from_utf8_lossy(&grep_long.stderr)
+    );
+
+    let grep_pretty = run_ap(
+        root,
+        &[
+            "sieve",
+            "peek",
+            sid,
+            "--pretty",
+            "--grep",
+            "NEEDLE_DEEP_9KB",
+        ],
+        None,
+        &iso_env,
+    );
+    let grep_pretty_s = String::from_utf8_lossy(&grep_pretty.stdout);
+    assert!(
+        grep_pretty.status.success()
+            && grep_pretty_s.contains("NEEDLE_DEEP_9KB")
+            && grep_pretty_s.contains("AcmeSvc"),
+        "sieve peek --pretty --grep must pretty-print before grepping: stdout={grep_pretty_s}"
+    );
+
+    // 2. `ap read`: hex `0x` `--offset`, `--chars` budget alias, `<archive>!<entry>` / `!/` / `::`
+    let offset_file = root.join("offsets.txt");
+    fs::write(
+        &offset_file,
+        "0123456789abcdefHEX_OFFSET_MARKER_OK_tail_padding_xyz\n",
+    )
+    .unwrap();
+    let hex_off = run_ap(
+        root,
+        &[
+            "read",
+            offset_file.to_str().unwrap(),
+            "--offset",
+            "0x10",
+            "--chars",
+            "20",
+        ],
+        None,
+        &iso_env,
+    );
+    let hex_off_s = String::from_utf8_lossy(&hex_off.stdout);
+    assert!(
+        hex_off.status.success() && hex_off_s.contains("HEX_OFFSET_MARKER_OK"),
+        "ap read --offset 0x10 failed: stdout={hex_off_s} stderr={}",
+        String::from_utf8_lossy(&hex_off.stderr)
+    );
+
+    let big_txt = root.join("big_lines.txt");
+    let big_body = (0..120)
+        .map(|i| format!("line_{i:03}_payload_content_value_0123456789"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&big_txt, &big_body).unwrap();
+    let chars_cap = run_ap(
+        root,
+        &["read", big_txt.to_str().unwrap(), "--chars", "450"],
+        None,
+        &iso_env,
+    );
+    let chars_cap_s = String::from_utf8_lossy(&chars_cap.stdout);
+    assert!(
+        chars_cap.status.success() && chars_cap_s.len() < 2500,
+        "ap read --chars without --offset must cap output budget: len={}",
+        chars_cap_s.len()
+    );
+
+    // Synthetic ASAR & ZIP for shorthand `<archive>!<entry>` / `!/` / `::`
+    let app_js = b"export const ASAR_ENTRY_OK = 42;\n";
+    let hdr_json = format!(
+        r#"{{"files":{{"app":{{"files":{{"main.js":{{"size":{},"offset":"0"}}}}}}}}}}"#,
+        app_js.len()
+    );
+    let hdr_bytes = hdr_json.as_bytes();
+    let pad_n = (4 - (hdr_bytes.len() % 4)) % 4;
+    let inner_len = 4 + hdr_bytes.len() + pad_n;
+    let mut asar_bytes = Vec::new();
+    asar_bytes.extend_from_slice(&4u32.to_le_bytes());
+    asar_bytes.extend_from_slice(&(inner_len as u32 + 4).to_le_bytes());
+    asar_bytes.extend_from_slice(&(inner_len as u32).to_le_bytes());
+    asar_bytes.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+    asar_bytes.extend_from_slice(hdr_bytes);
+    asar_bytes.resize(asar_bytes.len() + pad_n, 0);
+    asar_bytes.extend_from_slice(app_js);
+    let asar_path = root.join("pkg.asar");
+    fs::write(&asar_path, &asar_bytes).unwrap();
+
+    for sep in ["!app/main.js", "!/app/main.js", "::app/main.js"] {
+        let target = format!("{}{sep}", asar_path.display());
+        let rd_asar = run_ap(root, &["read", &target], None, &iso_env);
+        let rd_s = String::from_utf8_lossy(&rd_asar.stdout);
+        assert!(
+            rd_asar.status.success() && rd_s.contains("ASAR_ENTRY_OK"),
+            "ap read {target} failed: stdout={rd_s} stderr={}",
+            String::from_utf8_lossy(&rd_asar.stderr)
+        );
+    }
+
+    // 3. `ap atlas surface`: skips vendored/locales/bare ES imports/legal URLs, keeps canonical !/
+    let surf_dir = root.join("surf_c6");
+    fs::create_dir_all(surf_dir.join("src")).unwrap();
+    fs::create_dir_all(surf_dir.join("_vendored")).unwrap();
+    fs::create_dir_all(surf_dir.join("locales/en")).unwrap();
+    fs::write(
+        surf_dir.join("src/app.ts"),
+        "import { execSync } from 'child_process';\nconst url = \"https://example.test/legal/cookie-policy\";\nexport function go(x: string) { return execSync(x); }\n",
+    )
+    .unwrap();
+    fs::write(
+        surf_dir.join("_vendored/dep.js"),
+        "child_process.execSync('vendor');\n",
+    )
+    .unwrap();
+    fs::write(
+        surf_dir.join("locales/en/i18n.json"),
+        r#"{"cookie":"https://example.test/cookie-policy"}"#,
+    )
+    .unwrap();
+    let surf_out = run_ap(
+        root,
+        &["atlas", "surface", surf_dir.to_str().unwrap(), "--json"],
+        None,
+        &iso_env,
+    );
+    assert!(surf_out.status.success());
+    let surf_v: Value = serde_json::from_slice(&surf_out.stdout).unwrap();
+    let surf_items = surf_v["items"].as_array().unwrap();
+    assert!(
+        surf_items
+            .iter()
+            .any(|i| i["target"] == "src/app.ts" && i["line"] == 3),
+        "real call must appear: {surf_v}"
+    );
+    assert!(
+        !surf_items
+            .iter()
+            .any(|i| i["target"].as_str().unwrap_or("").contains("_vendored")
+                || i["target"].as_str().unwrap_or("").contains("locales/")
+                || (i["target"] == "src/app.ts" && i["line"] == 1)
+                || (i["axis"] == "auth_token_cred" && i["target"] == "src/app.ts")),
+        "vendored/locales/import/legal-url noise must be filtered: {surf_v}"
+    );
+
+    // 4. `ap baton frontier`: dead-PID `.tmp` pruned cleanly on save
+    let f_dir = root.join("frontier_c6");
+    fs::create_dir_all(&f_dir).unwrap();
+    let f_store = f_dir.join("frontier.json");
+    let dead_pid = if cfg!(windows) {
+        let mut ch = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let p = ch.id();
+        let _ = ch.wait();
+        p
+    } else {
+        let mut ch = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let p = ch.id();
+        let _ = ch.wait();
+        p
+    };
+    let orphan_tmp = f_dir.join(format!("frontier.json.{dead_pid}.12345.0.tmp"));
+    fs::write(&orphan_tmp, "stale").unwrap();
+    let seed_out = run_ap(
+        &f_dir,
+        &[
+            "baton",
+            "frontier",
+            "seed",
+            "--store",
+            f_store.to_str().unwrap(),
+            "--axis",
+            "exec_spawn",
+            "--target",
+            "src/app.ts",
+            "--json",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(seed_out.status.success());
+    assert!(
+        !orphan_tmp.exists(),
+        "stale dead-PID frontier .tmp must be removed on save"
+    );
+
+    // 5. `ap undo`: strips Windows `//?/` verbatim prefix from saved checkpoint paths
+    let undo_ws = root.join("undo_c6");
+    fs::create_dir_all(&undo_ws).unwrap();
+    fs::write(undo_ws.join("clean.txt"), "v1\n").unwrap();
+    let save_u = run_ap(
+        &undo_ws,
+        &[
+            "undo",
+            "--save",
+            "c6-clean",
+            "--cwd",
+            undo_ws.to_str().unwrap(),
+            "clean.txt",
+            "--json",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(save_u.status.success());
+    let save_uv: Value = serde_json::from_slice(&save_u.stdout).unwrap();
+    let saved_path = save_uv["files"][0].as_str().unwrap_or("");
+    assert!(
+        !saved_path.starts_with("//?/"),
+        "undo checkpoint path must strip //?/ prefix: {save_uv}"
+    );
+
+    // 6. `ap search -o -u --around N` preserves context while `-o -u` without `--around` stays exact
+    let min_js = root.join("min_c6.js");
+    fs::write(
+        &min_js,
+        "const prefix_ctx_alpha = 1; TARGET_CALL('arg1'); const suffix_ctx_beta = 2;\n",
+    )
+    .unwrap();
+    let s_exact = run_ap(
+        root,
+        &[
+            "search",
+            "-o",
+            "-u",
+            "TARGET_CALL",
+            min_js.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(s_exact.status.success());
+    let s_exact_v: Value = serde_json::from_slice(&s_exact.stdout).unwrap();
+    assert_eq!(s_exact_v["unique_matches"][0]["text"], "TARGET_CALL");
+
+    let s_around = run_ap(
+        root,
+        &[
+            "search",
+            "-o",
+            "-u",
+            "--around",
+            "24",
+            "TARGET_CALL",
+            min_js.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &iso_env,
+    );
+    assert!(s_around.status.success());
+    let s_around_v: Value = serde_json::from_slice(&s_around.stdout).unwrap();
+    let around_tok = s_around_v["unique_matches"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        around_tok.contains("prefix_ctx_alpha") && around_tok.contains("arg1"),
+        "search -o -u --around 24 must preserve context: {s_around_v}"
+    );
+
+    // 7. `ap ls -l` harmless alias + `ap probe win --pipes --limit 3` human & JSON modes
+    let ls_l = run_ap(root, &["ls", "-l", root.to_str().unwrap()], None, &iso_env);
+    assert!(
+        ls_l.status.success(),
+        "ap ls -l must succeed: {}",
+        String::from_utf8_lossy(&ls_l.stderr)
+    );
+    #[cfg(windows)]
+    {
+        let win_human = run_ap(
+            root,
+            &["probe", "win", "--pipes", "--limit", "3"],
+            None,
+            &iso_env,
+        );
+        let win_h_s = String::from_utf8_lossy(&win_human.stdout);
+        assert!(
+            win_human.status.success()
+                && win_h_s.contains("# WIN PIPES")
+                && !win_h_s.trim_start().starts_with('{'),
+            "ap probe win --pipes --limit 3 without --json must print readable human text: {win_h_s}"
+        );
+        let win_json = run_ap(
+            root,
+            &["probe", "win", "--pipes", "--limit", "3", "--json"],
+            None,
+            &iso_env,
+        );
+        assert!(win_json.status.success());
+        let win_jv: Value = serde_json::from_slice(&win_json.stdout).unwrap();
+        assert_eq!(win_jv["ok"], true);
+        assert!(win_jv["returned"].as_u64().unwrap_or(99) <= 3);
+
+        // Binary `--xref` must never trigger minified-file 1800B truncation
+        let whoami_bin = Path::new(r"C:\Windows\System32\whoami.exe");
+        if whoami_bin.is_file() {
+            let xref_out = run_ap(
+                root,
+                &["read", whoami_bin.to_str().unwrap(), "--xref"],
+                None,
+                &iso_env,
+            );
+            let xref_s = String::from_utf8_lossy(&xref_out.stdout);
+            assert!(
+                xref_out.status.success() && !xref_s.contains("[ap read minified pager:"),
+                "binary --xref must not hit minified pager truncation: {xref_s}"
+            );
+        }
+    }
 }

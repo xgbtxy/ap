@@ -82,9 +82,9 @@ struct SearchCli {
     /// Maximum matches to return
     #[arg(long, alias = "max", default_value_t = 50)]
     max_hits: usize,
-    /// Context characters on each side when slicing matches inside giant/minified single-line bundles
-    #[arg(long, default_value_t = 160)]
-    around: usize,
+    /// Context characters on each side when slicing matches inside giant/minified bundles (also slices around `-o` matches when passed explicitly)
+    #[arg(long)]
+    around: Option<usize>,
     /// Pretty-format minified JS/JSON match slices
     #[arg(long)]
     pretty: bool,
@@ -150,6 +150,7 @@ struct SearchCli {
 #[derive(Clone, Copy)]
 struct SearchOpts {
     around: usize,
+    explicit_around: bool,
     pretty: bool,
     multiline: bool,
     block: bool,
@@ -446,7 +447,18 @@ fn push_text_matches(
                 })
                 .unwrap_or_default();
             let snip = if opts.only_matching {
-                m.as_str().trim().chars().take(300).collect()
+                if opts.explicit_around && opts.around > 0 {
+                    let s = floor_char_boundary(text, m.start().saturating_sub(opts.around));
+                    let e = ceil_char_boundary(text, m.end().saturating_add(opts.around));
+                    let raw_snip = &text[s..e];
+                    if opts.pretty {
+                        crate::binary::pretty_format_js_snippet(raw_snip)
+                    } else {
+                        raw_snip.to_string()
+                    }
+                } else {
+                    m.as_str().trim().chars().take(300).collect()
+                }
             } else if opts.block {
                 if let Some(sp) = enc {
                     let s = sp.start_line.saturating_sub(1);
@@ -506,12 +518,25 @@ fn push_text_matches(
                     if tok.is_empty() {
                         continue;
                     }
+                    let snip = if opts.explicit_around && opts.around > 0 {
+                        let s =
+                            floor_char_boundary(ln_clean, m.start().saturating_sub(opts.around));
+                        let e = ceil_char_boundary(ln_clean, m.end().saturating_add(opts.around));
+                        let raw_snip = &ln_clean[s..e];
+                        if opts.pretty {
+                            crate::binary::pretty_format_js_snippet(raw_snip)
+                        } else {
+                            raw_snip.to_string()
+                        }
+                    } else {
+                        tok.chars().take(300).collect()
+                    };
                     matches.push(SearchMatch {
                         pattern: pat_label.to_string(),
                         file: rel.to_string(),
                         line: ln_no,
                         scope: scope.clone(),
-                        snippet: tok.chars().take(300).collect(),
+                        snippet: snip,
                         ast_kind: String::new(),
                         captures: BTreeMap::new(),
                     });
@@ -746,7 +771,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             .join(" | ")
     };
     let s_opts = SearchOpts {
-        around: cli.around,
+        around: cli.around.unwrap_or(160),
+        explicit_around: cli.around.is_some(),
         pretty: cli.pretty,
         multiline: cli.multiline,
         block: cli.block,
@@ -2090,6 +2116,7 @@ mod tests {
         // FileAstCache skips scan_symbols when need_scope is false (e.g. --files-only/--count/--no-filename)
         let opts_no_scope = SearchOpts {
             around: 160,
+            explicit_around: false,
             pretty: false,
             multiline: false,
             block: false,

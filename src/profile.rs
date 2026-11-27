@@ -70,7 +70,7 @@ impl ModelProfile {
                 recommended_mcp_profile: "core",
                 sieve_threshold_chars: 12_000,
                 kv_safe_sleep_s: 45,
-                mask_high_water_tokens: 135_000,
+                mask_high_water_tokens: 210_000,
                 dsml_recovery: true,
             },
             Self::Fast => ProfileKnobs {
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(small_k.recommended_mcp_profile, "deferred");
         assert_eq!(small_k.sieve_threshold_chars, 10_000);
         let ds_k = ModelProfile::DeepSeek.knobs();
-        assert_eq!(ds_k.mask_high_water_tokens, 135_000);
+        assert_eq!(ds_k.mask_high_water_tokens, 210_000);
         assert!(ds_k.dsml_recovery);
 
         let mut cfg = ApProfileConfig {

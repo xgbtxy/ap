@@ -667,7 +667,7 @@ const PATCH_SPECS: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "temp_log_cap_and_gc",
-        summary: "Cap OutputAccumulator temp logs at PI_TEMP_LOG_MAX_BYTES (default 32 MB) and lazily GC stale (>12h) pi-bash-*.log temp files",
+        summary: "Cap OutputAccumulator temp logs at PI_TEMP_LOG_MAX_BYTES (default 32 MB) and lazily GC stale (>12h) pi-bash-*.log and pi-codemode-*.txt temp files",
         hunks: &[
             PatchHunk {
                 id: "bundle_temp_log_cap_fields",
@@ -681,12 +681,15 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 id: "bundle_temp_log_cap_write_gc",
                 rel_hint: None,
                 old: r#"ensureTempFile(){if(this.tempFile)return this.tempFile;let tempFile=createOutputFileStream(this.tempFilePrefix,".log");this.tempFile=tempFile;for(let chunk of this.rawChunks)this.tempFile.write(chunk);return this.rawChunks=[],tempFile}"#,
-                alt_olds: &[],
-                new: r#"writeTempChunk(chunk){if(!this.tempFile||this.tempFileCapped||!chunk||chunk.length===0)return;let rem=this.maxTempFileBytes-this.tempFileBytesWritten;if(rem<=0){this.tempFileCapped=!0;return}chunk.length<=rem?(this.tempFile.write(chunk),this.tempFileBytesWritten+=chunk.length):(this.tempFile.write(chunk.subarray(0,rem)),this.tempFile.write(Buffer.from("\n[pi-patch19: temp log capped at "+this.maxTempFileBytes+" bytes to protect system drive]\n")),this.tempFileBytesWritten=this.maxTempFileBytes,this.tempFileCapped=!0)}ensureTempFile(){if(this.tempFile)return this.tempFile;if(!globalThis.__piPatch19GcRan){globalThis.__piPatch19GcRan=!0;Promise.all([import("node:fs/promises"),import("node:os"),import("node:path")]).then(async([fsp,osMod,pathMod])=>{try{let tmp=osMod.tmpdir(),cutoff=Date.now()-432e5,names=await fsp.readdir(tmp);for(let nm of names){if(!nm.startsWith("pi-bash-")||!nm.endsWith(".log"))continue;let fp=pathMod.join(tmp,nm);try{let st=await fsp.stat(fp);st.isFile()&&st.mtimeMs<cutoff&&await fsp.unlink(fp)}catch{}}}catch{}}).catch(()=>{})}let tempFile=createOutputFileStream(this.tempFilePrefix,".log");this.tempFile=tempFile;for(let chunk of this.rawChunks)this.writeTempChunk(chunk);return this.rawChunks=[],tempFile}"#,
+                alt_olds: &[
+                    r#"writeTempChunk(chunk){if(!this.tempFile||this.tempFileCapped||!chunk||chunk.length===0)return;let rem=this.maxTempFileBytes-this.tempFileBytesWritten;if(rem<=0){this.tempFileCapped=!0;return}chunk.length<=rem?(this.tempFile.write(chunk),this.tempFileBytesWritten+=chunk.length):(this.tempFile.write(chunk.subarray(0,rem)),this.tempFile.write(Buffer.from("\n[pi-patch19: temp log capped at "+this.maxTempFileBytes+" bytes to protect system drive]\n")),this.tempFileBytesWritten=this.maxTempFileBytes,this.tempFileCapped=!0)}ensureTempFile(){if(this.tempFile)return this.tempFile;if(!globalThis.__piPatch19GcRan){globalThis.__piPatch19GcRan=!0;Promise.all([import("node:fs/promises"),import("node:os"),import("node:path")]).then(async([fsp,osMod,pathMod])=>{try{let tmp=osMod.tmpdir(),cutoff=Date.now()-432e5,names=await fsp.readdir(tmp);for(let nm of names){if(!nm.startsWith("pi-bash-")||!nm.endsWith(".log"))continue;let fp=pathMod.join(tmp,nm);try{let st=await fsp.stat(fp);st.isFile()&&st.mtimeMs<cutoff&&await fsp.unlink(fp)}catch{}}}catch{}}).catch(()=>{})}let tempFile=createOutputFileStream(this.tempFilePrefix,".log");this.tempFile=tempFile;for(let chunk of this.rawChunks)this.writeTempChunk(chunk);return this.rawChunks=[],tempFile}"#,
+                ],
+                new: r#"writeTempChunk(chunk){if(!this.tempFile||this.tempFileCapped||!chunk||chunk.length===0)return;let rem=this.maxTempFileBytes-this.tempFileBytesWritten;if(rem<=0){this.tempFileCapped=!0;return}chunk.length<=rem?(this.tempFile.write(chunk),this.tempFileBytesWritten+=chunk.length):(this.tempFile.write(chunk.subarray(0,rem)),this.tempFile.write(Buffer.from("\n[pi-patch19: temp log capped at "+this.maxTempFileBytes+" bytes to protect system drive]\n")),this.tempFileBytesWritten=this.maxTempFileBytes,this.tempFileCapped=!0)}ensureTempFile(){if(this.tempFile)return this.tempFile;if(!globalThis.__piPatch19GcRan){globalThis.__piPatch19GcRan=!0;Promise.all([import("node:fs/promises"),import("node:os"),import("node:path")]).then(async([fsp,osMod,pathMod])=>{try{let tmp=osMod.tmpdir(),cutoff=Date.now()-432e5,names=await fsp.readdir(tmp);for(let nm of names){if(!((nm.startsWith("pi-bash-")&&nm.endsWith(".log"))||(nm.startsWith("pi-codemode-")&&nm.endsWith(".txt"))))continue;let fp=pathMod.join(tmp,nm);try{let st=await fsp.stat(fp);st.isFile()&&st.mtimeMs<cutoff&&await fsp.unlink(fp)}catch{}}}catch{}}).catch(()=>{})}let tempFile=createOutputFileStream(this.tempFilePrefix,".log");this.tempFile=tempFile;for(let chunk of this.rawChunks)this.writeTempChunk(chunk);return this.rawChunks=[],tempFile}"#,
                 already_present_markers: &[
                     "writeTempChunk(",
                     "__piPatch19GcRan",
                     "pi-patch19: temp log capped",
+                    "pi-codemode-",
                 ],
             },
             PatchHunk {
@@ -701,12 +704,15 @@ const PATCH_SPECS: &[PatchSpec] = &[
                 id: "core_temp_log_cap_write_gc",
                 rel_hint: Some("dist/core/tools/output-accumulator.js"),
                 old: "    ensureTempFile() {\n        if (this.tempFile) {\n            return this.tempFile;\n        }\n        const tempFile = createOutputFileStream(this.tempFilePrefix, \".log\");\n        this.tempFile = tempFile;\n        for (const chunk of this.rawChunks) {\n            this.tempFile.write(chunk);\n        }\n        this.rawChunks = [];\n        return tempFile;\n    }",
-                alt_olds: &[],
-                new: "    writeTempChunk(chunk) {\n        if (!this.tempFile || this.tempFileCapped || !chunk || chunk.length === 0) return;\n        const rem = this.maxTempFileBytes - this.tempFileBytesWritten;\n        if (rem <= 0) { this.tempFileCapped = true; return; }\n        if (chunk.length <= rem) {\n            this.tempFile.write(chunk);\n            this.tempFileBytesWritten += chunk.length;\n        } else {\n            this.tempFile.write(chunk.subarray(0, rem));\n            this.tempFile.write(Buffer.from(\"\\n[pi-patch19: temp log capped at \" + this.maxTempFileBytes + \" bytes to protect system drive]\\n\"));\n            this.tempFileBytesWritten = this.maxTempFileBytes;\n            this.tempFileCapped = true;\n        }\n    }\n    ensureTempFile() {\n        if (this.tempFile) {\n            return this.tempFile;\n        }\n        if (!globalThis.__piPatch19GcRan) {\n            globalThis.__piPatch19GcRan = true;\n            Promise.all([import(\"node:fs/promises\"), import(\"node:os\"), import(\"node:path\")]).then(async ([fsp, osMod, pathMod]) => {\n                try {\n                    const tmp = osMod.tmpdir();\n                    const cutoff = Date.now() - 12 * 3600 * 1000;\n                    const names = await fsp.readdir(tmp);\n                    for (const nm of names) {\n                        if (!nm.startsWith(\"pi-bash-\") || !nm.endsWith(\".log\")) continue;\n                        const fp = pathMod.join(tmp, nm);\n                        try { const st = await fsp.stat(fp); if (st.isFile() && st.mtimeMs < cutoff) await fsp.unlink(fp); } catch {}\n                    }\n                } catch {}\n            }).catch(() => {});\n        }\n\n        const tempFile = createOutputFileStream(this.tempFilePrefix, \".log\");\n        this.tempFile = tempFile;\n        for (const chunk of this.rawChunks) {\n            this.writeTempChunk(chunk);\n        }\n        this.rawChunks = [];\n        return tempFile;\n    }",
+                alt_olds: &[
+                    "    writeTempChunk(chunk) {\n        if (!this.tempFile || this.tempFileCapped || !chunk || chunk.length === 0) return;\n        const rem = this.maxTempFileBytes - this.tempFileBytesWritten;\n        if (rem <= 0) { this.tempFileCapped = true; return; }\n        if (chunk.length <= rem) {\n            this.tempFile.write(chunk);\n            this.tempFileBytesWritten += chunk.length;\n        } else {\n            this.tempFile.write(chunk.subarray(0, rem));\n            this.tempFile.write(Buffer.from(\"\\n[pi-patch19: temp log capped at \" + this.maxTempFileBytes + \" bytes to protect system drive]\\n\"));\n            this.tempFileBytesWritten = this.maxTempFileBytes;\n            this.tempFileCapped = true;\n        }\n    }\n    ensureTempFile() {\n        if (this.tempFile) {\n            return this.tempFile;\n        }\n        if (!globalThis.__piPatch19GcRan) {\n            globalThis.__piPatch19GcRan = true;\n            Promise.all([import(\"node:fs/promises\"), import(\"node:os\"), import(\"node:path\")]).then(async ([fsp, osMod, pathMod]) => {\n                try {\n                    const tmp = osMod.tmpdir();\n                    const cutoff = Date.now() - 12 * 3600 * 1000;\n                    const names = await fsp.readdir(tmp);\n                    for (const nm of names) {\n                        if (!nm.startsWith(\"pi-bash-\") || !nm.endsWith(\".log\")) continue;\n                        const fp = pathMod.join(tmp, nm);\n                        try { const st = await fsp.stat(fp); if (st.isFile() && st.mtimeMs < cutoff) await fsp.unlink(fp); } catch {}\n                    }\n                } catch {}\n            }).catch(() => {});\n        }\n\n        const tempFile = createOutputFileStream(this.tempFilePrefix, \".log\");\n        this.tempFile = tempFile;\n        for (const chunk of this.rawChunks) {\n            this.writeTempChunk(chunk);\n        }\n        this.rawChunks = [];\n        return tempFile;\n    }",
+                ],
+                new: "    writeTempChunk(chunk) {\n        if (!this.tempFile || this.tempFileCapped || !chunk || chunk.length === 0) return;\n        const rem = this.maxTempFileBytes - this.tempFileBytesWritten;\n        if (rem <= 0) { this.tempFileCapped = true; return; }\n        if (chunk.length <= rem) {\n            this.tempFile.write(chunk);\n            this.tempFileBytesWritten += chunk.length;\n        } else {\n            this.tempFile.write(chunk.subarray(0, rem));\n            this.tempFile.write(Buffer.from(\"\\n[pi-patch19: temp log capped at \" + this.maxTempFileBytes + \" bytes to protect system drive]\\n\"));\n            this.tempFileBytesWritten = this.maxTempFileBytes;\n            this.tempFileCapped = true;\n        }\n    }\n    ensureTempFile() {\n        if (this.tempFile) {\n            return this.tempFile;\n        }\n        if (!globalThis.__piPatch19GcRan) {\n            globalThis.__piPatch19GcRan = true;\n            Promise.all([import(\"node:fs/promises\"), import(\"node:os\"), import(\"node:path\")]).then(async ([fsp, osMod, pathMod]) => {\n                try {\n                    const tmp = osMod.tmpdir();\n                    const cutoff = Date.now() - 12 * 3600 * 1000;\n                    const names = await fsp.readdir(tmp);\n                    for (const nm of names) {\n                        if (!((nm.startsWith(\"pi-bash-\") && nm.endsWith(\".log\")) || (nm.startsWith(\"pi-codemode-\") && nm.endsWith(\".txt\")))) continue;\n                        const fp = pathMod.join(tmp, nm);\n                        try { const st = await fsp.stat(fp); if (st.isFile() && st.mtimeMs < cutoff) await fsp.unlink(fp); } catch {}\n                    }\n                } catch {}\n            }).catch(() => {});\n        }\n\n        const tempFile = createOutputFileStream(this.tempFilePrefix, \".log\");\n        this.tempFile = tempFile;\n        for (const chunk of this.rawChunks) {\n            this.writeTempChunk(chunk);\n        }\n        this.rawChunks = [];\n        return tempFile;\n    }",
                 already_present_markers: &[
                     "writeTempChunk(chunk)",
                     "__piPatch19GcRan",
                     "pi-patch19: temp log capped",
+                    "pi-codemode-",
                 ],
             },
         ],
@@ -2370,6 +2376,79 @@ console.log("OK_COMPACT_AND_DNS");
             .unwrap();
         assert_eq!(p1_rep.status, "applied");
         assert_eq!(p22_rep.status, "applied");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn patch21_upgrades_cleanly_from_previous_gc_and_sweeps_codemode_txt() {
+        let base = std::env::temp_dir().join(format!("ap_pi_p21_c6_upg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let pi_dir = base.join("pi-coding-agent");
+        let chunks = pi_dir.join("dist").join("bundle").join("chunks");
+        let tools_dir = pi_dir.join("dist").join("core").join("tools");
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&tools_dir).unwrap();
+        fs::write(
+            pi_dir.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"1.6.1-cycle5"}"#,
+        )
+        .unwrap();
+
+        let p21 = PATCH_SPECS
+            .iter()
+            .find(|s| s.id == "temp_log_cap_and_gc")
+            .unwrap();
+        assert_eq!(PATCH_SPECS.len(), 22);
+        // Seed files with the Cycle 5 already-applied #21 (stored in alt_olds[0])
+        fs::write(
+            chunks.join("chunk-out.js"),
+            format!("{}\n{}\n", p21.hunks[0].new, p21.hunks[1].alt_olds[0]),
+        )
+        .unwrap();
+        fs::write(
+            tools_dir.join("output-accumulator.js"),
+            format!("{}\n{}\n", p21.hunks[2].new, p21.hunks[3].alt_olds[0]),
+        )
+        .unwrap();
+
+        let _ap_home_guard = crate::stats::ApHomeTestGuard::set(&base.join("ap_home"));
+        let pi_str = pi_dir.to_string_lossy().to_string();
+        let before = inspect_pi_patches(Some(&pi_str));
+        let p21_before = before
+            .patches
+            .iter()
+            .find(|p| p.id == "temp_log_cap_and_gc")
+            .unwrap();
+        assert_ne!(
+            p21_before.status, "applied",
+            "old #21 without pi-codemode GC must be detected as upgradable"
+        );
+
+        let applied = apply_pi_patches(Some(&pi_str), false).unwrap();
+        let newly: Vec<String> = applied["newly_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(newly.contains(&"temp_log_cap_and_gc:bundle_temp_log_cap_write_gc".to_string()));
+        assert!(newly.contains(&"temp_log_cap_and_gc:core_temp_log_cap_write_gc".to_string()));
+
+        let bundle_src = fs::read_to_string(chunks.join("chunk-out.js")).unwrap();
+        let core_src = fs::read_to_string(tools_dir.join("output-accumulator.js")).unwrap();
+        assert!(bundle_src.contains("pi-codemode-") && bundle_src.contains(".txt"));
+        assert!(core_src.contains("pi-codemode-") && core_src.contains(".txt"));
+
+        // Verify 2nd run is 100% idempotent
+        let second = apply_pi_patches(Some(&pi_str), false).unwrap();
+        assert_eq!(second["newly_applied"].as_array().unwrap().len(), 0);
+        let after = inspect_pi_patches(Some(&pi_str));
+        let p21_after = after
+            .patches
+            .iter()
+            .find(|p| p.id == "temp_log_cap_and_gc")
+            .unwrap();
+        assert_eq!(p21_after.status, "applied");
         let _ = fs::remove_dir_all(&base);
     }
 }

@@ -106,7 +106,69 @@ fn execute_http_probe_with_raw(
         }
     };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0).round();
-    if !out.status.success() && out.stdout.is_empty() {
+    parse_curl_http_output(
+        method,
+        url,
+        &out.stdout,
+        &out.stderr,
+        out.status.success(),
+        elapsed_ms,
+    )
+}
+
+fn is_proxy_connect_header_block(hdr_block: &str) -> bool {
+    let Some(first) = hdr_block.lines().next() else {
+        return false;
+    };
+    let low = first.trim().to_ascii_lowercase();
+    low.starts_with("http/")
+        && (low.contains(" 200 connection established")
+            || low.contains(" 200 tunnel established")
+            || low.contains(" 200 connection-established"))
+}
+
+fn find_header_delimiter(s: &str) -> Option<(usize, usize)> {
+    match (s.find("\r\n\r\n"), s.find("\n\n")) {
+        (Some(a), Some(b)) => {
+            if a <= b {
+                Some((a, 4))
+            } else {
+                Some((b, 2))
+            }
+        }
+        (Some(a), None) => Some((a, 4)),
+        (None, Some(b)) => Some((b, 2)),
+        (None, None) => None,
+    }
+}
+
+fn find_header_delimiter_bytes(b: &[u8]) -> Option<(usize, usize)> {
+    let crlf = b.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf = b.windows(2).position(|w| w == b"\n\n");
+    match (crlf, lf) {
+        (Some(x), Some(y)) => {
+            if x <= y {
+                Some((x, 4))
+            } else {
+                Some((y, 2))
+            }
+        }
+        (Some(x), None) => Some((x, 4)),
+        (None, Some(y)) => Some((y, 2)),
+        (None, None) => None,
+    }
+}
+
+fn parse_curl_http_output(
+    method: &str,
+    url: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+    success: bool,
+    elapsed_ms: f64,
+) -> (HttpProbeResult, String) {
+    let stderr_msg = String::from_utf8_lossy(stderr).trim().to_string();
+    if !success && stdout.is_empty() {
         return (
             HttpProbeResult {
                 method: method.to_string(),
@@ -116,27 +178,84 @@ fn execute_http_probe_with_raw(
                 content_type: String::new(),
                 headers: Vec::new(),
                 body_preview: String::new(),
-                error: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                error: stderr_msg,
             },
             String::new(),
         );
     }
 
-    let raw = String::from_utf8_lossy(&out.stdout).to_string();
-    // Handle redirect chains / 100 Continue by taking the LAST HTTP header block
+    let raw = String::from_utf8_lossy(stdout).to_string();
+    // Handle proxy CONNECT tunnel headers, 100 Continue, and redirect chains by taking
+    // the LAST non-proxy origin HTTP header block.
     let mut rest = raw.as_str();
-    let mut hdr_block = "";
+    let mut origin_hdr_block: Option<&str> = None;
+    let mut saw_proxy_connect = false;
     while rest.starts_with("HTTP/") {
-        if let Some(idx) = rest.find("\r\n\r\n") {
-            hdr_block = &rest[..idx];
-            rest = &rest[idx + 4..];
-        } else if let Some(idx) = rest.find("\n\n") {
-            hdr_block = &rest[..idx];
-            rest = &rest[idx + 2..];
+        if let Some((idx, sep_len)) = find_header_delimiter(rest) {
+            let blk = &rest[..idx];
+            rest = &rest[idx + sep_len..];
+            if is_proxy_connect_header_block(blk) {
+                saw_proxy_connect = true;
+                continue;
+            }
+            origin_hdr_block = Some(blk);
         } else {
+            if is_proxy_connect_header_block(rest) {
+                saw_proxy_connect = true;
+                rest = "";
+            }
             break;
         }
     }
+
+    let Some(hdr_block) = origin_hdr_block else {
+        if !success || saw_proxy_connect {
+            let err = if !stderr_msg.is_empty() {
+                stderr_msg
+            } else if saw_proxy_connect {
+                "proxy CONNECT tunnel established without origin HTTP response".to_string()
+            } else {
+                "empty or incomplete HTTP response".to_string()
+            };
+            return (
+                HttpProbeResult {
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    status: 0,
+                    elapsed_ms,
+                    content_type: String::new(),
+                    headers: Vec::new(),
+                    body_preview: String::new(),
+                    error: err,
+                },
+                String::new(),
+            );
+        }
+        let body_raw = rest;
+        let preview: String = if body_raw.len() > 2400 {
+            format!(
+                "{}...\n[truncated: {}B total]",
+                body_raw.chars().take(2400).collect::<String>(),
+                body_raw.len()
+            )
+        } else {
+            body_raw.to_string()
+        };
+        return (
+            HttpProbeResult {
+                method: method.to_string(),
+                url: url.to_string(),
+                status: 0,
+                elapsed_ms,
+                content_type: String::new(),
+                headers: Vec::new(),
+                body_preview: preview,
+                error: String::new(),
+            },
+            body_raw.to_string(),
+        );
+    };
+
     let body_raw = rest;
     let mut status = 0u16;
     let mut ct = String::new();
@@ -180,7 +299,7 @@ fn execute_http_probe_with_raw(
             content_type: ct,
             headers: hdrs,
             body_preview: preview,
-            error: String::new(),
+            error: if !success { stderr_msg } else { String::new() },
         },
         body_raw.to_string(),
     )
@@ -2885,18 +3004,68 @@ fn parse_http_wire_response(
     elapsed_ms: f64,
 ) -> (HttpProbeResult, String) {
     let mut off = 0usize;
-    let mut hdr_bytes: &[u8] = &[];
+    let mut origin_hdr_bytes: Option<&[u8]> = None;
+    let mut saw_proxy_connect = false;
     while raw_bytes[off..].starts_with(b"HTTP/") {
-        if let Some(idx) = raw_bytes[off..].windows(4).position(|w| w == b"\r\n\r\n") {
-            hdr_bytes = &raw_bytes[off..off + idx];
-            off += idx + 4;
-        } else if let Some(idx) = raw_bytes[off..].windows(2).position(|w| w == b"\n\n") {
-            hdr_bytes = &raw_bytes[off..off + idx];
-            off += idx + 2;
+        if let Some((idx, sep_len)) = find_header_delimiter_bytes(&raw_bytes[off..]) {
+            let blk = &raw_bytes[off..off + idx];
+            off += idx + sep_len;
+            let blk_s = String::from_utf8_lossy(blk);
+            if is_proxy_connect_header_block(&blk_s) {
+                saw_proxy_connect = true;
+                continue;
+            }
+            origin_hdr_bytes = Some(blk);
         } else {
+            let rem_s = String::from_utf8_lossy(&raw_bytes[off..]);
+            if is_proxy_connect_header_block(&rem_s) {
+                saw_proxy_connect = true;
+                off = raw_bytes.len();
+            }
             break;
         }
     }
+    let Some(hdr_bytes) = origin_hdr_bytes else {
+        if saw_proxy_connect {
+            return (
+                HttpProbeResult {
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    status: 0,
+                    elapsed_ms,
+                    content_type: String::new(),
+                    headers: Vec::new(),
+                    body_preview: String::new(),
+                    error: "proxy CONNECT tunnel established without origin HTTP response"
+                        .to_string(),
+                },
+                String::new(),
+            );
+        }
+        let body_raw = String::from_utf8_lossy(&raw_bytes[off..]).into_owned();
+        let preview = if body_raw.len() > 2400 {
+            format!(
+                "{}...\n[truncated: {}B total]",
+                body_raw.chars().take(2400).collect::<String>(),
+                body_raw.len()
+            )
+        } else {
+            body_raw.clone()
+        };
+        return (
+            HttpProbeResult {
+                method: method.to_string(),
+                url: url.to_string(),
+                status: 0,
+                elapsed_ms,
+                content_type: String::new(),
+                headers: Vec::new(),
+                body_preview: preview,
+                error: String::new(),
+            },
+            body_raw,
+        );
+    };
     let hdr_block = String::from_utf8_lossy(hdr_bytes);
     let mut status = 0u16;
     let mut ct = String::new();
@@ -4792,5 +4961,71 @@ mod tests {
                     && a["actor"] == "other"),
             "expected WRITE_AUTHZ_BYPASS in {report}"
         );
+    }
+
+    #[test]
+    fn proxy_connect_tunnel_headers_never_mask_origin_failure_or_status() {
+        // 1. Proxy CONNECT established, then TLS/origin fails (non-zero curl exit + stderr)
+        let (res_fail, body_fail) = parse_curl_http_output(
+            "GET",
+            "https://target.example.test/api",
+            b"HTTP/1.1 200 Connection established\r\nProxy-Agent: corp-proxy\r\n\r\n",
+            b"curl: (35) schannel: next InitializeSecurityContext failed",
+            false,
+            12.0,
+        );
+        assert_eq!(res_fail.status, 0, "tunnel header must not fake status 200");
+        assert!(
+            res_fail.error.contains("curl: (35)"),
+            "expected curl stderr in error: {res_fail:?}"
+        );
+        assert!(body_fail.is_empty());
+
+        // 2. Proxy CONNECT followed by origin HTTP/2 403
+        let (res_403, body_403) = parse_curl_http_output(
+            "GET",
+            "https://target.example.test/admin",
+            b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/2 403\r\ncontent-type: application/json\r\n\r\n{\"denied\":true}",
+            b"",
+            true,
+            18.0,
+        );
+        assert_eq!(res_403.status, 403);
+        assert!(res_403.error.is_empty());
+        assert_eq!(res_403.content_type, "application/json");
+        assert_eq!(body_403, r#"{"denied":true}"#);
+
+        // 3. Proxy CONNECT + redirect 302 + origin 200 OK
+        let (res_redir, body_redir) = parse_curl_http_output(
+            "GET",
+            "https://target.example.test/start",
+            b"HTTP/1.1 200 Tunnel established\r\n\r\nHTTP/1.1 302 Found\r\nLocation: /done\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfinal-ok",
+            b"",
+            true,
+            25.0,
+        );
+        assert_eq!(res_redir.status, 200);
+        assert_eq!(body_redir, "final-ok");
+
+        // 4. Raw wire parser: tunnel-only returns status 0 + error; tunnel + 401 returns 401
+        let (wire_only, wire_body) = parse_http_wire_response(
+            "GET",
+            "https://target.example.test/x",
+            b"HTTP/1.1 200 Connection established\r\n\r\n",
+            5.0,
+        );
+        assert_eq!(wire_only.status, 0);
+        assert!(!wire_only.error.is_empty());
+        assert!(wire_body.is_empty());
+
+        let (wire_401, wire_401_body) = parse_http_wire_response(
+            "GET",
+            "https://target.example.test/x",
+            b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\r\nno-auth",
+            6.0,
+        );
+        assert_eq!(wire_401.status, 401);
+        assert!(wire_401.error.is_empty());
+        assert_eq!(wire_401_body, "no-auth");
     }
 }

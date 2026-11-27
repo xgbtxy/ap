@@ -53,6 +53,9 @@ struct LsCli {
     /// Include dotfiles and build/vendor dirs (`node_modules`, `target`, `.git`) when recursing
     #[arg(short = 'a', long)]
     all: bool,
+    /// Accepted for Unix `ls -l` muscle-memory compatibility (`ap ls` already shows compact metadata)
+    #[arg(short = 'l', long = "long")]
+    _long_format: bool,
     /// Count exact lines & bytes for files (`ap wc` compatible)
     #[arg(long)]
     lines: bool,
@@ -109,11 +112,50 @@ pub fn normalize_windows_tmp_path(raw: &str, temp_dir: &str) -> Option<String> {
         .map(|rest| format!("{base}/{}", rest.replace('\\', "/")))
 }
 
-/// Normalizes CLI paths on Windows so Git-Bash `/c/...` or `/tmp/...` paths resolve seamlessly.
+/// Expands a leading `~`, `~/...`, or `~\...` path against a provided home directory.
+pub fn expand_tilde_with_home(raw: &str, home: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed != "~" && !trimmed.starts_with("~/") && !trimmed.starts_with("~\\") {
+        return None;
+    }
+    if home.trim().is_empty() {
+        return None;
+    }
+    let base = home.trim_end_matches(['/', '\\']).replace('\\', "/");
+    if trimmed == "~" {
+        return Some(base);
+    }
+    let tail = trimmed[2..].replace('\\', "/");
+    if tail.is_empty() {
+        Some(base)
+    } else {
+        Some(format!("{base}/{tail}"))
+    }
+}
+
+/// Expands a leading `~`, `~/...`, or `~\...` path using `HOME` or `USERPROFILE`.
+pub fn expand_tilde_path(raw: &str) -> Option<String> {
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })?;
+    expand_tilde_with_home(raw, &home)
+}
+
+/// Normalizes CLI paths on Windows so Git-Bash `/c/...`, `/tmp/...`, and `~/...` paths resolve seamlessly.
 pub fn normalize_cli_path(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return trimmed.to_string();
+    }
+    if !Path::new(trimmed).exists() {
+        if let Some(expanded) = expand_tilde_path(trimmed) {
+            return expanded;
+        }
     }
     #[cfg(windows)]
     {
@@ -759,6 +801,30 @@ mod tests {
         );
         assert_eq!(
             normalize_windows_tmp_path("C:/tmp/local.txt", "C:/Temp"),
+            None
+        );
+    }
+
+    #[test]
+    fn tilde_home_path_expands_cleanly_without_touching_non_tilde_paths() {
+        assert_eq!(
+            expand_tilde_with_home("~", r"C:\Users\demo\"),
+            Some("C:/Users/demo".to_string())
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/.ssh/config", r"C:\Users\demo"),
+            Some("C:/Users/demo/.ssh/config".to_string())
+        );
+        assert_eq!(
+            expand_tilde_with_home(r"~\docs\notes.md", r"C:\Users\demo\"),
+            Some("C:/Users/demo/docs/notes.md".to_string())
+        );
+        assert_eq!(
+            expand_tilde_with_home("~other/file.txt", r"C:\Users\demo"),
+            None
+        );
+        assert_eq!(
+            expand_tilde_with_home("src/main.rs", r"C:\Users\demo"),
             None
         );
     }

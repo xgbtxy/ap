@@ -226,6 +226,65 @@ pub fn acquire_file_lock(store_path: &Path) -> Result<FrontierLockGuard, String>
     }
 }
 
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn prune_stale_tmp_files(store_path: &Path) {
+    let (Some(parent), Some(fname)) = (
+        store_path.parent(),
+        store_path.file_name().and_then(|s| s.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{fname}.");
+    let my_pid = std::process::id();
+    let Ok(rd) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let middle = &name[prefix.len()..name.len() - 4];
+        let mut stale = false;
+        if let Some(pid_tok) = middle.split('.').next() {
+            if let Ok(pid) = pid_tok.parse::<u32>() {
+                if pid != my_pid && !is_pid_alive(pid) {
+                    stale = true;
+                }
+            }
+        }
+        if !stale {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(age) = SystemTime::now().duration_since(mtime) {
+                        if age > Duration::from_secs(60) {
+                            stale = true;
+                        }
+                    }
+                }
+            }
+        }
+        if stale {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
 pub fn atomic_write_text(dst: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -238,15 +297,17 @@ pub fn atomic_write_text(dst: &Path, body: &str) -> Result<(), String> {
     let mut os = dst.as_os_str().to_os_string();
     os.push(format!(".{}.{nanos}.{seq}.tmp", std::process::id()));
     let tmp = PathBuf::from(os);
+    let mut tmp_guard = TempFileGuard {
+        path: tmp.clone(),
+        armed: true,
+    };
     {
         let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
         f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
         let _ = f.sync_all();
     }
-    if let Err(e) = win_replace::replace_atomic(&tmp, dst) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
+    win_replace::replace_atomic(&tmp, dst)?;
+    tmp_guard.armed = false;
     Ok(())
 }
 
@@ -497,7 +558,9 @@ pub fn load_frontier(store_path: &Path) -> FrontierState {
 pub fn save_frontier_unlocked(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
     state.updated_at = now_iso_utc();
     let body = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    atomic_write_text(store_path, &body)
+    let res = atomic_write_text(store_path, &body);
+    prune_stale_tmp_files(store_path);
+    res
 }
 
 pub fn save_frontier(store_path: &Path, state: &mut FrontierState) -> Result<(), String> {
@@ -3417,6 +3480,59 @@ mod tests {
                 t0.elapsed()
             );
         }
+
+        // Cycle 6: RAII temp guard on failed write & stale dead-PID `.tmp` cleanup on save
+        let tmp_dir_test = td.join("tmp_hygiene");
+        fs::create_dir_all(&tmp_dir_test).unwrap();
+        let store_p = tmp_dir_test.join("frontier.json");
+        let dead_child2 = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+        };
+        if let Ok(mut ch) = dead_child2 {
+            let dead_pid = ch.id();
+            let _ = ch.wait();
+            let stale_tmp = tmp_dir_test.join(format!("frontier.json.{dead_pid}.12345.0.tmp"));
+            let live_tmp =
+                tmp_dir_test.join(format!("frontier.json.{}.99999.0.tmp", std::process::id()));
+            fs::write(&stale_tmp, "orphaned partial write").unwrap();
+            fs::write(&live_tmp, "active peer write").unwrap();
+            let mut st_tmp = FrontierState::default();
+            save_frontier(&store_p, &mut st_tmp).unwrap();
+            assert!(
+                !stale_tmp.exists(),
+                "dead-PID stale frontier .tmp must be pruned on save"
+            );
+            assert!(
+                live_tmp.exists(),
+                "fresh live-PID .tmp must not be prematurely pruned"
+            );
+            let _ = fs::remove_file(&live_tmp);
+        }
+        // Replacing onto a directory path fails; RAII TempFileGuard must leave 0 `.tmp` behind
+        let dir_as_dst = tmp_dir_test.join("cannot_overwrite_dir");
+        fs::create_dir_all(&dir_as_dst).unwrap();
+        assert!(atomic_write_text(&dir_as_dst, "{}").is_err());
+        let leftover_tmps: Vec<_> = fs::read_dir(&tmp_dir_test)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("cannot_overwrite_dir.")
+                    && e.file_name().to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "RAII guard must remove temp file on failed atomic write: {leftover_tmps:?}"
+        );
+
         let _ = fs::remove_dir_all(&td);
     }
 }

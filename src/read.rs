@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use zip::ZipArchive;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "read",
     about = "Read any file (.docx, .xlsx, .pptx, .pdf, .csv, .json, GBK/UTF-16 text) or URL without context overflow or mojibake"
@@ -50,9 +50,9 @@ struct ReadCli {
     /// Byte offset or comma-separated batch offsets for minified bundles (e.g. --offset 18000,95000 --chars 1200 --pretty)
     #[arg(long)]
     offset: Option<String>,
-    /// Character/byte window size when slicing with --offset (default: 2400)
-    #[arg(long, default_value_t = 2400)]
-    chars: usize,
+    /// Character/byte window size when slicing with --offset/--hex/--rva/--va (or output budget alias for --max-chars)
+    #[arg(long)]
+    chars: Option<usize>,
     /// Pretty-format minified JS/JSON snippets when slicing with --offset or --query
     #[arg(long)]
     pretty: bool,
@@ -238,14 +238,22 @@ pub fn decode_any_bytes(raw: &[u8]) -> (String, &'static str, u32) {
     (win_cow.into_owned(), "windows-1252", 1)
 }
 
+const MAX_OFFICE_XML_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_XLSX_COL_INDEX: usize = 16_383; // Excel max column `XFD` (16,384 columns)
+
+fn read_bounded_utf8<R: Read>(reader: R, max_bytes: u64) -> Result<String, std::io::Error> {
+    let mut buf = Vec::new();
+    reader.take(max_bytes).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 fn extract_docx_md(bytes: &[u8]) -> Result<String, String> {
     let mut zip =
         ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("docx zip error: {e}"))?;
-    let mut xml = String::new();
-    zip.by_name("word/document.xml")
-        .map_err(|_| "word/document.xml missing in .docx".to_string())?
-        .read_to_string(&mut xml)
-        .map_err(|e| e.to_string())?;
+    let doc_f = zip
+        .by_name("word/document.xml")
+        .map_err(|_| "word/document.xml missing in .docx".to_string())?;
+    let xml = read_bounded_utf8(doc_f, MAX_OFFICE_XML_BYTES).map_err(|e| e.to_string())?;
 
     let re = xre();
     let mut out = Vec::new();
@@ -326,7 +334,11 @@ fn col_ref_to_index(attrs: &str) -> Option<usize> {
     }
     let mut idx = 0usize;
     for ch in letters.bytes() {
-        idx = idx * 26 + ((ch.to_ascii_uppercase() - b'A') as usize + 1);
+        let digit = (ch.to_ascii_uppercase() - b'A') as usize + 1;
+        idx = idx.checked_mul(26)?.checked_add(digit)?;
+        if idx > MAX_XLSX_COL_INDEX + 1 {
+            return None;
+        }
     }
     Some(idx.saturating_sub(1))
 }
@@ -339,9 +351,8 @@ pub fn extract_xlsx_sheets_raw(bytes: &[u8]) -> Result<Vec<XlsxSheetRows>, Strin
     let re = xre();
 
     let mut shared: Vec<String> = Vec::new();
-    if let Ok(mut sf) = zip.by_name("xl/sharedStrings.xml") {
-        let mut sxml = String::new();
-        let _ = sf.read_to_string(&mut sxml);
+    if let Ok(sf) = zip.by_name("xl/sharedStrings.xml") {
+        let sxml = read_bounded_utf8(sf, MAX_OFFICE_XML_BYTES).unwrap_or_default();
         for cap in re.xlsx_si.captures_iter(&sxml) {
             let plain = unescape_xml(&re.xml_tag.replace_all(&cap[1], ""));
             shared.push(plain.replace('\n', " ").trim().to_string());
@@ -349,9 +360,8 @@ pub fn extract_xlsx_sheets_raw(bytes: &[u8]) -> Result<Vec<XlsxSheetRows>, Strin
     }
 
     let mut sheet_names: Vec<String> = Vec::new();
-    if let Ok(mut wf) = zip.by_name("xl/workbook.xml") {
-        let mut wxml = String::new();
-        let _ = wf.read_to_string(&mut wxml);
+    if let Ok(wf) = zip.by_name("xl/workbook.xml") {
+        let wxml = read_bounded_utf8(wf, MAX_OFFICE_XML_BYTES).unwrap_or_default();
         for cap in re.xlsx_sheet.captures_iter(&wxml) {
             sheet_names.push(unescape_xml(&cap[1]));
         }
@@ -365,11 +375,10 @@ pub fn extract_xlsx_sheets_raw(bytes: &[u8]) -> Result<Vec<XlsxSheetRows>, Strin
             .cloned()
             .unwrap_or_else(|| format!("Sheet{}", idx + 1));
         let xml_path = format!("xl/worksheets/sheet{}.xml", idx + 1);
-        let Ok(mut shf) = zip.by_name(&xml_path) else {
+        let Ok(shf) = zip.by_name(&xml_path) else {
             continue;
         };
-        let mut shxml = String::new();
-        let _ = shf.read_to_string(&mut shxml);
+        let shxml = read_bounded_utf8(shf, MAX_OFFICE_XML_BYTES).unwrap_or_default();
 
         let mut rows: Vec<Vec<String>> = Vec::new();
         for rcap in re.xlsx_row.captures_iter(&shxml) {
@@ -379,6 +388,9 @@ pub fn extract_xlsx_sheets_raw(bytes: &[u8]) -> Result<Vec<XlsxSheetRows>, Strin
                 let attrs = &ccap[1];
                 let inner = &ccap[2];
                 let col_idx = col_ref_to_index(attrs).unwrap_or(cur_col);
+                if col_idx > MAX_XLSX_COL_INDEX {
+                    continue;
+                }
                 if row_cells.len() <= col_idx {
                     row_cells.resize(col_idx + 1, String::new());
                 }
@@ -475,14 +487,13 @@ fn extract_pptx_or_zip(bytes: &[u8], ext: &str) -> Result<String, String> {
         let mut slides = Vec::new();
         for i in 1..=200 {
             let name = format!("ppt/slides/slide{i}.xml");
-            let Ok(mut sf) = zip.by_name(&name) else {
+            let Ok(sf) = zip.by_name(&name) else {
                 if i == 1 {
                     break;
                 }
                 continue;
             };
-            let mut xml = String::new();
-            let _ = sf.read_to_string(&mut xml);
+            let xml = read_bounded_utf8(sf, MAX_OFFICE_XML_BYTES).unwrap_or_default();
             let mut paras = Vec::new();
             for pm in re.pptx_p.captures_iter(&xml) {
                 let txt: String = re
@@ -531,15 +542,18 @@ fn extract_pdf_text(bytes: &[u8]) -> Result<String, String> {
 
         let mut decoded = Vec::new();
         if ZlibDecoder::new(stream_slice)
+            .take(MAX_OFFICE_XML_BYTES)
             .read_to_end(&mut decoded)
             .is_err()
         {
             decoded.clear();
             if DeflateDecoder::new(stream_slice)
+                .take(MAX_OFFICE_XML_BYTES)
                 .read_to_end(&mut decoded)
                 .is_err()
             {
-                decoded.extend_from_slice(stream_slice);
+                let cap = stream_slice.len().min(MAX_OFFICE_XML_BYTES as usize);
+                decoded.extend_from_slice(&stream_slice[..cap]);
             }
         }
         let text = String::from_utf8_lossy(&decoded);
@@ -829,6 +843,42 @@ fn scrub_rendered_and_json(rendered: &mut String, jv: &mut serde_json::Value) {
     }
 }
 
+fn parse_byte_offset(tok: &str) -> Result<usize, ()> {
+    let t = tok.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        usize::from_str_radix(hex, 16).map_err(|_| ())
+    } else {
+        t.parse::<usize>().map_err(|_| ())
+    }
+}
+
+fn split_virtual_archive_target(target: &str) -> Option<(String, String)> {
+    const ARCHIVE_EXTS: &[&str] = &[".asar", ".zip", ".vsix", ".jar", ".whl", ".apk"];
+    let low = target.to_ascii_lowercase();
+    for ext in ARCHIVE_EXTS {
+        let mut search_from = 0usize;
+        while let Some(pos) = low[search_from..].find(ext) {
+            let end_ext = search_from + pos + ext.len();
+            let rest = &target[end_ext..];
+            let member = rest
+                .strip_prefix("!/")
+                .or_else(|| rest.strip_prefix("!\\"))
+                .or_else(|| rest.strip_prefix('!'))
+                .or_else(|| rest.strip_prefix("::"));
+            if let Some(m) = member {
+                let archive_path = &target[..end_ext];
+                let clean = m.replace('\\', "/");
+                let clean = clean.trim_start_matches('/');
+                if !clean.is_empty() && Path::new(archive_path).is_file() {
+                    return Some((archive_path.to_string(), clean.to_string()));
+                }
+            }
+            search_from = end_ext;
+        }
+    }
+    None
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     let mut cli = match ReadCli::try_parse_from(args) {
         Ok(c) => c,
@@ -841,6 +891,11 @@ pub fn run_cli(args: &[String]) -> i32 {
     if cli.lines.is_none() && cli.tail.is_none() {
         if let Some(n) = cli.limit.filter(|&n| n > 0) {
             cli.lines = Some(format!("1-{n}"));
+        }
+    }
+    if cli.offset.is_none() && cli.rva.is_none() && cli.va.is_none() && !cli.hex {
+        if let Some(c) = cli.chars {
+            cli.max_chars = c.max(200);
         }
     }
 
@@ -1227,6 +1282,13 @@ fn read_single_target(
     } else {
         let p = Path::new(target);
         if !p.exists() {
+            if cli.entry.is_none() {
+                if let Some((archive_path, member)) = split_virtual_archive_target(target) {
+                    let mut sub = cli.clone();
+                    sub.entry = Some(member);
+                    return read_single_target(&sub, &archive_path);
+                }
+            }
             if cli.jwt && (target.contains("eyJ") && target.contains('.')) {
                 let (rendered, jv_inner) = crate::inspect::inspect_jwt_md(target)
                     .map_err(|e| (1, format!("[ap read --jwt] {e}")))?;
@@ -1491,11 +1553,7 @@ fn read_single_target(
         if offs.is_empty() {
             offs.push(0);
         }
-        let win = if cli.chars == 2400 {
-            512
-        } else {
-            cli.chars.clamp(16, 4096)
-        };
+        let win = cli.chars.map(|c| c.clamp(16, 4096)).unwrap_or(512);
         let sha = crate::binary::sha256_hex(&raw_bytes);
         let ent =
             crate::binary::shannon_entropy(&raw_bytes[..raw_bytes.len().min(4 * 1024 * 1024)]);
@@ -1660,7 +1718,7 @@ fn read_single_target(
     }
 
     if let Some(ref addr_spec) = cli.rva {
-        let win = if cli.chars == 2400 { 256 } else { cli.chars };
+        let win = cli.chars.unwrap_or(256);
         let rendered = crate::binary::inspect_binary_address_md(&raw_bytes, addr_spec, false, win)
             .map_err(|e| (1, format!("[ap read --rva] {e}")))?;
         record_event(
@@ -1682,7 +1740,7 @@ fn read_single_target(
     }
 
     if let Some(ref addr_spec) = cli.va {
-        let win = if cli.chars == 2400 { 256 } else { cli.chars };
+        let win = cli.chars.unwrap_or(256);
         let rendered = crate::binary::inspect_binary_address_md(&raw_bytes, addr_spec, true, win)
             .map_err(|e| (1, format!("[ap read --va] {e}")))?;
         record_event(
@@ -2392,7 +2450,7 @@ fn read_single_target(
 
     let all_lines: Vec<&str> = converted.lines().collect();
     let total_lines = all_lines.len();
-    let is_minified = all_lines.iter().any(|l| l.len() > 1000);
+    let is_minified = format_tag != "binary" && all_lines.iter().any(|l| l.len() > 1000);
 
     let floor_boundary = |s: &str, mut idx: usize| -> usize {
         idx = idx.min(s.len());
@@ -2578,12 +2636,12 @@ fn read_single_target(
     } else if let Some(ref off_spec) = cli.offset {
         let mut offsets: Vec<usize> = Vec::new();
         for tok in off_spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            match tok.parse::<usize>() {
+            match parse_byte_offset(tok) {
                 Ok(n) => offsets.push(n),
                 Err(_) => {
                     return Err((
                         2,
-                        format!("[ap read] invalid --offset `{tok}` (expected byte offset(s), e.g. 18000 or 18000,95000)"),
+                        format!("[ap read] invalid --offset `{tok}` (expected decimal or 0x hex byte offset(s), e.g. 18000, 0x4650, or 18000,95000)"),
                     ));
                 }
             }
@@ -2591,9 +2649,10 @@ fn read_single_target(
         if offsets.is_empty() {
             return Err((2, "[ap read] empty --offset value".to_string()));
         }
+        let slice_chars = cli.chars.unwrap_or(2400).max(120);
         if offsets.len() == 1 {
             let s = floor_boundary(&converted, offsets[0]);
-            let e = ceil_boundary(&converted, s.saturating_add(cli.chars.max(120)));
+            let e = ceil_boundary(&converted, s.saturating_add(slice_chars));
             let raw_slice = &converted[s..e];
             let body = if cli.pretty {
                 crate::binary::pretty_format_js_snippet(raw_slice)
@@ -2609,7 +2668,7 @@ fn read_single_target(
             let mut blocks = Vec::new();
             for off in offsets.into_iter().take(12) {
                 let s = floor_boundary(&converted, off);
-                let e = ceil_boundary(&converted, s.saturating_add(cli.chars.max(120)));
+                let e = ceil_boundary(&converted, s.saturating_add(slice_chars));
                 let raw_slice = &converted[s..e];
                 let body = if cli.pretty {
                     crate::binary::pretty_format_js_snippet(raw_slice)

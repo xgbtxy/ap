@@ -1,7 +1,165 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-#[cfg(windows)]
-use serde_json::Value;
+use serde_json::{json, Value};
+
+fn looks_like_guid_prefix(s: &str) -> bool {
+    let trimmed = s.strip_prefix('{').unwrap_or(s);
+    let b = trimmed.as_bytes();
+    // Standard 8-4-4-4-12 UUID prefix (36 chars)
+    if b.len() >= 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b[..36]
+            .iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+    {
+        return true;
+    }
+    // Pure hex handle/UUID >= 24 chars (e.g. random IPC channel IDs)
+    b.len() >= 24 && b[..24].iter().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Identifies noisy browser/runtime GUID, Mojo, Crashpad, or libuv ephemeral pipe names so
+/// custom application named pipes are prioritized before noise when capped by `--max`.
+pub fn is_noisy_guid_or_mojo_pipe(nm_low: &str) -> bool {
+    let tail = nm_low.strip_prefix("local\\").unwrap_or(nm_low);
+    tail.starts_with("mojo.")
+        || tail.starts_with("crashpad_")
+        || tail.starts_with("chrome.")
+        || tail.starts_with("msedge.")
+        || tail.starts_with("uv\\")
+        || tail.starts_with("uv.")
+        || tail.contains(".mojo.")
+        || looks_like_guid_prefix(tail)
+}
+
+pub fn sort_pipe_names_by_signal(names: &mut [String]) {
+    names.sort_by(|a, b| {
+        let al = a.to_ascii_lowercase();
+        let bl = b.to_ascii_lowercase();
+        is_noisy_guid_or_mojo_pipe(&al)
+            .cmp(&is_noisy_guid_or_mojo_pipe(&bl))
+            .then_with(|| al.cmp(&bl))
+    });
+}
+
+/// Renders compact, readable multi-line text for `ap probe win` when `--json` is omitted.
+pub fn format_win_human(val: &Value) -> String {
+    let mode = val.get("mode").and_then(Value::as_str).unwrap_or("");
+    let ok = val.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        let err = val
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("win probe failed");
+        return format!("[ap probe win] error: {err}");
+    }
+    match mode {
+        "pipes" => {
+            let returned = val.get("returned").and_then(Value::as_u64).unwrap_or(0);
+            let total = val
+                .get("total_matched")
+                .and_then(Value::as_u64)
+                .unwrap_or(returned);
+            let arr = val
+                .get("pipes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let weak_cnt = arr
+                .iter()
+                .filter(|p| p["non_admin_write"].as_bool().unwrap_or(false))
+                .count();
+            let mut out = format!(
+                "# WIN PIPES [returned={returned} of {total} matched | weak_dacl={weak_cnt}]\n"
+            );
+            for p in arr {
+                let path = p["pipe"]
+                    .as_str()
+                    .unwrap_or(p["name"].as_str().unwrap_or(""));
+                let weak = p["non_admin_write"].as_bool().unwrap_or(false);
+                let sig = p["signal"].as_str().unwrap_or("");
+                let srv = p["server_process"].as_str().unwrap_or("");
+                let il = p["server_il"].as_str().unwrap_or("");
+                let pid = p["server_pid"].as_u64();
+                let mut tags = Vec::new();
+                if weak {
+                    let aces: Vec<&str> = p["weak_dacl"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    tags.push(format!("WEAK_DACL({})", aces.join(",")));
+                }
+                if !sig.is_empty() {
+                    tags.push(sig.to_string());
+                }
+                if let Some(pid_v) = pid {
+                    if !srv.is_empty() {
+                        tags.push(format!("pid={pid_v} {srv} {il}").trim().to_string());
+                    } else {
+                        tags.push(format!("pid={pid_v} {il}").trim().to_string());
+                    }
+                }
+                if tags.is_empty() {
+                    out.push_str(&format!("- {path}\n"));
+                } else {
+                    out.push_str(&format!("- {path} [{}]\n", tags.join(" | ")));
+                }
+            }
+            out.trim_end().to_string()
+        }
+        "services" => {
+            let arr = val
+                .get("services")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut out = format!("# WIN SERVICES [returned={}]\n", arr.len());
+            for s in arr {
+                let nm = s["name"].as_str().unwrap_or("");
+                let state = s["state"].as_str().unwrap_or("");
+                let acct = s["account"].as_str().unwrap_or("");
+                let bin = s["bin_path"].as_str().unwrap_or("");
+                out.push_str(&format!("- {nm} [{state}] ({acct}) {bin}\n"));
+            }
+            out.trim_end().to_string()
+        }
+        "unquoted" => {
+            let arr = val
+                .get("findings")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut out = format!("# WIN UNQUOTED SERVICES [findings={}]\n", arr.len());
+            for f in arr {
+                let nm = f["service"].as_str().unwrap_or("");
+                let exp = f["exploitable"].as_bool().unwrap_or(false);
+                let bin = f["bin_path"].as_str().unwrap_or("");
+                out.push_str(&format!("- {nm} [exploitable={exp}] {bin}\n"));
+            }
+            out.trim_end().to_string()
+        }
+        "procs" => {
+            let arr = val
+                .get("processes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut out = format!("# WIN PROCS [returned={}]\n", arr.len());
+            for p in arr {
+                let pid = p["pid"].as_u64().unwrap_or(0);
+                let il = p["integrity_level"].as_str().unwrap_or("?");
+                let sess = p["session_id"].as_u64().unwrap_or(0);
+                let name = p["name"].as_str().unwrap_or("");
+                out.push_str(&format!("- pid={pid} il={il} sess={sess} {name}\n"));
+            }
+            out.trim_end().to_string()
+        }
+        _ => serde_json::to_string_pretty(val).unwrap_or_default(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AceEntry {
@@ -1342,6 +1500,7 @@ mod imp {
         }
         all_names.sort();
         all_names.dedup();
+        super::sort_pipe_names_by_signal(&mut all_names);
         let total_matched = all_names.len();
         let cap = if enforce_200_cap {
             max.clamp(1, 200)
@@ -1411,6 +1570,7 @@ mod imp {
                 "signal": signal,
             }));
         }
+        entries.sort_by_key(|e| !e["non_admin_write"].as_bool().unwrap_or(false));
         json!({
             "ok": true,
             "mode": "pipes",
@@ -3514,11 +3674,11 @@ pub fn run_win_cli_ex(
         };
         let ok = val.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let serialized = if as_json {
-            serde_json::to_string_pretty(&val)
+            serde_json::to_string_pretty(&val).unwrap_or_default()
         } else {
-            serde_json::to_string(&val)
+            format_win_human(&val)
         };
-        println!("{}", serialized.unwrap_or_default());
+        println!("{serialized}");
         if ok {
             0
         } else {
@@ -3643,5 +3803,63 @@ mod tests {
         assert!(pipes_arr[0].get("pipe").is_some(), "{pipes}");
         assert!(pipes_arr[0].get("weak_dacl").is_some(), "{pipes}");
         assert!(pipes_arr[0].get("server_pid").is_some(), "{pipes}");
+    }
+
+    #[test]
+    fn cycle6_pipe_priority_sort_and_human_formatter() {
+        let mut names = vec![
+            "000012ab-34cd-56ef-9012-abcdef123456".to_string(),
+            "LOCAL\\mojo.1234.5678.9012".to_string(),
+            "crashpad_4012_ABCDEFGHIJ".to_string(),
+            "acme_agent_ipc".to_string(),
+            "uv\\pipe-1234".to_string(),
+            "custom_daemon_ctrl".to_string(),
+        ];
+        sort_pipe_names_by_signal(&mut names);
+        assert_eq!(names[0], "acme_agent_ipc");
+        assert_eq!(names[1], "custom_daemon_ctrl");
+        assert!(is_noisy_guid_or_mojo_pipe("local\\mojo.1234.5678.9012"));
+        assert!(is_noisy_guid_or_mojo_pipe(
+            "000012ab-34cd-56ef-9012-abcdef123456"
+        ));
+        assert!(!is_noisy_guid_or_mojo_pipe("acme_agent_ipc"));
+
+        let sample = json!({
+            "ok": true,
+            "mode": "pipes",
+            "total_matched": 2,
+            "returned": 2,
+            "pipes": [
+                {
+                    "name": "acme_agent_ipc",
+                    "pipe": r"\\.\pipe\acme_agent_ipc",
+                    "non_admin_write": true,
+                    "weak_dacl": ["WD:GW"],
+                    "server_pid": 4242,
+                    "server_process": "acme.exe",
+                    "server_il": "System",
+                    "signal": "CROSS_IL_PIPE_EOP_CANDIDATE"
+                },
+                {
+                    "name": "safe_pipe",
+                    "pipe": r"\\.\pipe\safe_pipe",
+                    "non_admin_write": false,
+                    "weak_dacl": []
+                }
+            ]
+        });
+        let human = format_win_human(&sample);
+        assert!(
+            human.lines().count() >= 3,
+            "expected multi-line human text: {human}"
+        );
+        assert!(
+            human.contains("WEAK_DACL(WD:GW)") && human.contains("acme_agent_ipc"),
+            "{human}"
+        );
+        assert!(
+            !human.trim_start().starts_with('{'),
+            "non-json mode must not emit raw minified JSON"
+        );
     }
 }

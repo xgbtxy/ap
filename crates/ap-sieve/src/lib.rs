@@ -91,6 +91,9 @@ enum SubCmd {
         lines: Option<String>,
         #[arg(long)]
         grep: Option<String>,
+        /// Accepted for grep `-i` muscle-memory compatibility (sieve grep is already case-insensitive)
+        #[arg(short = 'i', long = "ignore-case")]
+        _ignore_case: bool,
         #[arg(short = 'C', long, default_value_t = 3)]
         context: usize,
         #[arg(long, default_value_t = 10)]
@@ -417,6 +420,9 @@ fn upsert_chunk_tx(
 
 fn index_archive(store: &Path, item_id: &str, label: &str, raw_text: &str) -> Result<(), String> {
     let _lock = acquire_sieve_lock(store)?;
+    if !store.join(format!("{item_id}.raw")).is_file() {
+        return Ok(());
+    }
     let db_path = store.join("index.sqlite");
     let conn = open_sieve_db(&db_path).map_err(|e| format!("open index.sqlite: {e}"))?;
     ensure_chunks_table(&conn).map_err(|e| format!("init chunks fts5: {e}"))?;
@@ -493,6 +499,20 @@ fn collect_orphan_chunk_ids(
     orphans
 }
 
+fn maybe_compact_sieve_db(
+    conn: &Connection,
+    db_bytes: u64,
+    total_raw_bytes: u64,
+    min_db_bytes: u64,
+) -> bool {
+    if db_bytes > min_db_bytes && db_bytes > total_raw_bytes.saturating_mul(2) {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .is_ok()
+    } else {
+        false
+    }
+}
+
 fn prune_ring_buffer(store: &Path, max_bytes: u64) {
     let Ok(_lock) = acquire_sieve_lock(store) else {
         return;
@@ -532,17 +552,24 @@ fn prune_ring_buffer(store: &Path, max_bytes: u64) {
         idx += 1;
     }
 
-    if removed_ids.is_empty() {
-        return;
-    }
     let db_path = store.join("index.sqlite");
     if !db_path.is_file() {
         return;
     }
-    // Synchronously delete evicted IDs from FTS5 so pages are freed for reuse in <1ms without
-    // stalling the sub-20ms archive hot path; physical shrinkage runs via `ap sieve prune --vacuum`.
+    let db_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let need_vacuum = db_bytes > 24 * 1024 * 1024 && db_bytes > total.saturating_mul(2);
+    if removed_ids.is_empty() && !need_vacuum {
+        return;
+    }
+    // Synchronously delete evicted IDs from FTS5 in <1ms; compact automatically when index.sqlite
+    // bloats above 24 MiB and > 2x live .raw bytes under the already-held SieveLockGuard.
     if let Ok(conn) = open_sieve_db(&db_path) {
-        delete_chunk_ids(&conn, &removed_ids);
+        if !removed_ids.is_empty() {
+            delete_chunk_ids(&conn, &removed_ids);
+        }
+        if need_vacuum {
+            let _ = maybe_compact_sieve_db(&conn, db_bytes, total, 24 * 1024 * 1024);
+        }
     }
 }
 
@@ -2125,7 +2152,37 @@ pub fn compress_stream_in(
 }
 
 fn resolve_json_path<'a>(mut cur: &'a Value, path: &str) -> Option<&'a Value> {
-    for part in path.split('.').filter(|p| !p.is_empty()) {
+    let mut rest = path.trim();
+    if let Some(stripped) = rest.strip_prefix('$') {
+        rest = stripped;
+    }
+    rest = rest.trim_start_matches('.');
+    if rest.is_empty() {
+        return Some(cur);
+    }
+    let mut tokens: Vec<&str> = Vec::new();
+    for seg in rest.split('.').filter(|p| !p.is_empty()) {
+        let mut s = seg;
+        while let Some(b_start) = s.find('[') {
+            let head = &s[..b_start];
+            if !head.is_empty() {
+                tokens.push(head);
+            }
+            let after_open = &s[b_start + 1..];
+            let b_end = after_open.find(']')?;
+            let inner = after_open[..b_end]
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            if !inner.is_empty() {
+                tokens.push(inner);
+            }
+            s = &after_open[b_end + 1..];
+        }
+        if !s.is_empty() {
+            tokens.push(s);
+        }
+    }
+    for part in tokens {
         match cur {
             Value::Array(arr) => {
                 let idx: usize = part.parse().ok()?;
@@ -2272,8 +2329,30 @@ pub fn search_archives(store: &Path, query: &str, limit: usize) -> (Vec<SearchHi
     (hits, elapsed_ms)
 }
 
+fn normalize_sieve_cli_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0usize;
+    while i < args.len() {
+        if i + 2 < args.len()
+            && args[i] == "--grep"
+            && matches!(args[i + 1].as_str(), "-i" | "--ignore-case")
+            && !args[i + 2].starts_with('-')
+        {
+            out.push(args[i + 1].clone());
+            out.push(args[i].clone());
+            out.push(args[i + 2].clone());
+            i += 3;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
-    let cli = match Cli::try_parse_from(args) {
+    let norm_args = normalize_sieve_cli_args(args);
+    let cli = match Cli::try_parse_from(&norm_args) {
         Ok(c) => c,
         Err(e) => {
             let code = if e.use_stderr() { 2 } else { 0 };
@@ -2374,6 +2453,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             id,
             lines: line_spec,
             grep,
+            _ignore_case: _,
             context,
             max_hits,
             json_path,
@@ -2472,7 +2552,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 None
             };
 
-            let maybe_pretty_owned = if pretty && parsed_range.is_none() && grep.is_none() {
+            let maybe_pretty_owned = if pretty && parsed_range.is_none() {
                 let candidate = strip_wrapper_prefix_for_json(&raw_body);
                 serde_json::from_str::<Value>(candidate)
                     .ok()
@@ -2489,6 +2569,21 @@ pub fn run_cli(args: &[String]) -> i32 {
                 (s_idx, e_excl)
             } else {
                 (0usize, all_lines.len())
+            };
+
+            let floor_b = |s: &str, mut idx: usize| -> usize {
+                idx = idx.min(s.len());
+                while idx > 0 && !s.is_char_boundary(idx) {
+                    idx -= 1;
+                }
+                idx
+            };
+            let ceil_b = |s: &str, mut idx: usize| -> usize {
+                idx = idx.min(s.len());
+                while idx < s.len() && !s.is_char_boundary(idx) {
+                    idx += 1;
+                }
+                idx
             };
 
             let mut rendered_lines: Vec<String> = Vec::new();
@@ -2513,6 +2608,28 @@ pub fn run_cli(args: &[String]) -> i32 {
                             if shown.insert(j) {
                                 if raw_mode {
                                     rendered_lines.push((*j_line).to_string());
+                                } else if j == i && j_line.len() > 600 {
+                                    // Single-line minified/JSON archive: emit match-centered windows
+                                    // so matches deep in the line are never lost to head truncation.
+                                    for m in pat.find_iter(j_line).take(3) {
+                                        let ws = floor_b(j_line, m.start().saturating_sub(240));
+                                        let we = ceil_b(j_line, m.end().saturating_add(240));
+                                        let lead = if ws > 0 { "..." } else { "" };
+                                        let trail = if we < j_line.len() { "..." } else { "" };
+                                        rendered_lines.push(format!(
+                                            ">L{} [@off={}]: {lead}{}{trail}",
+                                            j + 1,
+                                            m.start(),
+                                            &j_line[ws..we]
+                                        ));
+                                    }
+                                } else if j_line.len() > 600 {
+                                    let cut = floor_b(j_line, 240);
+                                    rendered_lines.push(format!(
+                                        " L{}: {}...",
+                                        j + 1,
+                                        &j_line[..cut]
+                                    ));
                                 } else {
                                     let marker = if j == i { '>' } else { ' ' };
                                     rendered_lines.push(format!("{marker}L{}: {j_line}", j + 1));
@@ -2910,6 +3027,55 @@ mod tests {
         assert_eq!(
             fts_ids, raw_ids,
             "FTS5 chunks must match .raw files 1:1 with zero duplicates and zero loss"
+        );
+    }
+
+    #[test]
+    fn cycle6_json_path_brackets_and_auto_compact_helper() {
+        let doc = json!({
+            "items": [
+                {"service": "svc_alpha", "meta": {"ok": true}},
+                {"service": "svc_beta", "meta": {"ok": false}}
+            ]
+        });
+        assert_eq!(
+            resolve_json_path(&doc, "$.items[0].service").and_then(Value::as_str),
+            Some("svc_alpha")
+        );
+        assert_eq!(
+            resolve_json_path(&doc, "items[1]['service']").and_then(Value::as_str),
+            Some("svc_beta")
+        );
+        assert_eq!(
+            resolve_json_path(&doc, "items.0.meta.ok").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(resolve_json_path(&doc, "$"), Some(&doc));
+        assert!(resolve_json_path(&doc, "items[unclosed").is_none());
+
+        let td = std::env::temp_dir().join(format!("ap_sieve_c6_vac_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&td);
+        fs::create_dir_all(&td).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..8usize {
+            let body = format!("row-{i}-{}", "X".repeat(6000));
+            let res = compress_stream_in(&td, &body, &format!("v{i}"), 0, 1.0);
+            ids.push(res.id);
+        }
+        let db_p = td.join("index.sqlite");
+        let conn = open_sieve_db(&db_p).unwrap();
+        delete_chunk_ids(&conn, &ids);
+        let before_sz = fs::metadata(&db_p).unwrap().len();
+        assert!(
+            maybe_compact_sieve_db(&conn, before_sz, 1024, 1024),
+            "expected compaction when db exceeds min_db_bytes and 2x raw bytes"
+        );
+        drop(conn);
+        let after_sz = fs::metadata(&db_p).unwrap().len();
+        let _ = fs::remove_dir_all(&td);
+        assert!(
+            after_sz < before_sz,
+            "expected VACUUM to shrink db: before={before_sz}, after={after_sz}"
         );
     }
 }

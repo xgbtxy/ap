@@ -744,23 +744,37 @@ fn format_js_semantic_both(
 }
 
 fn load_asar_js_map(path: &Path) -> Result<BTreeMap<String, (String, Vec<u8>)>> {
+    const MAX_ASAR_JS_FILES: usize = 400;
+    const MAX_ASAR_TOTAL_BYTES: usize = 32 * 1024 * 1024;
     let mut r = BufReader::new(fs::File::open(path).map_err(|e| e.to_string())?);
     let (base, entries) = crate::binary::parse_asar_index_reader(&mut r)
         .map_err(|e| format!("ASAR parse error for `{}`: {e}", path.display()))?;
     let mut map = BTreeMap::new();
+    let mut total_bytes = 0usize;
     for ent in entries {
+        if map.len() >= MAX_ASAR_JS_FILES {
+            break;
+        }
         if ent.unpacked || ent.size == 0 || ent.size > 4 * 1024 * 1024 {
             continue;
         }
         if !is_js_or_ts_path(&ent.path) {
             continue;
         }
-        let pos = (base as u64)
-            .checked_add(ent.offset as u64)
-            .ok_or_else(|| "ASAR offset overflow".to_string())?;
-        r.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+        if total_bytes.saturating_add(ent.size) > MAX_ASAR_TOTAL_BYTES {
+            continue;
+        }
+        let Some(pos) = (base as u64).checked_add(ent.offset as u64) else {
+            continue;
+        };
+        if r.seek(SeekFrom::Start(pos)).is_err() {
+            continue;
+        }
         let mut buf = vec![0u8; ent.size];
-        r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        if r.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(buf.len());
         let norm = normalize_chunk_path(&ent.path);
         map.insert(norm, (ent.path, buf));
     }

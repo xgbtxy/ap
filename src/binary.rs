@@ -2287,23 +2287,24 @@ pub fn diff_binaries_or_archives(
         ) {
             let mut m_new = std::collections::BTreeMap::new();
             let mut m_old = std::collections::BTreeMap::new();
+            const MAX_DIFF_MEMBER_BYTES: u64 = 4 * 1024 * 1024;
             for i in 0..zn.len().min(3000) {
-                if let Ok(mut f) = zn.by_index(i) {
-                    if !f.is_dir() && f.size() <= 4 * 1024 * 1024 {
+                if let Ok(f) = zn.by_index(i) {
+                    if !f.is_dir() && f.size() <= MAX_DIFF_MEMBER_BYTES {
                         let nm = f.name().to_string();
-                        let mut buf = Vec::with_capacity(f.size() as usize);
-                        if f.read_to_end(&mut buf).is_ok() {
+                        let mut buf = Vec::with_capacity((f.size() as usize).min(256 * 1024));
+                        if f.take(MAX_DIFF_MEMBER_BYTES).read_to_end(&mut buf).is_ok() {
                             m_new.insert(nm, buf);
                         }
                     }
                 }
             }
             for i in 0..zo.len().min(3000) {
-                if let Ok(mut f) = zo.by_index(i) {
-                    if !f.is_dir() && f.size() <= 4 * 1024 * 1024 {
+                if let Ok(f) = zo.by_index(i) {
+                    if !f.is_dir() && f.size() <= MAX_DIFF_MEMBER_BYTES {
                         let nm = f.name().to_string();
-                        let mut buf = Vec::with_capacity(f.size() as usize);
-                        if f.read_to_end(&mut buf).is_ok() {
+                        let mut buf = Vec::with_capacity((f.size() as usize).min(256 * 1024));
+                        if f.take(MAX_DIFF_MEMBER_BYTES).read_to_end(&mut buf).is_ok() {
                             m_old.insert(nm, buf);
                         }
                     }
@@ -4298,6 +4299,14 @@ fn scan_elf64_xrefs(
 }
 
 fn parse_elf_details(bytes: &[u8], out: &mut Vec<String>) -> ElfContext {
+    if bytes.len() < 16 {
+        return ElfContext {
+            is_64: false,
+            machine: 0,
+            secs: Vec::new(),
+            func_syms: Vec::new(),
+        };
+    }
     let is_64 = bytes[4] == 2;
     let bits = if is_64 { "64-bit" } else { "32-bit" };
     let e_type = read_u16_le(bytes, 16).unwrap_or(0);

@@ -127,17 +127,26 @@ impl ExcludeMatcher {
     }
 
     pub fn is_excluded(&self, rel_path: &str) -> bool {
-        self.is_excluded_opts(rel_path, true)
+        self.is_excluded_with_vendor(rel_path, true, false)
     }
 
     pub fn is_excluded_opts(&self, rel_path: &str, apply_builtin_noise: bool) -> bool {
+        self.is_excluded_with_vendor(rel_path, apply_builtin_noise, false)
+    }
+
+    pub fn is_excluded_with_vendor(
+        &self,
+        rel_path: &str,
+        apply_builtin_noise: bool,
+        include_vendor: bool,
+    ) -> bool {
         let norm = rel_path.replace('\\', "/");
         let low = norm.to_ascii_lowercase();
         let fname = low.rsplit('/').next().unwrap_or(&low);
-        // Built-in generic OS CRT / uninstaller / declaration / log noise exclusions
+        // Built-in generic OS CRT / uninstaller / declaration / log / vendored runtime noise exclusions
         // (applied only on directory/archive sweeps, never dropping an explicit single-file target)
-        if apply_builtin_noise
-            && (fname.ends_with(".d.ts")
+        if apply_builtin_noise {
+            let is_builtin_non_vendor_noise = fname.ends_with(".d.ts")
                 || fname.ends_with(".log")
                 || fname.starts_with("api-ms-win-")
                 || fname.starts_with("vcruntime")
@@ -149,10 +158,28 @@ impl ExcludeMatcher {
                     && fname.ends_with(".exe"))
                 || low.contains("/node_modules/@types/")
                 || low.starts_with("node_modules/@types/")
+                || low.contains("!/node_modules/@types/")
                 || low.contains("/site-packages/")
-                || low.contains("/dist-packages/"))
-        {
-            return true;
+                || low.contains("/dist-packages/");
+            let is_builtin_vendor_noise = !include_vendor
+                && (low.contains("/node_modules/")
+                    || low.starts_with("node_modules/")
+                    || low.contains("!/node_modules/")
+                    || low.contains("/_vendored/")
+                    || low.starts_with("_vendored/")
+                    || low.contains("!/_vendored/")
+                    || low.contains("/lib/python")
+                    || low.starts_with("lib/python")
+                    || low.contains("!/lib/python")
+                    || low.contains("/runtime/lib/")
+                    || low.starts_with("runtime/lib/")
+                    || low.contains("!/runtime/lib/")
+                    || low.contains("/locales/")
+                    || low.starts_with("locales/")
+                    || low.contains("!/locales/"));
+            if is_builtin_non_vendor_noise || is_builtin_vendor_noise {
+                return true;
+            }
         }
         for pat in &self.globs {
             if pat.contains('*') || pat.contains('?') {
@@ -523,6 +550,55 @@ impl ScanAcc {
     }
 }
 
+fn normalize_surface_target(raw: &str) -> String {
+    let mut s = raw.replace('\\', "/");
+    for ext in [".asar!", ".zip!", ".vsix!", ".jar!", ".whl!", ".apk!"] {
+        let low = s.to_ascii_lowercase();
+        if let Some(pos) = low.find(ext) {
+            let bang_end = pos + ext.len();
+            if s.as_bytes().get(bang_end) != Some(&b'/') {
+                s.insert(bang_end, '/');
+            }
+            break;
+        }
+    }
+    s
+}
+
+fn is_bare_es_import_export_line(line: &str) -> bool {
+    let s = line.trim_start();
+    if let Some(after) = s.strip_prefix("import") {
+        let a = after.trim_start();
+        // Keep dynamic `import(...)` calls; skip static ES module import statements
+        return !a.starts_with('(')
+            && (after.starts_with(char::is_whitespace)
+                || after.starts_with('{')
+                || after.starts_with('*')
+                || after.starts_with('"')
+                || after.starts_with('\''));
+    }
+    if let Some(after) = s.strip_prefix("export") {
+        let a = after.trim_start();
+        return (after.starts_with(char::is_whitespace)
+            || after.starts_with('{')
+            || after.starts_with('*'))
+            && a.contains(" from ");
+    }
+    false
+}
+
+fn is_legal_doc_url_prose(axis: &str, text: &str) -> bool {
+    if axis != "auth_token_cred" {
+        return false;
+    }
+    let l = text.to_ascii_lowercase();
+    (l.contains("http://") || l.contains("https://"))
+        && (l.contains("cookie-policy")
+            || l.contains("privacy-policy")
+            || l.contains("/legal/")
+            || l.contains("/docs/"))
+}
+
 fn scan_text_into(
     rel_target: &str,
     text: &str,
@@ -530,6 +606,8 @@ fn scan_text_into(
     rules: &[AxisRule],
     acc: &mut ScanAcc,
 ) {
+    let norm_target = normalize_surface_target(rel_target);
+    let rel_target = norm_target.as_str();
     let module = derive_module(rel_target);
     let is_manifest = rel_target.ends_with("package.json")
         || rel_target.ends_with("manifest.json")
@@ -548,14 +626,26 @@ fn scan_text_into(
         let mut seen_symbols: HashSet<String> = HashSet::new();
         let mut file_axis_hits = 0usize;
         for m in rule.re.find_iter(text) {
-            // Skip obvious comment-only lines on non-minified files
+            // Skip obvious comment-only, bare ES import/export, and legal/docs URL prose lines
             let (line_no, snippet) = clip_snippet(text, m.start(), m.end());
-            if !is_binary_strings
-                && (snippet.starts_with("//")
+            if !is_binary_strings {
+                if snippet.starts_with("//")
                     || snippet.starts_with('#')
-                    || snippet.starts_with('*'))
-            {
-                continue;
+                    || snippet.starts_with('*')
+                    || is_legal_doc_url_prose(rule.axis, &snippet)
+                {
+                    continue;
+                }
+                let line_start = text[..m.start()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_end = text[m.end()..]
+                    .find('\n')
+                    .map(|i| m.end() + i)
+                    .unwrap_or(text.len());
+                if line_end.saturating_sub(line_start) <= 400
+                    && is_bare_es_import_export_line(&text[line_start..line_end])
+                {
+                    continue;
+                }
             }
             let sym = m
                 .as_str()
@@ -615,7 +705,13 @@ fn scan_text_into(
     }
 }
 
-fn collect_asar_files(node: &Value, prefix: &str, out: &mut Vec<(String, u64, u64)>, limit: usize) {
+fn collect_asar_files(
+    node: &Value,
+    prefix: &str,
+    include_vendor: bool,
+    out: &mut Vec<(String, u64, u64)>,
+    limit: usize,
+) {
     if out.len() >= limit {
         return;
     }
@@ -632,10 +728,16 @@ fn collect_asar_files(node: &Value, prefix: &str, out: &mut Vec<(String, u64, u6
             format!("{prefix}/{name}")
         };
         if val.get("files").is_some() {
-            if name == "node_modules" && prefix.contains("node_modules") {
+            let name_low = name.to_ascii_lowercase();
+            if !include_vendor
+                && matches!(name_low.as_str(), "node_modules" | "_vendored" | "locales")
+            {
                 continue;
             }
-            collect_asar_files(val, &next, out, limit);
+            if name_low == "node_modules" && prefix.to_ascii_lowercase().contains("node_modules") {
+                continue;
+            }
+            collect_asar_files(val, &next, include_vendor, out, limit);
         } else if let (Some(off_v), Some(size_v)) = (val.get("offset"), val.get("size")) {
             let off = off_v
                 .as_str()
@@ -661,6 +763,7 @@ fn collect_asar_files(node: &Value, prefix: &str, out: &mut Vec<(String, u64, u6
 fn scan_asar_archive(
     archive_path: &Path,
     rel_archive: &str,
+    include_vendor: bool,
     rules: &[AxisRule],
     matcher: &ExcludeMatcher,
     excluded_files: &mut usize,
@@ -686,7 +789,7 @@ fn scan_asar_archive(
         return 0;
     };
     let mut entries = Vec::new();
-    collect_asar_files(&header_json, "", &mut entries, 160);
+    collect_asar_files(&header_json, "", include_vendor, &mut entries, 160);
     let mut scanned = 0usize;
     for (inner_path, off, sz) in entries {
         let start = header_end.saturating_add(off as usize);
@@ -695,7 +798,9 @@ fn scan_asar_archive(
             continue;
         }
         let vpath = format!("{rel_archive}!/{inner_path}");
-        if matcher.is_excluded(&vpath) || matcher.is_excluded(&inner_path) {
+        if matcher.is_excluded_with_vendor(&vpath, true, include_vendor)
+            || matcher.is_excluded_with_vendor(&inner_path, true, include_vendor)
+        {
             *excluded_files += 1;
             continue;
         }
@@ -709,6 +814,7 @@ fn scan_asar_archive(
 fn scan_zip_archive(
     archive_path: &Path,
     rel_archive: &str,
+    include_vendor: bool,
     rules: &[AxisRule],
     matcher: &ExcludeMatcher,
     excluded_files: &mut usize,
@@ -731,7 +837,7 @@ fn scan_zip_archive(
         if scanned >= 120 {
             break;
         }
-        let Ok(mut entry) = zip.by_index(i) else {
+        let Ok(entry) = zip.by_index(i) else {
             continue;
         };
         if entry.is_dir() || entry.size() == 0 || entry.size() > 512_000 {
@@ -751,12 +857,14 @@ fn scan_zip_archive(
             continue;
         }
         let vpath = format!("{rel_archive}!/{name}");
-        if matcher.is_excluded(&vpath) || matcher.is_excluded(&name) {
+        if matcher.is_excluded_with_vendor(&vpath, true, include_vendor)
+            || matcher.is_excluded_with_vendor(&name, true, include_vendor)
+        {
             *excluded_files += 1;
             continue;
         }
         let mut buf = Vec::with_capacity(entry.size().min(512_000) as usize);
-        if entry.read_to_end(&mut buf).is_err() {
+        if entry.take(512_000).read_to_end(&mut buf).is_err() {
             continue;
         }
         let text = String::from_utf8_lossy(&buf);
@@ -861,12 +969,26 @@ pub fn try_build_surface_map_with_excludes(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if ext == "asar" {
-                scanned_files +=
-                    scan_asar_archive(root, &rel, rules, &matcher, &mut excluded_files, &mut acc);
+                scanned_files += scan_asar_archive(
+                    root,
+                    &rel,
+                    include_vendor,
+                    rules,
+                    &matcher,
+                    &mut excluded_files,
+                    &mut acc,
+                );
                 scanned_archives += 1;
             } else if is_archive_ext(&ext) {
-                scanned_files +=
-                    scan_zip_archive(root, &rel, rules, &matcher, &mut excluded_files, &mut acc);
+                scanned_files += scan_zip_archive(
+                    root,
+                    &rel,
+                    include_vendor,
+                    rules,
+                    &matcher,
+                    &mut excluded_files,
+                    &mut acc,
+                );
                 scanned_archives += 1;
             } else if is_native_binary_ext(&ext) {
                 if let Ok(raw) = fs::read(root) {
@@ -896,7 +1018,12 @@ pub fn try_build_surface_map_with_excludes(
                 if hard_skip.iter().any(|s| *s == nm) {
                     return false;
                 }
-                if !include_vendor && (nm == "node_modules" || nm == "vendor") {
+                if !include_vendor
+                    && matches!(
+                        nm.to_ascii_lowercase().as_str(),
+                        "node_modules" | "vendor" | "_vendored" | "locales"
+                    )
+                {
                     return false;
                 }
                 true
@@ -916,7 +1043,7 @@ pub fn try_build_surface_map_with_excludes(
                 .unwrap_or(p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if matcher.is_excluded(&rel) {
+            if matcher.is_excluded_with_vendor(&rel, true, include_vendor) {
                 excluded_files += 1;
                 continue;
             }
@@ -928,14 +1055,28 @@ pub fn try_build_surface_map_with_excludes(
                 .to_ascii_lowercase();
 
             if ext == "asar" && scanned_archives < 16 {
-                scanned_files +=
-                    scan_asar_archive(p, &rel, rules, &matcher, &mut excluded_files, &mut acc);
+                scanned_files += scan_asar_archive(
+                    p,
+                    &rel,
+                    include_vendor,
+                    rules,
+                    &matcher,
+                    &mut excluded_files,
+                    &mut acc,
+                );
                 scanned_archives += 1;
                 continue;
             }
             if is_archive_ext(&ext) && scanned_archives < 24 {
-                scanned_files +=
-                    scan_zip_archive(p, &rel, rules, &matcher, &mut excluded_files, &mut acc);
+                scanned_files += scan_zip_archive(
+                    p,
+                    &rel,
+                    include_vendor,
+                    rules,
+                    &matcher,
+                    &mut excluded_files,
+                    &mut acc,
+                );
                 scanned_archives += 1;
                 continue;
             }
@@ -988,6 +1129,16 @@ pub fn try_build_surface_map_with_excludes(
                 .cmp(&a.score)
                 .then_with(|| a.target.cmp(&b.target))
                 .then_with(|| a.line.cmp(&b.line))
+        });
+        // Deduplicate by normalized target (case-insensitive on Windows) + symbol so the highest-scored hit wins.
+        let mut seen_dedup: HashSet<(String, String)> = HashSet::new();
+        list.retain(|it| {
+            let t_key = if cfg!(windows) {
+                it.target.to_ascii_lowercase()
+            } else {
+                it.target.clone()
+            };
+            seen_dedup.insert((t_key, it.symbol.to_ascii_lowercase()))
         });
         // Pick up to max_per_axis with module round-robin so one huge file doesn't crowd out other modules
         let mut by_mod: BTreeMap<String, Vec<SurfaceItem>> = BTreeMap::new();
@@ -1291,6 +1442,109 @@ mod tests {
         assert_eq!(single_map.excluded_files, 0);
         assert_eq!(single_map.scanned_files, 1);
         assert!(!single_map.items.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cycle6_surface_filters_vendored_imports_legal_urls_and_normalizes_paths() {
+        let dir = std::env::temp_dir().join(format!("ap_surface_c6_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("_vendored/pkg")).unwrap();
+        fs::create_dir_all(dir.join("runtime/lib/python3.11")).unwrap();
+        fs::create_dir_all(dir.join("locales/en")).unwrap();
+
+        // Bare ES imports/exports & legal/docs URL prose must be skipped while real calls survive
+        fs::write(
+            dir.join("src/entry.ts"),
+            "import { execSync } from 'child_process';\n\
+export { spawnSync } from 'child_process';\n\
+const policyUrl = \"https://example.test/legal/cookie-policy\";\n\
+const docsUrl = \"https://example.test/docs/privacy-policy?token=1\";\n\
+export function runCmd(arg: string) { return execSync(arg); }\n",
+        )
+        .unwrap();
+        // Vendored/stdlib/locales noise must be skipped by default
+        fs::write(
+            dir.join("_vendored/pkg/tool.js"),
+            "child_process.execSync('vendored');\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("runtime/lib/python3.11/os_wrap.py"),
+            "import subprocess\nsubprocess.Popen(['sh'])\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("locales/en/strings.json"),
+            r#"{"cookie":"https://example.test/cookie-policy","authToken":"label"}"#,
+        )
+        .unwrap();
+
+        // Synthetic ASAR with both node_modules/dep.js (must skip!) and app/main.js (must scan!)
+        let dep_body = b"child_process.execSync('from_dep');\n";
+        let main_body = b"child_process.spawnSync('from_app');\n";
+        let hdr_json = format!(
+            r#"{{"files":{{"node_modules":{{"files":{{"dep.js":{{"size":{},"offset":"0"}}}}}},"app":{{"files":{{"main.js":{{"size":{},"offset":"{}"}}}}}}}}}}"#,
+            dep_body.len(),
+            main_body.len(),
+            dep_body.len()
+        );
+        let hdr_bytes = hdr_json.as_bytes();
+        let pad = (4 - (hdr_bytes.len() % 4)) % 4;
+        let pickle_inner_len = 4 + hdr_bytes.len() + pad;
+        let mut asar = Vec::new();
+        asar.extend_from_slice(&4u32.to_le_bytes());
+        asar.extend_from_slice(&(pickle_inner_len as u32 + 4).to_le_bytes());
+        asar.extend_from_slice(&(pickle_inner_len as u32).to_le_bytes());
+        asar.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+        asar.extend_from_slice(hdr_bytes);
+        asar.resize(asar.len() + pad, 0);
+        asar.extend_from_slice(dep_body);
+        asar.extend_from_slice(main_body);
+        fs::write(dir.join("bundle.asar"), &asar).unwrap();
+
+        let map = try_build_surface_map_with_excludes(&dir, 200, 12, false, false, &[]).unwrap();
+        assert!(
+            map.items
+                .iter()
+                .any(|i| i.target == "src/entry.ts" && i.line == 5),
+            "real call on L5 must survive: {:?}",
+            map.items
+        );
+        assert!(
+            !map.items
+                .iter()
+                .any(|i| i.target == "src/entry.ts" && (i.line == 1 || i.line == 2)),
+            "bare ES import/export lines must be skipped: {:?}",
+            map.items
+        );
+        assert!(
+            !map.items
+                .iter()
+                .any(|i| i.axis == "auth_token_cred" && i.target == "src/entry.ts"),
+            "legal/docs cookie-policy URL prose must be skipped: {:?}",
+            map.items
+        );
+        assert!(
+            !map.items.iter().any(|i| i.target.contains("_vendored")
+                || i.target.contains("runtime/lib")
+                || i.target.contains("locales/")
+                || i.target.contains("node_modules")),
+            "vendored/stdlib/locales/asar node_modules must be filtered: {:?}",
+            map.items
+        );
+        assert!(
+            map.items
+                .iter()
+                .any(|i| i.target == "bundle.asar!/app/main.js"),
+            "non-vendored asar entry must be scanned with canonical !/ path: {:?}",
+            map.items
+        );
+        assert_eq!(
+            normalize_surface_target(r"res\app.asar!dist\main.js"),
+            "res/app.asar!/dist/main.js"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

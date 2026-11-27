@@ -126,16 +126,22 @@ fn load_rows_into_table(
         .map(|c| format!("\"{c}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    conn.execute_batch(&format!(
+    if let Err(e) = conn.execute_batch(&format!(
         "BEGIN; DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" ({col_defs});"
-    ))
-    .map_err(|e| format!("create table `{table_name}`: {e}"))?;
+    )) {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(format!("create table `{table_name}`: {e}"));
+    }
 
     let placeholders = vec!["?"; cols.len()].join(", ");
     let insert_sql = format!("INSERT INTO \"{table_name}\" ({col_defs}) VALUES ({placeholders})");
-    let mut stmt = conn
-        .prepare(&insert_sql)
-        .map_err(|e| format!("prepare insert `{table_name}`: {e}"))?;
+    let mut stmt = match conn.prepare(&insert_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(format!("prepare insert `{table_name}`: {e}"));
+        }
+    };
 
     let mut inserted = 0usize;
     for r in rows {
@@ -147,12 +153,18 @@ fn load_rows_into_table(
             let s = r.get(ci).map(String::as_str).unwrap_or("");
             vals.push(parse_cell_sql_val(s));
         }
-        stmt.execute(params_from_iter(vals))
-            .map_err(|e| format!("insert row in `{table_name}`: {e}"))?;
+        if let Err(e) = stmt.execute(params_from_iter(vals)) {
+            drop(stmt);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(format!("insert row in `{table_name}`: {e}"));
+        }
         inserted += 1;
     }
     drop(stmt);
-    let _ = conn.execute_batch("COMMIT;");
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(format!("commit table `{table_name}`: {e}"));
+    }
     Ok((inserted, cols))
 }
 
@@ -356,13 +368,22 @@ pub fn run_cli(args: &[String]) -> i32 {
 
     for spec in &cli.files {
         let (alias_raw, path_str) = match spec.split_once('=') {
-            Some((a, p)) if !a.trim().is_empty() && Path::new(p.trim()).exists() => {
-                (a.trim().to_string(), p.trim().to_string())
+            Some((a, p)) if !a.trim().is_empty() => {
+                let norm_p = crate::ls::normalize_cli_path(p);
+                if Path::new(&norm_p).exists() {
+                    (a.trim().to_string(), norm_p)
+                } else {
+                    let norm_full = crate::ls::normalize_cli_path(spec);
+                    let pf = Path::new(&norm_full);
+                    let stem = pf.file_stem().and_then(|s| s.to_str()).unwrap_or("tbl");
+                    (sanitize_ident(stem), norm_full)
+                }
             }
             _ => {
-                let p = Path::new(spec.trim());
+                let norm_full = crate::ls::normalize_cli_path(spec);
+                let p = Path::new(&norm_full);
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("tbl");
-                (sanitize_ident(stem), spec.trim().to_string())
+                (sanitize_ident(stem), norm_full)
             }
         };
         let alias = sanitize_ident(&alias_raw);
@@ -554,12 +575,22 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 
     if let Some(ref out_p) = cli.out {
-        if let Ok(mut wtr) = csv::Writer::from_path(out_p) {
-            let _ = wtr.write_record(&col_names);
+        let norm_out = crate::ls::normalize_cli_path(out_p);
+        let write_res: Result<(), String> = (|| {
+            let mut wtr = csv::Writer::from_path(&norm_out).map_err(|e| e.to_string())?;
+            wtr.write_record(&col_names).map_err(|e| e.to_string())?;
             for r in &result_rows {
-                let _ = wtr.write_record(r);
+                wtr.write_record(r).map_err(|e| e.to_string())?;
             }
-            let _ = wtr.flush();
+            wtr.flush().map_err(|e| e.to_string())
+        })();
+        if let Err(e) = write_res {
+            emit_query_err(
+                cli.json,
+                t0,
+                &format!("[ap query] failed to write --out `{out_p}`: {e}"),
+            );
+            return 1;
         }
     }
 

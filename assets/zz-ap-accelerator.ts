@@ -11,6 +11,7 @@
 // - Native Pi v1.5 `agent_before_settle` closed-loop syntax + diff blocker gate (max 1 retry/run)
 // - Opt-in `deepseek/flash-auto` virtual model (dynamic low/high/max effort, zero cache-bust switch)
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -84,8 +85,8 @@ function healCmdCdSlashD(cmd: string): string {
 	const rewriteUnquoted = (seg: string, followedByQuote: boolean): string =>
 		seg.replace(
 			followedByQuote
-				? /(^|[;&|(\n])([ \t]*)cd\s+\/[dD]\s+(?=[^\s;&|)\n]|$)/gi
-				: /(^|[;&|(\n])([ \t]*)cd\s+\/[dD]\s+(?=[^\s;&|)\n])/gi,
+				? /((?:^|[;&|(\n])|(?:^|[;\n\s])(?:then|do|else)[ \t]+)([ \t]*)cd\s+\/[dD]\s+(?=[^\s;&|)\n]|$)/gi
+				: /((?:^|[;&|(\n])|(?:^|[;\n\s])(?:then|do|else)[ \t]+)([ \t]*)cd\s+\/[dD]\s+(?=[^\s;&|)\n])/gi,
 			"$1$2cd ",
 		);
 	for (let i = 0; i < head.length; i++) {
@@ -369,7 +370,7 @@ export interface ApProfileOverrides {
 
 const MODEL_PROFILE_KNOBS: Readonly<Record<string, Omit<ApProfileOverrides, "modelProfile" | "yieldCompact">>> = {
 	balanced: { sieveHardChars: 20000, kvSafeSleepSec: 60, maskHighWaterTokens: 180000, dsmlRecovery: false },
-	deepseek: { sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 135000, dsmlRecovery: true },
+	deepseek: { sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 210000, dsmlRecovery: true },
 	fast: { sieveHardChars: 12000, kvSafeSleepSec: 45, maskHighWaterTokens: 140000, dsmlRecovery: false },
 	reasoning: { sieveHardChars: 16000, kvSafeSleepSec: 45, maskHighWaterTokens: 180000, dsmlRecovery: false },
 	small: { sieveHardChars: 10000, kvSafeSleepSec: 45, maskHighWaterTokens: 90000, dsmlRecovery: false },
@@ -469,8 +470,12 @@ export function readModelCompactionTriggerTokens(
 }
 
 /**
- * Compute effective observation-masking high-water threshold, capping safely below active auto-compaction trigger
- * (`floor(trigger * 0.85)`) so masking actually runs before compaction resets KV-cache.
+ * Compute effective observation-masking high-water threshold:
+ * - For deep cache-discount models (e.g. 50:1 cache discount like DeepSeek V4.1 Flash), mid-prefix
+ *   `context_edit` invalidates ~80k cached tokens at 50x cost, which is strictly net-negative when
+ *   auto-compaction already triggers <= 210k. Preserve emergency-only `210k` (never clamp below
+ *   `compactionTriggerTokens`) so hot-cached runs ride cleanly to compaction.
+ * - For standard models, cap safely below active auto-compaction trigger (`floor(trigger * 0.85)`).
  */
 export function resolveEffectiveMaskHighWaterTokens(input: {
 	deepCacheDiscount?: boolean;
@@ -483,6 +488,9 @@ export function resolveEffectiveMaskHighWaterTokens(input: {
 			: input.deepCacheDiscount
 				? 210000
 				: MASK_HIGH_WATER_TOKENS;
+	if (input.deepCacheDiscount) {
+		return base;
+	}
 	if (typeof input.compactionTriggerTokens === "number" && input.compactionTriggerTokens >= 40000) {
 		const dynamicCap = Math.max(40000, Math.floor(input.compactionTriggerTokens * 0.85));
 		return Math.min(base, dynamicCap);
@@ -1034,7 +1042,7 @@ function maskCodemodeSpans(code: string): { masked: string; tokens: string[] } |
 }
 
 function stripTsTypesInCodemode(code: string): string {
-	if (!code || (!code.includes(":") && !/\bas\s+/.test(code))) return code;
+	if (!code || (!code.includes(":") && !/\bas\s+/.test(code) && !/\?[ \t]*[,)=]/.test(code))) return code;
 	const spanRes = maskCodemodeSpans(code);
 	if (!spanRes) return code;
 	const { masked, tokens } = spanRes;
@@ -1178,13 +1186,32 @@ function stripTsTypesInCodemode(code: string): string {
 		return p > start ? p : -1;
 	};
 
-	const stripParamList = (params: string): string => {
+	const stripParamList = (params: string, recDepth = 0): string => {
 		let outP = "";
 		let idx = 0;
 		let dp = 0;
 		let db = 0;
 		let da = 0;
 		let inDefault = false;
+		let defaultBuf = "";
+		const flushDefault = () => {
+			if (!inDefault) return;
+			if (
+				recDepth < 4 &&
+				(defaultBuf.includes(":") || /\?[ \t]*(?:,|=|\))/.test(defaultBuf)) &&
+				(defaultBuf.includes("=>") || /\bfunction\b/.test(defaultBuf))
+			) {
+				outP += stripFnAndArrowTypes(defaultBuf, recDepth + 1);
+			} else {
+				outP += defaultBuf;
+			}
+			defaultBuf = "";
+			inDefault = false;
+		};
+		const pushOut = (chunk: string) => {
+			if (inDefault) defaultBuf += chunk;
+			else outP += chunk;
+		};
 		while (idx < params.length) {
 			const ch = params[idx];
 			if (ch === "(") dp++;
@@ -1201,27 +1228,37 @@ function stripTsTypesInCodemode(code: string): string {
 					else if (params[j] === "}") bDepth--;
 					j++;
 				}
-				outP += params.slice(idx, j);
+				pushOut(params.slice(idx, j));
 				idx = j;
 				if (dp === 0 && db === 0 && da === 0 && !inDefault) {
 					const rest = params.slice(idx).match(/^[ \t]*\??[ \t]*:/);
 					if (rest) {
 						const tEnd = consumeBalancedType(params, idx + rest[0].length, true);
 						if (tEnd > 0) idx = tEnd;
+					} else {
+						const bareOpt = params.slice(idx).match(/^[ \t]*\?(?=[ \t]*(?:,|=|$))/);
+						if (bareOpt) idx += bareOpt[0].length;
 					}
 				}
 				continue;
 			}
 			if (dp === 0 && db === 0 && da === 0) {
 				if (ch === ",") {
-					inDefault = false;
+					flushDefault();
+					outP += ch;
+					idx++;
+					continue;
 				} else if (
+					!inDefault &&
 					ch === "=" &&
 					params[idx + 1] !== ">" &&
 					params[idx + 1] !== "=" &&
 					(idx === 0 || !"!=<>".includes(params[idx - 1]))
 				) {
+					outP += ch;
 					inDefault = true;
+					idx++;
+					continue;
 				} else if (!inDefault && (ch === "?" || ch === ":")) {
 					const colonM = params.slice(idx).match(/^\??[ \t]*:/);
 					if (colonM) {
@@ -1230,13 +1267,107 @@ function stripTsTypesInCodemode(code: string): string {
 							idx = tEnd;
 							continue;
 						}
+					} else if (ch === "?" && /[A-Za-z0-9_$}\]]$/.test(outP.trimEnd())) {
+						let k = idx + 1;
+						while (k < params.length && (params[k] === " " || params[k] === "\t")) k++;
+						if (k >= params.length || params[k] === "," || params[k] === "=") {
+							idx++;
+							continue;
+						}
 					}
 				}
 			}
-			outP += ch;
+			pushOut(ch);
 			idx++;
 		}
+		flushDefault();
 		return outP;
+	};
+
+	const hasStrippableParamToken = (rawParams: string): boolean =>
+		rawParams.includes(":") || /\?[ \t]*(?:,|=|$)/.test(rawParams);
+
+	const stripFnAndArrowTypes = (src: string, recDepth = 0): string => {
+		if (recDepth > 4 || (!src.includes(":") && !src.includes("?"))) return src;
+		let curSrc = src;
+		const fnHeadRe = /\b((?:async[ \t]+)?function(?:[ \t]+[A-Za-z_$][A-Za-z0-9_$]*)?[ \t]*)(?:<[^>\n;{]+>[ \t]*)?\(/g;
+		let fnOut = "";
+		let fnCur = 0;
+		let fm: RegExpExecArray | null;
+		while ((fm = fnHeadRe.exec(curSrc)) !== null) {
+			const openParen = fm.index + fm[0].length - 1;
+			let depth = 1;
+			let p = openParen + 1;
+			while (p < curSrc.length && depth > 0) {
+				if (curSrc[p] === "(") depth++;
+				else if (curSrc[p] === ")") depth--;
+				p++;
+			}
+			if (depth !== 0) continue;
+			const closeParen = p - 1;
+			const rawParams = curSrc.slice(openParen + 1, closeParen);
+			const cleanParams = hasStrippableParamToken(rawParams) ? stripParamList(rawParams, recDepth) : rawParams;
+			let afterClose = closeParen + 1;
+			const retColon = curSrc.slice(afterClose).match(/^[ \t]*:/);
+			if (retColon) {
+				const tEnd = consumeBalancedType(curSrc, afterClose + retColon[0].length, false);
+				if (tEnd > 0) {
+					let k = tEnd;
+					while (k < curSrc.length && (curSrc[k] === " " || curSrc[k] === "\t")) k++;
+					if (curSrc[k] === "{") {
+						afterClose = tEnd;
+					}
+				}
+			}
+			fnOut += curSrc.slice(fnCur, fm.index) + fm[1] + "(" + cleanParams + ")" + (afterClose > closeParen + 1 ? " " : "");
+			fnCur = afterClose;
+			fnHeadRe.lastIndex = afterClose;
+		}
+		if (fnCur > 0) curSrc = fnOut + curSrc.slice(fnCur);
+
+		// Arrow functions: `(params)[: ReturnType] =>`
+		let arrOut = "";
+		let arrCur = 0;
+		for (let p = 0; p < curSrc.length; p++) {
+			if (curSrc[p] !== "(") continue;
+			let depth = 1;
+			let q = p + 1;
+			while (q < curSrc.length && depth > 0) {
+				if (curSrc[q] === "(") depth++;
+				else if (curSrc[q] === ")") depth--;
+				q++;
+			}
+			if (depth !== 0) continue;
+			const closeP = q - 1;
+			let k = closeP + 1;
+			while (k < curSrc.length && (curSrc[k] === " " || curSrc[k] === "\t")) k++;
+			let arrowStart = -1;
+			let retEnd = closeP + 1;
+			if (curSrc[k] === "=" && curSrc[k + 1] === ">") {
+				arrowStart = k;
+			} else if (curSrc[k] === ":") {
+				const tEnd = consumeBalancedType(curSrc, k + 1, false);
+				if (tEnd > 0) {
+					let k2 = tEnd;
+					while (k2 < curSrc.length && (curSrc[k2] === " " || curSrc[k2] === "\t")) k2++;
+					if (curSrc[k2] === "=" && curSrc[k2 + 1] === ">") {
+						arrowStart = k2;
+						retEnd = tEnd;
+					}
+				}
+			}
+			if (arrowStart >= 0) {
+				const rawParams = curSrc.slice(p + 1, closeP);
+				if (hasStrippableParamToken(rawParams) || retEnd > closeP + 1) {
+					const cleanParams = hasStrippableParamToken(rawParams) ? stripParamList(rawParams, recDepth) : rawParams;
+					arrOut += curSrc.slice(arrCur, p) + "(" + cleanParams + ")" + (retEnd > closeP + 1 ? " " : "");
+					arrCur = retEnd;
+					p = arrowStart + 1;
+				}
+			}
+		}
+		if (arrCur > 0) curSrc = arrOut + curSrc.slice(arrCur);
+		return curSrc;
 	};
 
 	let res = masked;
@@ -1273,85 +1404,9 @@ function stripTsTypesInCodemode(code: string): string {
 		"catch ($1)",
 	);
 
-	// 3. Function declarations/expressions & arrow functions (params + return types)
-	if (res.includes(":")) {
-		const fnHeadRe = /\b((?:async[ \t]+)?function(?:[ \t]+[A-Za-z_$][A-Za-z0-9_$]*)?[ \t]*)(?:<[^>\n;{]+>[ \t]*)?\(/g;
-		let fnOut = "";
-		let fnCur = 0;
-		let fm: RegExpExecArray | null;
-		while ((fm = fnHeadRe.exec(res)) !== null) {
-			const openParen = fm.index + fm[0].length - 1;
-			let depth = 1;
-			let p = openParen + 1;
-			while (p < res.length && depth > 0) {
-				if (res[p] === "(") depth++;
-				else if (res[p] === ")") depth--;
-				p++;
-			}
-			if (depth !== 0) continue;
-			const closeParen = p - 1;
-			const rawParams = res.slice(openParen + 1, closeParen);
-			const cleanParams = rawParams.includes(":") ? stripParamList(rawParams) : rawParams;
-			let afterClose = closeParen + 1;
-			const retColon = res.slice(afterClose).match(/^[ \t]*:/);
-			if (retColon) {
-				const tEnd = consumeBalancedType(res, afterClose + retColon[0].length, false);
-				if (tEnd > 0) {
-					let k = tEnd;
-					while (k < res.length && (res[k] === " " || res[k] === "\t")) k++;
-					if (res[k] === "{") {
-						afterClose = tEnd;
-					}
-				}
-			}
-			fnOut += res.slice(fnCur, fm.index) + fm[1] + "(" + cleanParams + ")" + (afterClose > closeParen + 1 ? " " : "");
-			fnCur = afterClose;
-			fnHeadRe.lastIndex = afterClose;
-		}
-		if (fnCur > 0) res = fnOut + res.slice(fnCur);
-
-		// Arrow functions: `(params)[: ReturnType] =>`
-		let arrOut = "";
-		let arrCur = 0;
-		for (let p = 0; p < res.length; p++) {
-			if (res[p] !== "(") continue;
-			let depth = 1;
-			let q = p + 1;
-			while (q < res.length && depth > 0) {
-				if (res[q] === "(") depth++;
-				else if (res[q] === ")") depth--;
-				q++;
-			}
-			if (depth !== 0) continue;
-			const closeP = q - 1;
-			let k = closeP + 1;
-			while (k < res.length && (res[k] === " " || res[k] === "\t")) k++;
-			let arrowStart = -1;
-			let retEnd = closeP + 1;
-			if (res[k] === "=" && res[k + 1] === ">") {
-				arrowStart = k;
-			} else if (res[k] === ":") {
-				const tEnd = consumeBalancedType(res, k + 1, false);
-				if (tEnd > 0) {
-					let k2 = tEnd;
-					while (k2 < res.length && (res[k2] === " " || res[k2] === "\t")) k2++;
-					if (res[k2] === "=" && res[k2 + 1] === ">") {
-						arrowStart = k2;
-						retEnd = tEnd;
-					}
-				}
-			}
-			if (arrowStart >= 0) {
-				const rawParams = res.slice(p + 1, closeP);
-				if (rawParams.includes(":") || retEnd > closeP + 1) {
-					const cleanParams = rawParams.includes(":") ? stripParamList(rawParams) : rawParams;
-					arrOut += res.slice(arrCur, p) + "(" + cleanParams + ")" + (retEnd > closeP + 1 ? " " : "");
-					arrCur = retEnd;
-					p = arrowStart + 1;
-				}
-			}
-		}
-		if (arrCur > 0) res = arrOut + res.slice(arrCur);
+	// 3. Function declarations/expressions & arrow functions (params + return types, recursively into default exprs)
+	if (res.includes(":") || res.includes("?")) {
+		res = stripFnAndArrowTypes(res, 0);
 	}
 
 	// 4. `as <Type>` casts (supports nested generics like `as unknown as Record<string, any>`)
@@ -2904,15 +2959,44 @@ export function countCodemodeStoreKeys(branch: ReadonlyArray<Record<string, unkn
 	return listCodemodeStoreKeys(branch).length;
 }
 
+export function isSieveSelfCommand(cmd: string): boolean {
+	if (!cmd) return false;
+	return (
+		/(?:^|[\s;&|("'/\\])ap(?:\.exe)?["']?\s+sieve\b/i.test(cmd) ||
+		/\b(?:ap_sieve|sieve_query|sieve_peek)\b/i.test(cmd)
+	);
+}
+
+export function isSieveSelfCodemode(code: string): boolean {
+	if (!code) return false;
+	return (
+		/\btools\.(?:mcp__agent_primitives__ap_sieve|ap_sieve|[a-z0-9_]*sieve_query)\s*\(/i.test(code) ||
+		/(?:^|[\s;&|("'/\\`])ap(?:\.exe)?["']?\s+sieve\s+(?:peek|search|list|prune|stats)\b/i.test(code)
+	);
+}
+
+/**
+ * Clarify `ap sieve pipe` footer so models never pass regexes to FTS5 `search` or vice versa.
+ */
+export function formatAutoSieveDigest(stdout: string): string {
+	if (!stdout) return stdout;
+	return stdout.replace(
+		/\|\s*peek:\s*ap sieve peek ([a-z0-9_-]+) --lines A:B\s*\|\s*--grep REGEX\]/i,
+		"| regex: ap sieve peek $1 --grep REGEX [--lines A:B] | keywords(FTS5): ap sieve search <words>]",
+	);
+}
+
 export function normCmdFingerprint(raw: string): string {
-	return raw
+	const norm = raw
 		.replace(/^export\s+PYTHONUTF8=1\s+PYTHONIOENCODING=utf-8;\s*/i, "")
 		.replace(/^\$env:PYTHONUTF8='1';\s*\$env:PYTHONIOENCODING='utf-8';\s*/i, "")
 		.replace(/\b0x[0-9a-fA-F]{4,}\b/g, "<HEX>")
 		.replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b/g, "<TS>")
 		.replace(/\s+/g, " ")
-		.trim()
-		.slice(0, 180);
+		.trim();
+	if (norm.length < 8) return norm;
+	const digest = createHash("sha256").update(norm).digest("hex").slice(0, 16);
+	return `${digest}:${norm.slice(0, 96)}`;
 }
 
 export function formatPostEditLineShiftTip(
@@ -3555,7 +3639,94 @@ export function healBashPowerShellCommand(cmd: string): string | undefined {
 			/\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&]*?\s-(?:Command|c)\s+)(['"])/gi,
 			"$1$2[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
 		);
-		return psFixed !== cmd ? psFixed : undefined;
+		if (psFixed !== cmd) return psFixed;
+		// Lock UTF-8 output encoding on `powershell ... -File <script.ps1> [args...]` while preserving
+		// script arguments, `$LASTEXITCODE`, non-terminating/terminating failure status, and trailing pipes/redirects.
+		const psFileRe = /\b((?:powershell|pwsh)(?:\.exe)?\b[^|;&"'\r\n]*?)\s+-File\s+/gi;
+		let fileOut = "";
+		let fileCur = 0;
+		let fileChanged = false;
+		while (true) {
+			psFileRe.lastIndex = fileCur;
+			const fm = psFileRe.exec(cmd);
+			if (!fm) break;
+			const segStart = fm.index + fm[0].length;
+			let segEnd = segStart;
+			let q: string | null = null;
+			while (segEnd < cmd.length) {
+				const ch = cmd[segEnd];
+				if (q) {
+					if (ch === "\\" && q === '"' && segEnd + 1 < cmd.length) {
+						segEnd += 2;
+						continue;
+					}
+					if (ch === q) q = null;
+					segEnd++;
+					continue;
+				}
+				if (ch === "'" || ch === '"') {
+					q = ch;
+					segEnd++;
+					continue;
+				}
+				if (
+					ch === "|" ||
+					ch === ";" ||
+					ch === "&" ||
+					ch === ">" ||
+					ch === "<" ||
+					ch === "\n" ||
+					ch === "\r"
+				) {
+					break;
+				}
+				// Stop before `2>&1` / `1>&2` / `2>file`
+				if (
+					(ch === "1" || ch === "2") &&
+					cmd[segEnd + 1] === ">" &&
+					(segEnd === segStart || /\s/.test(cmd[segEnd - 1]))
+				) {
+					break;
+				}
+				segEnd++;
+			}
+			const rawTail = cmd.slice(segStart, segEnd);
+			const trailWs = rawTail.match(/\s*$/)?.[0] ?? "";
+			const argSpan = rawTail.slice(0, rawTail.length - trailWs.length).trim();
+			if (!argSpan || argSpan === "-") {
+				fileCur = segEnd;
+				continue;
+			}
+			// Extract script token + optional args
+			const tokM = argSpan.match(/^('[^']+'|"[^"\\]*(?:\\.[^"\\]*)*"|\S+)([\s\S]*)$/);
+			if (!tokM) {
+				fileCur = segEnd;
+				continue;
+			}
+			const rawScriptTok = tokM[1];
+			const restArgs = tokM[2] || "";
+			const scriptTok =
+				(rawScriptTok.startsWith('"') && rawScriptTok.endsWith('"')) ||
+				(rawScriptTok.startsWith("'") && rawScriptTok.endsWith("'"))
+					? rawScriptTok
+					: `"${rawScriptTok}"`;
+			const psCall = `${scriptTok}${restArgs}`;
+			if (/'[^']*[$`][^']*'/.test(psCall)) {
+				fileCur = segEnd;
+				continue;
+			}
+			const needsBashExpand = /[$`]/.test(psCall) || psCall.includes("'");
+			const wrappedCmd = needsBashExpand
+				? `"[Console]::OutputEncoding=[Text.Encoding]::UTF8; \\$OutputEncoding=[Text.Encoding]::UTF8; & ${psCall.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}; if (\\$LASTEXITCODE) { exit \\$LASTEXITCODE } elseif (-not \\$?) { exit 1 }"`
+				: `'[Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; & ${psCall}; if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }'`;
+			fileOut += `${cmd.slice(fileCur, fm.index)}${fm[1]} -Command ${wrappedCmd}${trailWs}`;
+			fileCur = segEnd;
+			fileChanged = true;
+		}
+		if (fileChanged) {
+			fileOut += cmd.slice(fileCur);
+			return fileOut !== cmd ? fileOut : undefined;
+		}
 	}
 	return undefined;
 }
@@ -3617,7 +3788,7 @@ export function clampKvSafeSleep(cmd: string, toolName: string, maxSec = 45): st
 	return undefined;
 }
 
-const MSYS_WIN_CLI_RE = /(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|taskkill(?:\.exe)?|tasklist(?:\.exe)?|sc(?:\.exe)?|icacls(?:\.exe)?|reg(?:\.exe)?|netstat(?:\.exe)?|whoami(?:\.exe)?|schtasks(?:\.exe)?|wevtutil(?:\.exe)?|netsh(?:\.exe)?|where(?:\.exe)?|wmic(?:\.exe)?|certutil(?:\.exe)?|bcdedit(?:\.exe)?|secedit(?:\.exe)?)\b[^\r\n;&|]*?\s\/[A-Za-z?]/i;
+const MSYS_WIN_CLI_RE = /(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|findstr(?:\.exe)?|taskkill(?:\.exe)?|tasklist(?:\.exe)?|sc(?:\.exe)?|icacls(?:\.exe)?|reg(?:\.exe)?|netstat(?:\.exe)?|whoami(?:\.exe)?|schtasks(?:\.exe)?|wevtutil(?:\.exe)?|netsh(?:\.exe)?|where(?:\.exe)?|wmic(?:\.exe)?|certutil(?:\.exe)?|bcdedit(?:\.exe)?|secedit(?:\.exe)?)\b[^\r\n;&|]*?\s\/[A-Za-z?]/i;
 const MSYS_OPENSSL_SUBJ_RE = /\bopenssl\b[^\r\n;&|]*?\s-subj\s+['"]?\//i;
 
 export function normalizeWindowsToolPath(rawPath: string, isWin = process.platform === "win32"): string | undefined {
@@ -3638,12 +3809,21 @@ export function normalizeWindowsToolPath(rawPath: string, isWin = process.platfo
 
 export function healMsysPathConv(raw: string, toolName = "bash"): string | undefined {
 	if (!raw || toolName !== "bash") return undefined;
-	if (/\b(?:MSYS_NO_PATHCONV|MSYS2_ARG_CONV_EXCL)=/.test(raw)) return undefined;
-	if (/(?:^|\s)\/\/[A-Za-z?]/.test(raw)) return undefined;
-	if (!MSYS_WIN_CLI_RE.test(raw) && !MSYS_OPENSSL_SUBJ_RE.test(raw)) return undefined;
-	const converted = raw.replace(/(^|[\s'"=])\/([a-zA-Z])\/([^\s'"`;&|<>()]*)/g, (_m, pfx: string, drv: string, tail: string) => {
+	const hasMsysEnv = /\b(?:MSYS_NO_PATHCONV|MSYS2_ARG_CONV_EXCL)=/.test(raw);
+	const hasBareWhoamiFlag = /(?:^|[\r\n;&|(]\s*)(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s+)*whoami(?=\s+\/[A-Za-z?])/i.test(raw);
+	if (hasMsysEnv && !hasBareWhoamiFlag) return undefined;
+	if (!hasBareWhoamiFlag && /(?:^|\s)\/\/[A-Za-z?]/.test(raw)) return undefined;
+	if (!hasBareWhoamiFlag && !MSYS_WIN_CLI_RE.test(raw) && !MSYS_OPENSSL_SUBJ_RE.test(raw)) return undefined;
+	let converted = raw.replace(/(^|[\s'"=])\/([a-zA-Z])\/([^\s'"`;&|<>()]*)/g, (_m, pfx: string, drv: string, tail: string) => {
 		return `${pfx}${drv.toUpperCase()}:/${tail}`;
 	});
+	if (hasBareWhoamiFlag) {
+		converted = converted.replace(
+			/((?:^|[\r\n;&|(]\s*)(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s+)*)whoami(?=\s+\/[A-Za-z?])/gi,
+			"$1whoami.exe",
+		);
+	}
+	if (hasMsysEnv) return converted !== raw ? converted : undefined;
 	const trimmed = converted.trimStart();
 	if (trimmed.includes("\n")) return `export MSYS_NO_PATHCONV=1\n${converted}`;
 	if (/(?:&&|\|\||[;|])/.test(trimmed)) return `export MSYS_NO_PATHCONV=1; ${converted}`;
@@ -4856,7 +5036,8 @@ export function healCommand(
 	// 1. Accelerate single-command slow patterns (`grep -rn`, `dir /b`, `sed`/`head`/`tail`/`cat`, `find`, slow PS `Get-ChildItem -Recurse -Filter`)
 	const singleAccel = accelerateSingleBashSegment(cmd, toolName);
 	if (singleAccel) {
-		return singleAccel;
+		const shieldedSingle = process.platform === "win32" ? healMsysPathConv(singleAccel, toolName) : undefined;
+		return shieldedSingle ?? singleAccel;
 	}
 
 	// 1f. Accelerate top-level `;` / `&&` compound Bash probes (and wrap mid-command bare PowerShell cmdlets)
@@ -5381,13 +5562,32 @@ interface MarkdownSegment {
 	isCode: boolean;
 }
 
+function consumeBlockquotePrefix(text: string, lineStart: number): { pos: number; bqDepth: number } {
+	const n = text.length;
+	let pos = lineStart;
+	let bqDepth = 0;
+	while (pos < n) {
+		let sp = pos;
+		while (sp < n && sp - pos < 3 && text[sp] === " ") sp++;
+		if (sp < n && text[sp] === ">") {
+			bqDepth++;
+			pos = sp + 1;
+			if (pos < n && text[pos] === " ") pos++;
+			continue;
+		}
+		break;
+	}
+	return { pos, bqDepth };
+}
+
 function matchCommonMarkFenceOpener(
 	text: string,
 	lineStart: number,
-): { fenceChar: string; fenceLen: number; infoEnd: number } | undefined {
+): { fenceChar: string; fenceLen: number; infoEnd: number; bqDepth: number } | undefined {
 	const n = text.length;
-	let p = lineStart;
-	while (p < n && p - lineStart < 3 && text[p] === " ") p++;
+	const { pos: afterBq, bqDepth } = consumeBlockquotePrefix(text, lineStart);
+	let p = afterBq;
+	while (p < n && p - afterBq < 3 && text[p] === " ") p++;
 	const fc = p < n ? text[p] : "";
 	if (fc !== "`" && fc !== "~") return undefined;
 	let fl = 0;
@@ -5398,16 +5598,16 @@ function matchCommonMarkFenceOpener(
 	const info = text.slice(p + fl, infoEnd);
 	// CommonMark §4.5: backtick code fence info strings cannot contain backticks (tilde fences may)
 	if (fc === "`" && info.includes("`")) return undefined;
-	return { fenceChar: fc, fenceLen: fl, infoEnd };
+	return { fenceChar: fc, fenceLen: fl, infoEnd, bqDepth };
 }
 
 /**
  * Segment Markdown text into non-overlapping prose (`isCode: false`) and code (`isCode: true`)
- * spans per CommonMark §3/§4.5/§6.1:
- * - Fenced code blocks (`0-3` leading spaces, `3+` backticks or tildes, nested longer fences, unclosed-to-EOF,
- *   rejecting backticks in backtick-fence info strings while allowing them in tilde-fence info strings).
- * - N-backtick inline code spans (respecting escaped `\` `, stopping at blank lines and at paragraph-interrupting
- *   CommonMark fenced code block openers).
+ * spans per CommonMark §3/§4.5/§5.1/§6.1:
+ * - Fenced code blocks (optional blockquote prefix `(?:[ ]{0,3}>[ ]?)+`, `0-3` leading spaces,
+ *   `3+` backticks or tildes, nested longer fences, unclosed-to-EOF/blockquote-end, rejecting
+ *   backticks in backtick-fence info strings while allowing them in tilde-fence info strings).
+ * - N-backtick inline code spans (respecting escaped `\` `, stopping at blank lines).
  */
 function segmentMarkdownCodeSpans(text: string): MarkdownSegment[] {
 	const n = text.length;
@@ -5431,16 +5631,27 @@ function segmentMarkdownCodeSpans(text: string): MarkdownSegment[] {
 				while (q < n) {
 					const lineEnd = text.indexOf("\n", q);
 					const nextLine = lineEnd < 0 ? n : lineEnd + 1;
-					let cp = q;
-					while (cp < n && cp - q < 3 && text[cp] === " ") cp++;
+					const lineStop = lineEnd < 0 ? n : lineEnd;
+					const lineNoCr = lineStop > q && text[lineStop - 1] === "\r" ? lineStop - 1 : lineStop;
+					const { pos: afterBq, bqDepth } = consumeBlockquotePrefix(text, q);
+					if (opener.bqDepth > 0 && bqDepth < opener.bqDepth) {
+						closeEnd =
+							q > 0 && text[q - 1] === "\n"
+								? q - 1 > i && text[q - 2] === "\r"
+									? q - 2
+									: q - 1
+								: q;
+						break;
+					}
+					let cp = afterBq;
+					while (cp < lineNoCr && cp - afterBq < 3 && text[cp] === " ") cp++;
 					let cl = 0;
-					while (cp + cl < n && text[cp + cl] === opener.fenceChar) cl++;
+					while (cp + cl < lineNoCr && text[cp + cl] === opener.fenceChar) cl++;
 					if (cl >= opener.fenceLen) {
 						let rest = cp + cl;
-						const stop = lineEnd < 0 ? n : lineEnd;
-						while (rest < stop && (text[rest] === " " || text[rest] === "\t" || text[rest] === "\r")) rest++;
-						if (rest === stop) {
-							closeEnd = stop;
+						while (rest < lineNoCr && (text[rest] === " " || text[rest] === "\t")) rest++;
+						if (rest === lineNoCr) {
+							closeEnd = lineNoCr;
 							break;
 						}
 					}
@@ -5456,8 +5667,9 @@ function segmentMarkdownCodeSpans(text: string): MarkdownSegment[] {
 			// Detect a CommonMark §4.5 rejected backtick fence opener (info string contains `` ` ``)
 			// so its opening backticks can still close on the same line (e.g. ```` ``` a ``` ````)
 			// without swallowing subsequent lines as a pseudo-fenced block.
-			let p = i;
-			while (p < n && p - i < 3 && text[p] === " ") p++;
+			const { pos: afterBq } = consumeBlockquotePrefix(text, i);
+			let p = afterBq;
+			while (p < n && p - afterBq < 3 && text[p] === " ") p++;
 			if (p < n && text[p] === "`") {
 				let fl = 0;
 				while (p + fl < n && text[p + fl] === "`") fl++;
@@ -7260,7 +7472,7 @@ export default function (pi: ExtensionAPI) {
 			justRebuiltColdCache && (effTokens === null || effTokens < MASK_TIER2_TOKENS);
 		if (Array.isArray(contextEntries) && cooldownReady && !protectFreshColdRebuild) {
 			const basePlanOpts = deepCacheDiscount
-				? { highWaterTokens: 210000, staleCharsFallback: 360000 }
+				? { highWaterTokens: 210000, highWaterPercent: 85, staleCharsFallback: 360000 }
 				: {};
 			const effMaskHighWater = getEffectiveMaskHighWaterTokens(
 				ctx?.model as { provider?: string; id?: string; contextWindow?: number; cost?: { input?: number; cacheRead?: number } } | undefined,
@@ -7595,26 +7807,29 @@ export default function (pi: ExtensionAPI) {
 
 		// 0. Lossless multi-block auto-sieve for oversized `codemode` dumps (content[1..N]; preserves header, Script error & images)
 		if (event.toolName === "codemode") {
-			const sieved = sieveCodemodeContentBlocks(
-				workingContent,
-				(rawBody) => {
-					const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-codemode"], {
-						input: rawBody,
-						encoding: "utf8",
-						timeout: 4000,
-						windowsHide: true,
-						env: { ...process.env, SIEVE_HOME },
-					});
-					return res.status === 0 && res.stdout ? res.stdout : undefined;
-				},
-				isFast,
-				apProfileOverrides?.sieveHardChars,
-				effContextTokens,
-			);
-			if (sieved) {
-				workingContent = sieved;
-				sievedCount += 1;
-				mutated = true;
+			const cmCode = typeof event.input?.code === "string" ? event.input.code : "";
+			if (!isSieveSelfCodemode(cmCode)) {
+				const sieved = sieveCodemodeContentBlocks(
+					workingContent,
+					(rawBody) => {
+						const res = spawnSync(AP_BIN, ["sieve", "pipe", "--label", "pi-codemode"], {
+							input: rawBody,
+							encoding: "utf8",
+							timeout: 4000,
+							windowsHide: true,
+							env: { ...process.env, SIEVE_HOME },
+						});
+						return res.status === 0 && res.stdout ? formatAutoSieveDigest(res.stdout) : undefined;
+					},
+					isFast,
+					apProfileOverrides?.sieveHardChars,
+					effContextTokens,
+				);
+				if (sieved) {
+					workingContent = sieved;
+					sievedCount += 1;
+					mutated = true;
+				}
 			}
 		}
 
@@ -7707,7 +7922,7 @@ export default function (pi: ExtensionAPI) {
 						env: { ...process.env, SIEVE_HOME },
 					});
 					if (res.status === 0 && res.stdout && res.stdout.length > 40 && res.stdout.length < readText.length * 0.78) {
-						readText = `${res.stdout.trimEnd()}\n[ap read-sieve] Unbounded full-file read archived losslessly; use read(offset, limit) for exact edit lines or ap sieve peek/search.`;
+						readText = `${formatAutoSieveDigest(res.stdout).trimEnd()}\n[ap read-sieve] Unbounded full-file read archived losslessly; use read(offset, limit) for exact edit lines, \`ap sieve peek <id> --grep <regex>\` for regex, or \`ap sieve search <keywords>\` for FTS5 keywords.`;
 						sievedCount += 1;
 						readBlockMutated = true;
 						didAutoSieveRead = true;
@@ -7869,7 +8084,7 @@ export default function (pi: ExtensionAPI) {
 		// C. Dual-tier multi-block shell auto-sieve (>=24KB unconditional, >=14KB structured/noisy) + failure tips + loop-breaker
 		if (event.toolName === "bash" || event.toolName === "powershell") {
 			const cmd = typeof event.input?.command === "string" ? event.input.command : "";
-			const isSieveSelf = /\bap(?:\.exe)?\s+sieve\b/.test(cmd);
+			const isSieveSelf = isSieveSelfCommand(cmd);
 			const isBoundedApCmd =
 				cmd.includes("ap.exe") ||
 				/\bap\s+(?:read|search|query|atlas|probe|guard|sieve|baton|splice|recall)\b/.test(cmd);
@@ -7901,7 +8116,7 @@ export default function (pi: ExtensionAPI) {
 							windowsHide: true,
 							env: { ...process.env, SIEVE_HOME },
 						});
-						return res.status === 0 && res.stdout ? res.stdout : undefined;
+						return res.status === 0 && res.stdout ? formatAutoSieveDigest(res.stdout) : undefined;
 					},
 					isFast,
 					apProfileOverrides?.sieveHardChars,

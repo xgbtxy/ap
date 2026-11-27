@@ -4,9 +4,83 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static UNDO_TX_SEQ: AtomicU64 = AtomicU64::new(0);
+static UNDO_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+fn replace_atomic_os(src: &Path, dst: &Path) -> std::io::Result<()> {
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(src: *const u16, dst: *const u16, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    let src_w: Vec<u16> = src
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let dst_w: Vec<u16> = dst
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let dst_readonly = fs::metadata(dst)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false);
+    for attempt in 0..8u64 {
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = unsafe { GetLastError() };
+        if (err == 32 || (err == 5 && !dst_readonly)) && attempt < 7 {
+            std::thread::sleep(std::time::Duration::from_millis(4 + attempt * 4));
+            continue;
+        }
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    Err(std::io::Error::other("MoveFileExW failed after retries"))
+}
+
+#[cfg(not(windows))]
+fn replace_atomic_os(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::rename(src, dst)
+}
+
+fn write_file_atomic(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let seq = UNDO_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let fname = dst.file_name().and_then(|s| s.to_str()).unwrap_or("undo");
+    let tmp = parent.join(format!(".{fname}.ap_undo_tmp.{}.{seq}", std::process::id()));
+    let mut f = fs::File::create(&tmp)?;
+    if let Err(e) = f.write_all(bytes) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
+    if let Err(e) = replace_atomic_os(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileBackupEntry {
@@ -78,13 +152,13 @@ fn sorted_tx_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-pub fn record_named_snapshot(
+pub fn record_named_snapshot_result(
     cwd: &Path,
     label: Option<&str>,
     rel_or_abs_paths: &[String],
-) -> Option<UndoTx> {
+) -> Result<UndoTx, String> {
     if rel_or_abs_paths.is_empty() {
-        return None;
+        return Err("no_files_to_snapshot".to_string());
     }
     let cwd_canon = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut entries = Vec::new();
@@ -97,12 +171,19 @@ pub fn record_named_snapshot(
         } else {
             cwd_canon.join(p)
         };
-        let key = full.to_string_lossy().replace('\\', "/");
+        let raw_key = full.to_string_lossy().replace('\\', "/");
+        let key = if let Some(unc) = raw_key.strip_prefix("//?/UNC/") {
+            format!("//{unc}")
+        } else if let Some(stripped) = raw_key.strip_prefix("//?/") {
+            stripped.to_string()
+        } else {
+            raw_key
+        };
         if !seen.insert(key.clone()) {
             continue;
         }
         if full.is_file() {
-            let bytes = fs::read(&full).unwrap_or_default();
+            let bytes = fs::read(&full).map_err(|e| format!("failed to read `{key}`: {e}"))?;
             let orig_lines = bytes.iter().filter(|&&b| b == b'\n').count() + 1;
             let orig_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             entries.push(FileBackupEntry {
@@ -111,6 +192,8 @@ pub fn record_named_snapshot(
                 orig_lines,
                 orig_b64,
             });
+        } else if full.exists() {
+            return Err(format!("cannot snapshot non-file path `{key}`"));
         } else {
             entries.push(FileBackupEntry {
                 path: key,
@@ -130,7 +213,8 @@ pub fn record_named_snapshot(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let id = format!("{now_ms:015}_{}", std::process::id());
+    let seq = UNDO_TX_SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{now_ms:015}_{}_{seq}", std::process::id());
     let tx = UndoTx {
         id: id.clone(),
         ts,
@@ -139,19 +223,27 @@ pub fn record_named_snapshot(
     };
 
     let dir = undo_dir();
-    if fs::create_dir_all(&dir).is_ok() {
-        let dst = dir.join(format!("tx_{id}.json"));
-        if let Ok(txt) = serde_json::to_string(&tx) {
-            let _ = fs::write(dst, txt);
-        }
-        let all = sorted_tx_files(&dir);
-        if all.len() > 25 {
-            for old in &all[..all.len() - 25] {
-                let _ = fs::remove_file(old);
-            }
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create undo directory: {e}"))?;
+    let dst = dir.join(format!("tx_{id}.json"));
+    let txt = serde_json::to_string(&tx)
+        .map_err(|e| format!("failed to serialize undo checkpoint: {e}"))?;
+    write_file_atomic(&dst, txt.as_bytes())
+        .map_err(|e| format!("failed to write undo checkpoint: {e}"))?;
+    let all = sorted_tx_files(&dir);
+    if all.len() > 25 {
+        for old in &all[..all.len() - 25] {
+            let _ = fs::remove_file(old);
         }
     }
-    Some(tx)
+    Ok(tx)
+}
+
+pub fn record_named_snapshot(
+    cwd: &Path,
+    label: Option<&str>,
+    rel_or_abs_paths: &[String],
+) -> Option<UndoTx> {
+    record_named_snapshot_result(cwd, label, rel_or_abs_paths).ok()
 }
 
 pub fn record_pre_edit_snapshot(cwd: &Path, rel_or_abs_paths: &[String]) -> Option<UndoTx> {
@@ -307,8 +399,20 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             return 1;
         }
-        let Some(tx) = record_named_snapshot(&cli.cwd, Some(lbl), &targets) else {
-            return 1;
+        let tx = match record_named_snapshot_result(&cli.cwd, Some(lbl), &targets) {
+            Ok(t) => t,
+            Err(err) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({"ok": false, "error": err}))
+                            .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("[ap undo] {err}");
+                }
+                return 1;
+            }
         };
         if cli.json {
             let saved_paths: Vec<&str> = tx.files.iter().map(|f| f.path.as_str()).collect();
@@ -413,21 +517,59 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 
     let mut restored = Vec::new();
+    let mut failed = Vec::new();
     for entry in &tx.files {
         let p = Path::new(&entry.path);
         if entry.existed {
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&entry.orig_b64) {
-                if let Some(parent) = p.parent() {
-                    let _ = fs::create_dir_all(parent);
+            match base64::engine::general_purpose::STANDARD.decode(&entry.orig_b64) {
+                Ok(bytes) => {
+                    if let Some(parent) = p.parent() {
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            failed.push(format!("{}: {e}", entry.path));
+                            continue;
+                        }
+                    }
+                    match write_file_atomic(p, &bytes) {
+                        Ok(()) => restored.push(format!("restored {}", entry.path)),
+                        Err(e) => failed.push(format!("{}: {e}", entry.path)),
+                    }
                 }
-                if fs::write(p, bytes).is_ok() {
-                    restored.push(format!("restored {}", entry.path));
-                }
+                Err(e) => failed.push(format!("{}: corrupt checkpoint payload ({e})", entry.path)),
             }
-        } else if p.exists() && fs::remove_file(p).is_ok() {
-            restored.push(format!("removed newly-created {}", entry.path));
+        } else if p.exists() {
+            match fs::remove_file(p) {
+                Ok(()) => restored.push(format!("removed newly-created {}", entry.path)),
+                Err(e) => failed.push(format!("{}: {e}", entry.path)),
+            }
         }
     }
+
+    if !failed.is_empty() {
+        let msg = format!(
+            "failed to restore {} file(s); checkpoint `{}` preserved",
+            failed.len(),
+            tx.id
+        );
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": false,
+                    "error": msg,
+                    "id": tx.id,
+                    "label": tx.label,
+                    "kept": true,
+                    "actions": restored,
+                    "failed": failed,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("[ap undo] ERROR: {msg}\n  - {}", failed.join("\n  - "));
+        }
+        return 1;
+    }
+
     if !cli.keep {
         let _ = fs::remove_file(tx_path);
     }
