@@ -446,32 +446,76 @@ fn scan_agy(f: &Path) -> SessionScan {
         return SessionScan::default();
     };
     let mut seen_reads: HashMap<String, usize> = HashMap::new();
+    let mut recent: VecDeque<String> = VecDeque::with_capacity(7);
+    let mut prev_prompt_tokens = 0u64;
+    let mut serial_1tool_run = 0usize;
+    let flush_serial = |run: &mut usize, out: &mut Counters| {
+        if *run >= 3 {
+            out.serial_single_tool_turns += *run;
+        }
+        *run = 0;
+    };
     for_each_bounded_line(file, MAX_LINE_PARSE_BYTES, |line, raw_len| {
         if raw_len > MAX_LINE_PARSE_BYTES {
-            st.outputs_over_8kb += 1;
+            if !line.contains("\"PLANNER_RESPONSE\"") {
+                st.outputs_over_8kb += 1;
+            }
             classify_err(line, &mut st);
             return;
         }
         if !line.contains("\"tool_calls\"")
             && !line.contains("\"model\"")
             && !line.contains("\"content\"")
+            && !line.contains("\"input_tokens\"")
+            && !line.contains("\"USER_INPUT\"")
         {
             return;
         }
         let Ok(o) = serde_json::from_str::<Value>(line) else {
             return;
         };
+        let step_type = o["type"].as_str().unwrap_or("");
+        if step_type == "USER_INPUT" {
+            flush_serial(&mut serial_1tool_run, &mut st);
+            return;
+        }
         if let Some(m) = o["model"].as_str() {
             record_model_hint(&mut hist, m);
         }
+        let u_in = o["input_tokens"].as_u64().unwrap_or(0);
+        let u_cr = o["cache_read_tokens"].as_u64().unwrap_or(0);
+        if u_in > 0 || u_cr > 0 {
+            st.prompt_input_tokens += u_in;
+            st.prompt_cache_read_tokens += u_cr;
+            let prompt_tok = u_in + u_cr;
+            let status = o["status"].as_str().unwrap_or("");
+            if step_type != "ERROR_MESSAGE" && !status.eq_ignore_ascii_case("error") {
+                if prompt_tok >= 10_000
+                    && prev_prompt_tokens >= 10_000
+                    && (u_cr * 100) / prompt_tok < 45
+                {
+                    st.kv_cache_cold_drops += 1;
+                }
+                if prompt_tok > 0 {
+                    prev_prompt_tokens = prompt_tok;
+                }
+            }
+        }
+        if let Some(th) = o["thinking"].as_str() {
+            if th.len() >= 8000 {
+                st.heavy_thinking_turns += 1;
+            }
+        }
         if let Some(c) = o["content"].as_str() {
-            if c.len() >= 8192 {
+            if step_type != "PLANNER_RESPONSE" && c.len() >= 8192 {
                 st.outputs_over_8kb += 1;
             }
             classify_err(c, &mut st);
         }
         if let Some(tcs) = o["tool_calls"].as_array() {
+            let mut turn_tool_calls = 0usize;
             for tc in tcs {
+                turn_tool_calls += 1;
                 st.tool_calls += 1;
                 let nm = tc["name"]
                     .as_str()
@@ -496,12 +540,23 @@ fn scan_agy(f: &Path) -> SessionScan {
                     }
                 } else if nm == "run_command" {
                     if let Some(cl) = args["CommandLine"].as_str() {
+                        if track_sliding_loop(&mut recent, norm_cmd_key(cl)) {
+                            st.identical_retry_loops += 1;
+                        }
                         classify_cmd(cl, &mut st);
                     }
                 }
             }
+            if turn_tool_calls == 1 {
+                serial_1tool_run += 1;
+            } else {
+                flush_serial(&mut serial_1tool_run, &mut st);
+            }
+        } else if step_type == "PLANNER_RESPONSE" {
+            flush_serial(&mut serial_1tool_run, &mut st);
         }
     });
+    flush_serial(&mut serial_1tool_run, &mut st);
     SessionScan {
         counters: st,
         model_family: pick_dominant_family(&hist),
@@ -1750,5 +1805,98 @@ mod tests {
             seen.len() <= 2,
             "expected early lines before tail cap skipped: {seen:?}"
         );
+    }
+
+    #[test]
+    fn audit_antigravity_tracks_tokens_cache_serial_thinking_and_loops() {
+        let tmp = std::env::temp_dir().join(format!("ap_audit_agy_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let logs_dir = tmp
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("conv-001")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+
+        let big_out = "x".repeat(9000);
+        let big_think = "t".repeat(8500);
+        let lines = [
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-2.5-pro",
+                "input_tokens": 2000,
+                "cache_read_tokens": 20000,
+                "thinking": big_think,
+                "tool_calls": [{"name": "read_file", "args": {"Path": "/tmp/app/main.rs"}}]
+            })
+            .to_string(),
+            json!({
+                "type": "GENERIC",
+                "content": big_out
+            })
+            .to_string(),
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-2.5-pro",
+                "input_tokens": 18000,
+                "cache_read_tokens": 2000,
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cargo test --lib foo"}}]
+            })
+            .to_string(),
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-2.5-pro",
+                "input_tokens": 1000,
+                "cache_read_tokens": 25000,
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cargo test --lib foo"}}]
+            })
+            .to_string(),
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-2.5-pro",
+                "input_tokens": 500,
+                "cache_read_tokens": 26000,
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cargo test --lib foo"}}]
+            })
+            .to_string(),
+            json!({
+                "type": "USER_INPUT",
+                "content": "next"
+            })
+            .to_string(),
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-2.5-pro",
+                "input_tokens": 400,
+                "cache_read_tokens": 27000,
+                "tool_calls": [
+                    {"name": "read_file", "args": {"Path": "/tmp/app/main.rs"}},
+                    {"name": "run_command", "args": {"CommandLine": "echo done"}}
+                ]
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(logs_dir.join("transcript.jsonl"), lines).unwrap();
+
+        let report = audit_home(&tmp, 10, false);
+        let _ = fs::remove_dir_all(&tmp);
+        let agy = &report["harnesses_detected"]["antigravity_cli"];
+        assert_eq!(agy["prompt_input_tokens"], 21900);
+        assert_eq!(agy["prompt_cache_read_tokens"], 100000);
+        assert_eq!(agy["kv_cache_cold_drops"], 1);
+        assert_eq!(agy["heavy_thinking_turns"], 1);
+        assert_eq!(agy["serial_single_tool_turns"], 4);
+        assert_eq!(agy["identical_retry_loops"], 1);
+        assert_eq!(agy["outputs_over_8kb"], 1);
+        assert_eq!(agy["redundant_same_file_rereads"], 1);
+        assert_eq!(report["model_families_detected"]["gemini"]["sessions"], 1);
     }
 }
